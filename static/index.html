@@ -8,37 +8,56 @@
   </head>
   <body>
     <main class="app">
-      <section class="chat-shell" aria-label="Linux diagnostics chat">
-        <header class="topbar">
-          <div>
-            <h1>Linux Diagnostics Agent</h1>
-            <p id="status">Ready</p>
-          </div>
-          <button id="stopBtn" class="icon-button" type="button" disabled title="中止当前会话">
-            <span aria-hidden="true">■</span>
-            <span class="sr-only">中止当前会话</span>
-          </button>
-        </header>
-
-        <div id="messages" class="messages" aria-live="polite">
-          <article class="message assistant">
-            <div class="bubble">
-              描述你看到的症状，例如“CPU load 很高但使用率不高”或“磁盘 IO 延迟突然升高”。我会按需采集证据并给出诊断。
+      <div class="layout">
+        <!-- 左侧：聊天面板 -->
+        <section class="chat-shell" aria-label="Linux diagnostics chat">
+          <header class="topbar">
+            <div>
+              <h1>Linux Diagnostics Agent</h1>
+              <p id="status">Ready</p>
             </div>
-          </article>
-        </div>
+            <div class="topbar-actions">
+              <button id="toggleTreeBtn" class="text-button" type="button" title="切换诊断步骤面板">
+                步骤
+              </button>
+              <button id="stopBtn" class="icon-button" type="button" disabled title="中止当前会话">
+                <span aria-hidden="true">■</span>
+                <span class="sr-only">中止当前会话</span>
+              </button>
+            </div>
+          </header>
 
-        <form id="chatForm" class="composer">
-          <textarea
-            id="promptInput"
-            rows="2"
-            autocomplete="off"
-            placeholder="输入要诊断的问题..."
-            required
-          ></textarea>
-          <button id="sendBtn" type="submit">发送</button>
-        </form>
-      </section>
+          <div id="messages" class="messages" aria-live="polite">
+            <article class="message assistant">
+              <div class="bubble">
+                描述你看到的症状，例如"CPU load 很高但使用率不高"或"磁盘 IO 延迟突然升高"。我会按需采集证据并给出诊断。
+              </div>
+            </article>
+          </div>
+
+          <form id="chatForm" class="composer">
+            <textarea
+              id="promptInput"
+              rows="2"
+              autocomplete="off"
+              placeholder="输入要诊断的问题..."
+              required
+            ></textarea>
+            <button id="sendBtn" type="submit">发送</button>
+          </form>
+        </section>
+
+        <!-- 右侧：步骤树状图面板 -->
+        <aside id="treePanel" class="tree-panel" aria-label="诊断步骤">
+          <header class="tree-header">
+            <h2>诊断步骤</h2>
+            <button id="closeTreeBtn" class="text-button" type="button" title="关闭">✕</button>
+          </header>
+          <div id="treeContainer" class="tree-container">
+            <div class="tree-empty">发送诊断请求后，步骤将在此显示</div>
+          </div>
+        </aside>
+      </div>
     </main>
 
     <script src="/static/app.js" type="module"></script>

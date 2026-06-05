@@ -16,6 +16,7 @@ from diagnostics.config import STATIC_DIR, Settings
 from diagnostics.server.schemas import ChatRequest
 from diagnostics.server.sessions import SessionStore
 from diagnostics.server.sse import sse
+from diagnostics.server.step_tracker import StepTracker
 
 
 def create_app(settings: Settings | None = None, agent: Any | None = None) -> FastAPI:
@@ -76,19 +77,57 @@ async def _chat_event_stream(
     state.messages = state.messages[-settings.max_history_messages :]
     assistant_text: list[str] = []
 
+    tracker = StepTracker()
+
     try:
         yield sse("session", {"session_id": session_id})
+
+        # Start a fresh thinking segment
+        yield sse("think_start", {})
+
         async for event in stream_agent_events(
             agent=agent,
             messages=state.messages,
             cancel_event=state.cancel_event,
             session_id=session_id,
         ):
-            if event.name == "token":
-                assistant_text.append(event.payload["text"])
-            yield sse(event.name, event.payload)
             if event.name == "cancelled":
+                yield sse(event.name, event.payload)
                 return
+
+            if event.name == "token":
+                for enriched in tracker.handle_token(event.payload["text"]):
+                    if enriched["type"] == "think_token":
+                        yield sse("think_token", {"text": enriched["text"]})
+                    elif enriched["type"] == "token":
+                        assistant_text.append(enriched["text"])
+                        yield sse("token", {"text": enriched["text"]})
+                    elif enriched["type"] in ("step_start", "step_end"):
+                        yield sse(enriched["type"], enriched)
+                    elif enriched["type"] == "think_end":
+                        yield sse("think_end", {"text": enriched.get("text", "")})
+
+            elif event.name == "tool_call":
+                for enriched in tracker.handle_tool_call(event.payload["tool_calls"]):
+                    yield sse(enriched["type"], enriched)
+
+            elif event.name == "update":
+                for enriched in tracker.handle_update(
+                    event.payload.get("data", {}),
+                    event.payload.get("namespace", []),
+                ):
+                    yield sse(enriched["type"], enriched)
+
+        # Finalize tracker and emit remaining events
+        for enriched in tracker.finalize():
+            if enriched["type"] == "token":
+                assistant_text.append(enriched["text"])
+            yield sse(enriched["type"], enriched)
+
+        # Emit tree snapshot for the frontend to render
+        tree = tracker.get_tree_snapshot()
+        if tree:
+            yield sse("tree_snapshot", {"steps": tree})
 
         content = "".join(assistant_text).strip()
         if content:
