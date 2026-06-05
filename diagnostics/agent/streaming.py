@@ -107,4 +107,12 @@ def jsonable(value: Any) -> Any:
             return {str(key): jsonable(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [jsonable(item) for item in value]
+        # Convert LangChain ToolCall objects to plain dicts
+        if hasattr(value, "name"):
+            d: dict[str, Any] = {"name": getattr(value, "name", "")}
+            if hasattr(value, "args"):
+                d["args"] = getattr(value, "args", {})
+            if hasattr(value, "id"):
+                d["id"] = getattr(value, "id", "")
+            return d
         return repr(value)

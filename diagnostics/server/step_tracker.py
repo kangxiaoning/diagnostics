@@ -69,6 +69,7 @@ class TreeBuilder:
 
     # Tree navigation
     _current_phase_id: str = ""   # phase node currently collecting tools
+    _prev_phase_id: str = "root"  # parent for the NEXT phase (creates nesting)
     _phase_index: int = 0         # which default title to use next
     _awaiting_phase: bool = True  # True when we need to create a new phase on next tool_call
 
@@ -181,12 +182,13 @@ class TreeBuilder:
     # ── helpers ──
 
     def _create_phase(self) -> str:
-        """Create a phase node named from the next default title."""
+        """Create a phase node as child of the previous phase (increasing depth)."""
         title = PHASE_DEFAULTS[min(self._phase_index, len(PHASE_DEFAULTS) - 1)]
         self._phase_index += 1
         nid = self._next_id()
-        phase = TreeNode(nid, title, "root", StepStatus.RUNNING, NodeType.PHASE)
+        phase = TreeNode(nid, title, self._prev_phase_id, StepStatus.RUNNING, NodeType.PHASE)
         self._add_node(phase)
+        self._prev_phase_id = nid  # next phase nests under this one
         self._current_phase_id = nid
         return nid
 
