@@ -504,19 +504,19 @@ textarea {
   font-size: 15px;
 }
 
-/* Anticipation (预判节点) */
-.tree-node.type-anticipation {
+/* Phase (分析阶段节点) */
+.tree-node.type-phase {
   border-style: dashed;
   border-color: var(--anticipation-border);
   background: var(--anticipation-bg);
 }
 
-.tree-node.type-anticipation .node-icon {
+.tree-node.type-phase .node-icon {
   background: #f3e8ff;
   color: #7c3aed;
 }
 
-.tree-node.type-anticipation .node-title {
+.tree-node.type-phase .node-title {
   color: #6b21a8;
 }
 
