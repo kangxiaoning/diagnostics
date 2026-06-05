@@ -21,7 +21,7 @@ let activeAnswerEl = null;
 let activeBubble = null;
 
 // ── 树状图状态 ──
-let treeNodes = new Map();  // step_id -> { element, status, title, children }
+let treeNodes = new Map();  // step_id -> { element, status, title, parentId, nodeType, children }
 let treeRootEl = null;
 
 // ── 面板切换 ──
@@ -31,10 +31,10 @@ function setTreeVisible(visible) {
   treeVisible = visible;
   if (visible) {
     treePanel.classList.remove("hidden");
-    toggleTreeBtn.textContent = "步骤";
+    toggleTreeBtn.textContent = "隐藏步骤";
   } else {
     treePanel.classList.add("hidden");
-    toggleTreeBtn.textContent = "步骤";
+    toggleTreeBtn.textContent = "显示步骤";
   }
 }
 
@@ -61,7 +61,7 @@ function resetTree() {
   treeNodes.clear();
   treeRootEl = null;
   treeContainer.innerHTML =
-    '<div class="tree-empty">正在分析...</div>';
+    '<div class="tree-empty">等待诊断开始…</div>';
 }
 
 // ── 创建思考过程区域 ──
@@ -69,7 +69,6 @@ function ensureThinkSection() {
   if (activeThinkSection) return;
   if (!activeBubble) return;
 
-  // 在气泡中创建思考区域
   const section = document.createElement("div");
   section.className = "think-section";
 
@@ -77,7 +76,7 @@ function ensureThinkSection() {
   toggle.className = "think-toggle open";
   toggle.type = "button";
   toggle.innerHTML =
-    '<span class="arrow">▶</span><span class="think-label">思考过程</span><span class="think-status">思考中...</span>';
+    '<span class="arrow">▶</span><span class="think-label">思考过程</span><span class="think-status">思考中…</span>';
 
   const content = document.createElement("div");
   content.className = "think-content open";
@@ -93,7 +92,6 @@ function ensureThinkSection() {
   section.appendChild(toggle);
   section.appendChild(content);
 
-  // 插入到气泡中，在 final answer 之前
   if (activeAnswerEl) {
     activeBubble.insertBefore(section, activeAnswerEl);
   } else {
@@ -117,36 +115,61 @@ function ensureAnswerContainer() {
   activeAnswerEl = answer;
 }
 
+// ── 树节点图标 ──
+function iconForNode(nodeType, status) {
+  if (status === "running") return "◉";
+  if (status === "completed") return "✓";
+  if (status === "error") return "✕";
+  if (nodeType === "root") return "🏠";
+  if (nodeType === "anticipation") return "💭";
+  if (nodeType === "tool") return "⚙️";
+  if (nodeType === "result") return "📋";
+  return "○";
+}
+
+function statusLabel(status) {
+  const labels = {
+    pending: "等待中",
+    running: "执行中",
+    completed: "已完成",
+    error: "失败",
+  };
+  return labels[status] || status;
+}
+
 // ── 更新树状图节点 ──
-function upsertTreeNode(stepId, title, parentId, status) {
+function upsertTreeNode(stepId, title, parentId, status, nodeType) {
   const existing = treeNodes.get(stepId);
 
   if (existing) {
-    // 更新现有节点状态
+    // Update existing node
     existing.element.classList.remove("pending", "running", "completed", "error");
     existing.element.classList.add(status);
     existing.status = status;
+    if (nodeType) existing.nodeType = nodeType;
+
+    const icon = existing.element.querySelector(".node-icon");
+    if (icon) {
+      icon.textContent = iconForNode(existing.nodeType, status);
+    }
 
     const badge = existing.element.querySelector(".node-status-badge");
     if (badge) {
       badge.textContent = statusLabel(status);
     }
-
-    // 更新图标
-    const icon = existing.element.querySelector(".node-icon");
-    if (icon) {
-      icon.textContent = statusIcon(status);
-    }
     return;
   }
 
-  // 创建新节点
+  // Create new node
   const nodeEl = document.createElement("div");
   nodeEl.className = `tree-node ${status}`;
+  if (nodeType) {
+    nodeEl.classList.add(`type-${nodeType}`);
+  }
 
   const icon = document.createElement("span");
   icon.className = "node-icon";
-  icon.textContent = statusIcon(status);
+  icon.textContent = iconForNode(nodeType, status);
 
   const content = document.createElement("div");
   content.className = "node-content";
@@ -169,12 +192,12 @@ function upsertTreeNode(stepId, title, parentId, status) {
     status: status,
     title: title,
     parentId: parentId,
+    nodeType: nodeType || "tool",
     children: [],
   });
 
-  // 插入到树中
+  // Insert into tree
   if (!parentId) {
-    // 根节点
     if (!treeRootEl) {
       treeRootEl = document.createElement("ul");
       treeRootEl.className = "tree";
@@ -186,7 +209,6 @@ function upsertTreeNode(stepId, title, parentId, status) {
     treeRootEl.appendChild(li);
     nodeEl._li = li;
   } else {
-    // 子节点
     const parent = treeNodes.get(parentId);
     if (parent) {
       let childList = parent.element._li.querySelector("ul");
@@ -203,26 +225,6 @@ function upsertTreeNode(stepId, title, parentId, status) {
   }
 }
 
-function statusLabel(status) {
-  const labels = {
-    pending: "等待中",
-    running: "执行中",
-    completed: "已完成",
-    error: "失败",
-  };
-  return labels[status] || status;
-}
-
-function statusIcon(status) {
-  const icons = {
-    pending: "○",
-    running: "◉",
-    completed: "✓",
-    error: "✕",
-  };
-  return icons[status] || "○";
-}
-
 // ── 构建完整树 ──
 function buildTreeFromSnapshot(steps) {
   treeContainer.innerHTML = "";
@@ -236,7 +238,13 @@ function buildTreeFromSnapshot(steps) {
   }
 
   for (const step of steps) {
-    upsertTreeNode(step.id, step.title, step.parent_id, step.status);
+    upsertTreeNode(
+      step.id,
+      step.title,
+      step.parent_id,
+      step.status,
+      step.node_type
+    );
   }
 }
 
@@ -246,15 +254,12 @@ formEl.addEventListener("submit", async (event) => {
   const prompt = inputEl.value.trim();
   if (!prompt || controller) return;
 
-  // 追加用户消息
   appendMessage("user", prompt);
   inputEl.value = "";
 
-  // 重置 UI
   resetMessageUI();
   resetTree();
 
-  // 创建 assistant 消息容器
   const article = document.createElement("article");
   article.className = "message assistant";
   activeBubble = document.createElement("div");
@@ -262,7 +267,7 @@ formEl.addEventListener("submit", async (event) => {
   article.appendChild(activeBubble);
   messagesEl.appendChild(article);
 
-  setRunning(true, "分析中...");
+  setRunning(true, "分析中…");
 
   controller = new AbortController();
   try {
@@ -297,10 +302,9 @@ stopBtn.addEventListener("click", async () => {
   controller.abort();
   setStatus("Cancelling");
 
-  // 将运行中的步骤标记为完成（因为被中断了）
   for (const [id, node] of treeNodes) {
     if (node.status === "running") {
-      upsertTreeNode(id, node.title, node.parentId, "completed");
+      upsertTreeNode(id, node.title, node.parentId, "completed", node.nodeType);
     }
   }
 
@@ -383,9 +387,9 @@ function handleSseEvent(rawEvent) {
         payload.step_id,
         payload.title,
         payload.parent_id,
-        "running"
+        payload.status || "running",
+        payload.node_type
       );
-      // 显示树面板
       if (!treeVisible) setTreeVisible(true);
       break;
 
@@ -394,7 +398,8 @@ function handleSseEvent(rawEvent) {
         payload.step_id,
         treeNodes.get(payload.step_id)?.title || "",
         treeNodes.get(payload.step_id)?.parentId || null,
-        payload.status
+        payload.status,
+        treeNodes.get(payload.step_id)?.nodeType
       );
       break;
 
@@ -407,7 +412,6 @@ function handleSseEvent(rawEvent) {
       if (activeAnswerEl) {
         activeAnswerEl.textContent += payload.text;
       }
-      // 当最终答案开始输出时，折叠思考区域
       if (activeThinkToggle && activeThinkContent) {
         activeThinkToggle.classList.remove("open");
         activeThinkContent.classList.remove("open");
@@ -415,21 +419,12 @@ function handleSseEvent(rawEvent) {
       scrollToBottom();
       break;
 
-    case "tool_call":
-      // Step tracker handles this via step_start events
-      break;
-
-    case "update":
-      // Step tracker handles this via step_end events
-      break;
-
     case "error":
       appendEvent(`${payload.message}\n${payload.hint || ""}`.trim());
       setStatus("Error");
-      // 标记运行中的步骤为错误
       for (const [id, node] of treeNodes) {
         if (node.status === "running") {
-          upsertTreeNode(id, node.title, node.parentId, "error");
+          upsertTreeNode(id, node.title, node.parentId, "error", node.nodeType);
         }
       }
       break;
@@ -441,20 +436,19 @@ function handleSseEvent(rawEvent) {
 
     case "done":
       setStatus("Ready");
-      // 确保所有运行中的步骤完成
       for (const [id, node] of treeNodes) {
         if (node.status === "running") {
-          upsertTreeNode(id, node.title, node.parentId, "completed");
+          upsertTreeNode(id, node.title, node.parentId, "completed", node.nodeType);
         }
       }
       break;
 
+    case "tool_call":
+    case "update":
     case "debug":
-      // 静默忽略调试事件
       break;
 
     default:
-      // 未知事件类型，静默忽略
       break;
   }
 }

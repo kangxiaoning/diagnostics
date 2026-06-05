@@ -17,6 +17,12 @@
   --step-error: #ef4444;
   --tree-bg: #fafbfc;
   --tree-line: #cbd5e1;
+  --anticipation-bg: #faf5ff;
+  --anticipation-border: #d8b4fe;
+  --tool-bg: #ffffff;
+  --tool-border: #e2e8f0;
+  --root-bg: #f0fdf4;
+  --root-border: #86efac;
 }
 
 * {
@@ -49,7 +55,7 @@ textarea {
 .layout {
   width: min(1280px, 100%);
   display: grid;
-  grid-template-columns: 1fr 360px;
+  grid-template-columns: 1fr 380px;
   gap: 0;
   height: min(860px, calc(100vh - 48px));
   min-height: 540px;
@@ -242,18 +248,6 @@ textarea {
   display: block;
 }
 
-.think-content p {
-  margin: 6px 0;
-}
-
-.think-content p:first-child {
-  margin-top: 8px;
-}
-
-.think-content p:last-child {
-  margin-bottom: 4px;
-}
-
 .final-answer {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -312,13 +306,13 @@ textarea {
 .tree-panel {
   display: flex;
   flex-direction: column;
-  background: var(--tree-bg);
+  background: #f8fafc;
   border: 1px solid var(--line);
-  border-left: none;
+  border-left: 1px solid var(--line);
   border-radius: 0 8px 8px 0;
   box-shadow: 0 18px 42px rgba(22, 32, 34, 0.06);
   overflow: hidden;
-  min-width: 280px;
+  min-width: 300px;
 }
 
 .tree-panel.hidden {
@@ -329,40 +323,61 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 20px;
-  border-bottom: 1px solid var(--line);
+  padding: 16px 20px;
+  border-bottom: 1px solid #e8ecf0;
+  background: #fff;
 }
 
 .tree-header h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 700;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tree-header h2::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 16px;
+  background: var(--accent);
+  border-radius: 2px;
 }
 
 .tree-header .text-button {
-  height: 32px;
-  width: 32px;
+  height: 28px;
+  width: 28px;
   padding: 0;
   text-align: center;
-  font-size: 16px;
+  font-size: 14px;
+  line-height: 28px;
+  color: var(--muted);
+  border: none;
+}
+
+.tree-header .text-button:hover {
+  background: var(--code);
+  color: var(--text);
 }
 
 .tree-container {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 16px;
+  padding: 16px 12px 16px 8px;
 }
 
 .tree-empty {
   color: var(--muted);
   font-size: 13px;
   text-align: center;
-  padding: 40px 20px;
-  line-height: 1.6;
+  padding: 60px 20px;
+  line-height: 1.8;
 }
 
-/* ── 树状图样式 ── */
+/* ── 树状图 ── */
 .tree {
   list-style: none;
   padding: 0;
@@ -375,7 +390,7 @@ textarea {
 }
 
 .tree ul {
-  padding-left: 28px;
+  padding-left: 24px;
   margin: 0;
   list-style: none;
 }
@@ -390,9 +405,9 @@ textarea {
 .tree li::before {
   content: "";
   position: absolute;
-  top: 18px;
-  left: -14px;
-  width: 14px;
+  top: 17px;
+  left: -12px;
+  width: 12px;
   height: 0;
   border-top: 1.5px solid var(--tree-line);
 }
@@ -401,50 +416,55 @@ textarea {
   content: "";
   position: absolute;
   top: 0;
-  left: -14px;
+  left: -12px;
   width: 0;
   height: 100%;
   border-left: 1.5px solid var(--tree-line);
 }
 
 .tree > li::after {
-  top: 18px;
-  height: calc(100% - 18px);
+  top: 17px;
+  height: calc(100% - 17px);
 }
 
 .tree > li:last-child::after {
-  height: 18px;
+  height: 17px;
 }
 
 .tree li:last-child::after {
-  height: 18px;
+  height: 17px;
 }
 
-/* 树节点 */
+.tree ul > li:last-child::after {
+  height: 17px;
+}
+
+/* ── 树节点基础 ── */
 .tree-node {
   display: flex;
   align-items: flex-start;
   gap: 10px;
   padding: 10px 14px;
-  margin: 4px 0;
-  border-radius: 8px;
-  border: 1.5px solid var(--line);
-  background: #fff;
-  transition: all 0.3s ease;
+  margin: 3px 0;
+  border-radius: 10px;
+  border: 1.5px solid var(--tool-border);
+  background: var(--tool-bg);
+  transition: all 0.35s ease;
   position: relative;
   z-index: 1;
 }
 
 .tree-node .node-icon {
   flex-shrink: 0;
-  width: 22px;
-  height: 22px;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
-  border-radius: 50%;
+  font-size: 14px;
+  border-radius: 8px;
   background: var(--code);
+  transition: all 0.3s ease;
 }
 
 .tree-node .node-content {
@@ -455,28 +475,65 @@ textarea {
 .tree-node .node-title {
   font-size: 13px;
   font-weight: 600;
-  line-height: 1.4;
+  line-height: 1.45;
   color: var(--text);
+  transition: color 0.3s ease;
 }
 
 .tree-node .node-status-badge {
   display: inline-block;
   font-size: 11px;
   font-weight: 600;
-  margin-top: 2px;
-  padding: 1px 8px;
+  margin-top: 3px;
+  padding: 2px 8px;
   border-radius: 10px;
+  transition: all 0.3s ease;
 }
 
-/* 步骤状态颜色 */
+/* ── 节点类型样式 ── */
+
+/* Root */
+.tree-node.type-root {
+  border-color: var(--root-border);
+  background: var(--root-bg);
+}
+
+.tree-node.type-root .node-icon {
+  background: #dcfce7;
+  color: #15803d;
+  font-size: 15px;
+}
+
+/* Anticipation (预判节点) */
+.tree-node.type-anticipation {
+  border-style: dashed;
+  border-color: var(--anticipation-border);
+  background: var(--anticipation-bg);
+}
+
+.tree-node.type-anticipation .node-icon {
+  background: #f3e8ff;
+  color: #7c3aed;
+}
+
+.tree-node.type-anticipation .node-title {
+  color: #6b21a8;
+}
+
+/* Tool */
+.tree-node.type-tool {
+  border-color: var(--tool-border);
+  background: var(--tool-bg);
+}
+
+.tree-node.type-tool .node-icon {
+  background: #eff6ff;
+  color: #2563eb;
+}
+
+/* ── 状态颜色 ── */
 .tree-node.pending {
-  border-color: var(--step-pending);
-  background: #f9fafb;
-  opacity: 0.7;
-}
-
-.tree-node.pending .node-icon {
-  background: #e5e7eb;
+  opacity: 0.65;
 }
 
 .tree-node.pending .node-status-badge {
@@ -485,30 +542,24 @@ textarea {
 }
 
 .tree-node.running {
-  border-color: var(--step-running);
-  background: #eff6ff;
-  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
-  animation: node-pulse 2s ease-in-out infinite;
+  border-width: 2px;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+  animation: node-pulse 2.2s ease-in-out infinite;
 }
 
 .tree-node.running .node-icon {
-  background: #dbeafe;
-  color: var(--step-running);
+  transform: scale(1.05);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.3);
 }
 
 .tree-node.running .node-status-badge {
   background: #dbeafe;
   color: var(--step-running);
+  animation: badge-blink 2.2s ease-in-out infinite;
 }
 
 .tree-node.completed {
-  border-color: var(--step-completed);
-  background: #f0fdf4;
-}
-
-.tree-node.completed .node-icon {
-  background: #dcfce7;
-  color: var(--step-completed);
+  opacity: 0.92;
 }
 
 .tree-node.completed .node-status-badge {
@@ -516,14 +567,8 @@ textarea {
   color: #15803d;
 }
 
-.tree-node.error {
-  border-color: var(--step-error);
-  background: #fef2f2;
-}
-
-.tree-node.error .node-icon {
-  background: #fee2e2;
-  color: var(--step-error);
+.tree-node.completed .node-icon {
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.3);
 }
 
 .tree-node.error .node-status-badge {
@@ -531,12 +576,40 @@ textarea {
   color: #991b1b;
 }
 
+.tree-node.error .node-icon {
+  background: #fee2e2;
+  color: var(--step-error);
+  box-shadow: 0 0 4px rgba(239, 68, 68, 0.3);
+}
+
+/* Animation */
 @keyframes node-pulse {
   0%, 100% {
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
   }
   50% {
-    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.25);
+    box-shadow: 0 0 0 6px rgba(59, 130, 246, 0.2);
+  }
+}
+
+@keyframes badge-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* Node enter animation */
+.tree-node {
+  animation: node-enter 0.35s ease-out;
+}
+
+@keyframes node-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
   }
 }
 
@@ -554,7 +627,7 @@ textarea {
 }
 
 /* ── 响应式 ── */
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .app {
     padding: 0;
   }
@@ -574,11 +647,11 @@ textarea {
     top: 0;
     right: 0;
     bottom: 0;
-    width: min(340px, 85vw);
+    width: min(360px, 88vw);
     border-radius: 0;
     border-left: 1px solid var(--line);
     z-index: 100;
-    box-shadow: -4px 0 24px rgba(0, 0, 0, 0.12);
+    box-shadow: -8px 0 30px rgba(0, 0, 0, 0.15);
   }
 
   .tree-panel.hidden {

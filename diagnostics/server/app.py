@@ -82,6 +82,10 @@ async def _chat_event_stream(
     try:
         yield sse("session", {"session_id": session_id})
 
+        # Initialize tree: root + first anticipation node
+        for init_event in tracker.start():
+            yield sse(init_event["type"], init_event)
+
         # Start a fresh thinking segment
         yield sse("think_start", {})
 

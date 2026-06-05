@@ -52,12 +52,13 @@ def format_stream_chunk(raw_chunk: Any) -> list[tuple[str, dict[str, Any]]]:
     if mode == "messages":
         message = data[0] if isinstance(data, tuple) and data else data
         text = message_text(message)
-        if text:
-            return [("token", {"text": text, "namespace": namespace})]
         tool_calls = getattr(message, "tool_calls", None)
+        result: list[tuple[str, dict[str, Any]]] = []
+        if text:
+            result.append(("token", {"text": text, "namespace": namespace}))
         if tool_calls:
-            return [("tool_call", {"tool_calls": jsonable(tool_calls), "namespace": namespace})]
-        return []
+            result.append(("tool_call", {"tool_calls": jsonable(tool_calls), "namespace": namespace}))
+        return result
 
     if mode == "updates":
         return [("update", {"data": summarize_update(data), "namespace": namespace})]
