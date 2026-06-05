@@ -1,0 +1,10 @@
+[project]
+name = "diagnostics"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "deepagents>=0.6.8",
+    "fastapi>=0.116.0",
+    "langchain-openai>=1.1.2",
+    "uvicorn[standard]>=0.35.0",
+]
