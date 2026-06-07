@@ -36,11 +36,13 @@
   → stream_agent_events() 启动 Agent 流
     → Agent 调用 LLM（通过 LM Studio / OpenAI兼容API）
       → LLM 输出含 <step>、<think> 标签的文本
-      → 解析为 text_delta (thinking/answering) 事件
+      → <step> 标签去重后发送到前端；<think> 标签分离思考/回答
+      → coordinator 文本双路发送: thinking(折叠块) + answering(回答区)
       → LLM 发起 tool_call → tool_start / tool_end 事件
+      → round_number 自增 → 前端用其创建新的折叠块
       → 子代理委派（task工具）→ agent_start / agent_end 事件
     → TreeBuilder 构建执行树 → tree_snapshot 事件
-  → SSE 事件流 → 前端实时渲染（Markdown + 诊断树）
+  → SSE 事件流 → 前端实时渲染（Markdown + 诊断树 + 多轮折叠块）
 ```
 
 技术栈：
@@ -323,11 +325,17 @@ async def stream_agent_events(agent, messages, cancel_event, session_id):
             yield evt
 ```
 
-**标签解析的三层架构**：
+**标签解析与文本路由**：
 
-1. **`_parse_step_tags()`** — 最先执行，提取 LLM 的 `<step>检查网络重传率</step>` 声明
-2. **`_parse_think_tags()`** — 解析 `<think>...</think>` 块，区分深度思考内容和最终回答
-3. **文本路由** — 根据来源（主代理 vs 子代理）和目标角色，将文本分发到 `thinking` 或 `answering` 阶段
+1. **`_parse_step_tags()`** — 最先执行，提取 `<step>` 标签声明。当 LLM 纯输出 `<step>` 标签（无其他文本）时，将步骤文本也发送到前端，用 `new_steps_added` 标志避免流式传输中每个中间 chunk 重复发送。
+
+2. **`_parse_think_tags()`** — 解析 `<think>...</think>` 块，区分深度思考内容和最终回答。
+
+3. **文本路由** — 对于主代理（coordinator），无 `<think>` 标签的文本会**双路发送**：
+   - `phase="thinking"` → 前端创建/更新对应轮次的折叠块
+   - `phase="answering"` → 前端更新回答区正文
+   
+   子代理文本按名称路由：`report-writer` → `answering`，其他 → `thinking`。
 
 **子代理的阶段路由规则**：
 
@@ -545,31 +553,40 @@ function onTreeSnapshot(payload) {
 - 简化同步逻辑，避免前后端状态不一致
 - 渲染性能足够（诊断树节点数通常 < 50）
 
-### 思考过程折叠面板
+### 思考过程折叠面板（DeepSeek 风格，多轮独立）
 
-借鉴 DeepSeek 风格的 UI 交互：
+左侧聊天区采用 DeepSeek 风格：**每轮 LLM 交互产生一个独立折叠块**，而非所有轮次堆在一起。
 
-- **流式阶段**：思考面板自动展开，实时渲染 AI 推理过程，带闪烁光标
-- **回答开始**：自动折叠思考面板，标记 "完成 (Xs)"，显示用时
-- **手动切换**：点击折叠条可随时展开/收起
-- **完成后**：自动折叠，标记为 "完成"
+**架构：`thinkSections[]` 数组**
 
 ```javascript
-function onTextDelta(payload) {
-    if (phase === "thinking") {
-        // 追加到可折叠的 think-body
-        thinkRawText += payload.text;
-        activeThinkBody.innerHTML = renderMarkdown(thinkRawText);
-    } else {
-        // 切换到 answer，自动折叠 think
-        if (activeThinkSection && !thinkCollapsed) {
-            finishThinking();
-        }
-        createAnswerSection();
-        answerRawText += payload.text;
-    }
-}
+// 每个 thinkSection 对象：
+{ sectionEl, bodyEl, textEl, labelEl, rawText, startTime, finalized, round }
 ```
+
+**关键行为：**
+
+| 时机 | 行为 |
+|---|---|
+| 后端发送 `phase=thinking` | `createThinkSection()` → eye SVG + "Thinking…" + chevron，自动展开 |
+| 新一轮 thinking 到达 | 用 `payload.round` 检测轮次变化 → `finalizeThink(prev)` → 上一块收起，显示 "Thought for Xs" |
+| 用户点击 toggle | 只控制该 section 自身的展开/收起（闭包捕获 DOM 元素，非全局变量） |
+| 流结束 | `finishStreamUI()` 最终化未完成的 section |
+
+**DOM 结构：**
+
+```
+msg-bubble
+├── think-section (Round 1, finalized, 收起)
+│   ├── think-toggle  [eye] Thought for 3s [chevron]
+│   └── think-body (hidden) — ::before 竖线 + Round 1 推理
+├── think-section (Round 2, finalized, 收起)  
+│   └── ...
+└── answer-section.has-think
+    └── answer-body — 最终回答 + 工具调用痕迹
+```
+
+**轮次检测：** 后端 `state.round_number` 在检测到新的 tool_call 时自增，前端通过 `payload.round` 对比当前 section 的 `sec.round` 来判断是否进入新轮次。后端将 coordinator 文本**双路发送**（thinking + answering），确保折叠块和回答区同步更新。
 
 ### 工具详情弹窗
 
@@ -615,7 +632,7 @@ diagnostics/
 │   └── test_cases/                  # 验证测试用例
 ├── static/
 │   ├── index.html                   # 双栏布局页面
-│   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格思考面板
+│   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格多轮折叠块
 │   └── styles.css                   # 完整设计系统
 └── log/                             # 日志目录
 ```
