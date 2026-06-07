@@ -2,6 +2,8 @@
 
 一个结合大语言模型（LLM）与领域工具，自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。前端提供实时聊天界面，右侧面板动态生成诊断执行树，直观展示 Agent 的思考路径和工具调用过程。
 
+![Diagnostics 界面截图](static/diagnostics-screen.png)
+
 ## 目录
 
 - [架构概览](#架构概览)
