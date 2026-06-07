@@ -1,6 +1,8 @@
+from diagnostics.logging_config import setup_logging
 from diagnostics.server import create_app
 
 
+setup_logging()
 app = create_app()
 
 

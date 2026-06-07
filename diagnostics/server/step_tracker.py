@@ -1,12 +1,42 @@
 from __future__ import annotations
 
-import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-TAG_RE = re.compile(r"<next_task>(.*?)</next_task>", re.DOTALL)
+logger = logging.getLogger(__name__)
+
+
+def format_tool_args(args: dict, tool_name: str = "") -> str:
+    """Format tool arguments for display. Shows key values like paths, namespaces."""
+    if not args:
+        logger.debug("format_tool_args: empty args for '%s'", tool_name)
+        return ""
+    logger.debug("format_tool_args: tool='%s' args=%s", tool_name, args)
+    # Write_todos: summarize task list
+    todos = args.get("todos")
+    if isinstance(todos, list) and todos:
+        items = []
+        for t in todos[:3]:
+            if isinstance(t, dict):
+                items.append(t.get("content", "")[:40])
+            else:
+                items.append(str(t)[:40])
+        suffix = f" +{len(todos)-3}" if len(todos) > 3 else ""
+        return "; ".join(items) + suffix
+    # Path/file: show basename for readability
+    path = args.get("path") or args.get("file_path") or args.get("filename")
+    if isinstance(path, str) and path.strip():
+        return path.rsplit("/", 1)[-1] if "/" in path else path
+    # Namespace
+    ns = args.get("namespace")
+    if isinstance(ns, str) and ns.strip():
+        return ns
+    # Generic fallback
+    parts = [str(v).strip() for v in args.values() if str(v).strip() and str(v).strip() != "{}"]
+    return ", ".join(parts)
 
 
 class StepStatus(Enum):
@@ -18,19 +48,34 @@ class StepStatus(Enum):
 
 class NodeType(Enum):
     ROOT = "root"
-    PHASE = "phase"  # one LLM-call round
-    TOOL = "tool"    # tool execution result
+    PHASE = "phase"
+    TOOL = "tool"
+    TASK = "task"
 
 
-PROFILE_NAME_MAP: dict[str, str] = {
-    "overview": "系统概览诊断",
-    "cpu": "CPU诊断",
-    "memory": "内存诊断",
-    "io": "磁盘IO诊断",
-    "network": "网络诊断",
-    "processes_cpu": "进程CPU诊断",
-    "processes_memory": "进程内存诊断",
-    "containers": "容器诊断",
+TOOL_LABELS: dict[str, str] = {
+    "get_system_overview": "获取系统概览",
+    "check_cpu": "分析CPU指标",
+    "check_memory": "分析内存使用",
+    "check_disk": "分析磁盘IO",
+    "check_network": "分析网络状态",
+    "check_processes": "排查进程状态",
+    "check_gpu_health": "检查GPU健康",
+    "check_gpu_memory": "检查GPU显存",
+    "check_gpu_utilization": "分析GPU利用率",
+    "check_kubernetes_pods": "排查Pod状态",
+    "check_kubernetes_nodes": "检查节点状态",
+    "list_diagnostic_capabilities": "列出诊断工具",
+    "write_todos": "规划诊断步骤",
+    "read_todos": "查看任务清单",
+    "task": "委派专家诊断",
+    "read_file": "读取文件内容",
+    "write_file": "写入诊断记录",
+    "edit_file": "编辑文件内容",
+    "ls": "浏览文件目录",
+    "glob": "搜索匹配文件",
+    "grep": "搜索文件内容",
+    "execute": "执行诊断命令",
 }
 
 
@@ -42,72 +87,66 @@ class TreeNode:
     status: StepStatus = StepStatus.PENDING
     node_type: NodeType = NodeType.TOOL
     detail: str = ""
+    description: str = ""
+    tool_name: str = ""
+    tool_args: str = ""
+    parent_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
 class TreeBuilder:
-    """Reactive tree driven by the Agent ↔ LLM interaction cycle.
+    """Reactive tree driven by Agent ↔ LLM interaction cycles.
 
-    Every round:
-      - tools-complete  → create phase node (before NEXT LLM call)
-      - LLM returns     → update phase title from tool names (after LLM result)
-      - tool nodes      → children of the phase
+    All node descriptions are driven by LLM output (via <step> and <round> tags
+    parsed in streaming.py), NOT by hardcoded backend strings.
 
-    Titles come from actual tool names + optional <next_task> tags,
-    never from hardcoded defaults.
+    Tree structure:
+      root ("开始诊断")
+        ├── phase ("第1轮智能分析")
+        │     ├── tool ("CPU诊断") ── description from LLM <step>
+        │     └── tool ("系统概览") ── description from LLM <step>
+        └── phase ("第2轮智能分析") ← edges from all round-1 tool nodes
+              ├── tool ("读取loadavg")
+              └── tool ("进程诊断")
     """
 
     nodes: dict[str, TreeNode] = field(default_factory=dict)
     node_order: list[str] = field(default_factory=list)
-    state: str = "init"  # init | thinking | executing | answering | done
+    state: str = "init"
     think_segments: list[str] = field(default_factory=list)
     think_buffer: list[str] = field(default_factory=list)
     answer_buffer: list[str] = field(default_factory=list)
     seen_tool_call_ids: set[str] = field(default_factory=set)
-    seen_next_tasks: set[str] = field(default_factory=set)
     _counter: int = 0
 
-    # ── tree navigation ──
-    _current_phase_id: str = ""       # phase collecting tools right now
-    _prev_phase_id: str = "root"      # parent for the NEXT phase
-    _awaiting_phase: bool = True      # need to create phase on next tool_call
-    _pending_phase_title: str = ""    # from <next_task>, used when creating phase
+    _current_phase_id: str = "root"
+    _last_tool_child_ids: list[str] = field(default_factory=list)
+    _current_response_text: list[str] = field(default_factory=list)
+    _round_descriptions: dict[int, str] = field(default_factory=dict)
 
-    # ── tag parsing buffer ──
-    _tag_buf: str = ""
-
-    # ── public API ──
+    # ── Public API ──
 
     def start(self) -> list[dict[str, Any]]:
-        root = TreeNode("root", "开始诊断", None, StepStatus.COMPLETED, NodeType.ROOT)
+        root = TreeNode("root", "开始诊断", None, StepStatus.RUNNING, NodeType.ROOT)
         self._add_node(root)
+        self._current_phase_id = root.id
         self.state = "thinking"
+        logger.info("Tree: started (root=%s)", root.id)
         return [self._snapshot_event()]
 
     def handle_token(self, text: str) -> list[dict[str, Any]]:
-        """Route text.  Also extract <next_task> for naming the next phase."""
         if self.state == "done":
             return []
-
-        # Extract <next_task> tags from streaming text
-        clean, next_task = self._parse_tags(text)
-        if next_task:
-            self._pending_phase_title = next_task
-
+        self._current_response_text.append(text)
         if self.state in ("thinking", "executing"):
-            self.think_buffer.append(clean)
-            return [{"type": "think_token", "text": clean}]
-
+            self.think_buffer.append(text)
+            return [{"type": "think_token", "text": text}]
         if self.state == "answering":
-            self.answer_buffer.append(clean)
-            return [{"type": "token", "text": clean}]
-
+            self.answer_buffer.append(text)
+            return [{"type": "token", "text": text}]
         return []
 
     def handle_tool_call(self, tool_calls: list[dict]) -> list[dict[str, Any]]:
-        """Before LLM call: ensure phase exists.
-        After LLM result: update phase title from tool names, create tool nodes.
-        """
         new_calls = self._filter_new(tool_calls)
         if not new_calls:
             return []
@@ -116,59 +155,116 @@ class TreeBuilder:
             self.state = "executing"
             self._flush_think()
 
-        # ── Before LLM: create phase if waiting for one ──
-        if self._awaiting_phase:
-            self._create_phase()
-            self._awaiting_phase = False
-        elif not self._current_phase_id or self._current_phase_id not in self.nodes:
-            self._create_phase()
+        current = self.nodes.get(self._current_phase_id)
+        if current and current.node_type == NodeType.ROOT:
+            self._create_first_phase()
 
-        # ── After LLM: update phase title from what the LLM actually decided ──
-        tool_purposes = list(dict.fromkeys(self._tool_title(c) for c in new_calls))
-        self._set_phase_title(tool_purposes)
+        parent_id = self._current_phase_id
+        parent = self.nodes.get(parent_id)
+        if parent and parent.status == StepStatus.RUNNING:
+            parent.status = StepStatus.COMPLETED
 
-        # Complete phase: its LLM response arrived
-        phase = self.nodes[self._current_phase_id]
-        if phase.status == StepStatus.RUNNING:
-            phase.status = StepStatus.COMPLETED
+        created_ids: list[str] = []
 
-        # ── Create tool nodes under phase ──
-        for call, purpose in zip(new_calls, tool_purposes):
+        for call in new_calls:
             nid = self._next_id()
-            tool = TreeNode(nid, purpose, self._current_phase_id,
-                            StepStatus.RUNNING, NodeType.TOOL)
+            title = self._tool_title(call)
+            description = call.get("description", "")
+            tool_name = call.get("name", "")
+            tool_args = format_tool_args(call.get("args", {}),
+                                        call.get("name", ""))
+            tool = TreeNode(
+                nid, title, parent_id,
+                StepStatus.RUNNING, NodeType.TOOL,
+                detail=call.get("id", ""),
+                description=description,
+                tool_name=tool_name,
+                tool_args=tool_args,
+            )
             self._add_node(tool)
+            created_ids.append(nid)
 
+        self._last_tool_child_ids.extend(created_ids)
+        self._current_response_text = []
+        logger.info("Tree: +%d tool nodes under %s (accumulated: %d)",
+                     len(new_calls), parent_id, len(self._last_tool_child_ids))
         return [self._snapshot_event()]
 
     def handle_update(self, _data: dict, namespace: list[str]) -> list[dict[str, Any]]:
-        """Tools completed → mark tools done, prepare for next LLM round."""
-        if not self._is_tools(namespace):
+        if not self._is_tool_update(_data, namespace):
             return []
 
+        tc_id = _data.get("tool_call_id", "")
         changed = False
-        for node in self.nodes.values():
-            if node.node_type == NodeType.TOOL and node.status == StepStatus.RUNNING:
-                node.status = StepStatus.COMPLETED
-                changed = True
+
+        if tc_id:
+            for node in self.nodes.values():
+                if (node.node_type == NodeType.TOOL and
+                        node.detail == tc_id and
+                        node.status == StepStatus.RUNNING):
+                    node.status = StepStatus.COMPLETED
+                    changed = True
+                    break
+
+        if not changed:
+            for node in self.nodes.values():
+                if node.node_type == NodeType.TOOL and node.status == StepStatus.RUNNING:
+                    node.status = StepStatus.COMPLETED
+                    changed = True
+
+        has_running = any(
+            n.node_type == NodeType.TOOL and n.status == StepStatus.RUNNING
+            for n in self.nodes.values()
+        )
+        if has_running:
+            return [self._snapshot_event()]
+
         if not changed:
             return []
 
         self._flush_think()
-
-        # ── Before next LLM: flag that a new phase should be created ──
-        self._awaiting_phase = True
-        # Assume final round; if more tools arrive, flipped back in handle_tool_call
+        logger.info("Tree: all tools done, creating next phase")
+        self._create_next_phase()
         self.state = "answering"
-
         return [self._snapshot_event()]
 
+    def update_tool_args(self, tc_id: str, tool_name: str, args: dict) -> list[dict[str, Any]]:
+        """Update tool name/args for an existing tool node when streaming args arrive."""
+        for node in self.nodes.values():
+            if node.node_type == NodeType.TOOL and node.detail == tc_id:
+                if not node.tool_args and args:
+                    node.tool_args = format_tool_args(args, tool_name)
+                    if tool_name:
+                        node.tool_name = tool_name
+                    return [self._snapshot_event()]
+        return []
+
     def finalize(self) -> list[dict[str, Any]]:
+        current_id = self._current_phase_id
+        report_phase = False
+        if current_id in self.nodes:
+            node = self.nodes[current_id]
+            if node.node_type == NodeType.PHASE:
+                # If this phase has no tool children, it's the diagnosis report
+                has_tools = any(
+                    n.node_type == NodeType.TOOL and n.parent_id == current_id
+                    for n in self.nodes.values()
+                )
+                if not has_tools:
+                    node.title = "诊断报告"
+                    report_phase = True
+                if node.status == StepStatus.RUNNING:
+                    node.status = StepStatus.COMPLETED
+
+        running_nodes = sum(1 for n in self.nodes.values() if n.status == StepStatus.RUNNING)
         for node in self.nodes.values():
             if node.status == StepStatus.RUNNING:
                 node.status = StepStatus.COMPLETED
 
         self._flush_think()
+
+        logger.info("Tree: finalized, %d nodes, %d running, report_phase=%s",
+                     len(self.nodes), running_nodes, report_phase)
 
         fallback: list[dict[str, Any]] = []
         if not self.answer_buffer:
@@ -176,41 +272,74 @@ class TreeBuilder:
             if fb.strip():
                 fallback.append({"type": "token", "text": fb})
 
+        logger.info("Tree: finalized, %d nodes, %d were running",
+                     len(self.nodes), running_nodes)
         self.state = "done"
         return fallback + [self._snapshot_event()]
 
-    # ── helpers ──
+    # ── Phase creation (LLM-driven descriptions) ──
 
-    def _create_phase(self) -> str:
-        """Create a phase node.  Title: from <next_task> or templated from tool info later."""
-        title = self._pending_phase_title or "正在分析…"
-        self._pending_phase_title = ""
+    def _create_next_phase(self) -> str:
+        parent_ids = list(dict.fromkeys(self._last_tool_child_ids)) or [self._current_phase_id]
+        parent_ids = [pid for pid in parent_ids if pid in self.nodes]
+        if not parent_ids:
+            parent_ids = ["root"]
+
+        phase_count = sum(
+            1 for n in self.nodes.values() if n.node_type == NodeType.PHASE
+        )
+        round_num = phase_count + 1
+        title = f"第{round_num}轮智能分析"
+
+        # Description from LLM's accumulated thinking — no hardcoded fallback
+        description = self._extract_phase_description() or ""
+
         nid = self._next_id()
-        phase = TreeNode(nid, title, self._prev_phase_id,
-                         StepStatus.RUNNING, NodeType.PHASE)
+        phase = TreeNode(
+            nid, title, parent_ids[0],
+            StepStatus.RUNNING, NodeType.PHASE,
+            parent_ids=parent_ids,
+            description=description,
+        )
         self._add_node(phase)
-        self._prev_phase_id = nid
         self._current_phase_id = nid
+        self._last_tool_child_ids = []
+        logger.info("Tree: phase '%s' (id=%s, parents=%s, desc=%r)",
+                     title, nid, parent_ids, description[:60])
         return nid
 
-    def _set_phase_title(self, tool_purposes: list[str]) -> None:
-        """Update phase title based on what the LLM actually called.
-        Only overwrites the generic placeholder — preserves <next_task> titles.
-        """
-        if not self._current_phase_id or self._current_phase_id not in self.nodes:
-            return
+    def _create_first_phase(self) -> str:
+        description = self._extract_phase_description() or ""
+        nid = self._next_id()
+        phase = TreeNode(
+            nid, "第1轮智能分析", "root",
+            StepStatus.RUNNING, NodeType.PHASE,
+            parent_ids=["root"],
+            description=description,
+        )
+        self._add_node(phase)
+        self._current_phase_id = nid
+        logger.info("Tree: phase '第1轮智能分析' (id=%s, desc=%r)", nid, description[:60])
+        return nid
 
-        phase = self.nodes[self._current_phase_id]
-        # If already named by <next_task>, keep it
-        if phase.title != "正在分析…":
-            return
-
-        if len(tool_purposes) == 1:
-            phase.title = tool_purposes[0]
-        elif len(tool_purposes) <= 3:
-            phase.title = "执行: " + " + ".join(tool_purposes)
+    def _extract_phase_description(self) -> str:
+        """Extract phase description from LLM's think text."""
+        if self.think_segments:
+            text = self.think_segments[-1]
+        elif self.think_buffer:
+            text = "".join(self.think_buffer)
         else:
-            phase.title = "批量诊断"
+            return ""
+        if text.strip():
+            sentences = re.split(r'[。；\n]', text)
+            for s in sentences:
+                s = s.strip()
+                if len(s) > 4:
+                    return s[:80]
+            return text.strip()[:80]
+        return ""
+
+    # ── Helpers ──
 
     def _snapshot_event(self) -> dict[str, Any]:
         return {
@@ -220,9 +349,13 @@ class TreeBuilder:
                     "id": node.id,
                     "title": node.title,
                     "parent_id": node.parent_id,
+                    "parent_ids": node.parent_ids or ([node.parent_id] if node.parent_id else []),
                     "status": node.status.value,
                     "node_type": node.node_type.value,
                     "detail": node.detail,
+                    "description": node.description,
+                    "tool_name": node.tool_name,
+                    "tool_args": node.tool_args,
                 }
                 for nid in self.node_order
                 if nid in self.nodes
@@ -231,6 +364,8 @@ class TreeBuilder:
         }
 
     def _add_node(self, node: TreeNode) -> None:
+        if node.parent_id and not node.parent_ids:
+            node.parent_ids = [node.parent_id]
         self.nodes[node.id] = node
         self.node_order.append(node.id)
 
@@ -254,39 +389,24 @@ class TreeBuilder:
             result.append(call)
         return result
 
-    def _parse_tags(self, text: str) -> tuple[str, str | None]:
-        """Extract <next_task> from accumulated text."""
-        self._tag_buf += text
-        next_task = None
-        for match in TAG_RE.finditer(self._tag_buf):
-            content = match.group(1).strip()
-            if content and content not in self.seen_next_tasks:
-                next_task = content
-                self.seen_next_tasks.add(content)
-        clean = TAG_RE.sub("", text)
-        clean = clean.replace("<next_task>", "").replace("</next_task>", "")
-        return clean, next_task
-
     @staticmethod
-    def _is_tools(namespace: list[str]) -> bool:
-        return any("tools" in str(n).lower() for n in namespace)
+    def _is_tool_update(data: dict, namespace: list[str]) -> bool:
+        if any("tools" in str(n).lower() for n in namespace):
+            return True
+        if not isinstance(data, dict):
+            return False
+        for key, value in data.items():
+            if "tools" in str(key).lower():
+                return True
+            if isinstance(value, dict) and value.get("message_type") == "ToolMessage":
+                return True
+        return False
 
     @staticmethod
     def _tool_title(call: dict) -> str:
+        """Map tool function name to Chinese display label."""
         name = call.get("name") or call.get("function", {}).get("name", "unknown")
-        args = call.get("args") or call.get("function", {}).get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-        if name == "run_diagnostic_profile":
-            profile = str(args.get("profile", "")).strip().lower()
-            return PROFILE_NAME_MAP.get(profile, f"执行诊断: {profile}")
-        if name == "read_proc_file":
-            path = str(args.get("path", ""))
-            filename = path.rsplit("/", 1)[-1] if "/" in path else path
-            return f"读取: {filename}"
-        if name == "explain_available_diagnostics":
-            return "查询可用诊断工具"
-        return f"执行: {name}"
+        return TOOL_LABELS.get(name, name)
+
+
+

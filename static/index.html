@@ -3,63 +3,77 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Linux Diagnostics Agent</title>
+    <title>Diagnostics</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="app">
-      <div class="layout">
-        <!-- 左侧：聊天面板 -->
-        <section class="chat-shell" aria-label="Linux diagnostics chat">
-          <header class="topbar">
+    <div class="app">
+      <!-- Left: Chat -->
+      <section class="chat" id="chatPanel">
+        <header class="chat-header">
+          <div class="chat-header-left">
+            <span class="logo">◈</span>
             <div>
-              <h1>Linux Diagnostics Agent</h1>
-              <p id="status">Ready</p>
+              <h1>Diagnostics</h1>
+              <p id="statusLabel" class="status-text">就绪</p>
             </div>
-            <div class="topbar-actions">
-              <button id="toggleTreeBtn" class="text-button" type="button" title="切换诊断步骤面板">
-                步骤
-              </button>
-              <button id="stopBtn" class="icon-button" type="button" disabled title="中止当前会话">
-                <span aria-hidden="true">■</span>
-                <span class="sr-only">中止当前会话</span>
-              </button>
+          </div>
+        </header>
+
+        <div id="messages" class="messages"></div>
+
+        <form id="chatForm" class="composer">
+          <textarea id="promptInput" rows="8" autocomplete="off"
+            placeholder="输入诊断问题，例如：
+【诊断对象】ACK 集群 prod-cluster / namespace default / deployment java-backend
+【故障时段】2026-06-06 14:30 起
+【运行负载】Spring Boot 应用，单 Pod memory limit=512Mi
+
+deployment java-backend 从下午 2 点半开始频繁重启，每小时重启 10+ 次，
+describe 显示 OOMKilled，但设置的 memory limit 是 512Mi，
+不确定是代码内存泄漏还是 limit 设太小。"
+            required></textarea>
+          <div class="composer-actions">
+            <span class="composer-hint">⌘↵ 发送 · 描述你观察到的症状，Agent 将逐步采集数据并给出诊断</span>
+            <button id="actionBtn" type="submit" title="发送 (⌘↵)">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+              </svg>
+              <span>发送</span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Resizer -->
+      <div class="resizer" id="resizer"></div>
+
+      <!-- Right: Graph -->
+      <aside class="graph">
+        <header class="graph-header">
+          <h2>执行过程</h2>
+          <span id="graphStatus" class="graph-status idle">等待任务</span>
+        </header>
+        <div id="graphCanvas" class="graph-canvas">
+          <svg id="graphEdges" class="graph-edges"></svg>
+          <div id="graphNodes" class="graph-nodes"></div>
+          <div id="graphEmpty" class="graph-empty">
+            <div class="graph-empty-icon">
+              <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="22" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="24" cy="18" r="3"/><path d="M24 25v8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="24" y1="33" x2="24" y2="33" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
             </div>
-          </header>
-
-          <div id="messages" class="messages" aria-live="polite">
-            <article class="message assistant">
-              <div class="bubble">
-                描述你看到的症状，例如"CPU load 很高但使用率不高"或"磁盘 IO 延迟突然升高"。我会按需采集证据并给出诊断。
-              </div>
-            </article>
+            <p>发送诊断请求后<br>Agent 执行流程将在此动态展示</p>
           </div>
-
-          <form id="chatForm" class="composer">
-            <textarea
-              id="promptInput"
-              rows="2"
-              autocomplete="off"
-              placeholder="输入要诊断的问题..."
-              required
-            ></textarea>
-            <button id="sendBtn" type="submit">发送</button>
-          </form>
-        </section>
-
-        <!-- 右侧：步骤树状图面板 -->
-        <aside id="treePanel" class="tree-panel" aria-label="诊断步骤">
-          <header class="tree-header">
-            <h2>诊断步骤</h2>
-            <button id="closeTreeBtn" class="text-button" type="button" title="关闭">✕</button>
-          </header>
-          <div id="treeContainer" class="tree-container">
-            <div class="tree-empty">发送诊断请求后，步骤将在此显示</div>
+        </div>
+        <div id="toolPopup" class="tool-popup hidden">
+          <div class="tool-popup-header">
+            <span id="toolPopupTitle"></span>
+            <button id="toolPopupClose" class="popup-close">&times;</button>
           </div>
-        </aside>
-      </div>
-    </main>
+          <div class="tool-popup-body" id="toolPopupBody"></div>
+        </div>
+      </aside>
+    </div>
 
-    <script src="/static/app.js" type="module"></script>
+    <script src="/static/app.js"></script>
   </body>
 </html>

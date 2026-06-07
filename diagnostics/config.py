@@ -13,7 +13,7 @@ STATIC_DIR = ROOT_DIR / "static"
 
 @dataclass(frozen=True)
 class Settings:
-    model: str = "qwen/qwen3.6-35b-a3b"
+    model: str = "google/gemma-4-26b-a4b-qat"
     base_url: str = "http://127.0.0.1:1234"
     api_key: str = "lm-studio"
     api_key_configured: bool = False
