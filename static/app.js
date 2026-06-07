@@ -18,17 +18,12 @@ const toolPopupClose = document.getElementById("toolPopupClose");
 let sessionId = localStorage.getItem("diagnostics.sessionId") || null;
 let controller = null;
 let activeBubble = null;
-let activeThinkSection = null;
-let activeThinkBody = null;
-let activeThinkBadge = null;
+let thinkSections = [];       // per-round: { sectionEl, bodyEl, textEl, labelEl, rawText, startTime, finalized }
 let activeAnswerSection = null;
 let activeAnswerBody = null;
 let activeCursor = null;
-let thinkRawText = "";
 let answerRawText = "";
 let userScrolledUp = false;
-let thinkStartTime = 0;      // for reasoning duration display
-let thinkCollapsed = false;  // tracks if think section was auto-collapsed
 
 // ── Graph state ──
 const GRAPH = {
@@ -88,13 +83,8 @@ formEl.addEventListener("submit", async (e) => {
   inputEl.style.height = "auto";
   resetGraph();
   toolPopup.classList.add("hidden");
-  thinkRawText = "";
+  thinkSections = [];
   answerRawText = "";
-  thinkStartTime = 0;
-  thinkCollapsed = false;
-  activeThinkSection = null;
-  activeThinkBody = null;
-  activeThinkBadge = null;
   activeAnswerSection = null;
   activeAnswerBody = null;
   activeCursor = null;
@@ -105,7 +95,6 @@ formEl.addEventListener("submit", async (e) => {
   article.innerHTML = '<div class="msg-avatar">◈</div>';
   activeBubble = document.createElement("div");
   activeBubble.className = "msg-bubble";
-  createThinkSection();
   article.appendChild(activeBubble);
   messagesEl.appendChild(article);
 
@@ -128,22 +117,8 @@ formEl.addEventListener("submit", async (e) => {
     }
   } finally {
     controller = null;
-    if (activeThinkBadge) {
-      activeThinkBadge.textContent = "完成";
-      activeThinkBadge.className = "think-badge done";
-    }
-    if (activeCursor) { activeCursor.remove(); activeCursor = null; }
-    // Collapse think section when done (DeepSeek-style)
-    if (activeThinkSection) {
-      activeThinkSection.classList.remove("open");
-      activeThinkSection.querySelector(".think-arrow").textContent = "▶";
-    }
-    activeBubble = null;
-    activeThinkSection = null;
-    activeThinkBody = null;
-    activeThinkBadge = null;
-    activeAnswerSection = null;
-    activeAnswerBody = null;
+    // SSE handler (done/cancelled/error) already called finishStreamUI for cleanup.
+    // Keep DOM refs alive so toggle click handlers continue to work.
     setRunning(false);
     if (GRAPH.hasContent) {
       setGraphStatus("done");
@@ -215,35 +190,18 @@ function parseSSE(raw) {
     case "done":
       setStatus("ready");
       finalizeGraph();
-      if (activeThinkBadge) {
-        activeThinkBadge.textContent = "完成";
-        activeThinkBadge.className = "think-badge done";
-      }
-      if (activeCursor) { activeCursor.remove(); activeCursor = null; }
-      if (activeThinkSection) {
-        activeThinkSection.classList.remove("open");
-      }
-      activeAnswerSection = null;
-      activeAnswerBody = null;
+      finishStreamUI("done");
       break;
     case "error":
       appendEvent(payload.message);
       setStatus("error");
       setGraphStatus("idle");
+      finishStreamUI("error");
       break;
     case "cancelled":
       setStatus("ready");
       setGraphStatus("idle");
-      if (activeThinkBadge) {
-        activeThinkBadge.textContent = "已取消";
-        activeThinkBadge.className = "think-badge done";
-      }
-      if (activeCursor) { activeCursor.remove(); activeCursor = null; }
-      if (activeThinkSection) {
-        activeThinkSection.classList.remove("open");
-      }
-      activeAnswerSection = null;
-      activeAnswerBody = null;
+      finishStreamUI("cancelled");
       break;
   }
 }
@@ -258,102 +216,145 @@ function onTextDelta(payload) {
   const phase = payload.phase || "answering";
 
   if (phase === "thinking") {
-    // Reasoning — collapsible think section
-    if (!activeThinkSection) {
-      createThinkSection();
-      thinkStartTime = Date.now();
+    // Each LLM round gets its own think section.
+    // The backend increments round_number when new tool calls are detected,
+    // so payload.round changes between rounds. Use it to segment sections.
+    const round = payload.round || 0;
+    let sec = currentThink();
+
+    // Finalize previous round's section when a new round starts
+    if (sec && sec.round !== round) {
+      finalizeThink(sec);
+      sec = null;
     }
-    thinkRawText += payload.text;
-    if (activeThinkBody) {
-      activeThinkBody.innerHTML = renderMarkdown(thinkRawText);
-      if (activeCursor) {
-        activeThinkBody.appendChild(activeCursor);
-      } else {
-        activeCursor = document.createElement("span");
-        activeCursor.className = "streaming-cursor";
-        activeThinkBody.appendChild(activeCursor);
-      }
-      activeThinkBody.scrollTop = activeThinkBody.scrollHeight;
+
+    if (!sec) {
+      sec = createThinkSection();
+      sec.round = round;
     }
+
+    sec.rawText += payload.text;
+    sec.textEl.innerHTML = renderMarkdown(sec.rawText);
+    if (!activeCursor) {
+      activeCursor = document.createElement("span");
+      activeCursor.className = "streaming-cursor";
+    }
+    sec.textEl.appendChild(activeCursor);
   } else {
-    // Answer — auto-collapse thinking when transitioning
-    if (activeThinkSection && !thinkCollapsed) {
-      finishThinking();
-    }
+    // Answering — do NOT finalize here; the next round's thinking
+    // (or stream end) triggers finalization so duration is accurate.
     if (!activeAnswerSection) createAnswerSection();
     answerRawText += payload.text;
     if (activeAnswerBody) {
       activeAnswerBody.innerHTML = renderMarkdown(answerRawText);
-      if (activeCursor) {
-        activeAnswerBody.appendChild(activeCursor);
-      } else {
+      if (!activeCursor) {
         activeCursor = document.createElement("span");
         activeCursor.className = "streaming-cursor";
-        activeAnswerBody.appendChild(activeCursor);
       }
+      activeAnswerBody.appendChild(activeCursor);
     }
   }
 
   autoScroll();
 }
 
-// ── Auto-collapse think section when answer begins (DeepSeek-style) ──
-function finishThinking() {
-  thinkCollapsed = true;
-  const elapsed = Math.round((Date.now() - thinkStartTime) / 1000);
-  if (activeThinkBadge) {
-    activeThinkBadge.textContent = `完成 (${elapsed}s)`;
-    activeThinkBadge.className = "think-badge done";
+// ── Current (latest unfinalized) think section ──
+function currentThink() {
+  for (let i = thinkSections.length - 1; i >= 0; i--) {
+    if (!thinkSections[i].finalized) return thinkSections[i];
   }
-  if (activeThinkSection) {
-    activeThinkSection.classList.remove("open");
-    const arrow = activeThinkSection.querySelector(".think-arrow");
-    if (arrow) arrow.textContent = "▶";
-  }
+  return null;
 }
 
-// ── Think Section (DeepSeek-style: auto-open, collapse on answer) ──
-function createThinkSection() {
-  if (!activeBubble) return;
-  activeThinkSection = document.createElement("div");
-  activeThinkSection.className = "think-section open";
+// ── Finalize a think section (DeepSeek-style) ──
+function finalizeThink(sec) {
+  sec.finalized = true;
+  const elapsed = Math.round((Date.now() - sec.startTime) / 1000);
+  sec.labelEl.textContent = `Thought for ${elapsed}s`;
+  sec.sectionEl.classList.remove("open");
+}
 
+// ── Create a new think section for a new round ──
+function createThinkSection() {
+  if (!activeBubble) return null;
+
+  const sectionEl = document.createElement("div");
+  sectionEl.className = "think-section open";
+
+  // Toggle bar: eye icon · "Thinking…" · chevron
   const toggle = document.createElement("button");
   toggle.className = "think-toggle";
   toggle.innerHTML = `
-    <span class="think-arrow">▼</span>
-    <span class="think-label">思考过程</span>
+    <svg class="think-eye" width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M8 6.6c.8 0 1.4.6 1.4 1.4S8.8 9.4 8 9.4 6.6 8.8 6.6 8 7.2 6.6 8 6.6z" fill="currentColor"/>
+      <path fill-rule="evenodd" clip-rule="evenodd" d="M2.2 8c.5-.8 1.2-1.7 2.2-2.4C5.7 4.6 7 4 8 4s2.3.6 3.6 1.6c1 .7 1.7 1.6 2.2 2.4-1 1.8-2.6 3.3-4.3 3.9a5.3 5.3 0 01-3 0C4.8 11.3 3.2 9.8 2.2 8zm7.2 3.4A8.1 8.1 0 0013.4 8 8.1 8.1 0 009.4 4.6 6.9 6.9 0 008 4.4a6.9 6.9 0 00-1.4.2A8.1 8.1 0 002.6 8a8.1 8.1 0 006.8 3.4z" fill="currentColor"/>
+    </svg>
   `;
-  activeThinkBadge = document.createElement("span");
-  activeThinkBadge.className = "think-badge thinking";
-  activeThinkBadge.textContent = "思考中";
-  toggle.appendChild(activeThinkBadge);
+  const labelEl = document.createElement("span");
+  labelEl.className = "think-label";
+  labelEl.textContent = "Thinking…";
+  toggle.appendChild(labelEl);
 
-  activeThinkBody = document.createElement("div");
-  activeThinkBody.className = "think-body";
+  const chevron = document.createElement("span");
+  chevron.className = "think-chevron";
+  chevron.innerHTML = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+    <path d="M4.5 5.5L7 8L9.5 5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+  toggle.appendChild(chevron);
 
+  // Body: left accent line + content
+  const bodyEl = document.createElement("div");
+  bodyEl.className = "think-body";
+  bodyEl.innerHTML = '<div class="think-body-line"></div><div class="think-body-text"></div>';
+  const textEl = bodyEl.querySelector(".think-body-text");
+
+  // Each section's toggle only controls its own section
   toggle.addEventListener("click", () => {
-    const open = activeThinkSection.classList.toggle("open");
-    activeThinkSection.querySelector(".think-arrow").textContent = open ? "▼" : "▶";
-    if (open) activeThinkBody.scrollTop = activeThinkBody.scrollHeight;
+    sectionEl.classList.toggle("open");
   });
 
-  activeThinkSection.appendChild(toggle);
-  activeThinkSection.appendChild(activeThinkBody);
-  activeBubble.appendChild(activeThinkSection);
+  sectionEl.appendChild(toggle);
+  sectionEl.appendChild(bodyEl);
+
+  // Insert before answer section (if exists), otherwise at end of bubble
+  if (activeAnswerSection) {
+    activeBubble.insertBefore(sectionEl, activeAnswerSection);
+  } else {
+    activeBubble.appendChild(sectionEl);
+  }
+
+  const sec = { sectionEl, bodyEl, textEl, labelEl, rawText: "", startTime: Date.now(), finalized: false };
+  thinkSections.push(sec);
+  return sec;
 }
 
-// ── Answer Section (diagnosis report, always visible) ──
+// ── Answer Section (diagnosis report, always visible, always last) ──
 function createAnswerSection() {
   if (!activeBubble) return;
   activeAnswerSection = document.createElement("div");
   activeAnswerSection.className = "answer-section";
+  if (thinkSections.length > 0) {
+    activeAnswerSection.classList.add("has-think");
+  }
 
   activeAnswerBody = document.createElement("div");
   activeAnswerBody.className = "answer-body";
   activeAnswerSection.appendChild(activeAnswerBody);
 
   activeBubble.appendChild(activeAnswerSection);
+}
+
+// ── Unified stream-end UI cleanup ──
+function finishStreamUI(reason) {
+  if (activeCursor) { activeCursor.remove(); activeCursor = null; }
+  // Finalize any remaining unfinalized think section
+  const sec = currentThink();
+  if (sec) finalizeThink(sec);
+  if (reason === "cancelled" && sec) {
+    sec.labelEl.textContent = "Cancelled";
+  }
+  activeAnswerSection = null;
+  activeAnswerBody = null;
 }
 
 // ── Structured Response Handler ──

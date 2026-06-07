@@ -328,7 +328,9 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 # ②a  Parse <step> tags FIRST from raw text — before think/answer split.
                 #     This ensures step descriptions are captured regardless of whether
                 #     the LLM puts <step> inside or outside <think> blocks.
+                prev_step_count = len(state._pending_step_descriptions)
                 clean_text = _parse_step_tags(text, state)
+                new_steps_added = len(state._pending_step_descriptions) > prev_step_count
 
                 # ②b  Then split think/answer from the cleaned text
                 think_text, answer_text = _parse_think_tags(clean_text, state)
@@ -358,15 +360,35 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         "text": answer_text, "path": path,
                         "round": state.round_number, "phase": phase,
                     }))
-                elif not think_text and not clean_text.strip() and state._pending_step_descriptions:
-                    # Step tags were parsed — accumulate for tool descriptions only.
-                    # Don't emit as text_delta (prevents duplicate display).
-                    step_text = "\n".join(state._pending_step_descriptions[-3:])
+                elif not think_text and not clean_text.strip() and new_steps_added:
+                    # Step tags were parsed — emit the NEW steps as text so
+                    # frontend think sections and answer body have content.
+                    # Only emit when steps were actually added in THIS chunk
+                    # to avoid repeating the same text for every mid-tag chunk.
+                    new_steps = state._pending_step_descriptions[prev_step_count:]
+                    step_text = "\n".join(new_steps)
                     if step_text.strip():
                         state._accumulated_think.append(step_text)
+                        if is_coordinator and not subagent_phase:
+                            events.append(AgentEvent("text_delta", {
+                                "text": step_text, "path": path,
+                                "round": state.round_number, "phase": "thinking",
+                            }))
+                        events.append(AgentEvent("text_delta", {
+                            "text": step_text, "path": path,
+                            "round": state.round_number,
+                            "phase": subagent_phase or "answering",
+                        }))
                 elif not think_text and clean_text.strip():
-                    # No think tags at all — route by agent
+                    # No think tags at all — route by agent.
+                    # For coordinator: also emit as thinking so the frontend
+                    # creates per-round collapsible sections for each LLM turn.
                     phase = subagent_phase or "answering"
+                    if is_coordinator and not subagent_phase:
+                        events.append(AgentEvent("text_delta", {
+                            "text": clean_text, "path": path,
+                            "round": state.round_number, "phase": "thinking",
+                        }))
                     events.append(AgentEvent("text_delta", {
                         "text": clean_text, "path": path,
                         "round": state.round_number, "phase": phase,
