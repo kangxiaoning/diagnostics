@@ -573,41 +573,25 @@ function createNodeDOM(node) {
 
 function drawAllEdges() {
   const svg = graphEdges;
-  const canvas = graphCanvas;
-  const sx = canvas.scrollLeft;
-  const sy = canvas.scrollTop;
+  const nodesRect = graphNodes.getBoundingClientRect();
 
-  // Use offsetTop/offsetLeft relative to graphCanvas — same origin
-  // as the SVG (both are children of graphCanvas with no padding offset).
-  function offsetLeft(el) {
-    let x = el.offsetLeft;
-    let p = el.offsetParent;
-    while (p && p !== canvas) { x += p.offsetLeft; p = p.offsetParent; }
-    return x;
-  }
-  function offsetTop(el) {
-    let y = el.offsetTop;
-    let p = el.offsetParent;
-    while (p && p !== canvas) { y += p.offsetTop; p = p.offsetParent; }
-    return y;
-  }
+  // Compute positions relative to graphNodes (shared origin with SVG).
+  // Both are children of graphCanvas at top:0 left:0.
+  function nodeLeft(el) { return el.getBoundingClientRect().left - nodesRect.left; }
+  function nodeTop(el) { return el.getBoundingClientRect().top - nodesRect.top; }
 
-  // Compute node dimensions and SVG viewBox from offset positions
+  // Compute viewBox from node positions + sizes
   let maxX = 0, maxY = 0, totalW = 0, count = 0;
   for (const node of GRAPH.nodes.values()) {
     if (!node.el) continue;
-    const w = node.el.offsetWidth;
-    const h = node.el.offsetHeight;
-    const nx = offsetLeft(node.el) + w;
-    const ny = offsetTop(node.el) + h;
-    if (nx > maxX) maxX = nx;
-    if (ny > maxY) maxY = ny;
-    totalW += w;
-    count++;
+    const w = node.el.offsetWidth, h = node.el.offsetHeight;
+    const nx = nodeLeft(node.el) + w, ny = nodeTop(node.el) + h;
+    if (nx > maxX) maxX = nx; if (ny > maxY) maxY = ny;
+    totalW += w; count++;
   }
   const pad = 60;
   const sw = maxX + pad;
-  const sh = maxY + pad + sy;
+  const sh = maxY + pad;
 
   svg.setAttribute("viewBox", `0 0 ${sw} ${sh}`);
   svg.setAttribute("width", sw);
@@ -615,16 +599,14 @@ function drawAllEdges() {
 
   const avgNodeW = count > 0 ? totalW / count : 200;
   const scale = avgNodeW / 200;
-  const arrowW = Math.round(5 * scale);
-  const arrowH = Math.round(4 * scale);
+  const arrowW = Math.round(5 * scale), arrowH = Math.round(4 * scale);
   const arrowRefX = Math.round(4.2 * scale);
   const baseSw = Math.max(1.2, 1.6 * scale);
   const accentSw = Math.max(1.5, 2.2 * scale);
-  const arrowColor = "#8e94a8";
 
   let svgContent = `<defs>
     <marker id="arrowHead" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
-      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="${arrowColor}"/>
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#8e94a8"/>
     </marker>
     <filter id="edgeGlow">
       <feGaussianBlur stdDeviation="0.8" result="blur"/>
@@ -638,11 +620,10 @@ function drawAllEdges() {
     if (!fromNode || !toNode) continue;
     if (!fromNode.el || !toNode.el) continue;
 
-    // Coordinates in SVG space (same origin as graphCanvas content area)
-    const x1 = offsetLeft(fromNode.el) + fromNode.el.offsetWidth / 2;
-    const y1 = offsetTop(fromNode.el) + fromNode.el.offsetHeight;
-    const x2 = offsetLeft(toNode.el) + toNode.el.offsetWidth / 2;
-    const y2 = offsetTop(toNode.el);
+    const x1 = nodeLeft(fromNode.el) + fromNode.el.offsetWidth / 2;
+    const y1 = nodeTop(fromNode.el) + fromNode.el.offsetHeight;
+    const x2 = nodeLeft(toNode.el) + toNode.el.offsetWidth / 2;
+    const y2 = nodeTop(toNode.el);
 
     const midY1 = y1 + Math.max(20, (y2 - y1) * 0.35);
     const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
@@ -668,6 +649,8 @@ function drawAllEdges() {
   }
 
   svg.innerHTML = svgContent;
+  // Ensure SVG container matches content height
+  svg.style.minHeight = (sh + 120) + "px";
 }
 
 // Redraw on resize or scroll
