@@ -32,6 +32,7 @@ const GRAPH = {
   nodeOrder: [],          // ordered list of node ids
   hasContent: false,
 };
+let _edgeDrawTimer = null;  // debounce rapid snapshot arrivals
 
 // ═══════════════════ Init ═══════════════════
 toolPopupClose.addEventListener("click", () => toolPopup.classList.add("hidden"));
@@ -449,11 +450,17 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Ensure DOM layout is stable before drawing edges.
-  // offsetTop/offsetLeft depend on computed layout.
-  requestAnimationFrame(() => {
-    setTimeout(() => drawAllEdges(), 50);
-  });
+  // Debounced edge draw: cancel any pending draw before scheduling.
+  // Double rAF ensures DOM layout before reading getBoundingClientRect.
+  clearTimeout(_edgeDrawTimer);
+  _edgeDrawTimer = setTimeout(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        drawAllEdges();
+      });
+    });
+  }, 5);
+
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
   });
@@ -470,7 +477,7 @@ function buildLevels() {
   for (const id of GRAPH.nodeOrder) {
     const node = GRAPH.nodes.get(id);
     if (!node) continue;
-    if (node.nodeType === "root" || !node.parentId) {
+    if (!node.parentId) {
       roots.push(id);
     }
   }
@@ -522,19 +529,11 @@ function buildLevels() {
 
 function createNodeDOM(node) {
   const el = document.createElement("div");
-  const typeClass = node.nodeType === "root" ? "root" :
-                    node.nodeType === "phase" ? "phase" : "tool";
+  const typeClass = node.nodeType === "phase" ? "phase" : "tool";
   el.className = `tnode ${typeClass} ${node.status}`;
   el.dataset.nodeId = node.id;
 
-  if (node.nodeType === "root") {
-    el.innerHTML = `
-      <div class="tnode-icon">◈</div>
-      <div class="tnode-content">
-        <div class="tnode-title">${esc(node.title)}</div>
-      </div>
-    `;
-  } else if (node.nodeType === "phase") {
+  if (node.nodeType === "phase") {
     const statusIcon = node.status === "running" ? "🔄" :
                        node.status === "completed" ? "✓" : "○";
     el.innerHTML = `
@@ -573,40 +572,39 @@ function createNodeDOM(node) {
 
 function drawAllEdges() {
   const svg = graphEdges;
-  const nodesRect = graphNodes.getBoundingClientRect();
-
-  // Compute positions relative to graphNodes (shared origin with SVG).
-  // Both are children of graphCanvas at top:0 left:0.
-  function nodeLeft(el) { return el.getBoundingClientRect().left - nodesRect.left; }
-  function nodeTop(el) { return el.getBoundingClientRect().top - nodesRect.top; }
-
-  // Compute viewBox from node positions + sizes
-  let maxX = 0, maxY = 0, totalW = 0, count = 0;
-  for (const node of GRAPH.nodes.values()) {
-    if (!node.el) continue;
-    const w = node.el.offsetWidth, h = node.el.offsetHeight;
-    const nx = nodeLeft(node.el) + w, ny = nodeTop(node.el) + h;
-    if (nx > maxX) maxX = nx; if (ny > maxY) maxY = ny;
-    totalW += w; count++;
-  }
-  const pad = 60;
-  const sw = maxX + pad;
-  const sh = maxY + pad;
+  const canvas = graphCanvas;
+  const sx = canvas.scrollLeft;
+  const sy = canvas.scrollTop;
+  const canvasRect = canvas.getBoundingClientRect();
+  const sw = canvas.scrollWidth;
+  const sh = canvas.scrollHeight;
 
   svg.setAttribute("viewBox", `0 0 ${sw} ${sh}`);
   svg.setAttribute("width", sw);
   svg.setAttribute("height", sh);
 
+  // Compute average node width for proportional sizing
+  let totalW = 0, count = 0;
+  for (const node of GRAPH.nodes.values()) {
+    if (node.el) {
+      totalW += node.el.getBoundingClientRect().width;
+      count++;
+    }
+  }
   const avgNodeW = count > 0 ? totalW / count : 200;
   const scale = avgNodeW / 200;
-  const arrowW = Math.round(5 * scale), arrowH = Math.round(4 * scale);
+
+  const arrowW = Math.round(5 * scale);
+  const arrowH = Math.round(4 * scale);
   const arrowRefX = Math.round(4.2 * scale);
+
   const baseSw = Math.max(1.2, 1.6 * scale);
   const accentSw = Math.max(1.5, 2.2 * scale);
 
+  const arrowColor = "#8e94a8";
   let svgContent = `<defs>
     <marker id="arrowHead" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
-      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#8e94a8"/>
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="${arrowColor}"/>
     </marker>
     <filter id="edgeGlow">
       <feGaussianBlur stdDeviation="0.8" result="blur"/>
@@ -620,10 +618,14 @@ function drawAllEdges() {
     if (!fromNode || !toNode) continue;
     if (!fromNode.el || !toNode.el) continue;
 
-    const x1 = nodeLeft(fromNode.el) + fromNode.el.offsetWidth / 2;
-    const y1 = nodeTop(fromNode.el) + fromNode.el.offsetHeight;
-    const x2 = nodeLeft(toNode.el) + toNode.el.offsetWidth / 2;
-    const y2 = nodeTop(toNode.el);
+    const fromRect = fromNode.el.getBoundingClientRect();
+    const toRect = toNode.el.getBoundingClientRect();
+
+    // Account for scroll offset so edges follow nodes
+    const x1 = fromRect.left - canvasRect.left + fromRect.width / 2 + sx;
+    const y1 = fromRect.bottom - canvasRect.top + sy;
+    const x2 = toRect.left - canvasRect.left + toRect.width / 2 + sx;
+    const y2 = toRect.top - canvasRect.top + sy;
 
     const midY1 = y1 + Math.max(20, (y2 - y1) * 0.35);
     const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
@@ -649,8 +651,6 @@ function drawAllEdges() {
   }
 
   svg.innerHTML = svgContent;
-  // Ensure SVG container matches content height
-  svg.style.minHeight = (sh + 120) + "px";
 }
 
 // Redraw on resize or scroll

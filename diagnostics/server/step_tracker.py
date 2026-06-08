@@ -98,26 +98,18 @@ class TreeNode:
 class TreeBuilder:
     """Reactive tree driven by Agent ↔ LLM interaction cycles.
 
-    All node descriptions are driven by LLM output (via <step> and <round> tags
-    parsed in streaming.py), NOT by hardcoded backend strings.
-
     Phase creation timing:
-      - Each LLM invocation starts a new phase. The backend tracks invocations
-        via round_number (incremented when new tool calls are detected).
-        When handle_token receives text with a new round number, a phase is
-        created — so it appears at the START of each LLM call, not when tools
-        complete or when tools are called.
-      - First phase: created on first LLM text with round_number.
-      - Subsequent phases: created when round_number changes (next LLM call).
+      - Each LLM invocation starts a new phase, tracked via round_number.
+      - First phase ("第1轮智能分析"): created at tree.start().
+      - Subsequent phases: created when round_number changes.
 
     Tree structure:
-      root ("开始诊断")
-        ├── phase ("第1轮智能分析")  ← created on first LLM text
-        │     ├── tool ("CPU诊断") ── description from LLM <step>
-        │     └── tool ("系统概览") ── description from LLM <step>
-        └── phase ("第2轮智能分析") ← created on next LLM invocation
-              ├── tool ("读取loadavg")
-              └── tool ("进程诊断")
+      phase ("第1轮智能分析")
+        ├── tool ("CPU诊断")
+        └── tool ("系统概览")
+      phase ("第2轮智能分析")  ← parent_ids from all round-1 tools
+        ├── tool ("读取loadavg")
+        └── tool ("进程诊断")
     """
 
     nodes: dict[str, TreeNode] = field(default_factory=dict)
@@ -129,7 +121,7 @@ class TreeBuilder:
     seen_tool_call_ids: set[str] = field(default_factory=set)
     _counter: int = 0
 
-    _current_phase_id: str = "root"
+    _current_phase_id: str = ""
     _last_tool_child_ids: list[str] = field(default_factory=list)
     _current_response_text: list[str] = field(default_factory=list)
     _round_descriptions: dict[int, str] = field(default_factory=dict)
@@ -138,16 +130,10 @@ class TreeBuilder:
     # ── Public API ──
 
     def start(self) -> list[dict[str, Any]]:
-        root = TreeNode("root", "开始诊断", None, StepStatus.RUNNING, NodeType.ROOT)
-        self._add_node(root)
-        self._current_phase_id = root.id
         self.state = "thinking"
-        # Create the first phase immediately — the user request triggers
-        # the first LLM call and deepagents has no "before LLM call" hook,
-        # so this is the earliest practical point to show round activity.
         self._create_first_phase()
         self._current_round = 1
-        logger.info("Tree: started (root=%s, first phase created)", root.id)
+        logger.info("Tree: started (first phase created)")
         return [self._snapshot_event()]
 
     def handle_token(self, text: str, round_num: int = 0) -> list[dict[str, Any]]:
@@ -155,16 +141,10 @@ class TreeBuilder:
         if self.state == "done":
             return []
 
-        # ── Detect new LLM invocation via round number change ──
         result: list[dict[str, Any]] = []
         if round_num > 0 and round_num != self._current_round:
             self._current_round = round_num
-            current = self.nodes.get(self._current_phase_id)
-            # Root → first phase; existing phase → next phase
-            if current and current.node_type == NodeType.ROOT:
-                self._create_first_phase()
-            else:
-                self._create_next_phase()
+            self._create_next_phase()
             self.state = "thinking"
             result.append(self._snapshot_event())
 
@@ -187,12 +167,6 @@ class TreeBuilder:
         if self.state in ("thinking", "answering"):
             self.state = "executing"
             self._flush_think()
-
-        current = self.nodes.get(self._current_phase_id)
-        # Defensive: create first phase if it wasn't already created by handle_token
-        # (e.g. LLM issued tool calls without any preceding text).
-        if current and current.node_type == NodeType.ROOT:
-            self._create_first_phase()
 
         parent_id = self._current_phase_id
         parent = self.nodes.get(parent_id)
@@ -277,30 +251,17 @@ class TreeBuilder:
 
     def finalize(self) -> list[dict[str, Any]]:
         current_id = self._current_phase_id
-        report_phase = False
         if current_id in self.nodes:
             node = self.nodes[current_id]
             if node.node_type == NodeType.PHASE:
-                # If this phase has no tool children, it's the diagnosis report
-                has_tools = any(
-                    n.node_type == NodeType.TOOL and n.parent_id == current_id
-                    for n in self.nodes.values()
-                )
-                if not has_tools:
-                    node.title = "诊断报告"
-                    report_phase = True
                 if node.status == StepStatus.RUNNING:
                     node.status = StepStatus.COMPLETED
 
-        running_nodes = sum(1 for n in self.nodes.values() if n.status == StepStatus.RUNNING)
         for node in self.nodes.values():
             if node.status == StepStatus.RUNNING:
                 node.status = StepStatus.COMPLETED
 
         self._flush_think()
-
-        logger.info("Tree: finalized, %d nodes, %d running, report_phase=%s",
-                     len(self.nodes), running_nodes, report_phase)
 
         fallback: list[dict[str, Any]] = []
         if not self.answer_buffer:
@@ -308,18 +269,16 @@ class TreeBuilder:
             if fb.strip():
                 fallback.append({"type": "token", "text": fb})
 
-        logger.info("Tree: finalized, %d nodes, %d were running",
-                     len(self.nodes), running_nodes)
         self.state = "done"
         return fallback + [self._snapshot_event()]
 
     # ── Phase creation (LLM-driven descriptions) ──
 
     def _create_next_phase(self) -> str:
-        parent_ids = list(dict.fromkeys(self._last_tool_child_ids)) or [self._current_phase_id]
+        parent_ids = list(dict.fromkeys(self._last_tool_child_ids))
         parent_ids = [pid for pid in parent_ids if pid in self.nodes]
         if not parent_ids:
-            parent_ids = ["root"]
+            parent_ids = [self._current_phase_id]
 
         phase_count = sum(
             1 for n in self.nodes.values() if n.node_type == NodeType.PHASE
@@ -327,7 +286,6 @@ class TreeBuilder:
         round_num = phase_count + 1
         title = f"第{round_num}轮智能分析"
 
-        # Description from LLM's accumulated thinking — no hardcoded fallback
         description = self._extract_phase_description() or ""
 
         nid = self._next_id()
@@ -348,9 +306,9 @@ class TreeBuilder:
         description = self._extract_phase_description() or ""
         nid = self._next_id()
         phase = TreeNode(
-            nid, "第1轮智能分析", "root",
+            nid, "第1轮智能分析", None,
             StepStatus.RUNNING, NodeType.PHASE,
-            parent_ids=["root"],
+            parent_ids=[],
             description=description,
         )
         self._add_node(phase)
