@@ -1,6 +1,6 @@
-# Diagnostics — AI 驱动的系统故障诊断代理
+# Diagnostics — AI 驱动的系统故障诊断 Agent
 
-一个结合大语言模型（LLM）与领域工具，自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。Coordinator 初筛 + 8 个领域 Expert 深度分析，强制 5 轮内完成。前端双栏布局：左侧多轮折叠块 + Markdown 报告，右侧诊断树实时生长。
+一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert 深度分析** 架构，强制 5 Round 交互内完成诊断并输出报告。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
 
 ![界面截图 1](static/1.png)
 ![界面截图 2](static/2.png)
@@ -37,31 +37,31 @@
 
 ```mermaid
 flowchart LR
-    User["🧑 用户"] -->|POST /api/chat| FastAPI["FastAPI SSE"]
-    FastAPI -->|tree.start| Tree["TreeBuilder"]
-    FastAPI -->|agent.astream| Stream["stream_agent_events"]
-    Stream -->|LLM 调用| LM["LM Studio / OpenAI"]
-    Stream -->|text_delta| SSE
-    Stream -->|tool_start/end| SSE
-    Stream -->|round_number| SSE
-    Tree -->|tree_snapshot| SSE
-    SSE -->|SSE 事件流| Frontend["🖥 前端"]
-    Frontend -->|"第N轮智能分析"| Chat["左侧聊天区"]
-    Frontend -->|"诊断树 + SVG 边线"| Graph["右侧诊断图"]
-    Stream -->|_coordinator_text 缓冲| Finalize["_finalize"]
-    Finalize -->|phase=answering| Chat
+    User["用户"] -->|"POST /api/chat/stream"| FastAPI["FastAPI SSE Endpoint"]
+    FastAPI -->|"初始化诊断树"| Tree["TreeBuilder"]
+    FastAPI -->|"启动 Agent Stream"| Stream["stream_agent_events()"]
+    Stream -->|"LLM 推理请求"| LM["LM Studio / OpenAI API"]
+    Stream -->|"text_delta Event"| SSE["SSE 格式化"]
+    Stream -->|"tool_start / tool_end"| SSE
+    Stream -->|"round_number"| SSE
+    Tree -->|"tree_snapshot Snapshot"| SSE
+    SSE -->|"SSE Event Stream"| Frontend["Frontend app.js"]
+    Frontend -->|"phase=thinking → 折叠块"| Chat["左侧聊天区"]
+    Frontend -->|"树节点 + SVG 边线"| Graph["右侧诊断图"]
+    Stream -->|"中间文本 Buffer"| Finalize["_finalize()"]
+    Finalize -->|"phase=answering → 诊断报告"| Chat
 ```
 
-**数据流分两路**：`text_delta(phase=thinking)` → 前端 "第N轮智能分析" 折叠块；流结束时 `_finalize` 将缓冲文本 → `phase=answering` → 回答区。
+**数据流分两路**：推理过程中的 `text_delta(phase=thinking)` 流入左侧按 Round 创建的折叠块（含 LLM 推理、🔧 Tool Call、📊 Tool Result）；Stream 结束时 `_finalize()` 将 Coordinator 最后一轮的 Buffer 文本以 `phase=answering` 发送到回答区，形成最终诊断报告。
 
 技术栈：
 
 | 层 | 技术 |
 |---|---|
-| Agent 框架 | `deepagents` — 支持子代理委派、文件系统后端、技能加载 |
+| Agent 框架 | `deepagents` — 支持 Subagent 委派、文件系统 Backend、Skill 加载 |
 | LLM 接入 | `langchain-openai` — 兼容 OpenAI API 的本地/远程模型 |
 | Web 框架 | `FastAPI` — SSE 流式响应 |
-| 前端 | 原生 HTML + CSS + JavaScript，零构建工具 |
+| Frontend | 原生 HTML + CSS + JavaScript，零构建工具 |
 | 可视化 | SVG 边线 + 自定义 BFS 层级布局 |
 | 运行环境 | `uvicorn` ASGI 服务器 |
 
@@ -86,9 +86,9 @@ python main.py
 
 ### 设计哲学
 
-诊断树完全由 **LLM 的实时输出驱动**，而非后端硬编码的步骤模板。核心理念：
+诊断树完全由 **LLM 的实时输出驱动**，而非 Backend 硬编码的步骤模板。核心理念：
 
-- **不预设诊断路径**：Agent 根据工具返回的数据，自主决策下一步检查什么
+- **不预设诊断路径**：Agent 根据 Tool 返回的数据，自主决策下一步检查什么
 - **LLM 提供语义描述**：每个节点的标题和描述来自 LLM 的思考文本，而非固定字符串
 - **树结构反映实际推理**：父子关系代表了 Agent 的真实决策链
 
@@ -98,111 +98,120 @@ python main.py
 
 ```python
 class NodeType(Enum):
-    ROOT  = "root"    # 根节点："开始诊断"
-    PHASE = "phase"   # 轮次节点："第N轮智能分析"
-    TOOL  = "tool"    # 工具节点："分析CPU指标"、"排查Pod状态"等
+    ROOT  = "root"    # 保留定义，实际未使用——Phase 直接作为根节点
+    PHASE = "phase"   # Round 节点："第N轮智能分析"
+    TOOL  = "tool"    # Tool 节点："分析CPU指标"、"排查Pod状态"等
+    TASK  = "task"    # Task 委派节点（预留扩展）
 ```
 
-树的结构层次：
+树的结构层次（以两轮诊断为例）：
 
 ```mermaid
 graph TD
-    P1["第1轮智能分析<br/>(LLM驱动描述)"]
-    P1 --> T1["获取系统概览<br/>(&lt;step&gt;标签驱动)"]
-    P1 --> T2["分析CPU指标<br/>(pending→running→completed)"]
-    P1 --> T3["排查Pod状态"]
+    P1["第1轮智能分析<br/>（来自 LLM 思考文本）"]
+    P1 --> T1["获取系统概览<br/>（get_system_overview）"]
+    P1 --> T2["分析CPU指标<br/>（pending → running → completed）"]
+    P1 --> T3["排查Pod状态<br/>（check_kubernetes_pods）"]
 
-    P2["第2轮智能分析<br/>(parent_ids来自上一轮tools)"]
-    P2 --> T4["分析内存使用"]
-    P2 --> T5["委派专家诊断<br/>(触发子代理)"]
+    P2["第2轮智能分析<br/>（parent_ids 继承上一轮 Tool 节点）"]
+    P2 --> T4["委派 cpu-expert<br/>（task Subagent 调用）"]
+    P2 --> T5["委派 k8s-workload-expert"]
 
     T1 -.-> P2
     T2 -.-> P2
     T3 -.-> P2
 ```
 
+**Phase 节点直接作为诊断树的根**：树启动时 `tree.start()` 直接创建第 1 Round Phase（`parent_ids=[]`），后续每 Round Phase 的 `parent_ids` 指向上一 Round 所有 Tool 子节点，形成链式因果连接。不再有独立的"开始诊断"根节点。
+
 每个节点携带的字段：
 
 | 字段 | 说明 |
 |---|---|
 | `id` | 唯一标识（如 `n1`, `n2`） |
-| `title` | 中文显示名称（工具名→中文映射表） |
+| `title` | 中文显示名称（Tool 名→中文映射表） |
 | `parent_id` / `parent_ids` | 父节点引用（PHASE 节点支持多父） |
 | `status` | `pending` / `running` / `completed` / `error` |
 | `description` | 由 LLM 输出驱动，描述此步骤的目的 |
-| `tool_name` / `tool_args` | 工具函数名和参数，前端展示为 `check_cpu(profile="default")` |
+| `tool_name` / `tool_args` | Tool 函数名和参数，Frontend 展示为 `check_cpu(profile="default")` |
 
-### 生命周期与状态机
+### 生命周期与 State Machine
 
-`TreeBuilder` 内部维护一个有限状态机，每个转换对应一次外部事件驱动：
+`TreeBuilder` 内部维护一个有限 State Machine，每个转换由外部 Event 触发：
 
 ```mermaid
 stateDiagram-v2
-    [*] --> init
-    init --> thinking : start() ─ 创建首个 phase
-    thinking --> thinking : handle_token() ─ 同轮文本
-    thinking --> executing : handle_tool_call() ─ LLM 调用工具
-    executing --> executing : handle_update() ─ 工具仍在运行
-    executing --> thinking : handle_token() ─ 新一轮 LLM 调用
-    executing --> answering : handle_update() ─ 所有工具完成
-    answering --> executing : handle_tool_call() ─ 更多工具调用
-    answering --> done : finalize() ─ 流结束
-    thinking --> done : finalize() ─ 直接结束
+    [*] --> init : TreeBuilder 创建
+    init --> thinking : start() — 创建首个 Phase 节点
+    thinking --> thinking : handle_token() — 同 Round 文本累积
+    thinking --> executing : handle_tool_call() — LLM 发出 Tool Call
+    executing --> executing : handle_update() — Tool 逐个完成
+    executing --> thinking : handle_token() — 新一轮 LLM 调用（Round 递增）
+    executing --> answering : handle_update() — 本轮所有 Tool 执行完毕
+    answering --> executing : handle_tool_call() — 补充 Tool Call
+    answering --> done : finalize() — Stream 结束，标记所有节点完成
+    thinking --> done : finalize() — 无 Tool Call 的直接结束
 ```
 
-### Phase（轮次）创建策略
+**State 转换要点**：
+- `thinking`：LLM 正在流式输出文本，`handle_token()` 检测 Round 变化时自动创建新 Phase
+- `executing`：Tool 正在执行，`handle_tool_call()` 在当前 Phase 下挂载 Tool 子节点
+- `answering`：Coordinator 进入报告生成阶段，`_finalize()` 将 Buffer 文本写入回答区
+- 新 Phase 在下一 Round LLM 调用时由 `handle_token()` 的 Round 变化触发，而非在 Tool 完成时创建
 
-整个诊断由多个**轮次（Round）**组成，每轮对应一次 LangGraph **model 节点进入**。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换，递增 `round_number`。
+### Phase（Round）创建策略
+
+整个诊断由多个 **Round** 组成，每 Round 对应一次 LangGraph **model 节点进入**。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换，递增 `round_number`。
 
 ```mermaid
 flowchart TD
-    START["START"] --> M1["model 节点"]
-    M1 -->|"round_number = 1"| T1["tools 节点"]
-    T1 -->|"工具执行"| M2["model 节点"]
-    M2 -->|"round_number = 2"| T2["tools 节点"]
-    T2 -->|"..."| MN["model 节点"]
-    MN -->|"round_number = N"| END["END"]
+    START["Agent 启动"] -->|"stream_mode=messages"| M1["model 节点（第1次）"]
+    M1 -->|"round_number = 1<br/>创建第1 Round Phase"| T1["tools 节点<br/>执行 Tool Call"]
+    T1 -->|"Tool 返回"| M2["model 节点（第2次）"]
+    M2 -->|"round_number = 2<br/>创建第2 Round Phase"| T2["tools 节点"]
+    T2 -->|"..."| MN["model 节点（第N次）"]
+    MN -->|"round_number = N<br/>创建第N Round Phase"| END["Stream 结束"]
 
-    M1 -.->|"Phase 创建"| P1["第1轮智能分析"]
-    M2 -.->|"Phase 创建"| P2["第2轮智能分析"]
-    MN -.->|"Phase 创建"| PN["第N轮智能分析"]
+    M1 -.->|"tree.start()"| P1["Phase: 第1轮智能分析"]
+    M2 -.->|"handle_token() 检测 Round 变化"| P2["Phase: 第2轮智能分析"]
+    MN -.->|"handle_token()"| PN["Phase: 第N轮智能分析"]
 ```
 
-**Phase 创建时机**：`handle_token(text, round_num)` 中 round 变化时创建新 phase。随后工具调用作为子节点加入当前 phase。下一轮的所有 tool 节点通过 `_last_tool_child_ids` 成为下一 phase 的 `parent_ids`，在 BFS 层级布局中形成链式连接。
+**Round 检测机制**：`streaming.py` 通过 LangGraph 流式 metadata 中的 `langgraph_node` 字段判断当前节点类型。Coordinator 每次进入 `"model"` 节点即表示一次新的 LLM 调用，`round_number` 在首次 text token 处理前递增。Frontend 通过 `payload.round` 对比当前折叠块的 `sec.round` 判断是否进入新 Round。
 
 **关键：parent_ids 继承**
 
 ```python
 def _create_next_phase(self) -> str:
-    # 新 phase 的 parent_ids 指向上一轮的所有 tool 子节点
+    # 新 Phase 的 parent_ids 指向上一 Round 的所有 Tool 子节点
     parent_ids = list(dict.fromkeys(self._last_tool_child_ids)) or [self._current_phase_id]
     ...
     phase = TreeNode(nid, title, parent_ids[0],
                      parent_ids=parent_ids, ...)
 ```
 
-这意味着在BFS层级布局中，第N轮的 phase 节点会和第N-1轮的所有 tool 节点产生父子连线，形成清晰的因果链可视化。
+这意味着在 BFS 层级布局中，第 N Round 的 Phase 节点会和第 N-1 Round 的所有 Tool 节点产生父子连线，形成清晰的因果链可视化。
 
 ### 节点描述：完全由 LLM 驱动
 
 这是本项目区别于硬编码流程图方案的核心设计。节点描述（`description` 字段）的来源优先级：
 
-1. **`<step>` 标签**（最高优先级）：LLM 在思考过程中使用 `<step>检查 CPU 使用率和负载均衡</step>` 声明即将执行的操作。`streaming.py` 的 `_parse_step_tags()` 在所有文本处理**之前**提取这些描述，存入 `_pending_step_descriptions` 队列。
+1. **`<step>` Tag**（最高优先级）：LLM 在思考过程中使用 `<step>检查 CPU 使用率和负载均衡</step>` 声明即将执行的操作。`streaming.py` 的 `_parse_step_tags()` 在所有文本处理**之前**提取这些描述，存入 `_pending_step_descriptions` 队列。
 
-2. **思考文本提取**（次优先级）：当 `<step>` 标签不足时，`_build_tool_descriptions()` 从 LLM 的累积思考文本中按语义模式提取：
-   - 多工具场景：搜索包含"检查/执行/查看/采集/读取/排查"等动作关键词的句子
-   - 单工具场景：取最后一句话
+2. **思考文本提取**（次优先级）：当 `<step>` Tag 不足时，`_build_tool_descriptions()` 从 LLM 的累积思考文本中按语义模式提取：
+   - 多 Tool 场景：搜索包含"检查/执行/查看/采集/读取/排查"等动作关键词的句子
+   - 单 Tool 场景：取最后一句话
 
-3. **工具参数回退**（兜底）：如果 LLM 未提供任何描述，用工具名称和参数生成（如 `check_cpu(profile="default")`）。
+3. **Tool 参数回退**（兜底）：如果 LLM 未提供任何描述，用 Tool 名称和参数生成（如 `check_cpu(profile="default")`）。
 
 ```python
 # streaming.py: _process_chunk 中的处理顺序
 text = _extract_text(message)
 
-# ① 首先从原始文本解析 <step> 标签
+# ① 首先从原始文本解析 <step> Tag
 clean_text = _parse_step_tags(text, state)
 
-# ② 然后解析 <think> 标签，区分思考/回答
+# ② 然后解析 <think> Tag，区分思考/回答
 think_text, answer_text = _parse_think_tags(clean_text, state)
 
 # ③ 当 LLM 发出 tool_call 时，消费 pending_step_descriptions
@@ -217,22 +226,22 @@ step_descs = _build_tool_descriptions(state, tool_count)
 
 ```
 ┌──────────┐    ┌───────────┐    ┌──────────────────┐    ┌──────────────┐    ┌─────┐
-│  Browser │    │  FastAPI  │    │  stream_agent_    │    │  TreeBuilder │    │ LLM │
-│ (app.js) │    │  (app.py) │    │  events()         │    │              │    │     │
+│  Browser │    │  FastAPI  │    │  stream_agent_   │    │  TreeBuilder │    │ LLM │
+│ (app.js) │    │  (app.py) │    │  events()        │    │              │    │     │
 └────┬─────┘    └─────┬─────┘    └────────┬─────────┘    └──────┬───────┘    └──┬──┘
      │                │                   │                     │               │
      │ POST /api/chat │                   │                     │               │
      │───────────────>│                   │                     │               │
      │                │ tree.start()      │                     │               │
      │                │──────────────────>│                     │               │
-     │  SSE session   │                   │ tree_snapshot(root) │               │
+     │  SSE session   │                   │ tree_snapshot(phase)│               │
      │<───────────────│                   │<────────────────────│               │
      │                │                   │                     │               │
      │                │ agent.astream()   │                     │               │
      │                │──────────────────>│                     │               │
      │                │                   │ ── LLM chunk ──>    │               │
-     │                │                   │                     │  "系统CPU使用  │
-     │                │                   │                     │   率偏高..."  │
+     │                │                   │                     │  系统CPU使用   │
+     │                │                   │                     │   率偏高...    │
      │                │                   │ <── text delta ──   │               │
      │                │                   │                     │               │
      │                │                   │ handle_token(text)  │               │
@@ -259,11 +268,11 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │                   │<────────────────────│               │
      │                │                   │                     │               │
      │ SSE tree_      │                   │                     │               │
-     │ snapshot +      │                   │                     │               │
-     │ tool_start      │                   │                     │               │
+     │ snapshot +     │                   │                     │               │
+     │ tool_start     │                   │                     │               │
      │<───────────────│                   │                     │               │
      │                │                   │                     │               │
-     │ ── frontend renders tree ──>       │                     │               │
+     │ ── Frontend renders tree ──>       │                     │               │
      │                │                   │                     │               │
      │                │                   │ ── Tool executes ─> │               │
      │                │                   │ <── ToolMessage ──  │               │
@@ -278,11 +287,11 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │                   │ tree_snapshot       │               │
      │                │                   │<────────────────────│               │
      │                │                   │                     │               │
-     │ SSE tool_end +  │                   │                     │               │
-     │ tree_snapshot   │                   │                     │               │
+     │ SSE tool_end + │                   │                     │               │
+     │ tree_snapshot  │                   │                     │               │
      │<───────────────│                   │                     │               │
      │                │                   │                     │               │
-     │     ... 多轮交互循环重复 ...        │                     │               │
+     │     ... 多 Round 交互循环重复 ...      │                     │               │
      │                │                   │                     │               │
      │                │                   │ _finalize()         │               │
      │                │                   │ tree.finalize()     │               │
@@ -291,25 +300,25 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │                   │ tree_snapshot       │               │
      │                │                   │<────────────────────│               │
      │                │                   │                     │               │
-     │ SSE done +      │                   │                     │               │
-     │ tree_snapshot   │                   │                     │               │
+     │ SSE done +     │                   │                     │               │
+     │ tree_snapshot  │                   │                     │               │
      │<───────────────│                   │                     │               │
      │                │                   │                     │               │
-     │ ── finalizeGraph() ──>            │                     │               │
+     │ ── finalizeGraph() ──>             │                     │               │
 ```
 
-### 事件类型一览
+### Event 类型一览
 
-| SSE 事件 | 触发时机 | 前端行为 |
+| SSE Event | 触发时机 | Frontend 行为 |
 |---|---|---|
 | `session` | 连接建立 | 保存 session_id |
-| `text_delta` | LLM 输出文本 / 工具结果 | phase=thinking → 追加到 "第N轮智能分析" 折叠块（含 🔧📊）；phase=answering → 追加到诊断报告区（仅流结束时最终报告） |
-| `tool_start` | LLM 发出工具调用 | （信息性，树由 tree_snapshot 驱动） |
-| `tool_end` | 工具执行完毕 | （信息性，树由 tree_snapshot 驱动） |
+| `text_delta` | LLM 输出文本 / Tool Result | phase=thinking → 追加到 "第N轮智能分析" 折叠块（含 🔧📊）；phase=answering → 追加到诊断报告区 |
 | `tree_snapshot` | 树结构发生变化 | **完全重建诊断树**：重新计算 BFS 层级、渲染节点、绘制 SVG 边线 |
-| `tool_args_available` | 流式参数到达（updates模式） | 更新 tool 节点的参数显示 |
-| `agent_start` / `agent_end` | 子代理启动/结束 | （信息性） |
-| `done` / `cancelled` / `error` | 流终止 | 折叠思考面板、标记完成状态 |
+| `tool_start` | LLM 发出 Tool Call | 信息性 Event（树由 tree_snapshot 驱动） |
+| `tool_end` | Tool 执行完毕 | 信息性 Event（树由 tree_snapshot 驱动） |
+| `tool_args_available` | 流式参数到达（updates 模式补全） | 更新 Tool 节点的参数显示 |
+| `agent_start` / `agent_end` | Subagent 启动/结束 | 信息性 Event |
+| `done` / `cancelled` / `error` | Stream 终止 | 折叠未完成面板、标记完成状态 |
 
 ## 后端关键实现
 
@@ -321,14 +330,14 @@ step_descs = _build_tool_descriptions(state, tool_count)
 
 ```python
 async def stream_agent_events(agent, messages, cancel_event, session_id):
-    chunk_queue = asyncio.Queue()  # 解耦生产和消费
+    chunk_queue = asyncio.Queue()  # 解耦 Producer 和 Consumer
 
-    # 生产者: 将 agent.astream() 的原始数据放入队列
+    # Producer: 将 agent.astream() 的原始数据放入队列
     async def _producer():
         async for raw in agent.astream(...):
             await chunk_queue.put(raw)
 
-    # 消费者: 从队列取数据，用 asyncio.wait 同时监听取消信号
+    # Consumer: 从队列取数据，用 asyncio.wait 同时监听取消信号
     while True:
         get_task = asyncio.ensure_future(chunk_queue.get())
         cancel_task = asyncio.ensure_future(cancel_event.wait())
@@ -344,36 +353,37 @@ async def stream_agent_events(agent, messages, cancel_event, session_id):
             yield evt
 ```
 
-**LangGraph 节点检测与轮次管理**：
+**LangGraph 节点检测与 Round 管理**：
 
-`_process_chunk()` 从 `stream_mode="messages"` 的 metadata 中提取 `langgraph_node` 字段，检测 coordinator 是否进入 `"model"` 节点。每次 model 节点转换代表一次新的 LLM 调用，`round_number` 在文本处理之前递增，确保所有 `text_delta` 事件携带正确的轮次号。
+`_process_chunk()` 从 `stream_mode="messages"` 的 metadata 中提取 `langgraph_node` 字段，检测 Coordinator 是否进入 `"model"` 节点。每次 model 节点转换代表一次新的 LLM 调用，`round_number` 在文本处理之前递增，确保所有 `text_delta` Event 携带正确的 Round 号。
 
 ```python
 node_type = metadata.get("langgraph_node", "")
 if is_coordinator and node_type == "model":
     if state._last_node_type != "model":
-        state.round_number += 1  # 新 LLM 调用 → 新轮次
+        state.round_number += 1  # 新 LLM 调用 → 新 Round
 ```
 
-**标签解析与文本路由**：
+**Tag 解析与文本路由**：
 
-1. **`_parse_step_tags()`** — 最先执行，提取 `<step>` 标签声明。当 LLM 纯输出 `<step>` 标签（无其他文本）时，将步骤文本也发送到前端，用 `new_steps_added` 标志避免流式传输中每个中间 chunk 重复发送。
+1. **`_parse_step_tags()`** — 最先执行，提取 `<step>` Tag 声明。当 LLM 纯输出 `<step>` Tag（无其他文本）时，将步骤文本也发送到 Frontend，用 `new_steps_added` 标志避免流式传输中每个中间 chunk 重复发送。
 
 2. **`_parse_think_tags()`** — 解析 `<think>...</think>` 块，区分深度思考内容和最终回答。
 
-3. **文本路由** — 主代理（coordinator）的中间推理文本仅发送到 `phase="thinking"`（创建折叠块），并累积到 `_coordinator_text` 缓冲区。流结束时 `_finalize()` 将缓冲区内容发送到 `phase="answering"`（回答区正文）。工具调用痕迹（🔧）和工具返回结果（📊）同样路由到 `phase="thinking"`，归入当前轮次折叠块。子代理文本按名称路由：`report-writer` → `answering`，其他 → `thinking`。
+3. **文本路由** — Coordinator 的中间推理文本仅发送到 `phase="thinking"`（创建折叠块），并累积到 `_coordinator_text` Buffer。Stream 结束时 `_finalize()` 将 Buffer 内容发送到 `phase="answering"`（回答区正文）。Tool Call 痕迹（🔧）和 Tool Result（📊）同样 Route 到 `phase="thinking"`，归入当前 Round 折叠块。
 
-**子代理的阶段路由规则**：
+**Subagent 的 Phase 路由规则**：
 
 ```python
 def _subagent_phase(path, state) -> str:
-    # report-writer 的所有输出 → answering（显示为诊断报告）
-    # 其他子代理的输出 → thinking（显示为可折叠的推理过程）
-    name = state._task_call_id_to_name.get(call_id, "")
-    return "answering" if name == "report-writer" else "thinking"
+    # 所有 Subagent 的输出 → thinking（显示为可折叠的推理过程）
+    # Coordinator 的最终报告由 _finalize 处理 → answering
+    if len(path) <= 1 or path[0] == "coordinator":
+        return "answering"  # Coordinator → answer 区域
+    return "thinking"       # Subagent → 折叠块
 ```
 
-**双通道参数提取**：部分 LLM 后端（如 LM Studio/Qwen）在流式模式下，`messages` 模式的 tool_call 中参数为空，完整参数出现在 `updates` 模式。`_process_chunk()` 同时处理两种模式：
+**双通道参数提取**：部分 LLM Backend（如 LM Studio/Qwen）在流式模式下，`messages` 模式的 tool_call 中参数为空，完整参数出现在 `updates` 模式。`_process_chunk()` 同时处理两种模式：
 
 ```python
 if mode == "messages":
@@ -391,23 +401,23 @@ elif mode == "updates":
                     events.append(AgentEvent("tool_args_available", ...))
 ```
 
-### 诊断树构建器（`diagnostics/server/step_tracker.py`）
+### TreeBuilder（`diagnostics/server/step_tracker.py`）
 
-`TreeBuilder` 是一个**被动响应式**构建器，它在接收到事件时同步更新内部树状态。
+`TreeBuilder` 是一个**被动响应式**构建器，它在接收到 Event 时同步更新内部树 State。
 
 ```python
 @dataclass
 class TreeBuilder:
     nodes: dict[str, TreeNode]           # id → TreeNode
     node_order: list[str]                # 保持插入顺序
-    state: str = "init"                  # 状态机
-    _current_phase_id: str               # 当前活跃 phase
-    _last_tool_child_ids: list[str]      # 上一轮创建的 tool 节点 ID
+    state: str = "init"                  # State Machine
+    _current_phase_id: str               # 当前活跃 Phase
+    _last_tool_child_ids: list[str]      # 上一 Round 创建的 Tool 节点 ID
     think_buffer / think_segments        # LLM 思考文本累积
     answer_buffer                        # LLM 回答文本累积
 ```
 
-**快照生成**：每次树状态变更时，调用 `_snapshot_event()` 生成完整的节点列表快照：
+**Snapshot 生成**：每次树 State 变更时，调用 `_snapshot_event()` 生成完整的节点列表 Snapshot：
 
 ```python
 def _snapshot_event(self) -> dict[str, Any]:
@@ -420,7 +430,7 @@ def _snapshot_event(self) -> dict[str, Any]:
                 "parent_id": node.parent_id,
                 "parent_ids": node.parent_ids,
                 "status": node.status.value,     # "pending"|"running"|"completed"|"error"
-                "node_type": node.node_type.value, # "root"|"phase"|"tool"
+                "node_type": node.node_type.value, # "phase"|"tool"|"task"
                 "description": node.description,   # LLM 驱动的描述
                 "tool_name": node.tool_name,
                 "tool_args": node.tool_args,
@@ -430,11 +440,11 @@ def _snapshot_event(self) -> dict[str, Any]:
     }
 ```
 
-前端接收到 `tree_snapshot` 事件时，**完全重建**可视化树，而非增量更新。这种设计简化了前后端同步，避免增量 diff 的复杂性。
+Frontend 接收到 `tree_snapshot` Event 时，**完全重建**可视化树，而非增量更新。这种设计简化了前后端同步，避免增量 diff 的复杂性。
 
-### SSE 端点（`diagnostics/server/app.py`）
+### SSE Endpoint（`diagnostics/server/app.py`）
 
-`_chat_event_stream()` 是 SSE 事件的生产者。它协调三个关键组件：
+`_chat_event_stream()` 是 SSE Event 的 Producer。它协调三个关键组件：
 
 ```python
 async def _chat_event_stream(request, session_id, state, agent, settings):
@@ -443,20 +453,20 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
     # 1. 发送 session_id
     yield sse("session", {"session_id": session_id})
 
-    # 2. 初始化树（创建 root 节点）
+    # 2. 初始化树（创建首个 Phase 节点）
     for snap in tree.start():
         yield sse("tree_snapshot", snap)
 
-    # 3. 主循环：消费 Agent 事件，同时驱动 TreeBuilder
+    # 3. 主循环：消费 Agent Event，同时驱动 TreeBuilder
     async for event in stream_agent_events(...):
         if event.name == "text_delta":
             yield sse("text_delta", event.payload)
-            # 将文本 token 也送入 TreeBuilder
+            # 将 text token 也送入 TreeBuilder
             for tok_evt in tree.handle_token(event.payload["text"]):
                 ...
 
         elif event.name == "tool_start":
-            # 将工具调用送入 TreeBuilder（带 LLM 描述）
+            # 将 Tool Call 送入 TreeBuilder（带 LLM 描述）
             tool_calls = [{
                 "id": event.payload["id"],
                 "name": event.payload["name"],
@@ -467,11 +477,11 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
                 yield sse("tree_snapshot", snap)
 
         elif event.name == "tool_end":
-            # 标记工具完成 → 可能触发新 phase 创建
+            # 标记 Tool 完成 → 可能触发新 Phase 创建
             for snap in tree.handle_update(...):
                 yield sse("tree_snapshot", snap)
 
-    # 4. 最终化：关闭树，发送最终快照
+    # 4. Finalize：关闭树，发送最终 Snapshot
     for snap in tree.finalize():
         yield sse("tree_snapshot", snap)
 
@@ -480,54 +490,56 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
 
 ### Agent 工厂（`diagnostics/agent/factory.py`）
 
-使用 `deepagents` 的 `create_deep_agent()` 构建主 Agent，配置：
+使用 `deepagents` 的 `create_deep_agent()` 构建主 Agent，核心配置如下：
 
-- **8 个子代理**：
+- **8 个 Subagent**（系统层 + K8s 组件层）：
   - 系统层：`cpu-expert`, `memory-expert`, `disk-io-expert`, `network-expert`, `gpu-expert`
   - K8s 组件层（按 Kubernetes 官方排障模型拆分）：
     - `k8s-control-plane-expert` — API Server、etcd、scheduler、controller-manager
     - `k8s-workload-expert` — Pod 生命周期、OOMKilled、资源限制
     - `k8s-node-expert` — 节点状态、kubelet、压力驱逐
-  - 诊断报告由 Coordinator 亲自撰写，不再委派独立的 report-writer
-- **双层存储后端**：`CompositeBackend` — `/agent_data/` 路径路由到 `FilesystemBackend`（虚拟文件系统），其他使用 `StateBackend`（内存状态）
-- **记忆加载**：`AGENTS.md`/`LEARNINGS.md` 在首次会话调用时从磁盘加载并缓存于 state，新会话自动重新读取（无需重启服务）
+- **双层存储 Backend**：`CompositeBackend` — `/agent_data/` 路径 Route 到 `FilesystemBackend`（虚拟文件系统，支持 `read_file`/`write_file`/`edit_file`），其他使用 `StateBackend`（内存 State）
+- **Memory 与 Skill 加载**：
+  - `memory` 路径（`AGENTS.md`、`LEARNINGS.md`）和 `skills` 路径在 `create_deep_agent()` 时固化到 `CompiledStateGraph`
+  - 具体文件内容在 `before_agent` Hook 中按需从磁盘读取，缓存于 LangGraph State 中
+  - **同 Session 内复用缓存**，无需重复读取；**新 Session**（新 session_id）自动重新从磁盘加载，无需重启服务
 
 ```mermaid
 flowchart LR
-    Create["create_deep_agent()"] -->|"固化 memory/skills 路径"| Graph["CompiledStateGraph"]
+    Create["create_deep_agent()"] -->|"固化 memory/skills 路径<br/>到 CompiledStateGraph"| Graph["CompiledStateGraph"]
 
-    subgraph "首次会话调用"
-        Before1["before_agent 钩子"] -->|"state 无缓存"| Read1["读取磁盘文件"]
-        Read1 -->|"缓存到 state"| Invoke1["agent.invoke()"]
+    subgraph S1["首次 Session 调用"]
+        B1["before_agent Hook"] -->|"State 无缓存"| R1["从磁盘读取文件内容"]
+        R1 -->|"缓存到 State"| I1["agent.invoke()"]
     end
 
-    subgraph "后续同会话"
-        Before2["before_agent 钩子"] -->|"state 已有缓存"| Skip2["跳过磁盘读取"]
-        Skip2 --> Invoke2["agent.invoke()"]
+    subgraph S2["同 Session 后续调用"]
+        B2["before_agent Hook"] -->|"State 已有缓存"| SK2["跳过磁盘读取"]
+        SK2 --> I2["agent.invoke()"]
     end
 
-    subgraph "新会话（新 session_id）"
-        Before3["before_agent 钩子"] -->|"新 state, 无缓存"| Read3["重新读取磁盘"]
-        Read3 --> Invoke3["agent.invoke()"]
+    subgraph S3["新 Session（新 session_id）"]
+        B3["before_agent Hook"] -->|"新 State, 无缓存"| R3["重新从磁盘读取"]
+        R3 --> I3["agent.invoke()"]
     end
 
-    Graph --> Before1
-    Graph --> Before2
-    Graph --> Before3
+    Graph --> S1
+    Graph --> S2
+    Graph --> S3
 ```
 
 ## 前端关键实现
 
 ### 诊断树可视化（`static/app.js`）
 
-前端诊断树是一个**自上而下的分层树状图**，核心渲染流程：
+Frontend 诊断树是一个**自上而下的分层树状图**，核心渲染流程：
 
 **1. BFS 层级计算**：
 
 ```javascript
 function buildLevels() {
-    // 从 root 节点开始 BFS
-    const roots = [];  // nodeType === "root" 或 parentId 为空的节点
+    // 从 parentId 为空的节点（Phase 根节点）开始 BFS
+    const roots = [];  // parentId === null 的节点
     const levels = [[...roots]];
 
     // BFS 遍历，按 parent_ids 关系构建层级
@@ -546,22 +558,20 @@ function buildLevels() {
 }
 ```
 
-**2. DOM 渲染**：每个层级渲染为一个 `.tree-level` 弹性容器，层间用 `.tree-connector` 分隔。节点根据类型（root/phase/tool）应用不同的 CSS 类和图标：
+**2. DOM 渲染**：每个层级渲染为一个 `.tree-level` 弹性容器，层间用 `.tree-connector` 分隔。节点根据类型（Phase/Tool）应用不同的 CSS 类和图标：
 
 ```javascript
 function createNodeDOM(node) {
-    if (node.nodeType === "root") {
-        // ◈ 图标 + 标题
-    } else if (node.nodeType === "phase") {
-        // ○/🔄/✓ 状态图标 + 标题 + LLM 驱动的描述
+    if (node.nodeType === "phase") {
+        // ○/🔄/✓ Status 图标 + 标题 + LLM 驱动的描述
     } else {
-        // tool 节点：○/⚙/✓/✕ + 标题 + 函数签名 + 描述
+        // Tool 节点：○/⚙/✓/✕ + 标题 + 函数签名 + 描述
         // 点击触发详情弹窗
     }
 }
 ```
 
-**3. SVG 边线绘制**：使用贝塞尔曲线连接父子节点，状态驱动样式：
+**3. SVG 边线绘制**：使用贝塞尔曲线连接父子节点，Status 驱动样式：
 
 ```javascript
 function drawAllEdges() {
@@ -569,7 +579,7 @@ function drawAllEdges() {
     // C x1,y1  x1,midY  x2,midY  x2,y2
     const d = `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
 
-    // 状态 → 视觉样式
+    // Status → 视觉样式
     if (toNode.status === "running") {
         color = "#6c8cff"; dash = 'stroke-dasharray="6 3"';  // 蓝色虚线 + 发光
     } else if (toNode.status === "completed") {
@@ -580,13 +590,13 @@ function drawAllEdges() {
 }
 ```
 
-边线在 resize 和 scroll 事件时实时重绘，保证拖拽分隔条和滚动画布时连线正确跟随。
+边线在 resize 和 scroll Event 时实时重绘，保证拖拽分隔条和滚动画布时连线正确跟随。
 
-**4. 完整重建策略**：每次收到 `tree_snapshot` 事件，前端完全重建可视化：
+**4. 完整重建策略**：每次收到 `tree_snapshot` Event，Frontend 完全重建可视化：
 
 ```javascript
 function onTreeSnapshot(payload) {
-    // 清空本地 GRAPH 状态
+    // 清空本地 GRAPH State
     GRAPH.nodes.clear();
     GRAPH.edges = [];
 
@@ -603,14 +613,14 @@ function onTreeSnapshot(payload) {
 ```
 
 **为什么是完整重建而非增量更新？**
-- 树结构可能在任意位置插入新节点（子代理调用时）
+- 树结构可能在任意位置插入新节点（Subagent 调用时）
 - BFS 层级可能因新节点加入而整体重排
-- 简化同步逻辑，避免前后端状态不一致
+- 简化同步逻辑，避免前后端 State 不一致
 - 渲染性能足够（诊断树节点数通常 < 50）
 
-### 思考过程折叠面板（多轮独立，含工具结果）
+### 思考过程折叠面板（多 Round 独立，含 Tool Result）
 
-左侧聊天区每轮 LLM 交互产生一个独立折叠块，标题为**"第N轮智能分析"**。
+左侧聊天区每 Round LLM 交互产生一个独立折叠块，标题为**"第N轮智能分析"**。
 
 **架构：`thinkSections[]` 数组**
 
@@ -619,42 +629,42 @@ function onTreeSnapshot(payload) {
 { sectionEl, bodyEl, textEl, labelEl, rawText, startTime, finalized, round }
 ```
 
-**内容构成：** 每轮折叠块包含该轮的完整交互内容：
+**内容构成：** 每 Round 折叠块包含该 Round 的完整交互内容：
 - LLM 推理文本（`phase="thinking"`）
-- 🔧 工具调用痕迹（`phase="thinking"`）
-- 📊 工具返回结果（`phase="thinking"`）
+- 🔧 Tool Call 痕迹（`phase="thinking"`）
+- 📊 Tool Result（`phase="thinking"`）
 
 **关键行为：**
 
 | 时机 | 行为 |
 |---|---|
-| 后端发送 `phase=thinking` | `createThinkSection(round)` → eye SVG + "第N轮智能分析" + chevron，自动展开 |
-| 新一轮 thinking 到达 | 用 `payload.round` 检测轮次变化 → `finalizeThink(prev)` → 上一块收起 |
+| Backend 发送 `phase=thinking` | `createThinkSection(round)` → eye SVG + "第N轮智能分析" + chevron，自动展开 |
+| 新 Round thinking 到达 | 用 `payload.round` 检测 Round 变化 → `finalizeThink(prev)` → 上一块收起 |
 | 用户点击 toggle | 只控制该 section 自身的展开/收起 |
-| 流结束 | `finishStreamUI()` 最终化未完成的 section；缓冲的 coordinator 文本发送到 answer-body |
+| Stream 结束 | `finishStreamUI()` 最终化未完成的 section；Buffer 的 Coordinator 文本发送到 answer-body |
 
 **DOM 结构：**
 
 ```
 msg-bubble
 ├── think-section (第1轮智能分析, 收起)
-│   ├── think-toggle  [eye] 第1轮智能分析 [chevron]
-│   └── think-body (hidden) — LLM推理 + 🔧工具调用 + 📊工具结果
+│   ├── think-toggle  [eye SVG] 第1轮智能分析 [chevron ▼]
+│   └── think-body (hidden) — LLM 推理 + 🔧 Tool Call + 📊 Tool Result
 ├── think-section (第2轮智能分析, 收起)  
 │   └── ...
 └── answer-section.has-think
-    └── answer-body — 最终诊断报告（流结束时发送）
+    └── answer-body — 最终诊断报告（_finalize 时 phase=answering 发送）
 ```
 
-**轮次检测：** 后端通过 `metadata["langgraph_node"]` 检测 LangGraph 节点转换（每次进入 `"model"` 节点 = 一次新 LLM 调用），在文本处理之前递增 `round_number`。前端通过 `payload.round` 对比当前 section 的 `sec.round` 来判断是否进入新轮次。中间推理文本只发送到 `phase="thinking"`（折叠块），流结束时 `_finalize()` 将缓冲的完整文本一次性发送到 `phase="answering"`（回答区）。
+**Round 检测**：Backend 通过 `metadata["langgraph_node"]` 检测 LangGraph 节点转换——Coordinator 每次进入 `"model"` 节点意味着一次新 LLM 调用，在文本处理前递增 `round_number`。Frontend 通过 `payload.round` 与当前 `thinkSections[]` 中最新 section 的 `sec.round` 对比判断新 Round。当检测到新 Round 时，上一 Round section 自动收起（`finalizeThink()`），新 Round section 自动展开。所有中间推理文本（含 `<step>` Tag 解析后的步骤文本）Route 到 `phase="thinking"`，Stream 结束时 `_finalize()` 将 Coordinator 最后一 Round 的 Buffer 文本一次性以 `phase="answering"` 发送到回答区。
 
-### 工具详情弹窗
+### Tool 详情弹窗
 
-点击执行树中的 tool 节点，弹出详情面板，展示：
+点击执行树中的 Tool 节点，弹出详情面板，展示：
 
 - LLM 驱动的步骤描述
-- 执行状态（等待/执行中/已完成/失败）
-- 工具调用 ID（用于调试追踪）
+- 执行 Status（pending / running / completed / error）
+- Tool Call ID（用于调试追踪）
 
 ## 项目结构
 
