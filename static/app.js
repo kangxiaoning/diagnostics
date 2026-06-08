@@ -449,13 +449,15 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Double-RAF: first frame applies scroll, second frame draws edges
-  // with correct post-scroll coordinates.
+  // Single RAF: let the browser lay out new nodes, then draw edges.
+  // Canvas scroll is handled by the scroll event listener on graphCanvas,
+  // which calls drawAllEdges() with correct scroll-aware coordinates.
+  requestAnimationFrame(() => {
+    drawAllEdges();
+  });
+  // Also scroll to reveal the newest nodes at the bottom.
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
-    requestAnimationFrame(() => {
-      drawAllEdges();
-    });
   });
 }
 
