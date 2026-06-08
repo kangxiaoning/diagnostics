@@ -291,7 +291,7 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │ tree_snapshot  │                   │                     │               │
      │<───────────────│                   │                     │               │
      │                │                   │                     │               │
-     │     ... Multi-Round loop repeats ...  │                     │               │
+     │  ... Multi-Round loop repeats ...  │                     │               │
      │                │                   │                     │               │
      │                │                   │ _finalize()         │               │
      │                │                   │ tree.finalize()     │               │
