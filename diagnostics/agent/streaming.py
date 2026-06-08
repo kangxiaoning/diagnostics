@@ -387,17 +387,14 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     }))
                 elif not think_text and not clean_text.strip() and new_steps_added:
                     # Step tags were parsed — emit the NEW steps as text so
-                    # frontend think sections and answer body have content.
-                    # Only emit when steps were actually added in THIS chunk
-                    # to avoid repeating the same text for every mid-tag chunk.
+                    # frontend think sections have content for each round.
                     new_steps = state._pending_step_descriptions[prev_step_count:]
                     step_text = "\n".join(new_steps)
                     if step_text.strip():
                         state._accumulated_think.append(step_text)
-                        # Emit to thinking for per-round sections.
-                        # Do NOT emit to answering — step descriptions
-                        # are intermediate reasoning, not final output.
+                        # Also buffer for per-round filtering in _finalize
                         if is_coordinator and not subagent_phase:
+                            state._coordinator_text.append((step_text, state.round_number))
                             events.append(AgentEvent("text_delta", {
                                 "text": step_text, "path": path,
                                 "round": state.round_number, "phase": "thinking",
