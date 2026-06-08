@@ -195,6 +195,9 @@ class _EventState:
     # Track LangGraph node transitions to detect LLM invocation boundaries
     _last_node_type: str = ""  # "model" or "tools" or empty (initial)
     _first_model_seen: bool = False
+    # Buffer for the final answer body: only coordinator non-think-tagged text
+    # (accumulated during all rounds, emitted once in _finalize).
+    _coordinator_text: list[str] = field(default_factory=list)
 
 
 async def stream_agent_events(
@@ -390,30 +393,36 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     step_text = "\n".join(new_steps)
                     if step_text.strip():
                         state._accumulated_think.append(step_text)
+                        # Emit to thinking for per-round sections.
+                        # Do NOT emit to answering — step descriptions
+                        # are intermediate reasoning, not final output.
                         if is_coordinator and not subagent_phase:
                             events.append(AgentEvent("text_delta", {
                                 "text": step_text, "path": path,
                                 "round": state.round_number, "phase": "thinking",
                             }))
-                        events.append(AgentEvent("text_delta", {
-                            "text": step_text, "path": path,
-                            "round": state.round_number,
-                            "phase": subagent_phase or "answering",
-                        }))
+                        elif not is_coordinator:
+                            events.append(AgentEvent("text_delta", {
+                                "text": step_text, "path": path,
+                                "round": state.round_number,
+                                "phase": subagent_phase or "answering",
+                            }))
                 elif not think_text and clean_text.strip():
                     # No think tags at all — route by agent.
-                    # For coordinator: also emit as thinking so the frontend
-                    # creates per-round collapsible sections for each LLM turn.
+                    # For coordinator: emit to thinking so the frontend
+                    # creates per-round sections. Buffer for final answer.
                     phase = subagent_phase or "answering"
                     if is_coordinator and not subagent_phase:
+                        state._coordinator_text.append(clean_text)
                         events.append(AgentEvent("text_delta", {
                             "text": clean_text, "path": path,
                             "round": state.round_number, "phase": "thinking",
                         }))
-                    events.append(AgentEvent("text_delta", {
-                        "text": clean_text, "path": path,
-                        "round": state.round_number, "phase": phase,
-                    }))
+                    else:
+                        events.append(AgentEvent("text_delta", {
+                            "text": clean_text, "path": path,
+                            "round": state.round_number, "phase": phase,
+                        }))
 
             # ③ Process tool calls — both main agent and subagent.
             #    Subagent tool calls show the expert's diagnostic work in the tree.
@@ -887,22 +896,29 @@ def _summarize_output(output: str, max_len: int = 80) -> str:
 def _finalize(state: _EventState) -> list[AgentEvent]:
     events: list[AgentEvent] = []
 
-    # Emit any remaining buffered text as the final answer (diagnosis report)
-    if state._think_tag_buf.strip():
+    # Emit the final answer body content from buffered coordinator text
+    # (accumulated during all rounds, suppressed from answering phase until now).
+    if state._coordinator_text:
+        report = "".join(state._coordinator_text).strip()
+        if report:
+            events.append(AgentEvent("text_delta", {
+                "text": report[-3000:],
+                "path": ["coordinator"], "round": state.round_number,
+                "phase": "answering",
+            }))
+    elif state._think_tag_buf.strip():
         events.append(AgentEvent("text_delta", {
             "text": state._think_tag_buf,
             "path": ["coordinator"], "round": state.round_number,
             "phase": "answering",
         }))
-    else:
-        # If no buffered text but LLM was working, emit accumulated think as report
+    elif "".join(state._accumulated_think).strip():
         report = "".join(state._accumulated_think).strip()
-        if report:
-            events.append(AgentEvent("text_delta", {
-                "text": f"\n## 诊断报告\n\n{report[-2000:]}",
-                "path": ["coordinator"], "round": state.round_number,
-                "phase": "answering",
-            }))
+        events.append(AgentEvent("text_delta", {
+            "text": f"\n## 诊断报告\n\n{report[-2000:]}",
+            "path": ["coordinator"], "round": state.round_number,
+            "phase": "answering",
+        }))
 
     for tc_id, info in state.active_tools.items():
         if tc_id in state.done_tools:
