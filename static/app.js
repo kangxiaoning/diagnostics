@@ -449,12 +449,12 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // setTimeout(0) ensures the browser has completed layout before drawing
-  // edges. requestAnimationFrame may fire before layout, causing zero
-  // coordinates or wrong viewBox dimensions.
+  // Use a short delay to ensure browser layout is complete before drawing.
+  // setTimeout(0) may still be too early — 20ms gives the render pipeline
+  // enough time to compute layout and paint.
   setTimeout(() => {
     drawAllEdges();
-  }, 0);
+  }, 20);
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
   });
