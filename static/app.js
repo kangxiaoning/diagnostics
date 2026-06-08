@@ -579,21 +579,31 @@ function drawAllEdges() {
   const sx = canvas.scrollLeft;
   const sy = canvas.scrollTop;
   const canvasRect = canvas.getBoundingClientRect();
-  const sw = canvas.scrollWidth;
-  const sh = canvas.scrollHeight;
+
+  // Compute SVG viewBox from actual node positions, not canvas scroll
+  // dimensions (which may be 0 before first layout).
+  let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
+  let totalW = 0, count = 0;
+  for (const node of GRAPH.nodes.values()) {
+    if (!node.el) continue;
+    const r = node.el.getBoundingClientRect();
+    const nx = r.left - canvasRect.left + sx;
+    const ny = r.top - canvasRect.top + sy;
+    if (nx < minX) minX = nx;
+    if (ny < minY) minY = ny;
+    if (nx + r.width > maxX) maxX = nx + r.width;
+    if (ny + r.height > maxY) maxY = ny + r.height;
+    totalW += r.width;
+    count++;
+  }
+  const pad = 60;
+  const sw = Math.max(maxX + pad, canvasRect.width);
+  const sh = Math.max(maxY + pad, canvasRect.height);
 
   svg.setAttribute("viewBox", `0 0 ${sw} ${sh}`);
   svg.setAttribute("width", sw);
   svg.setAttribute("height", sh);
 
-  // Compute average node width for proportional sizing
-  let totalW = 0, count = 0;
-  for (const node of GRAPH.nodes.values()) {
-    if (node.el) {
-      totalW += node.el.getBoundingClientRect().width;
-      count++;
-    }
-  }
   const avgNodeW = count > 0 ? totalW / count : 200;
   const scale = avgNodeW / 200;
 
