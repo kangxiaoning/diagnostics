@@ -1,6 +1,6 @@
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
-一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert 深度分析** 架构，强制 5 Round 交互内完成诊断并输出报告。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
+一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert 深度分析** 架构，强制 5 Round 交互内完成诊断并输出报告。报告按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障，实现 **实体级别的历史追溯与故障模式学习**。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
 
 ![界面截图 1](static/1.png)
 ![界面截图 2](static/2.png)
@@ -12,6 +12,12 @@
 
 - [架构概览](#架构概览)
 - [快速开始](#快速开始)
+- [持久化报告与历史关联](#持久化报告与历史关联)
+  - [设计动机](#设计动机)
+  - [文件系统层级组织](#文件系统层级组织)
+  - [报告命名规范](#报告命名规范)
+  - [历史关联流程](#历史关联流程)
+  - [关键实现](#关键实现)
 - [动态诊断图：原理与实现](#动态诊断图原理与实现)
   - [设计哲学](#设计哲学)
   - [核心数据结构](#核心数据结构)
@@ -79,6 +85,100 @@ cp .env.example .env
 python main.py
 # 访问 http://127.0.0.1:8000
 ```
+
+## 持久化报告与历史关联
+
+### 设计动机
+
+运维诊断不是一次性事件——同一个主机或 K8s 集群可能反复出现相同或关联的故障。本系统将每次诊断报告**按运维实体层级化持久存储**，并在诊断前自动读取该实体的历史故障记录，使 Coordinator 能够：
+- 识别是否属于历史故障复发
+- 对比当前异常指标与历史特征信号
+- 优先排查已被证实的历史根因
+- 在全局经验库（LEARNINGS.md）中积累跨实体的通用诊断模式
+
+### 文件系统层级组织
+
+报告按**实体类别** → **实体名称** → **日期+症状** 三级结构归档。GPU 以 K8s 形态提供，归属到所在集群目录：
+
+```
+agent_data/reports/
+├── hosts/                                   ← 传统物理/虚拟机
+│   ├── server01/
+│   │   ├── HISTORY.md                       ← 该主机故障历史摘要
+│   │   ├── 2026-06-08_server01_oom-killed.md
+│   │   └── 2026-06-09_server01_cpu-load-high.md
+│   └── db-node-03/
+│       ├── HISTORY.md
+│       └── 2026-06-09_db-node-03_disk-io-saturation.md
+│
+└── kubernetes/                              ← 所有 K8s 集群（含 GPU）
+    ├── prod-cluster/
+    │   ├── HISTORY.md                       ← 该集群故障历史摘要
+    │   ├── 2026-06-09_prod-cluster_pod-java-backend-crashloop.md
+    │   ├── 2026-06-09_prod-cluster_node-worker3-notready.md
+    │   └── 2026-06-09_prod-cluster_gpu-gpu01-memory-oom.md
+    └── staging-cluster/
+        ├── HISTORY.md
+        └── ...
+```
+
+### 报告命名规范
+
+```
+{YYYY-MM-DD}_{entity_name}_{brief-symptom}.md
+```
+
+| 组成部分 | 说明 | 示例 |
+|---|---|---|
+| `YYYY-MM-DD` | 诊断日期，便于按时间搜索 | `2026-06-09` |
+| `entity_name` | 主机名或集群名，便于按实体过滤 | `server01`, `prod-cluster` |
+| `brief-symptom` | 英文简短症状（小写，连字符分隔） | `cpu-load-high`, `gpu-memory-oom` |
+
+搜索示例：
+- 按时间过滤：`ls reports/hosts/server01/2026-06*`
+- 按实体列出所有报告：`ls reports/kubernetes/prod-cluster/`
+- 跨实体搜索根因：`grep -r "OOMKilled" reports/`
+
+### 历史关联流程
+
+以下一次完整的"带历史追溯"诊断请求为例，展示 Coordinator 如何关联历史故障：
+
+```mermaid
+flowchart TD
+    Input["用户输入: 'prod-cluster 集群 Pod java-backend 频繁重启'"]
+    Input --> Step1["Step 1: 实体识别<br/>category=kubernetes<br/>entity=prod-cluster"]
+    Step1 --> Step2["Step 2: 读取历史<br/>read_file reports/kubernetes/prod-cluster/HISTORY.md"]
+    Step2 --> Step3{"历史命中?"}
+    Step3 -->|"是: 3天前 worker2 有过 MemoryPressure"| Step4["Step 3: 将历史模式注入诊断上下文<br/>委派专家时提示关联历史案例"]
+    Step3 -->|"否: 无历史记录"| Step5["Step 3: 首次诊断该实体<br/>执行完整5轮诊断流程"]
+    Step4 --> Step5
+    Step5 --> Step6["Step 4: 第5轮收束<br/>write_file 层级归档路径"]
+    Step6 --> Step7["Step 5: 更新 HISTORY.md<br/>追加本次诊断摘要"]
+    Step7 --> Step8["Step 6: 全局自我进化<br/>更新 LEARNINGS.md"]
+```
+
+**设计了两个层次的记忆**：
+- **实体级记忆（HISTORY.md）**：同一运维对象的故障时间线，精确到主机/集群
+- **全局级记忆（LEARNINGS.md）**：跨实体的通用诊断模式和方法论积累
+
+### 关键实现
+
+**1. FilesystemBackend 天然支持**
+
+现有的 `CompositeBackend` 已将 `/agent_data/` 路由到 `FilesystemBackend`，Agent 通过 `write_file("/agent_data/reports/hosts/server01/...")` 写入的报告直接落盘持久化，无需任何后端改动。
+
+**2. Prompt 驱动，零代码新增**
+
+实体识别、路径规划、历史读取、HISTORY.md 更新等全部逻辑通过 `prompt.py` 中的任务指令驱动，无需新增 Python 模块。Coordinator 在诊断开始时被指令：
+- 提取运维对象 → 确定归档路径
+- 读取 HISTORY.md → 注入诊断上下文
+- 报告写入选定路径 → 更新 HISTORY.md → 更新 LEARNINGS.md
+
+**3. 目录自动初始化**
+
+`factory.py` 在 Agent 构建时自动创建 `reports/hosts/` 和 `reports/kubernetes/` 目录，确保 Agent 首次写入时路径已就绪。
+
+---
 
 ## 动态诊断图：原理与实现
 
@@ -498,7 +598,8 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
     - `k8s-control-plane-expert` — API Server、etcd、scheduler、controller-manager
     - `k8s-workload-expert` — Pod 生命周期、OOMKilled、资源限制
     - `k8s-node-expert` — 节点状态、kubelet、压力驱逐
-- **双层存储 Backend**：`CompositeBackend` — `/agent_data/` 路径 Route 到 `FilesystemBackend`（虚拟文件系统，支持 `read_file`/`write_file`/`edit_file`），其他使用 `StateBackend`（内存 State）
+- **双层存储 Backend**：`CompositeBackend` — `/agent_data/` 路径 Route 到 `FilesystemBackend`（虚拟文件系统，支持 `read_file`/`write_file`/`edit_file`），其他使用 `StateBackend`（内存 State）。所有诊断报告通过此 Backend 写入 `reports/` 目录层级归档。
+- **报告目录初始化**：`build_agent()` 时自动创建 `agent_data/reports/hosts/` 和 `agent_data/reports/kubernetes/` 目录，确保 Agent 首次写入就绪。
 - **Memory 与 Skill 加载**：
   - `memory` 路径（`AGENTS.md`、`LEARNINGS.md`）和 `skills` 路径在 `create_deep_agent()` 时固化到 `CompiledStateGraph`
   - 具体文件内容在 `before_agent` Hook 中按需从磁盘读取，缓存于 LangGraph State 中
@@ -696,9 +797,12 @@ diagnostics/
 │       ├── gpu_tools.py             # GPU诊断工具
 │       └── kubernetes_tools.py      # K8s ControlPlane/Pod/Node诊断工具
 ├── agent_data/
-│   ├── AGENTS.md                    # 诊断方法论
-│   ├── LEARNINGS.md                 # 历史经验（Agent自动更新）
+│   ├── AGENTS.md                    # 诊断方法论（全局记忆）
+│   ├── LEARNINGS.md                 # 历史经验（Agent自动更新，跨实体通用模式）
 │   ├── skills/                      # 19个专业诊断技能
+│   ├── reports/                     # 持久化报告归档（分层级）
+│   │   ├── hosts/                   # 主机故障报告
+│   │   └── kubernetes/              # K8s 集群故障报告（含 GPU）
 │   └── test_cases/                  # 验证测试用例
 ├── static/
 │   ├── index.html                   # 双栏布局页面

@@ -25,6 +25,14 @@ from diagnostics.tools.system_tools import (
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 AGENT_DATA_ROOT = PROJECT_ROOT / "agent_data"
 
+# Ensure report directory structure exists for hierarchical archiving
+_REPORT_DIRS = [
+    AGENT_DATA_ROOT / "reports" / "hosts",
+    AGENT_DATA_ROOT / "reports" / "kubernetes",
+]
+for _d in _REPORT_DIRS:
+    _d.mkdir(parents=True, exist_ok=True)
+
 
 def _build_subagents() -> list[dict[str, Any]]:
     """Define specialized diagnostic subagents following deepagents best practices.
