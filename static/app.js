@@ -449,13 +449,12 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Single RAF: let the browser lay out new nodes, then draw edges.
-  // Canvas scroll is handled by the scroll event listener on graphCanvas,
-  // which calls drawAllEdges() with correct scroll-aware coordinates.
-  requestAnimationFrame(() => {
+  // setTimeout(0) ensures the browser has completed layout before drawing
+  // edges. requestAnimationFrame may fire before layout, causing zero
+  // coordinates or wrong viewBox dimensions.
+  setTimeout(() => {
     drawAllEdges();
-  });
-  // Also scroll to reveal the newest nodes at the bottom.
+  }, 0);
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
   });
