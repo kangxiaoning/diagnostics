@@ -449,10 +449,13 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Scroll to bottom of canvas
+  // Double-RAF: first frame applies scroll, second frame draws edges
+  // with correct post-scroll coordinates.
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
-    drawAllEdges();
+    requestAnimationFrame(() => {
+      drawAllEdges();
+    });
   });
 }
 
