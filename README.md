@@ -38,8 +38,8 @@
       → LLM 输出含 <step>、<think> 标签的文本
       → <step> 标签去重后发送到前端；<think> 标签分离思考/回答
       → coordinator 文本双路发送: thinking(折叠块) + answering(回答区)
+      → 检测 metadata["langgraph_node"] → "model" 转换 → round_number 自增
       → LLM 发起 tool_call → tool_start / tool_end 事件
-      → round_number 自增 → 前端用其创建新的折叠块
       → 子代理委派（task工具）→ agent_start / agent_end 事件
     → TreeBuilder 构建执行树 → tree_snapshot 事件
   → SSE 事件流 → 前端实时渲染（Markdown + 诊断树 + 多轮折叠块）
@@ -146,11 +146,22 @@ init → thinking → executing → answering → done
 
 ### Phase（轮次）创建策略
 
-整个诊断由多个**轮次（Round）**组成，每轮对应一次 "LLM 思考 → 发起工具调用 → 工具返回结果" 的完整交互。
+整个诊断由多个**轮次（Round）**组成，每轮对应一次 LangGraph **model 节点进入**（即一次 LLM 调用）。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换——当 coordinator 进入 `"model"` 节点时递增 `round_number`，**在文本处理之前**完成，确保文本带着正确的轮次号发出。
 
-**第一轮 phase 的创建时机**：当 `handle_token` 收到第一条 LLM 文本且 `round_number` 从 0 变为 1 时创建。phase 代表一次完整的 LLM 调用回合（思考+工具），因此在 LLM 开始输出时就出现，而非延后到工具调用。
+```
+LangGraph 图:  START → model → tools → model → tools → ... → model → END
+                       ↑ 第1轮      ↑ 第2轮                  ↑ 第N轮
+metadata:         {"langgraph_node":"model"}
+round_number:     1                           2                     N
+```
 
-**后续轮次 phase 的创建时机**：后端 `streaming.py` 在检测到新工具调用时将 `round_number` 递增。`handle_token` 收到带新 `round_num` 的文本时自动创建下一 phase——phase 创建与 LLM 调用同步，而非在工具执行完成后。
+**Phase 创建时机**：`handle_token(text, round_num)` 中，当 `round_num` 与 `_current_round` 不同时创建新 phase。这发生在每轮 LLM 调用开始输出文本时——与 LangGraph 节点转换完全同步。
+
+| 事件 | round_number | 前端 phase |
+|---|---|---|
+| model 节点首次进入 | 1 | 创建 "第1轮智能分析" |
+| tools 节点 → model 再次进入 | +1 → 2 | 创建 "第2轮智能分析" |
+| 每轮中间文本（round 不变） | 不变 | 同一 phase，不新建 |
 
 **关键：parent_ids 继承**
 
@@ -324,6 +335,17 @@ async def stream_agent_events(agent, messages, cancel_event, session_id):
         raw = await get_task
         for evt in _process_chunk(raw, state, session_id):
             yield evt
+```
+
+**LangGraph 节点检测与轮次管理**：
+
+`_process_chunk()` 从 `stream_mode="messages"` 的 metadata 中提取 `langgraph_node` 字段，检测 coordinator 是否进入 `"model"` 节点。每次 model 节点转换代表一次新的 LLM 调用，`round_number` 在文本处理之前递增，确保所有 `text_delta` 事件携带正确的轮次号。
+
+```python
+node_type = metadata.get("langgraph_node", "")
+if is_coordinator and node_type == "model":
+    if state._last_node_type != "model":
+        state.round_number += 1  # 新 LLM 调用 → 新轮次
 ```
 
 **标签解析与文本路由**：
