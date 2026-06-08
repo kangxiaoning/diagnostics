@@ -37,19 +37,19 @@
 
 ```mermaid
 flowchart LR
-    User["用户"] -->|"POST /api/chat/stream"| FastAPI["FastAPI SSE Endpoint"]
-    FastAPI -->|"初始化诊断树"| Tree["TreeBuilder"]
-    FastAPI -->|"启动 Agent Stream"| Stream["stream_agent_events()"]
-    Stream -->|"LLM 推理请求"| LM["LM Studio / OpenAI API"]
-    Stream -->|"text_delta Event"| SSE["SSE 格式化"]
+    User["User"] -->|"POST /api/chat/stream"| FastAPI["FastAPI SSE Endpoint"]
+    FastAPI -->|"Initialize Tree"| Tree["TreeBuilder"]
+    FastAPI -->|"Start Agent Stream"| Stream["stream_agent_events()"]
+    Stream -->|"LLM Request"| LM["LM Studio / OpenAI API"]
+    Stream -->|"text_delta Event"| SSE["SSE Formatter"]
     Stream -->|"tool_start / tool_end"| SSE
     Stream -->|"round_number"| SSE
-    Tree -->|"tree_snapshot Snapshot"| SSE
-    SSE -->|"SSE Event Stream"| Frontend["Frontend app.js"]
-    Frontend -->|"phase=thinking → 折叠块"| Chat["左侧聊天区"]
-    Frontend -->|"树节点 + SVG 边线"| Graph["右侧诊断图"]
-    Stream -->|"中间文本 Buffer"| Finalize["_finalize()"]
-    Finalize -->|"phase=answering → 诊断报告"| Chat
+    Tree -->|"tree_snapshot"| SSE
+    SSE -->|"SSE Event Stream"| Frontend["Frontend (app.js)"]
+    Frontend -->|"phase=thinking → Collapsible Panel"| Chat["Chat Panel (Left)"]
+    Frontend -->|"Tree Nodes + SVG Edges"| Graph["Diagnosis Graph (Right)"]
+    Stream -->|"Text Buffer"| Finalize["_finalize()"]
+    Finalize -->|"phase=answering → Report"| Chat
 ```
 
 **数据流分两路**：推理过程中的 `text_delta(phase=thinking)` 流入左侧按 Round 创建的折叠块（含 LLM 推理、🔧 Tool Call、📊 Tool Result）；Stream 结束时 `_finalize()` 将 Coordinator 最后一轮的 Buffer 文本以 `phase=answering` 发送到回答区，形成最终诊断报告。
@@ -108,14 +108,14 @@ class NodeType(Enum):
 
 ```mermaid
 graph TD
-    P1["第1轮智能分析<br/>（来自 LLM 思考文本）"]
-    P1 --> T1["获取系统概览<br/>（get_system_overview）"]
-    P1 --> T2["分析CPU指标<br/>（pending → running → completed）"]
-    P1 --> T3["排查Pod状态<br/>（check_kubernetes_pods）"]
+    P1["Round 1 Analysis<br/>（Driven by LLM thinking）"]
+    P1 --> T1["get_system_overview<br/>（pending → running → completed）"]
+    P1 --> T2["check_cpu"]
+    P1 --> T3["check_kubernetes_pods"]
 
-    P2["第2轮智能分析<br/>（parent_ids 继承上一轮 Tool 节点）"]
-    P2 --> T4["委派 cpu-expert<br/>（task Subagent 调用）"]
-    P2 --> T5["委派 k8s-workload-expert"]
+    P2["Round 2 Analysis<br/>（parent_ids from Round 1 Tool nodes）"]
+    P2 --> T4["Delegate cpu-expert<br/>（task Subagent）"]
+    P2 --> T5["Delegate k8s-workload-expert"]
 
     T1 -.-> P2
     T2 -.-> P2
@@ -141,16 +141,16 @@ graph TD
 
 ```mermaid
 stateDiagram-v2
-    [*] --> init : TreeBuilder 创建
-    init --> thinking : start() — 创建首个 Phase 节点
-    thinking --> thinking : handle_token() — 同 Round 文本累积
-    thinking --> executing : handle_tool_call() — LLM 发出 Tool Call
-    executing --> executing : handle_update() — Tool 逐个完成
-    executing --> thinking : handle_token() — 新一轮 LLM 调用（Round 递增）
-    executing --> answering : handle_update() — 本轮所有 Tool 执行完毕
-    answering --> executing : handle_tool_call() — 补充 Tool Call
-    answering --> done : finalize() — Stream 结束，标记所有节点完成
-    thinking --> done : finalize() — 无 Tool Call 的直接结束
+    [*] --> init : TreeBuilder created
+    init --> thinking : start() — Create first Phase
+    thinking --> thinking : handle_token() — Accumulate text (same Round)
+    thinking --> executing : handle_tool_call() — LLM issues Tool Call
+    executing --> executing : handle_update() — Tools completing
+    executing --> thinking : handle_token() — New LLM call (Round++)
+    executing --> answering : handle_update() — All tools done
+    answering --> executing : handle_tool_call() — Additional Tool Call
+    answering --> done : finalize() — Stream ends, mark all done
+    thinking --> done : finalize() — No tool calls, end directly
 ```
 
 **State 转换要点**：
@@ -165,16 +165,16 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    START["Agent 启动"] -->|"stream_mode=messages"| M1["model 节点（第1次）"]
-    M1 -->|"round_number = 1<br/>创建第1 Round Phase"| T1["tools 节点<br/>执行 Tool Call"]
-    T1 -->|"Tool 返回"| M2["model 节点（第2次）"]
-    M2 -->|"round_number = 2<br/>创建第2 Round Phase"| T2["tools 节点"]
-    T2 -->|"..."| MN["model 节点（第N次）"]
-    MN -->|"round_number = N<br/>创建第N Round Phase"| END["Stream 结束"]
+    START["Agent Start"] -->|"stream_mode=messages"| M1["model node (#1)"]
+    M1 -->|"round_number = 1<br/>Create Round 1 Phase"| T1["tools node<br/>Execute Tool Calls"]
+    T1 -->|"Tools return"| M2["model node (#2)"]
+    M2 -->|"round_number = 2<br/>Create Round 2 Phase"| T2["tools node"]
+    T2 -->|"..."| MN["model node (#N)"]
+    MN -->|"round_number = N<br/>Create Round N Phase"| END["Stream End"]
 
-    M1 -.->|"tree.start()"| P1["Phase: 第1轮智能分析"]
-    M2 -.->|"handle_token() 检测 Round 变化"| P2["Phase: 第2轮智能分析"]
-    MN -.->|"handle_token()"| PN["Phase: 第N轮智能分析"]
+    M1 -.->|"tree.start()"| P1["Phase: Round 1"]
+    M2 -.->|"handle_token() detects Round change"| P2["Phase: Round 2"]
+    MN -.->|"handle_token()"| PN["Phase: Round N"]
 ```
 
 **Round 检测机制**：`streaming.py` 通过 LangGraph 流式 metadata 中的 `langgraph_node` 字段判断当前节点类型。Coordinator 每次进入 `"model"` 节点即表示一次新的 LLM 调用，`round_number` 在首次 text token 处理前递增。Frontend 通过 `payload.round` 对比当前折叠块的 `sec.round` 判断是否进入新 Round。
@@ -240,8 +240,8 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │ agent.astream()   │                     │               │
      │                │──────────────────>│                     │               │
      │                │                   │ ── LLM chunk ──>    │               │
-     │                │                   │                     │  系统CPU使用   │
-     │                │                   │                     │   率偏高...    │
+     │                │                   │                     │  "CPU usage   │
+     │                │                   │                     │   high..."    │
      │                │                   │ <── text delta ──   │               │
      │                │                   │                     │               │
      │                │                   │ handle_token(text)  │               │
@@ -262,8 +262,8 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │                   │                     │               │
      │                │                   │ handle_tool_call()  │               │
      │                │                   │────────────────────>│               │
-     │                │                   │                     │ create phase  │
-     │                │                   │                     │ + tool nodes  │
+     │                │                   │                     │ create Phase  │
+     │                │                   │                     │ + Tool nodes  │
      │                │                   │ tree_snapshot       │               │
      │                │                   │<────────────────────│               │
      │                │                   │                     │               │
@@ -283,7 +283,7 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │                │                   │ handle_update()     │               │
      │                │                   │────────────────────>│               │
      │                │                   │                     │ all done →    │
-     │                │                   │                     │ next phase    │
+     │                │                   │                     │ next Phase    │
      │                │                   │ tree_snapshot       │               │
      │                │                   │<────────────────────│               │
      │                │                   │                     │               │
@@ -291,7 +291,7 @@ step_descs = _build_tool_descriptions(state, tool_count)
      │ tree_snapshot  │                   │                     │               │
      │<───────────────│                   │                     │               │
      │                │                   │                     │               │
-     │     ... 多 Round 交互循环重复 ...      │                     │               │
+     │     ... Multi-Round loop repeats ...  │                     │               │
      │                │                   │                     │               │
      │                │                   │ _finalize()         │               │
      │                │                   │ tree.finalize()     │               │
@@ -506,20 +506,20 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
 
 ```mermaid
 flowchart LR
-    Create["create_deep_agent()"] -->|"固化 memory/skills 路径<br/>到 CompiledStateGraph"| Graph["CompiledStateGraph"]
+    Create["create_deep_agent()"] -->|"Embed memory/skills paths<br/>into CompiledStateGraph"| Graph["CompiledStateGraph"]
 
-    subgraph S1["首次 Session 调用"]
-        B1["before_agent Hook"] -->|"State 无缓存"| R1["从磁盘读取文件内容"]
-        R1 -->|"缓存到 State"| I1["agent.invoke()"]
+    subgraph S1["First Session Call"]
+        B1["before_agent Hook"] -->|"State not cached"| R1["Read files from disk"]
+        R1 -->|"Cache to State"| I1["agent.invoke()"]
     end
 
-    subgraph S2["同 Session 后续调用"]
-        B2["before_agent Hook"] -->|"State 已有缓存"| SK2["跳过磁盘读取"]
+    subgraph S2["Same Session, later call"]
+        B2["before_agent Hook"] -->|"State cached"| SK2["Skip disk read"]
         SK2 --> I2["agent.invoke()"]
     end
 
-    subgraph S3["新 Session（新 session_id）"]
-        B3["before_agent Hook"] -->|"新 State, 无缓存"| R3["重新从磁盘读取"]
+    subgraph S3["New Session (new session_id)"]
+        B3["before_agent Hook"] -->|"New State, not cached"| R3["Re-read from disk"]
         R3 --> I3["agent.invoke()"]
     end
 
@@ -647,13 +647,13 @@ function onTreeSnapshot(payload) {
 
 ```
 msg-bubble
-├── think-section (第1轮智能分析, 收起)
-│   ├── think-toggle  [eye SVG] 第1轮智能分析 [chevron ▼]
-│   └── think-body (hidden) — LLM 推理 + 🔧 Tool Call + 📊 Tool Result
-├── think-section (第2轮智能分析, 收起)  
+├── think-section (Round 1 Analysis, collapsed)
+│   ├── think-toggle  [eye SVG] Round 1 Analysis [chevron ▼]
+│   └── think-body (hidden) — LLM reasoning + 🔧 Tool Call + 📊 Tool Result
+├── think-section (Round 2 Analysis, collapsed)  
 │   └── ...
 └── answer-section.has-think
-    └── answer-body — 最终诊断报告（_finalize 时 phase=answering 发送）
+    └── answer-body — Final diagnosis report (sent at _finalize with phase=answering)
 ```
 
 **Round 检测**：Backend 通过 `metadata["langgraph_node"]` 检测 LangGraph 节点转换——Coordinator 每次进入 `"model"` 节点意味着一次新 LLM 调用，在文本处理前递增 `round_number`。Frontend 通过 `payload.round` 与当前 `thinkSections[]` 中最新 section 的 `sec.round` 对比判断新 Round。当检测到新 Round 时，上一 Round section 自动收起（`finalizeThink()`），新 Round section 自动展开。所有中间推理文本（含 `<step>` Tag 解析后的步骤文本）Route 到 `phase="thinking"`，Stream 结束时 `_finalize()` 将 Coordinator 最后一 Round 的 Buffer 文本一次性以 `phase="answering"` 发送到回答区。
