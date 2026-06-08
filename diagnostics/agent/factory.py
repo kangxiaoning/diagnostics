@@ -13,7 +13,7 @@ from diagnostics.agent.prompt import SYSTEM_PROMPT
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools
 from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
-from diagnostics.tools.kubernetes_tools import check_kubernetes_nodes, check_kubernetes_pods
+from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
 from diagnostics.tools.storage_tools import check_disk
 from diagnostics.tools.system_tools import (
@@ -110,21 +110,61 @@ def _build_subagents() -> list[dict[str, Any]]:
                 check_gpu_utilization,
             ],
         },
+        # ── Kubernetes component experts ──
         {
-            "name": "kubernetes-expert",
+            "name": "k8s-control-plane-expert",
             "description": (
-                "Diagnoses pod crashes, OOMKilled restarts, node pressure, and "
-                "resource limit misconfigurations. Use when K8s workloads are unstable."
+                "Diagnoses Kubernetes control plane issues: API Server timeouts, "
+                "etcd disk IO saturation, scheduler failures, controller-manager "
+                "crashes. Use when kubectl commands timeout or API Server is "
+                "unreachable or returning 5xx errors."
             ),
             "system_prompt": (
-                "You are a Kubernetes diagnostics expert. Analyze pod statuses, "
-                "restart reasons (OOMKilled, CrashLoopBackOff), and node conditions "
-                "(MemoryPressure, DiskPressure, PIDPressure). Compare memory limits "
-                "against actual usage. "
-                "Return under 150 words: root cause, affected resources, "
-                "fix (limit adjustment, scaling, or scheduler config)."
+                "You are a Kubernetes control plane diagnostics expert. Check "
+                "API Server health, etcd latency/raft index, scheduler leader, "
+                "and controller-manager status. Correlate with node conditions "
+                "and pod statuses when needed. "
+                "Return under 150 words: affected component, root cause, "
+                "impact on cluster, recommended recovery steps."
+            ),
+            "tools": [check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods],
+        },
+        {
+            "name": "k8s-workload-expert",
+            "description": (
+                "Diagnoses Pod lifecycle issues: OOMKilled, CrashLoopBackOff, "
+                "ImagePullBackOff, resource limit misconfigurations, deployment "
+                "rollout failures. Use when K8s workloads are crashing, restarting, "
+                "or failing to start."
+            ),
+            "system_prompt": (
+                "You are a Kubernetes workload diagnostics expert. Analyze pod "
+                "statuses, restart counts, termination reasons (OOMKilled, Error, "
+                "Completed), container resource limits vs actual usage, and "
+                "deployment rollout status. Identify root cause: resource pressure, "
+                "image issues, probe failures, or configuration errors. "
+                "Return under 150 words: root cause, affected pods/deployments, "
+                "fix (limit adjustment, image fix, or probe tuning)."
             ),
             "tools": [check_kubernetes_pods, check_kubernetes_nodes],
+        },
+        {
+            "name": "k8s-node-expert",
+            "description": (
+                "Diagnoses Kubernetes node issues: NotReady status, MemoryPressure, "
+                "DiskPressure, PIDPressure, kubelet failures, node evictions. "
+                "Use when nodes become unhealthy, unschedulable, or show resource "
+                "exhaustion."
+            ),
+            "system_prompt": (
+                "You are a Kubernetes node diagnostics expert. Check node conditions "
+                "(MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable), "
+                "node status transitions, resource utilization per node, and "
+                "eviction events. Correlate with system-level checks when needed. "
+                "Return under 150 words: affected node(s), condition causing issue, "
+                "impact on workloads, recommended fix (drain, scale, or resource adjustment)."
+            ),
+            "tools": [check_kubernetes_nodes, check_kubernetes_pods],
         },
         # ── Report Writer (synthesis, not data collection) ──
         {

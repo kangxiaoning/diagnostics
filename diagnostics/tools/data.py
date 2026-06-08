@@ -553,3 +553,26 @@ Encoder: 0% | Decoder: 0% | Memory BW: 92%
 Running processes: PID 1234 (GpuMemory: 28GiB, Type: C)
 System Memory BW: 15.0 GB/s read, 12.0 GB/s write (CPU-GPU transfer bottleneck?)"""
     return base
+
+
+# ════════════════ K8s Control Plane ════════════════
+
+def kubernetes_control_plane_data(scenario: str) -> str:
+    base = """COMPONENT              STATUS   MESSAGE
+kube-apiserver         Healthy  serving at https://172.16.0.1:6443
+kube-scheduler         Healthy  leader elected
+kube-controller-manager Healthy leader elected
+etcd-0                 Healthy  raft index: 123456"""
+    if scenario == "node_oom_kubelet_killed":
+        return """COMPONENT              STATUS    MESSAGE
+kube-apiserver         Unhealthy timeout: dial tcp 172.16.0.1:6443 i/o timeout
+kube-scheduler         Healthy   leader elected
+kube-controller-manager Healthy  leader elected
+etcd-0                 Unhealthy request timed out (disk io saturated)"""
+    if scenario == "api_server_overload":
+        return """COMPONENT              STATUS    MESSAGE
+kube-apiserver         Healthy   serving at https://172.16.0.1:6443 (high latency: 3s+ p99)
+kube-scheduler         Healthy   leader elected
+kube-controller-manager Healthy  leader elected
+etcd-0                 Healthy   raft index: 234567 (fsync latency: 250ms p99)"""
+    return base

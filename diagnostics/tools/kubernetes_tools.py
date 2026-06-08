@@ -1,10 +1,11 @@
-"""Kubernetes diagnostic tools: pods and nodes."""
+"""Kubernetes diagnostic tools: pods, nodes, and control plane."""
 
 from langchain_core.tools import tool
 
 from diagnostics.tools.data import (
     kubernetes_pods_data,
     kubernetes_nodes_data,
+    kubernetes_control_plane_data,
 )
 from diagnostics.tools.scenarios import _active_scenario
 
@@ -24,3 +25,9 @@ def check_kubernetes_pods(namespace: str = "default") -> str:
 def check_kubernetes_nodes() -> str:
     """Check Kubernetes node statuses, resource usage, and conditions (MemoryPressure, etc.)."""
     return kubernetes_nodes_data(_active_scenario)
+
+
+@tool
+def check_kubernetes_control_plane() -> str:
+    """Check Kubernetes control plane health: kube-apiserver, etcd, kube-scheduler, kube-controller-manager."""
+    return kubernetes_control_plane_data(_active_scenario)

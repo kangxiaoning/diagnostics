@@ -63,6 +63,7 @@ TOOL_LABELS: dict[str, str] = {
     "check_gpu_health": "检查GPU健康",
     "check_gpu_memory": "检查GPU显存",
     "check_gpu_utilization": "分析GPU利用率",
+    "check_kubernetes_control_plane": "检查控制平面",
     "check_kubernetes_pods": "排查Pod状态",
     "check_kubernetes_nodes": "检查节点状态",
     "list_diagnostic_capabilities": "列出诊断工具",

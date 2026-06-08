@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
-from diagnostics.tools.kubernetes_tools import check_kubernetes_nodes, check_kubernetes_pods
+from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
 from diagnostics.tools.storage_tools import check_disk
 from diagnostics.tools.system_tools import (
@@ -32,6 +32,7 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         check_gpu_utilization,
         check_kubernetes_pods,
         check_kubernetes_nodes,
+        check_kubernetes_control_plane,
         list_diagnostic_capabilities,
         *extra_tools,
     ]
