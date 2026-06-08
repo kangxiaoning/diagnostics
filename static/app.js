@@ -449,12 +449,11 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Use a short delay to ensure browser layout is complete before drawing.
-  // setTimeout(0) may still be too early — 20ms gives the render pipeline
-  // enough time to compute layout and paint.
-  setTimeout(() => {
-    drawAllEdges();
-  }, 20);
+  // Ensure DOM layout is stable before drawing edges.
+  // offsetTop/offsetLeft depend on computed layout.
+  requestAnimationFrame(() => {
+    setTimeout(() => drawAllEdges(), 50);
+  });
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
   });
@@ -577,27 +576,38 @@ function drawAllEdges() {
   const canvas = graphCanvas;
   const sx = canvas.scrollLeft;
   const sy = canvas.scrollTop;
-  const canvasRect = canvas.getBoundingClientRect();
 
-  // Compute SVG viewBox from actual node positions, not canvas scroll
-  // dimensions (which may be 0 before first layout).
-  let minX = Infinity, minY = Infinity, maxX = 0, maxY = 0;
-  let totalW = 0, count = 0;
+  // Use offsetTop/offsetLeft relative to graphCanvas — same origin
+  // as the SVG (both are children of graphCanvas with no padding offset).
+  function offsetLeft(el) {
+    let x = el.offsetLeft;
+    let p = el.offsetParent;
+    while (p && p !== canvas) { x += p.offsetLeft; p = p.offsetParent; }
+    return x;
+  }
+  function offsetTop(el) {
+    let y = el.offsetTop;
+    let p = el.offsetParent;
+    while (p && p !== canvas) { y += p.offsetTop; p = p.offsetParent; }
+    return y;
+  }
+
+  // Compute node dimensions and SVG viewBox from offset positions
+  let maxX = 0, maxY = 0, totalW = 0, count = 0;
   for (const node of GRAPH.nodes.values()) {
     if (!node.el) continue;
-    const r = node.el.getBoundingClientRect();
-    const nx = r.left - canvasRect.left + sx;
-    const ny = r.top - canvasRect.top + sy;
-    if (nx < minX) minX = nx;
-    if (ny < minY) minY = ny;
-    if (nx + r.width > maxX) maxX = nx + r.width;
-    if (ny + r.height > maxY) maxY = ny + r.height;
-    totalW += r.width;
+    const w = node.el.offsetWidth;
+    const h = node.el.offsetHeight;
+    const nx = offsetLeft(node.el) + w;
+    const ny = offsetTop(node.el) + h;
+    if (nx > maxX) maxX = nx;
+    if (ny > maxY) maxY = ny;
+    totalW += w;
     count++;
   }
   const pad = 60;
-  const sw = Math.max(maxX + pad, canvasRect.width);
-  const sh = Math.max(maxY + pad, canvasRect.height);
+  const sw = maxX + pad;
+  const sh = maxY + pad + sy;
 
   svg.setAttribute("viewBox", `0 0 ${sw} ${sh}`);
   svg.setAttribute("width", sw);
@@ -605,17 +615,13 @@ function drawAllEdges() {
 
   const avgNodeW = count > 0 ? totalW / count : 200;
   const scale = avgNodeW / 200;
-
-  // Arrow size proportional to node width
   const arrowW = Math.round(5 * scale);
   const arrowH = Math.round(4 * scale);
   const arrowRefX = Math.round(4.2 * scale);
-
-  // Edge thickness proportional to node width
   const baseSw = Math.max(1.2, 1.6 * scale);
   const accentSw = Math.max(1.5, 2.2 * scale);
-
   const arrowColor = "#8e94a8";
+
   let svgContent = `<defs>
     <marker id="arrowHead" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
       <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="${arrowColor}"/>
@@ -632,14 +638,11 @@ function drawAllEdges() {
     if (!fromNode || !toNode) continue;
     if (!fromNode.el || !toNode.el) continue;
 
-    const fromRect = fromNode.el.getBoundingClientRect();
-    const toRect = toNode.el.getBoundingClientRect();
-
-    // Account for scroll offset so edges follow nodes
-    const x1 = fromRect.left - canvasRect.left + fromRect.width / 2 + sx;
-    const y1 = fromRect.bottom - canvasRect.top + sy;
-    const x2 = toRect.left - canvasRect.left + toRect.width / 2 + sx;
-    const y2 = toRect.top - canvasRect.top + sy;
+    // Coordinates in SVG space (same origin as graphCanvas content area)
+    const x1 = offsetLeft(fromNode.el) + fromNode.el.offsetWidth / 2;
+    const y1 = offsetTop(fromNode.el) + fromNode.el.offsetHeight;
+    const x2 = offsetLeft(toNode.el) + toNode.el.offsetWidth / 2;
+    const y2 = offsetTop(toNode.el);
 
     const midY1 = y1 + Math.max(20, (y2 - y1) * 0.35);
     const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
