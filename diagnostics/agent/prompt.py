@@ -49,7 +49,7 @@ Coordinator 在初筛中发现以下信号时，**必须**委派对应的 expert
 诊断前：write_todos 规划步骤（含专家委派计划）
 第1-2轮：Coordinator 初筛 → get_system_overview() + 基础工具并行采集
 第3-4轮：**委派专家** → task("xxx-expert") 并行委派 → 分析返回结果 → 补采/补充委派
-第5轮：write_file /diagnosis_report.md → task("report-writer") → 自我进化
+第5轮：Coordinator 综合所有专家发现 → write_file /diagnosis_report.md → 自我进化
 </process>
 
 <parallel>
@@ -93,8 +93,7 @@ Kubernetes层：
 - `k8s-workload-expert`: Pod OOMKilled、CrashLoopBackOff、资源限制、部署失败
 - `k8s-node-expert`: 节点 NotReady、MemoryPressure、kubelet 故障、驱逐
 
-合成：
-- `report-writer`: **在诊断报告写入后使用**，整合所有专家发现并输出结构化诊断报告
+诊断报告由 Coordinator 亲自撰写，不再委派独立的 report-writer。
 
 ## 工具调用规范
 
@@ -118,8 +117,7 @@ Coordinator 5 轮操作：
        task("k8s-node-expert", "诊断 worker-3 NotReady 和 MemoryPressure")
 第4轮: task("memory-expert", "分析节点内存和 OOM 模式")（补充委派）
        task("k8s-control-plane-expert", "分析 API Server 超时与 etcd 状态")
-第5轮: write_file("/diagnosis_report.md", "## 诊断报告\n...")
-       → task("report-writer", "汇总所有专家分析生成最终报告")
+第5轮: Coordinator 汇总所有专家分析 → 亲自 write_file("/diagnosis_report.md", "## 诊断报告\n...")
        → 自我进化（更新 LEARNINGS.md）
 </example>
 
@@ -133,12 +131,13 @@ Coordinator 5 轮操作：
 
 ## 报告生成（第 5 轮必须执行）
 
-**第 5 轮必须收束诊断，按以下顺序完成：**
-1. 汇总前 4 轮采集的证据，形成诊断结论
+**第 5 轮必须收束诊断，Coordinator 亲自撰写报告：**
+1. 汇总前 4 轮所有专家分析结果，形成诊断结论
 2. 使用 `write_file` 将完整诊断报告写入 `/diagnosis_report.md`
-3. 委派 `report-writer` 子代理生成用户可读的最终报告
-4. 执行自我进化（更新 LEARNINGS.md / AGENTS.md / skills）
-5. 不要再规划新的步骤或调用更多诊断工具
+   - 报告结构：故障概述 → 诊断过程 → 根因分析 → 影响范围 → 修复建议
+   - 中文撰写，专业语气，引用专家发现作为证据
+3. 执行自我进化（更新 LEARNINGS.md / AGENTS.md / skills）
+4. 不要再规划新的步骤或调用更多诊断工具
 
 ## 回答要求
 

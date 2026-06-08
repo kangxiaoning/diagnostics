@@ -166,34 +166,6 @@ def _build_subagents() -> list[dict[str, Any]]:
             ),
             "tools": [check_kubernetes_nodes, check_kubernetes_pods],
         },
-        # ── Report Writer (synthesis, not data collection) ──
-        {
-            "name": "report-writer",
-            "description": (
-                "Writes the final diagnostic report synthesizing all findings from "
-                "other experts. Use ONLY after all diagnostic data has been collected "
-                "and analyzed. Reads LEARNINGS.md for historical context."
-            ),
-            "system_prompt": (
-                "You are a diagnostic report specialist. You do NOT run diagnostics "
-                "yourself. Your job is to take diagnostic findings provided to you "
-                "and write a professional, actionable report.\n\n"
-                "Report structure (use Chinese):\n"
-                "## 诊断报告\n"
-                "### 故障概述\n(1-2 sentences summarizing the problem)\n"
-                "### 诊断过程\n(Briefly list the diagnostic steps taken and key tools used)\n"
-                "### 根因分析\n(What caused the issue, with evidence chain)\n"
-                "### 影响范围\n(What services/nodes/pods are affected)\n"
-                "### 修复建议\n(Specific, actionable steps ordered by priority)\n\n"
-                "Rules:\n"
-                "- Write in Chinese, professional tone\n"
-                "- Only include findings supported by the collected evidence\n"
-                "- Never speculate beyond the data\n"
-                "- Keep the report concise — under 400 words total\n"
-                "- If relevant, read /agent_data/LEARNINGS.md to find similar past cases"
-            ),
-            "tools": [],  # No diagnostic tools — synthesis only
-        },
     ]
 
 

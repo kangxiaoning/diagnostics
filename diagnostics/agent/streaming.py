@@ -98,17 +98,12 @@ def _agent_path(namespace: tuple) -> list[str]:
 def _subagent_phase(path: list[str], state: _EventState) -> str:
     """Determine text_delta phase for a subagent based on its name.
 
-    report-writer → answering (visible diagnostic report)
-    all others   → thinking  (collapsible reasoning section)
+    All subagent output → thinking (collapsible reasoning section).
+    Main agent handles answer-body via _finalize.
     """
     if len(path) <= 1 or path[0] == "coordinator":
         return "answering"  # main agent → answer section
-    # Extract tool_call_id from ns path (e.g. "tools:call_abc123" → "call_abc123")
-    call_id = path[0]
-    if ":" in call_id:
-        call_id = call_id.split(":", 1)[1]
-    name = state._task_call_id_to_name.get(call_id, "")
-    return "answering" if name == "report-writer" else "thinking"
+    return "thinking"
 
 
 def _extract_text(message: Any) -> str:
