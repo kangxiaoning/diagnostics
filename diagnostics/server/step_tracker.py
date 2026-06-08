@@ -100,9 +100,15 @@ class TreeBuilder:
     All node descriptions are driven by LLM output (via <step> and <round> tags
     parsed in streaming.py), NOT by hardcoded backend strings.
 
+    Phase creation timing:
+      - First phase: created on first LLM text (handle_token), so it appears
+        as soon as reasoning begins — not deferred until tool calls.
+      - Subsequent phases: created when all tools of the previous round
+        complete (handle_update).
+
     Tree structure:
       root ("开始诊断")
-        ├── phase ("第1轮智能分析")
+        ├── phase ("第1轮智能分析")  ← created on first LLM text
         │     ├── tool ("CPU诊断") ── description from LLM <step>
         │     └── tool ("系统概览") ── description from LLM <step>
         └── phase ("第2轮智能分析") ← edges from all round-1 tool nodes
@@ -140,6 +146,12 @@ class TreeBuilder:
         self._current_response_text.append(text)
         if self.state in ("thinking", "executing"):
             self.think_buffer.append(text)
+            # Create first phase on first real LLM text, not on first tool call.
+            # Phase represents the full interaction round (thinking + tools),
+            # so it should appear as soon as the LLM starts reasoning.
+            current = self.nodes.get(self._current_phase_id)
+            if current and current.node_type == NodeType.ROOT and text.strip():
+                self._create_first_phase()
             return [{"type": "think_token", "text": text}]
         if self.state == "answering":
             self.answer_buffer.append(text)
@@ -156,6 +168,8 @@ class TreeBuilder:
             self._flush_think()
 
         current = self.nodes.get(self._current_phase_id)
+        # Defensive: create first phase if it wasn't already created by handle_token
+        # (e.g. LLM issued tool calls without any preceding text).
         if current and current.node_type == NodeType.ROOT:
             self._create_first_phase()
 

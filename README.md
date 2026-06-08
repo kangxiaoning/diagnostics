@@ -131,6 +131,7 @@ init → thinking → executing → answering → done
 ```
 1. start()                    → init → thinking（创建 root 节点）
 2. handle_token("text")       → thinking 阶段缓冲 think 文本
+                              → 首次非空文本：创建 "第1轮智能分析" phase
 3. handle_tool_call([...])   → thinking/answering → executing
                               → 创建当前 phase 下的 tool 子节点
                               → 将新 tool 节点状态设为 running
@@ -147,7 +148,7 @@ init → thinking → executing → answering → done
 
 整个诊断由多个**轮次（Round）**组成，每轮对应一次 "LLM 思考 → 发起工具调用 → 工具返回结果" 的完整交互。
 
-**第一轮 phase 的创建时机**：当 `handle_tool_call` 被调用且当前节点是 root 时，自动创建 `"第1轮智能分析"`。
+**第一轮 phase 的创建时机**：当 `handle_token` 收到第一条 LLM 文本时创建——而非等到工具调用。phase 代表整轮交互（思考+工具执行），应从 LLM 开始推理时就出现。`handle_tool_call` 中保留创建逻辑作为防御（LLM 无文本直接调用工具的极端情况）。
 
 **后续轮次 phase 的创建时机**：当上一轮的**所有** tool 节点都转为 `completed` 状态时，`handle_update` 触发 `_create_next_phase()`。
 
