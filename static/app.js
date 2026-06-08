@@ -694,14 +694,16 @@ function finalizeGraph() {
 
 function renderMarkdown(text) {
   if (!text) return "";
-  let out = escNoBr(text);
+  let out = text;
+
+  // ── Phase 1: block-level elements ──
 
   // Fenced code blocks ```...```
-  out = out.replace(/```(\w*)\n([\s\S]*?)```/g,
-    (_, lang, code) => `<pre><code>${code.trimEnd()}</code></pre>`);
+  out = out.replace(/```(\w*)\r?\n([\s\S]*?)```/g,
+    (_, lang, code) => `<pre><code>${escNoBr(code.trimEnd())}</code></pre>`);
 
-  // Inline code `...`
-  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Inline code `...` — process BEFORE bold/italic to avoid conflicts
+  out = out.replace(/`([^`]+)`/g, (_, code) => `<code>${escNoBr(code)}</code>`);
 
   // Headers
   out = out.replace(/^### (.+)$/gm, '<h3>$1</h3>');
@@ -712,33 +714,39 @@ function renderMarkdown(text) {
   out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/__(.+?)__/g, '<strong>$1</strong>');
 
-  // Italic *...* or _..._ (not inside words)
+  // Italic *...* or _..._
   out = out.replace(/\*(.+?)\*/g, '<em>$1</em>');
   out = out.replace(/\b_(.+?)_\b/g, '<em>$1</em>');
 
-  // Blockquote >
-  out = out.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
-
-  // Unordered lists
-  out = out.replace(/^(\s*)[-*] (.+)$/gm, (_, indent, item) => {
-    const depth = indent.length ? 1 : 0;
-    return depth ? `  <li>${item}</li>` : `</ul><ul><li>${item}</li>`;
-  });
-  out = out.replace(/<\/ul><ul>/, '</ul>\n<ul>');
-  out = out.replace(/^<li>/, '<ul><li>');
-  out = out.replace(/<\/li>$/, '</li></ul>');
-
-  // Ordered lists
-  out = out.replace(/^(\s*)\d+\. (.+)$/gm, (_, indent, item) => {
-    const depth = indent.length ? 1 : 0;
-    return depth ? `  <li>${item}</li>` : `</ol><ol><li>${item}</li>`;
-  });
-  out = out.replace(/<\/ol><ol>/, '</ol>\n<ol>');
-  out = out.replace(/^<li>/, '<ol><li>');
-  out = out.replace(/<\/li>$/, '</li></ol>');
-
   // Links
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+  // Blockquote > (processed before escNoBr)
+  out = out.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
+
+  // ── Phase 2: lists — process lines into <ul>/<ol> blocks ──
+  const lines = out.split('\n');
+  let inUl = false, inOl = false;
+  for (let i = 0; i < lines.length; i++) {
+    let m;
+    if ((m = lines[i].match(/^[-*] (.+)$/))) {
+      if (!inUl) { lines[i] = '<ul><li>' + m[1] + '</li>'; inUl = true; }
+      else { lines[i] = '<li>' + m[1] + '</li>'; }
+    } else if ((m = lines[i].match(/^\d+\. (.+)$/))) {
+      if (!inOl) { lines[i] = '<ol><li>' + m[1] + '</li>'; inOl = true; }
+      else { lines[i] = '<li>' + m[1] + '</li>'; }
+    } else {
+      if (inUl) { lines[i - 1] += '</ul>'; inUl = false; }
+      if (inOl) { lines[i - 1] += '</ol>'; inOl = false; }
+    }
+  }
+  if (inUl) lines[lines.length - 1] += '</ul>';
+  if (inOl) lines[lines.length - 1] += '</ol>';
+  out = lines.join('\n');
+
+  // ── Phase 3: paragraphs and cleanup ──
+  // Escape remaining special chars
+  out = escNoBr(out);
 
   // Double newline → paragraph break
   out = out.replace(/\n\n+/g, '</p><p>');
