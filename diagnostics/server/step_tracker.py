@@ -141,7 +141,12 @@ class TreeBuilder:
         self._add_node(root)
         self._current_phase_id = root.id
         self.state = "thinking"
-        logger.info("Tree: started (root=%s)", root.id)
+        # Create the first phase immediately — the user request triggers
+        # the first LLM call and deepagents has no "before LLM call" hook,
+        # so this is the earliest practical point to show round activity.
+        self._create_first_phase()
+        self._current_round = 1
+        logger.info("Tree: started (root=%s, first phase created)", root.id)
         return [self._snapshot_event()]
 
     def handle_token(self, text: str, round_num: int = 0) -> list[dict[str, Any]]:
