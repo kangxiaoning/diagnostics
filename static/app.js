@@ -216,9 +216,8 @@ function onTextDelta(payload) {
   const phase = payload.phase || "answering";
 
   if (phase === "thinking") {
-    // Each LLM round gets its own think section.
-    // The backend increments round_number when new tool calls are detected,
-    // so payload.round changes between rounds. Use it to segment sections.
+    // Each LLM round gets its own section: "第N轮智能分析"
+    // Contains: LLM reasoning text + tool call traces + tool results.
     const round = payload.round || 0;
     let sec = currentThink();
 
@@ -229,7 +228,7 @@ function onTextDelta(payload) {
     }
 
     if (!sec) {
-      sec = createThinkSection();
+      sec = createThinkSection(round);
       sec.round = round;
     }
 
@@ -241,8 +240,7 @@ function onTextDelta(payload) {
     }
     sec.textEl.appendChild(activeCursor);
   } else {
-    // Answering — do NOT finalize here; the next round's thinking
-    // (or stream end) triggers finalization so duration is accurate.
+    // Answering phase: final diagnosis report (answer-body).
     if (!activeAnswerSection) createAnswerSection();
     answerRawText += payload.text;
     if (activeAnswerBody) {
@@ -266,22 +264,20 @@ function currentThink() {
   return null;
 }
 
-// ── Finalize a think section (DeepSeek-style) ──
+// ── Finalize a think section ──
 function finalizeThink(sec) {
   sec.finalized = true;
-  const elapsed = Math.round((Date.now() - sec.startTime) / 1000);
-  sec.labelEl.textContent = `Thought for ${elapsed}s`;
   sec.sectionEl.classList.remove("open");
 }
 
-// ── Create a new think section for a new round ──
-function createThinkSection() {
+// ── Create a new think section: title "第N轮智能分析" ──
+function createThinkSection(round) {
   if (!activeBubble) return null;
 
   const sectionEl = document.createElement("div");
   sectionEl.className = "think-section open";
 
-  // Toggle bar: eye icon · "Thinking…" · chevron
+  // Toggle bar: eye icon · "第N轮智能分析" · chevron
   const toggle = document.createElement("button");
   toggle.className = "think-toggle";
   toggle.innerHTML = `
@@ -292,7 +288,7 @@ function createThinkSection() {
   `;
   const labelEl = document.createElement("span");
   labelEl.className = "think-label";
-  labelEl.textContent = "Thinking…";
+  labelEl.textContent = `第${round}轮智能分析`;
   toggle.appendChild(labelEl);
 
   const chevron = document.createElement("span");
@@ -347,11 +343,10 @@ function createAnswerSection() {
 // ── Unified stream-end UI cleanup ──
 function finishStreamUI(reason) {
   if (activeCursor) { activeCursor.remove(); activeCursor = null; }
-  // Finalize any remaining unfinalized think section
   const sec = currentThink();
   if (sec) finalizeThink(sec);
   if (reason === "cancelled" && sec) {
-    sec.labelEl.textContent = "Cancelled";
+    sec.labelEl.textContent = "第" + sec.round + "轮智能分析（已取消）";
   }
   activeAnswerSection = null;
   activeAnswerBody = null;

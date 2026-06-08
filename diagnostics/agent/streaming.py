@@ -547,13 +547,13 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 "round": state.round_number,
                                 "description": description,
                             }))
-                            # Emit tool call to answer section (execution trace)
+                            # Emit tool call to the current round's think section
                             step_info = description or label
                             events.append(AgentEvent("text_delta", {
                                 "text": f"\n\n🔧 {step_info}",
                                 "path": path,
                                 "round": state.round_number,
-                                "phase": "answering",
+                                "phase": "thinking",
                             }))
 
         elif msg_type == "ToolMessage":
@@ -573,14 +573,14 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     "output_full": output,
                     "round": state.round_number,
                 }))
-                # Emit tool result summary to answer section
+                # Emit tool result summary to the current round's think section
                 label = info["label"] if info else "工具调用"
                 summary = _summarize_output(output)
                 events.append(AgentEvent("text_delta", {
-                    "text": f"\n📊 {label} 返回: {summary}",
+                    "text": f"\n📊 **{label}**: {summary}",
                     "path": path,
                     "round": state.round_number,
-                    "phase": "answering",
+                    "phase": "thinking",
                 }))
 
     elif mode == "updates":
