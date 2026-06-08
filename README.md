@@ -130,8 +130,8 @@ init → thinking → executing → answering → done
 
 ```
 1. start()                    → init → thinking（创建 root 节点）
-2. handle_token("text")       → thinking 阶段缓冲 think 文本
-                              → 首次非空文本：创建 "第1轮智能分析" phase
+2. handle_token("text",n)     → thinking 阶段缓冲 think 文本
+                              → round_num 变化时创建新 phase（每轮 LLM 调用一个）
 3. handle_tool_call([...])   → thinking/answering → executing
                               → 创建当前 phase 下的 tool 子节点
                               → 将新 tool 节点状态设为 running
@@ -148,9 +148,9 @@ init → thinking → executing → answering → done
 
 整个诊断由多个**轮次（Round）**组成，每轮对应一次 "LLM 思考 → 发起工具调用 → 工具返回结果" 的完整交互。
 
-**第一轮 phase 的创建时机**：当 `handle_token` 收到第一条 LLM 文本时创建——而非等到工具调用。phase 代表整轮交互（思考+工具执行），应从 LLM 开始推理时就出现。`handle_tool_call` 中保留创建逻辑作为防御（LLM 无文本直接调用工具的极端情况）。
+**第一轮 phase 的创建时机**：当 `handle_token` 收到第一条 LLM 文本且 `round_number` 从 0 变为 1 时创建。phase 代表一次完整的 LLM 调用回合（思考+工具），因此在 LLM 开始输出时就出现，而非延后到工具调用。
 
-**后续轮次 phase 的创建时机**：当上一轮的**所有** tool 节点都转为 `completed` 状态时，`handle_update` 触发 `_create_next_phase()`。
+**后续轮次 phase 的创建时机**：后端 `streaming.py` 在检测到新工具调用时将 `round_number` 递增。`handle_token` 收到带新 `round_num` 的文本时自动创建下一 phase——phase 创建与 LLM 调用同步，而非在工具执行完成后。
 
 **关键：parent_ids 继承**
 

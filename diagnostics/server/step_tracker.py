@@ -101,17 +101,20 @@ class TreeBuilder:
     parsed in streaming.py), NOT by hardcoded backend strings.
 
     Phase creation timing:
-      - First phase: created on first LLM text (handle_token), so it appears
-        as soon as reasoning begins — not deferred until tool calls.
-      - Subsequent phases: created when all tools of the previous round
-        complete (handle_update).
+      - Each LLM invocation starts a new phase. The backend tracks invocations
+        via round_number (incremented when new tool calls are detected).
+        When handle_token receives text with a new round number, a phase is
+        created — so it appears at the START of each LLM call, not when tools
+        complete or when tools are called.
+      - First phase: created on first LLM text with round_number.
+      - Subsequent phases: created when round_number changes (next LLM call).
 
     Tree structure:
       root ("开始诊断")
         ├── phase ("第1轮智能分析")  ← created on first LLM text
         │     ├── tool ("CPU诊断") ── description from LLM <step>
         │     └── tool ("系统概览") ── description from LLM <step>
-        └── phase ("第2轮智能分析") ← edges from all round-1 tool nodes
+        └── phase ("第2轮智能分析") ← created on next LLM invocation
               ├── tool ("读取loadavg")
               └── tool ("进程诊断")
     """
@@ -129,6 +132,7 @@ class TreeBuilder:
     _last_tool_child_ids: list[str] = field(default_factory=list)
     _current_response_text: list[str] = field(default_factory=list)
     _round_descriptions: dict[int, str] = field(default_factory=dict)
+    _current_round: int = 0
 
     # ── Public API ──
 
@@ -140,23 +144,34 @@ class TreeBuilder:
         logger.info("Tree: started (root=%s)", root.id)
         return [self._snapshot_event()]
 
-    def handle_token(self, text: str) -> list[dict[str, Any]]:
+    def handle_token(self, text: str, round_num: int = 0) -> list[dict[str, Any]]:
+        """Feed a text token. Creates a new phase when the LLM round changes."""
         if self.state == "done":
             return []
+
+        # ── Detect new LLM invocation via round number change ──
+        result: list[dict[str, Any]] = []
+        if round_num > 0 and round_num != self._current_round:
+            self._current_round = round_num
+            current = self.nodes.get(self._current_phase_id)
+            # Root → first phase; existing phase → next phase
+            if current and current.node_type == NodeType.ROOT:
+                self._create_first_phase()
+            else:
+                self._create_next_phase()
+            self.state = "thinking"
+            result.append(self._snapshot_event())
+
         self._current_response_text.append(text)
         if self.state in ("thinking", "executing"):
             self.think_buffer.append(text)
-            # Create first phase on first real LLM text, not on first tool call.
-            # Phase represents the full interaction round (thinking + tools),
-            # so it should appear as soon as the LLM starts reasoning.
-            current = self.nodes.get(self._current_phase_id)
-            if current and current.node_type == NodeType.ROOT and text.strip():
-                self._create_first_phase()
-            return [{"type": "think_token", "text": text}]
+            result.append({"type": "think_token", "text": text})
+            return result
         if self.state == "answering":
             self.answer_buffer.append(text)
-            return [{"type": "token", "text": text}]
-        return []
+            result.append({"type": "token", "text": text})
+            return result
+        return result
 
     def handle_tool_call(self, tool_calls: list[dict]) -> list[dict[str, Any]]:
         new_calls = self._filter_new(tool_calls)
@@ -237,9 +252,10 @@ class TreeBuilder:
             return []
 
         self._flush_think()
-        logger.info("Tree: all tools done, creating next phase")
-        self._create_next_phase()
+        # Next phase is created on the next LLM invocation (round change in handle_token),
+        # not here. This way each phase spans the full LLM interaction round.
         self.state = "answering"
+        logger.info("Tree: all tools done, state -> answering")
         return [self._snapshot_event()]
 
     def update_tool_args(self, tc_id: str, tool_name: str, args: dict) -> list[dict[str, Any]]:

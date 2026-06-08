@@ -117,8 +117,13 @@ async def _chat_event_stream(
                     assistant_text.append(event.payload["text"])
                 elif isinstance(path_val, str) and path_val == "coordinator":
                     assistant_text.append(event.payload["text"])
-                # Feed text tokens to tree
-                for tok_evt in tree.handle_token(event.payload.get("text", "")):
+                # Feed text tokens to tree with round number.
+                # Round changes detected here drive phase creation — one phase
+                # per LLM invocation.
+                for tok_evt in tree.handle_token(
+                    event.payload.get("text", ""),
+                    round_num=event.payload.get("round", 0),
+                ):
                     if tok_evt.get("type") == "tree_snapshot":
                         yield sse("tree_snapshot", tok_evt)
 
