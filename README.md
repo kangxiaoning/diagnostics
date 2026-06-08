@@ -477,10 +477,15 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
 
 使用 `deepagents` 的 `create_deep_agent()` 构建主 Agent，配置：
 
-- **7 个子代理**：`cpu-expert`, `memory-expert`, `disk-io-expert`, `network-expert`, `gpu-expert`, `kubernetes-expert`, `report-writer`
+- **9 个子代理**：
+  - 系统层：`cpu-expert`, `memory-expert`, `disk-io-expert`, `network-expert`, `gpu-expert`
+  - K8s 组件层（按 Kubernetes 官方排障模型拆分）：
+    - `k8s-control-plane-expert` — API Server、etcd、scheduler、controller-manager
+    - `k8s-workload-expert` — Pod 生命周期、OOMKilled、资源限制
+    - `k8s-node-expert` — 节点状态、kubelet、压力驱逐
+  - 合成：`report-writer`（无诊断工具，仅撰写最终报告）
 - **双层存储后端**：`CompositeBackend` — `/agent_data/` 路径路由到 `FilesystemBackend`（虚拟文件系统），其他使用 `StateBackend`（内存状态）
-- **记忆加载**：自动加载 `AGENTS.md`（诊断方法论）+ `LEARNINGS.md`（历史经验）
-- **技能系统**：加载 `agent_data/skills/` 目录下的 19 个专业诊断技能文件
+- **记忆加载**：`AGENTS.md`/`LEARNINGS.md` 在首次会话调用时从磁盘加载并缓存于 state，新会话自动重新读取（无需重启服务）
 
 ## 前端关键实现
 
@@ -650,7 +655,7 @@ diagnostics/
 │       ├── storage_tools.py         # 磁盘IO工具
 │       ├── network_tools.py         # 网络诊断工具
 │       ├── gpu_tools.py             # GPU诊断工具
-│       └── kubernetes_tools.py      # K8s Pod/Node诊断工具
+│       └── kubernetes_tools.py      # K8s ControlPlane/Pod/Node诊断工具
 ├── agent_data/
 │   ├── AGENTS.md                    # 诊断方法论
 │   ├── LEARNINGS.md                 # 历史经验（Agent自动更新）
