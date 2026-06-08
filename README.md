@@ -1,8 +1,12 @@
 # Diagnostics — AI 驱动的系统故障诊断代理
 
-一个结合大语言模型（LLM）与领域工具，自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。前端提供实时聊天界面，右侧面板动态生成诊断执行树，直观展示 Agent 的思考路径和工具调用过程。
+一个结合大语言模型（LLM）与领域工具，自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。Coordinator 初筛 + 8 个领域 Expert 深度分析，强制 5 轮内完成。前端双栏布局：左侧多轮折叠块 + Markdown 报告，右侧诊断树实时生长。
 
-![Diagnostics 界面截图](static/diagnostics-screen.png)
+![界面截图 1](static/1.png)
+![界面截图 2](static/2.png)
+![界面截图 3](static/3.png)
+![界面截图 4](static/4.png)
+![界面截图 5](static/5.png)
 
 ## 目录
 
