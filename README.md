@@ -36,13 +36,15 @@
   → stream_agent_events() 启动 Agent 流
     → Agent 调用 LLM（通过 LM Studio / OpenAI兼容API）
       → LLM 输出含 <step>、<think> 标签的文本
-      → <step> 标签去重后发送到前端；<think> 标签分离思考/回答
-      → coordinator 文本双路发送: thinking(折叠块) + answering(回答区)
+      → <step> 标签去重后发送到 thinking 折叠块
+      → coordinator 文本路由到 thinking(折叠块)，缓冲到 _coordinator_text
+      → 🔧 工具调用 / 📊 工具结果 也路由到 thinking(折叠块)
       → 检测 metadata["langgraph_node"] → "model" 转换 → round_number 自增
       → LLM 发起 tool_call → tool_start / tool_end 事件
       → 子代理委派（task工具）→ agent_start / agent_end 事件
     → TreeBuilder 构建执行树 → tree_snapshot 事件
-  → SSE 事件流 → 前端实时渲染（Markdown + 诊断树 + 多轮折叠块）
+  → SSE 事件流 → 前端实时渲染（诊断树 + "第N轮智能分析" 折叠块）
+  → 流结束 → _finalize 将缓冲文本发送到 answer-body（最终诊断报告）
 ```
 
 技术栈：
@@ -296,7 +298,7 @@ step_descs = _build_tool_descriptions(state, tool_count)
 | SSE 事件 | 触发时机 | 前端行为 |
 |---|---|---|
 | `session` | 连接建立 | 保存 session_id |
-| `text_delta` | LLM 输出文本 | phase=thinking → 追加到可折叠思考面板；phase=answering → 追加到诊断报告区 |
+| `text_delta` | LLM 输出文本 / 工具结果 | phase=thinking → 追加到 "第N轮智能分析" 折叠块（含 🔧📊）；phase=answering → 追加到诊断报告区（仅流结束时最终报告） |
 | `tool_start` | LLM 发出工具调用 | （信息性，树由 tree_snapshot 驱动） |
 | `tool_end` | 工具执行完毕 | （信息性，树由 tree_snapshot 驱动） |
 | `tree_snapshot` | 树结构发生变化 | **完全重建诊断树**：重新计算 BFS 层级、渲染节点、绘制 SVG 边线 |
@@ -354,11 +356,7 @@ if is_coordinator and node_type == "model":
 
 2. **`_parse_think_tags()`** — 解析 `<think>...</think>` 块，区分深度思考内容和最终回答。
 
-3. **文本路由** — 对于主代理（coordinator），无 `<think>` 标签的文本会**双路发送**：
-   - `phase="thinking"` → 前端创建/更新对应轮次的折叠块
-   - `phase="answering"` → 前端更新回答区正文
-   
-   子代理文本按名称路由：`report-writer` → `answering`，其他 → `thinking`。
+3. **文本路由** — 主代理（coordinator）的中间推理文本仅发送到 `phase="thinking"`（创建折叠块），并累积到 `_coordinator_text` 缓冲区。流结束时 `_finalize()` 将缓冲区内容发送到 `phase="answering"`（回答区正文）。工具调用痕迹（🔧）和工具返回结果（📊）同样路由到 `phase="thinking"`，归入当前轮次折叠块。子代理文本按名称路由：`report-writer` → `answering`，其他 → `thinking`。
 
 **子代理的阶段路由规则**：
 
@@ -576,9 +574,9 @@ function onTreeSnapshot(payload) {
 - 简化同步逻辑，避免前后端状态不一致
 - 渲染性能足够（诊断树节点数通常 < 50）
 
-### 思考过程折叠面板（DeepSeek 风格，多轮独立）
+### 思考过程折叠面板（多轮独立，含工具结果）
 
-左侧聊天区采用 DeepSeek 风格：**每轮 LLM 交互产生一个独立折叠块**，而非所有轮次堆在一起。
+左侧聊天区每轮 LLM 交互产生一个独立折叠块，标题为**"第N轮智能分析"**。
 
 **架构：`thinkSections[]` 数组**
 
@@ -587,29 +585,34 @@ function onTreeSnapshot(payload) {
 { sectionEl, bodyEl, textEl, labelEl, rawText, startTime, finalized, round }
 ```
 
+**内容构成：** 每轮折叠块包含该轮的完整交互内容：
+- LLM 推理文本（`phase="thinking"`）
+- 🔧 工具调用痕迹（`phase="thinking"`）
+- 📊 工具返回结果（`phase="thinking"`）
+
 **关键行为：**
 
 | 时机 | 行为 |
 |---|---|
-| 后端发送 `phase=thinking` | `createThinkSection()` → eye SVG + "Thinking…" + chevron，自动展开 |
-| 新一轮 thinking 到达 | 用 `payload.round` 检测轮次变化 → `finalizeThink(prev)` → 上一块收起，显示 "Thought for Xs" |
-| 用户点击 toggle | 只控制该 section 自身的展开/收起（闭包捕获 DOM 元素，非全局变量） |
-| 流结束 | `finishStreamUI()` 最终化未完成的 section |
+| 后端发送 `phase=thinking` | `createThinkSection(round)` → eye SVG + "第N轮智能分析" + chevron，自动展开 |
+| 新一轮 thinking 到达 | 用 `payload.round` 检测轮次变化 → `finalizeThink(prev)` → 上一块收起 |
+| 用户点击 toggle | 只控制该 section 自身的展开/收起 |
+| 流结束 | `finishStreamUI()` 最终化未完成的 section；缓冲的 coordinator 文本发送到 answer-body |
 
 **DOM 结构：**
 
 ```
 msg-bubble
-├── think-section (Round 1, finalized, 收起)
-│   ├── think-toggle  [eye] Thought for 3s [chevron]
-│   └── think-body (hidden) — ::before 竖线 + Round 1 推理
-├── think-section (Round 2, finalized, 收起)  
+├── think-section (第1轮智能分析, 收起)
+│   ├── think-toggle  [eye] 第1轮智能分析 [chevron]
+│   └── think-body (hidden) — LLM推理 + 🔧工具调用 + 📊工具结果
+├── think-section (第2轮智能分析, 收起)  
 │   └── ...
 └── answer-section.has-think
-    └── answer-body — 最终回答 + 工具调用痕迹
+    └── answer-body — 最终诊断报告（流结束时发送）
 ```
 
-**轮次检测：** 后端 `state.round_number` 在检测到新的 tool_call 时自增，前端通过 `payload.round` 对比当前 section 的 `sec.round` 来判断是否进入新轮次。后端将 coordinator 文本**双路发送**（thinking + answering），确保折叠块和回答区同步更新。
+**轮次检测：** 后端通过 `metadata["langgraph_node"]` 检测 LangGraph 节点转换（每次进入 `"model"` 节点 = 一次新 LLM 调用），在文本处理之前递增 `round_number`。前端通过 `payload.round` 对比当前 section 的 `sec.round` 来判断是否进入新轮次。中间推理文本只发送到 `phase="thinking"`（折叠块），流结束时 `_finalize()` 将缓冲的完整文本一次性发送到 `phase="answering"`（回答区）。
 
 ### 工具详情弹窗
 
