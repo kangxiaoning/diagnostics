@@ -674,7 +674,7 @@ diagnostics/
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DIAGNOSTICS_MODEL` | `google/gemma-4-26b-a4b-qat` | LLM 模型名称 |
+| `DIAGNOSTICS_MODEL` | `qwen/qwen3.6-27b` | LLM 模型名称（推荐 Qwen 系列，工具调用稳定） |
 | `DIAGNOSTICS_BASE_URL` | `http://127.0.0.1:1234` | LLM API 地址（自动追加 `/v1`） |
 | `DIAGNOSTICS_API_KEY` | `lm-studio` | API 密钥（也支持 `LM_STUDIO_API_KEY`、`LM_API_TOKEN`） |
 | `DIAGNOSTICS_TEMPERATURE` | `0.2` | LLM 温度参数 |
