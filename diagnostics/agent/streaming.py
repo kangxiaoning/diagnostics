@@ -195,9 +195,10 @@ class _EventState:
     # Track LangGraph node transitions to detect LLM invocation boundaries
     _last_node_type: str = ""  # "model" or "tools" or empty (initial)
     _first_model_seen: bool = False
-    # Buffer for the final answer body: only coordinator non-think-tagged text
-    # (accumulated during all rounds, emitted once in _finalize).
-    _coordinator_text: list[str] = field(default_factory=list)
+    # Buffer for the final answer body: (text, round_number) tuples.
+    # In _finalize, only text from the LAST round is emitted — intermediate
+    # reasoning and step descriptions belong in per-round think sections.
+    _coordinator_text: list[tuple[str, int]] = field(default_factory=list)
 
 
 async def stream_agent_events(
@@ -413,7 +414,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     # creates per-round sections. Buffer for final answer.
                     phase = subagent_phase or "answering"
                     if is_coordinator and not subagent_phase:
-                        state._coordinator_text.append(clean_text)
+                        state._coordinator_text.append((clean_text, state.round_number))
                         events.append(AgentEvent("text_delta", {
                             "text": clean_text, "path": path,
                             "round": state.round_number, "phase": "thinking",
@@ -896,10 +897,13 @@ def _summarize_output(output: str, max_len: int = 80) -> str:
 def _finalize(state: _EventState) -> list[AgentEvent]:
     events: list[AgentEvent] = []
 
-    # Emit the final answer body content from buffered coordinator text
-    # (accumulated during all rounds, suppressed from answering phase until now).
+    # Emit the final answer body: only text from the LAST round.
+    # Intermediate reasoning and step descriptions belong in per-round
+    # think sections, not in the answer-body.
     if state._coordinator_text:
-        report = "".join(state._coordinator_text).strip()
+        last_round = state._coordinator_text[-1][1] if state._coordinator_text else 0
+        report_parts = [t for t, r in state._coordinator_text if r == last_round]
+        report = "".join(report_parts).strip()
         if report:
             events.append(AgentEvent("text_delta", {
                 "text": report[-3000:],
