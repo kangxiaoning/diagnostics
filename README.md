@@ -35,21 +35,24 @@
 
 ## 架构概览
 
+```mermaid
+flowchart LR
+    User["🧑 用户"] -->|POST /api/chat| FastAPI["FastAPI SSE"]
+    FastAPI -->|tree.start| Tree["TreeBuilder"]
+    FastAPI -->|agent.astream| Stream["stream_agent_events"]
+    Stream -->|LLM 调用| LM["LM Studio / OpenAI"]
+    Stream -->|text_delta| SSE
+    Stream -->|tool_start/end| SSE
+    Stream -->|round_number| SSE
+    Tree -->|tree_snapshot| SSE
+    SSE -->|SSE 事件流| Frontend["🖥 前端"]
+    Frontend -->|"第N轮智能分析"| Chat["左侧聊天区"]
+    Frontend -->|"诊断树 + SVG 边线"| Graph["右侧诊断图"]
+    Stream -->|_coordinator_text 缓冲| Finalize["_finalize"]
+    Finalize -->|phase=answering| Chat
 ```
-用户输入 → FastAPI SSE端点
-  → stream_agent_events() 启动 Agent 流
-    → Agent 调用 LLM（通过 LM Studio / OpenAI兼容API）
-      → LLM 输出含 <step>、<think> 标签的文本
-      → <step> 标签去重后发送到 thinking 折叠块
-      → coordinator 文本路由到 thinking(折叠块)，缓冲到 _coordinator_text
-      → 🔧 工具调用 / 📊 工具结果 也路由到 thinking(折叠块)
-      → 检测 metadata["langgraph_node"] → "model" 转换 → round_number 自增
-      → LLM 发起 tool_call → tool_start / tool_end 事件
-      → 子代理委派（task工具）→ agent_start / agent_end 事件
-    → TreeBuilder 构建执行树 → tree_snapshot 事件
-  → SSE 事件流 → 前端实时渲染（诊断树 + "第N轮智能分析" 折叠块）
-  → 流结束 → _finalize 将缓冲文本发送到 answer-body（最终诊断报告）
-```
+
+**数据流分两路**：`text_delta(phase=thinking)` → 前端 "第N轮智能分析" 折叠块；流结束时 `_finalize` 将缓冲文本 → `phase=answering` → 回答区。
 
 技术栈：
 
@@ -102,15 +105,20 @@ class NodeType(Enum):
 
 树的结构层次：
 
-```
-root ("开始诊断")
-  ├── phase ("第1轮智能分析")          ← LLM 思考文本驱动描述
-  │     ├── tool ("获取系统概览")       ← LLM <step> 标签驱动描述
-  │     ├── tool ("分析CPU指标")        ← 状态: pending → running → completed
-  │     └── tool ("排查Pod状态")
-  └── phase ("第2轮智能分析")          ← 上一轮所有 tool 节点完成后自动创建
-        ├── tool ("分析内存使用")       ← parent_ids 指向第1轮的多个 tool 节点
-        └── tool ("委派专家诊断")       ← 可能触发子代理
+```mermaid
+graph TD
+    P1["第1轮智能分析<br/>(LLM驱动描述)"]
+    P1 --> T1["获取系统概览<br/>(&lt;step&gt;标签驱动)"]
+    P1 --> T2["分析CPU指标<br/>(pending→running→completed)"]
+    P1 --> T3["排查Pod状态"]
+
+    P2["第2轮智能分析<br/>(parent_ids来自上一轮tools)"]
+    P2 --> T4["分析内存使用"]
+    P2 --> T5["委派专家诊断<br/>(触发子代理)"]
+
+    T1 -.-> P2
+    T2 -.-> P2
+    T3 -.-> P2
 ```
 
 每个节点携带的字段：
@@ -126,48 +134,41 @@ root ("开始诊断")
 
 ### 生命周期与状态机
 
-`TreeBuilder` 内部维护一个有限状态机：
+`TreeBuilder` 内部维护一个有限状态机，每个转换对应一次外部事件驱动：
 
-```
-init → thinking → executing → answering → done
-```
-
-**关键转换规则**：
-
-```
-1. start()                    → init → thinking（创建 root 节点）
-2. handle_token("text",n)     → thinking 阶段缓冲 think 文本
-                              → round_num 变化时创建新 phase（每轮 LLM 调用一个）
-3. handle_tool_call([...])   → thinking/answering → executing
-                              → 创建当前 phase 下的 tool 子节点
-                              → 将新 tool 节点状态设为 running
-4. handle_update(tool_done)   → executing 阶段
-                              → 将对应 tool 节点状态改为 completed
-                              → 当所有 tool 都完成时 → 创建新的 phase 节点
-                              → executing → answering
-5. finalize()                 → 任意状态 → done
-                              → 将最后 phase 的标题改为"诊断报告"（如果无 tool 子节点）
-                              → 所有 running 节点 → completed
+```mermaid
+stateDiagram-v2
+    [*] --> init
+    init --> thinking : start() ─ 创建首个 phase
+    thinking --> thinking : handle_token() ─ 同轮文本
+    thinking --> executing : handle_tool_call() ─ LLM 调用工具
+    executing --> executing : handle_update() ─ 工具仍在运行
+    executing --> thinking : handle_token() ─ 新一轮 LLM 调用
+    executing --> answering : handle_update() ─ 所有工具完成
+    answering --> executing : handle_tool_call() ─ 更多工具调用
+    answering --> done : finalize() ─ 流结束
+    thinking --> done : finalize() ─ 直接结束
 ```
 
 ### Phase（轮次）创建策略
 
-整个诊断由多个**轮次（Round）**组成，每轮对应一次 LangGraph **model 节点进入**（即一次 LLM 调用）。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换——当 coordinator 进入 `"model"` 节点时递增 `round_number`，**在文本处理之前**完成，确保文本带着正确的轮次号发出。
+整个诊断由多个**轮次（Round）**组成，每轮对应一次 LangGraph **model 节点进入**。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换，递增 `round_number`。
 
+```mermaid
+flowchart TD
+    START["START"] --> M1["model 节点"]
+    M1 -->|"round_number = 1"| T1["tools 节点"]
+    T1 -->|"工具执行"| M2["model 节点"]
+    M2 -->|"round_number = 2"| T2["tools 节点"]
+    T2 -->|"..."| MN["model 节点"]
+    MN -->|"round_number = N"| END["END"]
+
+    M1 -.->|"Phase 创建"| P1["第1轮智能分析"]
+    M2 -.->|"Phase 创建"| P2["第2轮智能分析"]
+    MN -.->|"Phase 创建"| PN["第N轮智能分析"]
 ```
-LangGraph 图:  START → model → tools → model → tools → ... → model → END
-                       ↑ 第1轮      ↑ 第2轮                  ↑ 第N轮
-metadata:         {"langgraph_node":"model"}
-round_number:     1                           2                     N
-```
 
-**Phase 创建时机**：`handle_token(text, round_num)` 中，当 `round_num` 与 `_current_round` 不同时创建新 phase。这发生在每轮 LLM 调用开始输出文本时——与 LangGraph 节点转换完全同步。
-
-| 事件 | round_number | 前端 phase |
-|---|---|---|
-| model 节点首次进入 | 1 | 创建 "第1轮智能分析" |
-| tools 节点 → model 再次进入 | +1 → 2 | 创建 "第2轮智能分析" |
-| 每轮中间文本（round 不变） | 不变 | 同一 phase，不新建 |
+**Phase 创建时机**：`handle_token(text, round_num)` 中 round 变化时创建新 phase。随后工具调用作为子节点加入当前 phase。下一轮的所有 tool 节点通过 `_last_tool_child_ids` 成为下一 phase 的 `parent_ids`，在 BFS 层级布局中形成链式连接。
 
 **关键：parent_ids 继承**
 
@@ -490,6 +491,30 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
   - 诊断报告由 Coordinator 亲自撰写，不再委派独立的 report-writer
 - **双层存储后端**：`CompositeBackend` — `/agent_data/` 路径路由到 `FilesystemBackend`（虚拟文件系统），其他使用 `StateBackend`（内存状态）
 - **记忆加载**：`AGENTS.md`/`LEARNINGS.md` 在首次会话调用时从磁盘加载并缓存于 state，新会话自动重新读取（无需重启服务）
+
+```mermaid
+flowchart LR
+    Create["create_deep_agent()"] -->|"固化 memory/skills 路径"| Graph["CompiledStateGraph"]
+
+    subgraph "首次会话调用"
+        Before1["before_agent 钩子"] -->|"state 无缓存"| Read1["读取磁盘文件"]
+        Read1 -->|"缓存到 state"| Invoke1["agent.invoke()"]
+    end
+
+    subgraph "后续同会话"
+        Before2["before_agent 钩子"] -->|"state 已有缓存"| Skip2["跳过磁盘读取"]
+        Skip2 --> Invoke2["agent.invoke()"]
+    end
+
+    subgraph "新会话（新 session_id）"
+        Before3["before_agent 钩子"] -->|"新 state, 无缓存"| Read3["重新读取磁盘"]
+        Read3 --> Invoke3["agent.invoke()"]
+    end
+
+    Graph --> Before1
+    Graph --> Before2
+    Graph --> Before3
+```
 
 ## 前端关键实现
 
