@@ -35,11 +35,12 @@ for _d in _REPORT_DIRS:
 
 
 def _build_subagents() -> list[dict[str, Any]]:
-    """Define specialized diagnostic subagents following deepagents best practices.
+    """Define specialized diagnostic subagents with domain-specific skills.
 
     Each subagent has:
     - Precise description for correct routing by main agent
     - Focused tool set (never inherit all tools)
+    - Domain skills loaded lazily (skills-first diagnosis)
     - Output format with word limit to keep context clean
     """
     return [
@@ -50,12 +51,17 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Use when load average exceeds CPU cores or iowait exceeds 30%."
             ),
             "system_prompt": (
-                "You are a CPU diagnostics expert. Check vmstat r/b columns, "
-                "iowait percentage, and process D-states. Classify whether "
-                "bottleneck is compute-bound, IO-wait-bound, or scheduler-bound. "
+                "You are a CPU diagnostics expert. "
+                "First, use your cpu-diagnosis skill to follow the structured CPU diagnostic workflow. "
+                "If the skill's tools are insufficient, use check_cpu and check_processes to dig deeper. "
+                "Classify whether bottleneck is compute-bound, IO-wait-bound, or scheduler-bound. "
                 "Return under 150 words: key findings, hypothesis, confidence (high/medium/low)."
             ),
             "tools": [check_cpu, check_processes],
+            "skills": [
+                "/agent_data/skills/cpu-diagnosis/",
+                "/agent_data/skills/system-health-check/",
+            ],
         },
         {
             "name": "memory-expert",
@@ -64,12 +70,17 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Use when memory is exhausted, RSS grows unbounded, or swap usage increases."
             ),
             "system_prompt": (
-                "You are a memory diagnostics expert. Check free/available ratios, "
-                "swap usage trends, and per-process RSS. Identify native memory leaks "
-                "(RSS >> heap limit) and swap pressure. "
+                "You are a memory diagnostics expert. "
+                "First, use your memory-diagnosis skill to follow the structured memory diagnostic workflow. "
+                "If the skill's tools are insufficient, use check_memory and check_processes to dig deeper. "
+                "Identify native memory leaks (RSS >> heap limit) and swap pressure. "
                 "Return under 150 words: key findings, root cause hypothesis, fix recommendation."
             ),
             "tools": [check_memory, check_processes],
+            "skills": [
+                "/agent_data/skills/memory-diagnosis/",
+                "/agent_data/skills/system-health-check/",
+            ],
         },
         {
             "name": "disk-io-expert",
@@ -78,27 +89,44 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Use when iowait exceeds 30% or apps report slow disk operations."
             ),
             "system_prompt": (
-                "You are a storage performance expert. Analyze %util, await, "
-                "svctm, aqu-sz from iostat. High %util + high await = saturation. "
+                "You are a storage performance expert. "
+                "First, use your disk-io-diagnosis skill to follow the structured IO diagnostic workflow. "
+                "If the skill's tools are insufficient, use check_disk to dig deeper. "
+                "Analyze %util, await, svctm, aqu-sz from iostat. High %util + high await = saturation. "
                 "Determine if bottleneck is read or write bound. "
                 "Return under 100 words: severity, root cause, which processes affected."
             ),
             "tools": [check_disk],
+            "skills": ["/agent_data/skills/disk-io-diagnosis/"],
         },
         {
             "name": "network-expert",
             "description": (
                 "Diagnoses TCP retransmits, packet loss, connection saturation, "
-                "CLOSE-WAIT leaks, and interface errors. Use when network latency "
-                "or drops are suspected."
+                "CLOSE-WAIT leaks, interface errors, and kernel network issues "
+                "(ARP cache, conntrack, MTU, softirq, TCP queue overflow, gRPC leaks). "
+                "Use when network latency or drops are suspected."
             ),
             "system_prompt": (
-                "You are a network diagnostics expert. Check ss connection state, "
-                "interface errors/drops, TCP retransmit rate, and CLOSE-WAIT counts. "
-                "High retransmits + Send-Q backlog = congestion. Many CLOSE-WAIT = app socket leak. "
+                "You are a network diagnostics expert. "
+                "First, use your network-diagnosis skill for standard TCP/connection analysis. "
+                "If symptoms suggest kernel-level issues, use the relevant kernel networking skills "
+                "(arp-cache-diagnosis, conntrack-diagnosis, mtu-misconfig-diagnosis, "
+                "softirq-starvation, kernel-parameter-drops, tcp-listen-overflow, grpc-connection-leak). "
+                "If skills are insufficient, use check_network and check_processes to dig deeper. "
                 "Return under 150 words: key findings, root cause, recommended fix."
             ),
             "tools": [check_network, check_processes],
+            "skills": [
+                "/agent_data/skills/network-diagnosis/",
+                "/agent_data/skills/arp-cache-diagnosis/",
+                "/agent_data/skills/conntrack-diagnosis/",
+                "/agent_data/skills/mtu-misconfig-diagnosis/",
+                "/agent_data/skills/softirq-starvation/",
+                "/agent_data/skills/kernel-parameter-drops/",
+                "/agent_data/skills/tcp-listen-overflow/",
+                "/agent_data/skills/grpc-connection-leak/",
+            ],
         },
         {
             "name": "gpu-expert",
@@ -107,9 +135,12 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "and ECC errors. Use for GPU-intensive workloads."
             ),
             "system_prompt": (
-                "You are a GPU diagnostics expert. Check health first (temperature, "
-                "throttling, ECC, PCIe), then memory (OOM, leaks), then utilization "
-                "(compute vs memory bandwidth). "
+                "You are a GPU diagnostics expert. "
+                "First, use your gpu-diagnosis skill to follow the structured GPU diagnostic workflow. "
+                "If the skill's tools are insufficient, use check_gpu_health, check_gpu_memory, "
+                "and check_gpu_utilization to dig deeper. "
+                "Check health first (temperature, throttling, ECC, PCIe), then memory (OOM, leaks), "
+                "then utilization (compute vs memory bandwidth). "
                 "Return under 150 words: bottleneck type, affected GPU, recommended action."
             ),
             "tools": [
@@ -117,6 +148,7 @@ def _build_subagents() -> list[dict[str, Any]]:
                 check_gpu_memory,
                 check_gpu_utilization,
             ],
+            "skills": ["/agent_data/skills/gpu-diagnosis/"],
         },
         # ── Kubernetes component experts ──
         {
@@ -124,55 +156,78 @@ def _build_subagents() -> list[dict[str, Any]]:
             "description": (
                 "Diagnoses Kubernetes control plane issues: API Server timeouts, "
                 "etcd disk IO saturation, scheduler failures, controller-manager "
-                "crashes. Use when kubectl commands timeout or API Server is "
-                "unreachable or returning 5xx errors."
+                "crashes, CoreDNS resolution failures. Use when kubectl commands "
+                "timeout or API Server is unreachable or returning 5xx errors."
             ),
             "system_prompt": (
-                "You are a Kubernetes control plane diagnostics expert. Check "
-                "API Server health, etcd latency/raft index, scheduler leader, "
-                "and controller-manager status. Correlate with node conditions "
-                "and pod statuses when needed. "
+                "You are a Kubernetes control plane diagnostics expert. "
+                "First, use your control-plane-diagnosis skill to follow the structured workflow. "
+                "If etcd is involved, use the etcd-diagnosis skill. "
+                "If DNS issues are suspected, use the coredns-diagnosis skill. "
+                "For host-to-K8s cascading failures, use the cross-layer-diagnosis skill. "
+                "If skills are insufficient, use check_kubernetes_control_plane, "
+                "check_kubernetes_nodes, and check_kubernetes_pods to dig deeper. "
                 "Return under 150 words: affected component, root cause, "
                 "impact on cluster, recommended recovery steps."
             ),
             "tools": [check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods],
+            "skills": [
+                "/agent_data/skills/control-plane-diagnosis/",
+                "/agent_data/skills/etcd-diagnosis/",
+                "/agent_data/skills/coredns-diagnosis/",
+                "/agent_data/skills/cross-layer-diagnosis/",
+            ],
         },
         {
             "name": "k8s-workload-expert",
             "description": (
                 "Diagnoses Pod lifecycle issues: OOMKilled, CrashLoopBackOff, "
-                "ImagePullBackOff, resource limit misconfigurations, deployment "
-                "rollout failures. Use when K8s workloads are crashing, restarting, "
-                "or failing to start."
+                "ImagePullBackOff, resource limit misconfigurations, container "
+                "runtime failures, deployment rollout failures. Use when K8s "
+                "workloads are crashing, restarting, or failing to start."
             ),
             "system_prompt": (
-                "You are a Kubernetes workload diagnostics expert. Analyze pod "
-                "statuses, restart counts, termination reasons (OOMKilled, Error, "
-                "Completed), container resource limits vs actual usage, and "
-                "deployment rollout status. Identify root cause: resource pressure, "
-                "image issues, probe failures, or configuration errors. "
+                "You are a Kubernetes workload diagnostics expert. "
+                "First, use your kubernetes-diagnosis skill for standard Pod/Deployment analysis. "
+                "If container runtime issues are suspected, use the container-runtime-diagnosis skill. "
+                "For host-to-Pod cascading failures, use the cross-layer-diagnosis skill. "
+                "If skills are insufficient, use check_kubernetes_pods and check_kubernetes_nodes. "
+                "Identify root cause: resource pressure, image issues, probe failures, "
+                "or configuration errors. "
                 "Return under 150 words: root cause, affected pods/deployments, "
                 "fix (limit adjustment, image fix, or probe tuning)."
             ),
             "tools": [check_kubernetes_pods, check_kubernetes_nodes],
+            "skills": [
+                "/agent_data/skills/kubernetes-diagnosis/",
+                "/agent_data/skills/container-runtime-diagnosis/",
+                "/agent_data/skills/cross-layer-diagnosis/",
+            ],
         },
         {
             "name": "k8s-node-expert",
             "description": (
                 "Diagnoses Kubernetes node issues: NotReady status, MemoryPressure, "
                 "DiskPressure, PIDPressure, kubelet failures, node evictions. "
-                "Use when nodes become unhealthy, unschedulable, or show resource "
-                "exhaustion."
+                "Use when nodes become unhealthy, unschedulable, or show resource exhaustion."
             ),
             "system_prompt": (
-                "You are a Kubernetes node diagnostics expert. Check node conditions "
-                "(MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable), "
-                "node status transitions, resource utilization per node, and "
-                "eviction events. Correlate with system-level checks when needed. "
+                "You are a Kubernetes node diagnostics expert. "
+                "First, use your kubernetes-diagnosis skill for standard node analysis. "
+                "For host-to-node cascading failures (e.g., disk IO causing kubelet heartbeat "
+                "timeout), use the cross-layer-diagnosis skill. "
+                "If skills are insufficient, use check_kubernetes_nodes and check_kubernetes_pods. "
+                "Check node conditions (MemoryPressure, DiskPressure, PIDPressure, "
+                "NetworkUnavailable), status transitions, and eviction events. "
                 "Return under 150 words: affected node(s), condition causing issue, "
                 "impact on workloads, recommended fix (drain, scale, or resource adjustment)."
             ),
             "tools": [check_kubernetes_nodes, check_kubernetes_pods],
+            "skills": [
+                "/agent_data/skills/kubernetes-diagnosis/",
+                "/agent_data/skills/cross-layer-diagnosis/",
+                "/agent_data/skills/system-health-check/",
+            ],
         },
     ]
 
