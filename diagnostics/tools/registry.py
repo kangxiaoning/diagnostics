@@ -17,6 +17,7 @@ from diagnostics.tools.kubernetes_live_tools import (
     get_cluster_overview,
     get_configmap,
     get_ingress_status,
+    get_namespaces,
     get_node_info,
     get_node_resource_usage,
     get_pod_events,
@@ -28,6 +29,7 @@ from diagnostics.tools.kubernetes_live_tools import (
     get_pv_pvc_status,
     get_resource_yaml,
     get_system_pods,
+    list_clusters,
     list_namespace_resources,
 )
 from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
@@ -59,6 +61,8 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         check_kubernetes_control_plane,
         list_diagnostic_capabilities,
         # Live K8s tools
+        list_clusters,
+        get_namespaces,
         get_cluster_overview,
         get_pod_logs,
         get_pod_logs_since,
@@ -88,6 +92,8 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
 def get_k8s_live_tools() -> list[Any]:
     """Return only the live K8s tools (for subagent binding)."""
     return [
+        list_clusters,
+        get_namespaces,
         get_cluster_overview,
         get_pod_logs,
         get_pod_logs_since,

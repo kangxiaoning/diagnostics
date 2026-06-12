@@ -100,6 +100,8 @@ TOOL_LABELS: dict[str, str] = {
     "list_namespace_resources": "列出命名空间资源",
     "get_pv_pvc_status": "查看PV/PVC状态",
     "get_ingress_status": "查看Ingress状态",
+    "list_clusters": "列出配置的集群",
+    "get_namespaces": "列出命名空间",
 }
 
 

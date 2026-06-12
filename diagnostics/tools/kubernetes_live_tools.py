@@ -83,6 +83,33 @@ def _kubectl(cluster_name: str, args: list[str],
 
 
 @tool
+def list_clusters() -> str:
+    """List all configured Kubernetes cluster names.
+
+    Use this FIRST before any other K8s tool to discover valid cluster_name values.
+    """
+    servers = _load_cluster_servers()
+    if not servers:
+        return "No clusters configured. Set DIAGNOSTICS_K8S_SERVERS env var."
+    lines = ["## Configured Clusters"]
+    for name, url in servers.items():
+        lines.append(f"- `{name}` → {url}")
+    return "\n".join(lines)
+
+
+@tool
+def get_namespaces(cluster_name: str) -> str:
+    """List all namespaces in a Kubernetes cluster.
+
+    Use this to discover valid namespace values BEFORE calling tools that require a namespace.
+
+    Args:
+        cluster_name: cluster name from list_clusters().
+    """
+    return _kubectl(cluster_name, ["get", "namespaces", "-o", "wide"], timeout=10)
+
+
+@tool
 def get_cluster_overview(cluster_name: str) -> str:
     """Get high-level overview of a Kubernetes cluster: nodes, pods, namespaces.
 

@@ -259,8 +259,17 @@ Kubernetes 层：
 
 ### 实时 K8s 诊断工具（直接访问 kube-apiserver）
 
-这些工具通过 `kubectl --server` 直接访问集群 API Server。使用时需要提供 `cluster_name`（在 `DIAGNOSTICS_K8S_SERVERS` 环境变量中配置）。
+这些工具通过 `kubectl --server` 直接访问集群 API Server。
 
+**参数发现规范（必须先发现再操作）**：
+- `cluster_name` → 先调用 `list_clusters()` 获取有效值
+- `namespace` → 先调用 `get_namespaces(cluster_name)` 获取有效值
+- `pod_name` → 先调用 `get_cluster_overview(cluster_name)` 或 `list_namespace_resources(cluster_name, namespace)` 获取有效值
+- `resource_type` → `describe_controller` 的 resource_type 参数必须使用完整名称：`deployment` 而非 `deploy`，`daemonset` 而非 `ds`，`statefulset` 而非 `sts`
+- `configmap_name` → 先调用 `list_namespace_resources` 发现 ConfigMap 名称
+
+- `list_clusters()` — 列出所有已配置的集群名称（**必须首先调用**）
+- `get_namespaces(cluster_name)` — 列出集群所有命名空间
 - `get_cluster_overview(cluster_name)` — 集群概览：节点、非正常 Pod、命名空间数
 - `get_pod_logs(cluster_name, namespace, pod_name, tail_lines=200)` — 获取 Pod 最近日志
 - `describe_pod(cluster_name, namespace, pod_name)` — Pod 完整详情（事件、条件、容器状态、卷挂载）
