@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage
 
 from diagnostics.agent import build_agent
+from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.streaming import stream_agent_events
 from diagnostics.config import STATIC_DIR, Settings
 from diagnostics.server.schemas import ChatRequest
@@ -60,7 +61,7 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
             raise HTTPException(status_code=409, detail="session is already running")
 
         return StreamingResponse(
-            _chat_event_stream(request, session_id, state, agent, settings),
+            _chat_event_stream(request, session_id, state, settings, build_agent),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -68,16 +69,34 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     return app
 
 
+def _make_report_path(entity_type: str, entity_name: str) -> str:
+    """Generate a UUID-based report path from entity info."""
+    import uuid as _uuid
+    from datetime import datetime as _dt
+
+    safe_entity = entity_name.replace("/", "-").replace(" ", "-").strip()
+    if not safe_entity:
+        return ""
+    ts = _dt.now().strftime("%Y-%m-%d-%H%M%S")
+    uid = _uuid.uuid4().hex[:8]
+    return f"/agent_data/reports/{entity_type}/{safe_entity}/{ts}-{uid}.md"
+
+
 async def _chat_event_stream(
     request: ChatRequest,
     session_id: str,
     state: Any,
-    agent: Any,
     settings: Settings,
+    agent_factory: Any,
 ) -> AsyncIterator[str]:
     t_start = time.monotonic()
     state.running = True
     state.cancel_event = asyncio.Event()
+
+    # ── Generate report path and build agent with formatted prompt ──
+    report_path = _make_report_path(request.entity_type, request.entity_name)
+    agent = agent_factory(settings, system_prompt=make_system_prompt(report_path))
+
     state.messages.append(HumanMessage(content=request.message))
     state.messages = state.messages[-settings.max_history_messages :]
     assistant_text: list[str] = []

@@ -79,6 +79,26 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 .status-text.running { color: var(--accent); }
 .status-text.error { color: var(--red); }
 
+/* ════════════════ Entity Selector ════════════════ */
+.entity-bar {
+  display: flex; gap: 8px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.entity-select {
+  padding: 6px 10px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface);
+  font-size: 12px; color: var(--text);
+  min-width: 160px;
+}
+.entity-input {
+  flex: 1; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface); font-size: 12px; color: var(--text);
+}
+.entity-input::placeholder { color: var(--text-3); }
+
 /* ════════════════ Messages ════════════════ */
 .messages {
   flex: 1; overflow-y: auto;

@@ -9,7 +9,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from langchain.chat_models import init_chat_model
 
-from diagnostics.agent.prompt import SYSTEM_PROMPT
+from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools, get_k8s_live_tools
 from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
@@ -235,7 +235,8 @@ def _build_subagents() -> list[dict[str, Any]]:
     ]
 
 
-def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = ()):
+def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (),
+                system_prompt: str | None = None):
     settings = settings or Settings.from_env()
 
     # Disable stream chunk timeout for local LLMs (LM Studio)
@@ -253,7 +254,7 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
     return create_deep_agent(
         model=model,
         tools=get_agent_tools(extra_tools),
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt or make_system_prompt(),
         backend=CompositeBackend(
             default=StateBackend(),
             routes={"/agent_data/": FilesystemBackend(

@@ -20,6 +20,16 @@
           </div>
         </header>
 
+        <div class="entity-bar" id="entityBar">
+          <select id="entityType" class="entity-select">
+            <option value="">-- 选择诊断对象类型 --</option>
+            <option value="hosts">🖥 物理/虚拟机</option>
+            <option value="kubernetes">☸ Kubernetes 集群</option>
+          </select>
+          <input id="entityName" class="entity-input" type="text"
+            placeholder="主机名 或 集群名（如 server01, prod-cluster）" />
+        </div>
+
         <div id="messages" class="messages"></div>
 
         <form id="chatForm" class="composer">

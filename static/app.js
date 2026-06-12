@@ -9,6 +9,8 @@ const graphNodes = document.getElementById("graphNodes");
 const graphEdges = document.getElementById("graphEdges");
 const graphEmpty = document.getElementById("graphEmpty");
 const graphStatus = document.getElementById("graphStatus");
+const entityTypeEl = document.getElementById("entityType");
+const entityNameEl = document.getElementById("entityName");
 const toolPopup = document.getElementById("toolPopup");
 const toolPopupTitle = document.getElementById("toolPopupTitle");
 const toolPopupBody = document.getElementById("toolPopupBody");
@@ -106,7 +108,12 @@ formEl.addEventListener("submit", async (e) => {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: prompt, session_id: sessionId }),
+      body: JSON.stringify({
+        message: prompt,
+        session_id: sessionId,
+        entity_type: entityTypeEl.value,
+        entity_name: entityNameEl.value.trim(),
+      }),
       signal: controller.signal,
     });
     if (!response.ok || !response.body) throw new Error(await response.text());
