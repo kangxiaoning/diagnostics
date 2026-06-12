@@ -1,6 +1,6 @@
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
-一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert 深度分析** 架构，强制 5 Round 交互内完成诊断并输出报告。报告按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障，实现 **实体级别的历史追溯与故障模式学习**。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
+一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
 
 ![界面截图 1](static/1.png)
 ![界面截图 2](static/2.png)
@@ -177,6 +177,26 @@ flowchart TD
 **3. 目录自动初始化**
 
 `factory.py` 在 Agent 构建时自动创建 `reports/hosts/` 和 `reports/kubernetes/` 目录，确保 Agent 首次写入时路径已就绪。
+
+**4. 报告路径程序生成与变量注入**
+
+报告路径由程序预生成，不依赖 LLM。流程如下：
+
+```
+Frontend 选择实体类型 + 输入实体名
+  → POST /api/chat/stream (entity_type + entity_name)
+    → app.py: _make_report_path() 生成 UUID 路径
+      格式: /agent_data/reports/{hosts|kubernetes}/{entity}/{YYYY-MM-DD-HHmmss}-{uuid8}.md
+    → make_system_prompt(report_path) 将路径渲染进 SYSTEM_PROMPT
+    → build_agent(system_prompt=...) 创建携带精确路径的 Agent
+    → Agent 直接使用 prompt 中的 {report_path} 写入报告
+      （无需 LLM 自行总结症状或拼接文件名）
+```
+
+关键技术点：
+- `prompt.py` 中报告路径用 `{report_path}` 占位，`make_system_prompt(report_path)` 在每次请求时格式化模板
+- `factory.py` 的 `build_agent()` 接受可选 `system_prompt` 参数，按请求动态构建 Agent
+- 文件名使用 `日期-时间-UUID` 格式，避免依赖 LLM 的症状总结，保证唯一且可追溯
 
 ---
 
