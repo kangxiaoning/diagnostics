@@ -251,6 +251,136 @@ def get_resource_yaml(cluster_name: str, resource_type: str,
 
 
 @tool
+def get_pod_previous_logs(cluster_name: str, namespace: str,
+                          pod_name: str, tail_lines: int = 200) -> str:
+    """Retrieve logs from the PREVIOUS crashed container instance.
+
+    Use this when a container has restarted and you need logs from before the restart.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace of the pod.
+        pod_name: pod name.
+        tail_lines: number of recent log lines to fetch (default 200).
+    """
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--previous", f"--tail={tail_lines}", "--timestamps",
+    ], timeout=20)
+
+
+@tool
+def get_system_pods(cluster_name: str) -> str:
+    """Get status of all system pods in kube-system namespace.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system", "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def describe_controller(cluster_name: str, resource_type: str,
+                        resource_name: str, namespace: str = "") -> str:
+    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        resource_type: controller type (deploy, statefulset, ds, rs).
+        resource_name: controller name.
+        namespace: Kubernetes namespace.
+    """
+    args = ["describe", resource_type, resource_name]
+    if namespace:
+        args.extend(["-n", namespace])
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def check_service_endpoints(cluster_name: str, service_name: str,
+                            namespace: str = "default") -> str:
+    """Check whether a Service has healthy endpoints backing it.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        service_name: service name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    svc = _kubectl(cluster_name, [
+        "get", "svc", service_name, "-n", namespace, "-o", "wide",
+    ], timeout=10)
+    ep = _kubectl(cluster_name, [
+        "get", "endpointslices", "-n", namespace,
+        "-l", f"kubernetes.io/service-name={service_name}",
+    ], timeout=10)
+    return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
+
+
+@tool
+def get_configmap(cluster_name: str, configmap_name: str,
+                  namespace: str = "default") -> str:
+    """Get the content of a ConfigMap (keys and values).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        configmap_name: ConfigMap name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
+    ], timeout=10)
+
+
+@tool
+def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
+    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "all", "-n", namespace, "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
+    """Get PersistentVolume and PersistentVolumeClaim status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
+    """
+    pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
+    pvc_args = ["get", "pvc"]
+    if namespace:
+        pvc_args.extend(["-n", namespace])
+    else:
+        pvc_args.append("--all-namespaces")
+    pvc = _kubectl(cluster_name, pvc_args, timeout=10)
+    return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
+
+
+@tool
+def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
+    """Get Ingress resources and their backend status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = ["get", "ingress", "-o", "wide"]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    return _kubectl(cluster_name, args, timeout=10)
+
+
+@tool
 def get_pod_logs_since(cluster_name: str, namespace: str,
                        pod_name: str, minutes: int = 5) -> str:
     """Retrieve pod logs from the last N minutes.
@@ -298,3 +428,263 @@ def explain_resource(cluster_name: str, resource_path: str,
     if recursive:
         args.append("--recursive")
     return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def get_pod_previous_logs(cluster_name: str, namespace: str,
+                          pod_name: str, tail_lines: int = 200) -> str:
+    """Retrieve logs from the PREVIOUS crashed container instance.
+
+    Use this when a container has restarted and you need logs from before the restart.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace of the pod.
+        pod_name: pod name.
+        tail_lines: number of recent log lines to fetch (default 200).
+    """
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--previous", f"--tail={tail_lines}", "--timestamps",
+    ], timeout=20)
+
+
+@tool
+def get_system_pods(cluster_name: str) -> str:
+    """Get status of all system pods in kube-system namespace.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system", "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def describe_controller(cluster_name: str, resource_type: str,
+                        resource_name: str, namespace: str = "") -> str:
+    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        resource_type: controller type (deploy, statefulset, ds, rs).
+        resource_name: controller name.
+        namespace: Kubernetes namespace.
+    """
+    args = ["describe", resource_type, resource_name]
+    if namespace:
+        args.extend(["-n", namespace])
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def check_service_endpoints(cluster_name: str, service_name: str,
+                            namespace: str = "default") -> str:
+    """Check whether a Service has healthy endpoints backing it.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        service_name: service name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    svc = _kubectl(cluster_name, [
+        "get", "svc", service_name, "-n", namespace, "-o", "wide",
+    ], timeout=10)
+    ep = _kubectl(cluster_name, [
+        "get", "endpointslices", "-n", namespace,
+        "-l", f"kubernetes.io/service-name={service_name}",
+    ], timeout=10)
+    return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
+
+
+@tool
+def get_configmap(cluster_name: str, configmap_name: str,
+                  namespace: str = "default") -> str:
+    """Get the content of a ConfigMap (keys and values).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        configmap_name: ConfigMap name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
+    ], timeout=10)
+
+
+@tool
+def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
+    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "all", "-n", namespace, "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
+    """Get PersistentVolume and PersistentVolumeClaim status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
+    """
+    pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
+    pvc_args = ["get", "pvc"]
+    if namespace:
+        pvc_args.extend(["-n", namespace])
+    else:
+        pvc_args.append("--all-namespaces")
+    pvc = _kubectl(cluster_name, pvc_args, timeout=10)
+    return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
+
+
+@tool
+def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
+    """Get Ingress resources and their backend status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = ["get", "ingress", "-o", "wide"]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    return _kubectl(cluster_name, args, timeout=10)
+
+
+@tool
+def get_pod_previous_logs(cluster_name: str, namespace: str,
+                          pod_name: str, tail_lines: int = 200) -> str:
+    """Retrieve logs from the PREVIOUS crashed container instance.
+
+    Use this when a container has restarted and you need logs from before the restart.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace of the pod.
+        pod_name: pod name.
+        tail_lines: number of recent log lines to fetch (default 200).
+    """
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--previous", f"--tail={tail_lines}", "--timestamps",
+    ], timeout=20)
+
+
+@tool
+def get_system_pods(cluster_name: str) -> str:
+    """Get status of all system pods in kube-system namespace.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system", "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def describe_controller(cluster_name: str, resource_type: str,
+                        resource_name: str, namespace: str = "") -> str:
+    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        resource_type: controller type (deploy, statefulset, ds, rs).
+        resource_name: controller name.
+        namespace: Kubernetes namespace.
+    """
+    args = ["describe", resource_type, resource_name]
+    if namespace:
+        args.extend(["-n", namespace])
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def check_service_endpoints(cluster_name: str, service_name: str,
+                            namespace: str = "default") -> str:
+    """Check whether a Service has healthy endpoints backing it.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        service_name: service name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    svc = _kubectl(cluster_name, [
+        "get", "svc", service_name, "-n", namespace, "-o", "wide",
+    ], timeout=10)
+    ep = _kubectl(cluster_name, [
+        "get", "endpointslices", "-n", namespace,
+        "-l", f"kubernetes.io/service-name={service_name}",
+    ], timeout=10)
+    return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
+
+
+@tool
+def get_configmap(cluster_name: str, configmap_name: str,
+                  namespace: str = "default") -> str:
+    """Get the content of a ConfigMap (keys and values).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        configmap_name: ConfigMap name.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
+    ], timeout=10)
+
+
+@tool
+def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
+    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace (default "default").
+    """
+    return _kubectl(cluster_name, [
+        "get", "all", "-n", namespace, "-o", "wide",
+    ], timeout=15)
+
+
+@tool
+def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
+    """Get PersistentVolume and PersistentVolumeClaim status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
+    """
+    pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
+    pvc_args = ["get", "pvc"]
+    if namespace:
+        pvc_args.extend(["-n", namespace])
+    else:
+        pvc_args.append("--all-namespaces")
+    pvc = _kubectl(cluster_name, pvc_args, timeout=10)
+    return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
+
+
+@tool
+def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
+    """Get Ingress resources and their backend status.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = ["get", "ingress", "-o", "wide"]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    return _kubectl(cluster_name, args, timeout=10)

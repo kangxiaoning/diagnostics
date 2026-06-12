@@ -275,6 +275,14 @@ Kubernetes 层：
 - `get_api_versions(cluster_name)` — 列出集群支持的 API 组版本
 - `get_resource_yaml(cluster_name, resource_type, resource_name, namespace="")` — 获取任意资源的完整 YAML（如 `get_resource_yaml("prod", "deploy", "vpc-cni", "kube-system")`）
 - `explain_resource(cluster_name, resource_path, recursive=False)` — 查看资源字段结构文档（如 `explain_resource("prod", "pods.spec.containers")`）
+- `get_pod_previous_logs(cluster_name, namespace, pod_name, tail_lines=200)` — 获取容器崩溃前的日志（--previous）
+- `get_system_pods(cluster_name)` — 查看 kube-system 下所有系统 Pod 状态
+- `describe_controller(cluster_name, resource_type, resource_name, namespace="")` — 查看控制器详情（deploy/statefulset/ds/rs）
+- `check_service_endpoints(cluster_name, service_name, namespace="default")` — 检查 Service 是否有健康后端 Endpoint
+- `get_configmap(cluster_name, configmap_name, namespace="default")` — 查看 ConfigMap 内容
+- `list_namespace_resources(cluster_name, namespace="default")` — 列出命名空间内所有资源
+- `get_pv_pvc_status(cluster_name, namespace="")` — 查看 PV/PVC 绑定状态
+- `get_ingress_status(cluster_name, namespace="")` — 查看 Ingress 及后端状态
 
 ### 文件系统工具（deepagents 内置）
 

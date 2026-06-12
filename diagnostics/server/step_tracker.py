@@ -92,6 +92,14 @@ TOOL_LABELS: dict[str, str] = {
     "get_api_versions": "列出API版本",
     "get_resource_yaml": "查看资源YAML",
     "explain_resource": "查看资源字段文档",
+    "get_pod_previous_logs": "查看Pod崩溃前日志",
+    "get_system_pods": "查看系统Pod状态",
+    "describe_controller": "查看控制器详情",
+    "check_service_endpoints": "检查Service端点",
+    "get_configmap": "查看ConfigMap",
+    "list_namespace_resources": "列出命名空间资源",
+    "get_pv_pvc_status": "查看PV/PVC状态",
+    "get_ingress_status": "查看Ingress状态",
 }
 
 
