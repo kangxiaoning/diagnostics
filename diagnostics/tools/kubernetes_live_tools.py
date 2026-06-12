@@ -211,3 +211,90 @@ def get_node_resource_usage(cluster_name: str) -> str:
         cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
     """
     return _kubectl(cluster_name, ["top", "nodes"], timeout=20)
+
+
+@tool
+def get_api_resources(cluster_name: str) -> str:
+    """List all API resources available on the cluster (CRDs, native resources).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, ["api-resources", "--sort-by=name"], timeout=15)
+
+
+@tool
+def get_api_versions(cluster_name: str) -> str:
+    """List all API group versions supported by the cluster.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, ["api-versions"], timeout=15)
+
+
+@tool
+def get_resource_yaml(cluster_name: str, resource_type: str,
+                      resource_name: str, namespace: str = "") -> str:
+    """Get the full YAML manifest of any Kubernetes resource.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        resource_type: resource type (e.g., deploy, svc, elbsvc, daemonset, configmap).
+        resource_name: resource name (e.g., vpc-cni, my-service).
+        namespace: Kubernetes namespace. Leave empty for cluster-scoped resources.
+    """
+    args = ["get", resource_type, resource_name, "-o", "yaml"]
+    if namespace:
+        args.extend(["-n", namespace])
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def get_pod_logs_since(cluster_name: str, namespace: str,
+                       pod_name: str, minutes: int = 5) -> str:
+    """Retrieve pod logs from the last N minutes.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace of the pod.
+        pod_name: pod name.
+        minutes: fetch logs from the last N minutes (default 5).
+    """
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        f"--since={minutes}m", "--timestamps",
+    ], timeout=20)
+
+
+@tool
+def get_pod_logs_lines(cluster_name: str, namespace: str,
+                       pod_name: str, head_lines: int = 50) -> str:
+    """Retrieve the first N lines of pod logs.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: Kubernetes namespace of the pod.
+        pod_name: pod name.
+        head_lines: number of lines to fetch from the beginning of the log (default 50).
+    """
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--tail", str(head_lines),
+    ], timeout=20)
+
+
+@tool
+def explain_resource(cluster_name: str, resource_path: str,
+                     recursive: bool = False) -> str:
+    """Get documentation and field descriptions for a Kubernetes resource via kubectl explain.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        resource_path: resource path (e.g., pods.spec.containers, deployment.spec.template).
+        recursive: if True, show full field tree recursively.
+    """
+    args = ["explain", resource_path]
+    if recursive:
+        args.append("--recursive")
+    return _kubectl(cluster_name, args, timeout=15)

@@ -8,13 +8,19 @@ from typing import Any
 from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
 from diagnostics.tools.kubernetes_live_tools import (
     describe_pod,
+    explain_resource,
+    get_api_resources,
+    get_api_versions,
     get_cluster_events,
     get_cluster_overview,
     get_node_info,
     get_node_resource_usage,
     get_pod_events,
     get_pod_logs,
+    get_pod_logs_lines,
+    get_pod_logs_since,
     get_pod_resource_usage,
+    get_resource_yaml,
 )
 from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
@@ -47,12 +53,18 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         # Live K8s tools
         get_cluster_overview,
         get_pod_logs,
+        get_pod_logs_since,
+        get_pod_logs_lines,
         describe_pod,
         get_pod_events,
         get_node_info,
         get_cluster_events,
         get_pod_resource_usage,
         get_node_resource_usage,
+        get_api_resources,
+        get_api_versions,
+        get_resource_yaml,
+        explain_resource,
         *extra_tools,
     ]
 
@@ -62,10 +74,16 @@ def get_k8s_live_tools() -> list[Any]:
     return [
         get_cluster_overview,
         get_pod_logs,
+        get_pod_logs_since,
+        get_pod_logs_lines,
         describe_pod,
         get_pod_events,
         get_node_info,
         get_cluster_events,
         get_pod_resource_usage,
         get_node_resource_usage,
+        get_api_resources,
+        get_api_versions,
+        get_resource_yaml,
+        explain_resource,
     ]

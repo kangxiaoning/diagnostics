@@ -86,6 +86,12 @@ TOOL_LABELS: dict[str, str] = {
     "get_cluster_events": "查看集群事件",
     "get_pod_resource_usage": "查看Pod资源使用",
     "get_node_resource_usage": "查看节点资源使用",
+    "get_pod_logs_since": "查看最近Pod日志",
+    "get_pod_logs_lines": "查看Pod日志行数",
+    "get_api_resources": "列出API资源",
+    "get_api_versions": "列出API版本",
+    "get_resource_yaml": "查看资源YAML",
+    "explain_resource": "查看资源字段文档",
 }
 
 

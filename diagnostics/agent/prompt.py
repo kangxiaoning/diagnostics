@@ -269,6 +269,12 @@ Kubernetes 层：
 - `get_cluster_events(cluster_name, namespace="")` — 集群范围内最近的 Warning 事件
 - `get_pod_resource_usage(cluster_name, namespace="")` — Pod CPU/内存实际使用量（需 metrics-server）
 - `get_node_resource_usage(cluster_name)` — 节点 CPU/内存实际使用量（需 metrics-server）
+- `get_pod_logs_since(cluster_name, namespace, pod_name, minutes=5)` — 获取最近 N 分钟内的 Pod 日志
+- `get_pod_logs_lines(cluster_name, namespace, pod_name, head_lines=50)` — 获取 Pod 日志的前 N 行
+- `get_api_resources(cluster_name)` — 列出集群所有 API 资源（含 CRD）
+- `get_api_versions(cluster_name)` — 列出集群支持的 API 组版本
+- `get_resource_yaml(cluster_name, resource_type, resource_name, namespace="")` — 获取任意资源的完整 YAML（如 `get_resource_yaml("prod", "deploy", "vpc-cni", "kube-system")`）
+- `explain_resource(cluster_name, resource_path, recursive=False)` — 查看资源字段结构文档（如 `explain_resource("prod", "pods.spec.containers")`）
 
 ### 文件系统工具（deepagents 内置）
 
