@@ -257,6 +257,19 @@ Kubernetes 层：
 辅助：
 - `list_diagnostic_capabilities()` — 列出所有工具及用途
 
+### 实时 K8s 诊断工具（直接访问 kube-apiserver）
+
+这些工具通过 `kubectl --server` 直接访问集群 API Server。使用时需要提供 `cluster_name`（在 `DIAGNOSTICS_K8S_SERVERS` 环境变量中配置）。
+
+- `get_cluster_overview(cluster_name)` — 集群概览：节点、非正常 Pod、命名空间数
+- `get_pod_logs(cluster_name, namespace, pod_name, tail_lines=200)` — 获取 Pod 最近日志
+- `describe_pod(cluster_name, namespace, pod_name)` — Pod 完整详情（事件、条件、容器状态、卷挂载）
+- `get_pod_events(cluster_name, namespace, pod_name)` — Pod 相关事件（按时间排序）
+- `get_node_info(cluster_name, node_name)` — 节点详情（Conditions、Capacity、Allocatable、系统信息）
+- `get_cluster_events(cluster_name, namespace="")` — 集群范围内最近的 Warning 事件
+- `get_pod_resource_usage(cluster_name, namespace="")` — Pod CPU/内存实际使用量（需 metrics-server）
+- `get_node_resource_usage(cluster_name)` — 节点 CPU/内存实际使用量（需 metrics-server）
+
 ### 文件系统工具（deepagents 内置）
 
 - `read_file` — 读取文件内容

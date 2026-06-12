@@ -11,7 +11,7 @@ from langchain.chat_models import init_chat_model
 
 from diagnostics.agent.prompt import SYSTEM_PROMPT
 from diagnostics.config import Settings
-from diagnostics.tools import get_agent_tools
+from diagnostics.tools import get_agent_tools, get_k8s_live_tools
 from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
 from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
@@ -170,7 +170,10 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Return under 150 words: affected component, root cause, "
                 "impact on cluster, recommended recovery steps."
             ),
-            "tools": [check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods],
+            "tools": [
+                check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods,
+                *get_k8s_live_tools(),
+            ],
             "skills": [
                 "/agent_data/skills/control-plane-diagnosis/",
                 "/agent_data/skills/etcd-diagnosis/",
@@ -197,7 +200,7 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Return under 150 words: root cause, affected pods/deployments, "
                 "fix (limit adjustment, image fix, or probe tuning)."
             ),
-            "tools": [check_kubernetes_pods, check_kubernetes_nodes],
+            "tools": [check_kubernetes_pods, check_kubernetes_nodes, *get_k8s_live_tools()],
             "skills": [
                 "/agent_data/skills/kubernetes-diagnosis/",
                 "/agent_data/skills/container-runtime-diagnosis/",
@@ -222,7 +225,7 @@ def _build_subagents() -> list[dict[str, Any]]:
                 "Return under 150 words: affected node(s), condition causing issue, "
                 "impact on workloads, recommended fix (drain, scale, or resource adjustment)."
             ),
-            "tools": [check_kubernetes_nodes, check_kubernetes_pods],
+            "tools": [check_kubernetes_nodes, check_kubernetes_pods, *get_k8s_live_tools()],
             "skills": [
                 "/agent_data/skills/kubernetes-diagnosis/",
                 "/agent_data/skills/cross-layer-diagnosis/",

@@ -77,6 +77,15 @@ TOOL_LABELS: dict[str, str] = {
     "glob": "搜索匹配文件",
     "grep": "搜索文件内容",
     "execute": "执行诊断命令",
+    # Live K8s tools
+    "get_cluster_overview": "获取集群概览",
+    "get_pod_logs": "查看Pod日志",
+    "describe_pod": "查看Pod详情",
+    "get_pod_events": "查看Pod事件",
+    "get_node_info": "查看节点详情",
+    "get_cluster_events": "查看集群事件",
+    "get_pod_resource_usage": "查看Pod资源使用",
+    "get_node_resource_usage": "查看节点资源使用",
 }
 
 
