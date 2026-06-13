@@ -104,6 +104,9 @@ TOOL_LABELS: dict[str, str] = {
     "get_namespaces": "列出命名空间",
     "get_coredns_logs": "查看CoreDNS日志",
     "describe_coredns": "查看CoreDNS详情",
+    "list_helm_releases": "列出Helm部署",
+    "get_helm_release_history": "查看Helm部署历史",
+    "get_helm_release_values": "查看Helm部署参数",
 }
 
 

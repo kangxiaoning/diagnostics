@@ -369,3 +369,132 @@ def describe_coredns(cluster_name: str) -> str:
         f"## kube-dns Service\n{svc}\n\n"
         f"## Corefile ConfigMap\n{cm}"
     )
+
+
+# ═══════════════ Helm 3 ═══════════════
+
+@tool
+def list_helm_releases(cluster_name: str, namespace: str = "") -> str:
+    """List all Helm 3 releases by querying release secrets.
+
+    Helm 3 stores release metadata in secrets with label owner=helm.
+    Returns release name, revision, status, chart, and last deployed time.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = [
+        "get", "secrets",
+        "-l", "owner=helm",
+        "--sort-by=.metadata.creationTimestamp",
+        "-o",
+        "custom-columns="
+        "RELEASE:.metadata.labels.name,"
+        "REVISION:.metadata.labels.version,"
+        "STATUS:.metadata.labels.status,"
+        "CHART:.metadata.labels.chart,"
+        "NAMESPACE:.metadata.namespace,"
+        "AGE:.metadata.creationTimestamp",
+    ]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+@tool
+def get_helm_release_history(cluster_name: str, release_name: str,
+                              namespace: str = "default", max_revisions: int = 10) -> str:
+    """Get revision history of a Helm release from its stored secrets.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        release_name: Helm release name.
+        namespace: namespace where the release is deployed (default "default").
+        max_revisions: max number of revisions to show (default 10).
+    """
+    secrets = _kubectl(cluster_name, [
+        "get", "secrets", "-n", namespace,
+        "-l", f"owner=helm,name={release_name}",
+        "--sort-by=.metadata.labels.version",
+        "-o",
+        "custom-columns="
+        "REVISION:.metadata.labels.version,"
+        "STATUS:.metadata.labels.status,"
+        "CHART:.metadata.labels.chart,"
+        "APP_VERSION:.metadata.labels.app,"
+        "CREATED:.metadata.creationTimestamp",
+    ], timeout=15)
+    if not secrets or "[kubectl error" in secrets:
+        return f"[Helm release '{release_name}' not found in namespace '{namespace}']"
+
+    lines = secrets.splitlines()
+    if len(lines) <= 1:
+        return f"[No revision history for '{release_name}']"
+    header = lines[0]
+    recent = lines[-max_revisions:] if len(lines) > max_revisions + 1 else lines[1:]
+    return "REVISION  STATUS  CHART  APP_VERSION  CREATED\n" + "\n".join(recent)
+
+
+@tool
+def get_helm_release_values(cluster_name: str, release_name: str,
+                             namespace: str = "default", revision: int = 0) -> str:
+    """Extract values from a Helm release secret for a specific revision.
+
+    If revision=0, returns the latest revision's values. Values are stored
+    base64-encoded in the release secret's data.release field.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        release_name: Helm release name.
+        namespace: namespace (default "default").
+        revision: revision number. 0 = latest (default).
+    """
+    import base64
+    import json
+
+    if revision > 0:
+        secret_name_pattern = f"sh.helm.release.v1.{release_name}.v{revision}"
+    else:
+        # Get latest revision
+        secrets_raw = _kubectl(cluster_name, [
+            "get", "secrets", "-n", namespace,
+            "-l", f"owner=helm,name={release_name}",
+            "--sort-by=.metadata.labels.version",
+            "-o", "jsonpath={.items[-1].metadata.name}",
+        ], timeout=10)
+        if not secrets_raw or "[kubectl error" in secrets_raw:
+            return f"[Helm release '{release_name}' not found in '{namespace}']"
+        secret_name_pattern = secrets_raw.strip()
+
+    secret_yaml = _kubectl(cluster_name, [
+        "get", "secret", secret_name_pattern, "-n", namespace, "-o", "json",
+    ], timeout=10)
+    if "[kubectl error" in secret_yaml:
+        return f"[Secret '{secret_name_pattern}' not found]"
+
+    try:
+        secret = json.loads(secret_yaml)
+        release_b64 = secret.get("data", {}).get("release", "")
+        if release_b64:
+            decoded = base64.b64decode(release_b64)
+            # The release data is gzip-compressed
+            import gzip
+            release_data = json.loads(gzip.decompress(decoded))
+            config = release_data.get("config", {})
+            chart = release_data.get("chart", {}).get("metadata", {})
+            info = release_data.get("info", {})
+            return (
+                f"## {release_name} (revision {release_data.get('version', '?')})\n"
+                f"Chart: {chart.get('name', '?')}-{chart.get('version', '?')}\n"
+                f"Status: {info.get('status', '?')}\n"
+                f"Deployed: {info.get('last_deployed', '?')}\n\n"
+                f"### Values\n```yaml\n{json.dumps(config, indent=2, ensure_ascii=False)}\n```"
+            )
+    except Exception as e:
+        return f"[Failed to decode release values: {e}]"
+
+    return "[No values found]"
+
