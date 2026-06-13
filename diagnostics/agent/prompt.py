@@ -231,125 +231,41 @@ Coordinator 不重复专家已覆盖的分析领域。
 **何时记录**：发现假设因为工具缺失而无法验证时，立即记录；不需要等到诊断完成。
 </tool_evolution>
 
-<available_tools>
-## 可用工具
+<tool_guidance>
+## 工具使用指南
 
-### 诊断工具
+deepagents 会自动生成所有工具的函数签名和描述。以下仅提供框架无法自动传达的行为规范：
 
-系统层：
-- `get_system_overview()` — OS 版本、uptime、load average，**必须首先调用**
-- `check_cpu()` — CPU 利用率、vmstat、进程 top
-- `check_memory()` — 内存使用、swap、/proc/meminfo
-- `check_processes()` — 进程列表及状态（D/S/R）
-- `check_disk()` — iostat 磁盘 IO、df 空间
-- `check_network()` — ss 连接、接口错误、TCP 重传
+### 诊断入口
 
-GPU 层：
-- `check_gpu_health()` — 温度、功耗、节流、ECC、PCIe
-- `check_gpu_memory()` — 显存使用及进程
-- `check_gpu_utilization()` — GPU 利用率、SM 活动、内存带宽
+`get_system_overview()` **必须首先调用**，建立诊断基线。
 
-Kubernetes 层：
-- `check_kubernetes_control_plane()` — API Server、etcd、scheduler 状态
-- `check_kubernetes_pods(namespace)` — Pod 状态、重启次数、OOM 事件
-- `check_kubernetes_nodes()` — 节点状态、Conditions
+### K8s 工具参数发现（必须先发现再操作）
 
-辅助：
-- `list_diagnostic_capabilities()` — 列出所有工具及用途
-- `read_file` — 读取诊断脚本内容（如 `/agent_data/scripts/collect_node_diagnostics.sh`）
+- `cluster_name` → 先调用 `list_clusters()` 获取有效值
+- `namespace` → 先调用 `get_namespaces(cluster_name)` 获取有效值
+- `pod_name` → 先调用 `get_cluster_overview(cluster_name)` 或 `list_namespace_resources()` 获取有效值
+- `resource_type` → 必须使用完整名称：`deployment` 而非 `deploy`，`daemonset` 而非 `ds`
 
 ### 远程节点诊断脚本
 
-以下脚本位于 `/agent_data/scripts/`，通过远程 Shell 功能下发到目标节点执行，用于从节点上收集运行时日志和关键指标：
+以下脚本位于 `/agent_data/scripts/`，通过远程 Shell 功能下发到目标节点执行：
 
 - `collect_node_diagnostics.sh <all|kubelet|kube-proxy|runtime> [since] [tail]` — 综合入口，自动检测运行时
-- `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志（含 PLEG/OOM/eviction 过滤）
-- `collect_kube_proxy_logs.sh [since] [tail]` — kube-proxy 日志（含 iptables/ipvs 模式检测）
+- `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志
+- `collect_kube_proxy_logs.sh [since] [tail]` — kube-proxy 日志
 - `collect_runtime_logs.sh <docker|containerd|kata|crio> [since] [tail]` — 容器运行时日志
 
-**使用方式**：当需要从节点收集底层日志时，先用 `read_file` 读取脚本内容，再通过远程 Shell 功能下发到目标节点执行。`collect_node_diagnostics.sh all` 会自动检测容器运行时类型并收集所有组件日志。
-
-### 实时 K8s 诊断工具（直接访问 kube-apiserver）
-
-这些工具通过 `kubectl --server` 直接访问集群 API Server。
-
-**参数发现规范（必须先发现再操作）**：
-- `cluster_name` → 先调用 `list_clusters()` 获取有效值
-- `namespace` → 先调用 `get_namespaces(cluster_name)` 获取有效值
-- `pod_name` → 先调用 `get_cluster_overview(cluster_name)` 或 `list_namespace_resources(cluster_name, namespace)` 获取有效值
-- `resource_type` → `describe_controller` 的 resource_type 参数必须使用完整名称：`deployment` 而非 `deploy`，`daemonset` 而非 `ds`，`statefulset` 而非 `sts`
-- `configmap_name` → 先调用 `list_namespace_resources` 发现 ConfigMap 名称
-
-- `list_clusters()` — 列出所有已配置的集群名称（**必须首先调用**）
-- `get_namespaces(cluster_name)` — 列出集群所有命名空间
-- `get_cluster_overview(cluster_name)` — 集群概览：节点、非正常 Pod、命名空间数
-- `get_pod_logs(cluster_name, namespace, pod_name, tail_lines=200)` — 获取 Pod 最近日志
-- `describe_pod(cluster_name, namespace, pod_name)` — Pod 完整详情（事件、条件、容器状态、卷挂载）
-- `get_pod_events(cluster_name, namespace, pod_name)` — Pod 相关事件（按时间排序）
-- `get_node_info(cluster_name, node_name)` — 节点详情（Conditions、Capacity、Allocatable、系统信息）
-- `get_cluster_events(cluster_name, namespace="")` — 集群范围内最近的 Warning 事件
-- `get_pod_resource_usage(cluster_name, namespace="")` — Pod CPU/内存实际使用量（需 metrics-server）
-- `get_node_resource_usage(cluster_name)` — 节点 CPU/内存实际使用量（需 metrics-server）
-- `get_pod_logs_since(cluster_name, namespace, pod_name, minutes=5)` — 获取最近 N 分钟内的 Pod 日志
-- `get_pod_logs_lines(cluster_name, namespace, pod_name, head_lines=50)` — 获取 Pod 日志的前 N 行
-- `get_api_resources(cluster_name)` — 列出集群所有 API 资源（含 CRD）
-- `get_api_versions(cluster_name)` — 列出集群支持的 API 组版本
-- `get_resource_yaml(cluster_name, resource_type, resource_name, namespace="")` — 获取任意资源的完整 YAML（如 `get_resource_yaml("prod", "deploy", "vpc-cni", "kube-system")`）
-- `explain_resource(cluster_name, resource_path, recursive=False)` — 查看资源字段结构文档（如 `explain_resource("prod", "pods.spec.containers")`）
-- `get_pod_previous_logs(cluster_name, namespace, pod_name, tail_lines=200)` — 获取容器崩溃前的日志（--previous）
-- `get_system_pods(cluster_name)` — 查看 kube-system 下所有系统 Pod 状态
-- `describe_controller(cluster_name, resource_type, resource_name, namespace="")` — 查看控制器详情（deploy/statefulset/ds/rs）
-- `check_service_endpoints(cluster_name, service_name, namespace="default")` — 检查 Service 是否有健康后端 Endpoint
-- `get_configmap(cluster_name, configmap_name, namespace="default")` — 查看 ConfigMap 内容
-- `list_namespace_resources(cluster_name, namespace="default")` — 列出命名空间内所有资源
-- `get_pv_pvc_status(cluster_name, namespace="")` — 查看 PV/PVC 绑定状态
-- `get_ingress_status(cluster_name, namespace="")` — 查看 Ingress 及后端状态
-
-### 文件系统工具（deepagents 内置）
-
-- `read_file` — 读取文件内容
-- `write_file` — 写入新文件
-- `edit_file` — 编辑已有文件（仅用于 LEARNINGS.md 和 HISTORY.md 追加内容）
-- `ls` — 浏览目录
-- `glob` — 按模式搜索文件
-- `grep` — 搜索文件内容
-
-### 任务管理工具（deepagents 内置）
-
-- `write_todos` — 创建诊断任务清单
-- `read_todos` — 查看当前任务清单状态
-- `task` — 委派子代理执行专家诊断。参数格式：`task(subagent_type="expert-name", description="任务描述")`
+使用方式：先用 `read_file` 读取脚本内容，再通过远程 Shell 下发执行。
 
 ### 禁用工具
 
-- `execute` — **禁止使用**。诊断过程只读优先，不执行任意 Shell 命令。
-</available_tools>
+`execute` — **禁止使用**。诊断过程只读优先，不执行任意 Shell 命令。
+</tool_guidance>
 
-<available_experts>
-## 可委派的诊断专家（含专属 Skills）
-
-系统层：
-- `cpu-expert` — CPU 负载、iowait、D 状态进程分析
-  Skills: cpu-diagnosis, system-health-check
-- `memory-expert` — 内存泄漏、OOM、swap 分析
-  Skills: memory-diagnosis, system-health-check
-- `disk-io-expert` — 磁盘 IO 饱和度与延迟分析
-  Skills: disk-io-diagnosis
-- `network-expert` — TCP 重传、连接状态、接口错误、内核网络（ARP/conntrack/MTU/softirq/TCP队列/gRPC泄漏）
-  Skills: network-diagnosis, arp-cache-diagnosis, conntrack-diagnosis, mtu-misconfig-diagnosis, softirq-starvation, kernel-parameter-drops, tcp-listen-overflow, grpc-connection-leak
-- `gpu-expert` — GPU 温度、显存、节流、ECC 分析
-  Skills: gpu-diagnosis
-
-Kubernetes 层：
-- `k8s-control-plane-expert` — API Server、etcd、scheduler、controller-manager、CoreDNS
-  Skills: control-plane-diagnosis, etcd-diagnosis, coredns-diagnosis, cross-layer-diagnosis
-- `k8s-workload-expert` — Pod 生命周期、OOMKilled、资源限制、容器运行时、部署失败
-  Skills: kubernetes-diagnosis, container-runtime-diagnosis, cross-layer-diagnosis
-- `k8s-node-expert` — 节点状态、kubelet、MemoryPressure、驱逐、跨层故障
-  Skills: kubernetes-diagnosis, cross-layer-diagnosis, system-health-check
-
-诊断报告由 Coordinator 亲自撰写。
-</available_experts>
+<delegation_note>
+诊断报告由 Coordinator 亲自撰写。专家委派时按 Skills-First 原则：优先使用专家技能工作流，技能不足时再自行发挥。
+</delegation_note>
 
 <self_evolution>
 ## 自我进化
