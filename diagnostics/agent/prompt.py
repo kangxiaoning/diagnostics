@@ -249,7 +249,7 @@ deepagents 会自动生成所有工具的函数签名和描述。以下仅提供
 
 ### 远程节点诊断脚本
 
-以下脚本位于 `/agent_data/scripts/`，通过远程 Shell 功能下发到目标节点执行：
+以下诊断脚本通过远程 Shell 命令通道下发到目标节点执行：
 
 - `collect_node_diagnostics.sh <all|kubelet|kube-proxy|runtime> [since] [tail]` — 综合入口，自动检测运行时
 - `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志
