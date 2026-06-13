@@ -11,12 +11,14 @@ from langchain.chat_models import init_chat_model
 
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.config import Settings
-from diagnostics.tools import get_agent_tools, get_k8s_live_tools
-from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
-from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
-from diagnostics.tools.network_tools import check_network
-from diagnostics.tools.storage_tools import check_disk
-from diagnostics.tools.system_tools import (
+from diagnostics.tools import get_agent_tools as _get_live_tools
+from diagnostics.tools import get_k8s_live_tools
+from diagnostics.tools.mock import get_mock_tools
+from diagnostics.tools.mock.gpu_tools import check_gpu_health, check_gpu_memory, check_gpu_utilization
+from diagnostics.tools.mock.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
+from diagnostics.tools.mock.network_tools import check_network
+from diagnostics.tools.mock.storage_tools import check_disk
+from diagnostics.tools.mock.system_tools import (
     check_cpu,
     check_memory,
     check_processes,
@@ -240,8 +242,6 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
     settings = settings or Settings.from_env()
 
     # Disable stream chunk timeout for local LLMs (LM Studio)
-    # LM Studio loads models on-demand, first request may take 10-60s
-    # before producing the first token.
     os.environ.setdefault("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S", "0")
 
     model = init_chat_model(
@@ -251,9 +251,17 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
         api_key=settings.api_key,
         temperature=settings.temperature,
     )
+
+    # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
+    mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
+    if mode == "production":
+        tools = _get_live_tools(extra_tools)
+    else:
+        tools = get_mock_tools(extra_tools)
+
     return create_deep_agent(
         model=model,
-        tools=get_agent_tools(extra_tools),
+        tools=tools,
         system_prompt=system_prompt or make_system_prompt(),
         backend=CompositeBackend(
             default=StateBackend(),

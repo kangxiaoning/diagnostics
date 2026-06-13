@@ -249,16 +249,27 @@ deepagents 会自动生成所有工具的函数签名和描述。以下仅提供
 
 ### 远程节点诊断脚本
 
-以下诊断脚本通过远程 Shell 命令通道下发到目标节点执行：
+以下诊断脚本通过远程 Shell 命令通道下发到目标节点执行。工具参数由 deepagents 自动注入，你不需要手动描述工具签名。脚本通过 `ls` 或 `glob` 发现位于 `diagnostics/tools/scripts/` 目录下。
+
+**Linux 诊断**：
+
+- `collect_linux_quick_check.sh` — 60 秒快速诊断（USE 方法：uptime/dmesg/vmstat/mpstat/pidstat/iostat/free/sar/top）[Brendan Gregg]
+- `collect_cpu_diagnostics.sh [since_seconds]` — CPU 深度诊断（lscpu/mpstat/中断/软中断/D状态进程/上下文切换/调度器延迟）
+- `collect_memory_diagnostics.sh` — 内存深度诊断（free/meminfo/vmstat swap/RSS/OOM评分/slab/HugePages/cgroup）
+- `collect_disk_diagnostics.sh` — 磁盘 IO 深度诊断（df/iostat/diskstats/lsblk/调度器/写入进程）
+- `collect_network_diagnostics.sh` — 网络深度诊断（接口错误/ss连接统计/TCP重传/路由/DNS/Conntrack/监听端口）
+- `collect_process_diagnostics.sh [pid|name]` — 进程深度诊断（状态/线程/RSS/FD/IO/limits/cgroup/strace）
+
+**容器与 GPU**：
 
 - `collect_node_diagnostics.sh <all|kubelet|kube-proxy|runtime> [since] [tail]` — 综合入口，自动检测运行时
 - `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志
 - `collect_kube_proxy_logs.sh [since] [tail]` — kube-proxy 日志
 - `collect_runtime_logs.sh <docker|containerd|kata|crio> [since] [tail]` — 容器运行时日志
-- `collect_gpu_diagnostics.sh [gpu_index|all] [dmesg_since_seconds]` — GPU 健康状态、温度/功耗/ECC/进程/拓扑
-- `check_gpu_xid_errors.sh [hours]` — Xid 错误检查与分类（硬件/驱动/应用/用户）
+- `collect_gpu_diagnostics.sh [gpu_index|all] [dmesg_since_seconds]` — GPU 健康状态
+- `check_gpu_xid_errors.sh [hours]` — Xid 错误检查与分类
 
-使用方式：先用 `read_file` 读取脚本内容，再通过远程 Shell 下发执行。
+使用方式：先用 `ls` 或 `glob` 发现脚本，再用 `read_file` 读取内容，通过远程 Shell 下发执行。
 
 ### 禁用工具
 
