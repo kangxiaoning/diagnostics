@@ -255,6 +255,8 @@ deepagents 会自动生成所有工具的函数签名和描述。以下仅提供
 - `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志
 - `collect_kube_proxy_logs.sh [since] [tail]` — kube-proxy 日志
 - `collect_runtime_logs.sh <docker|containerd|kata|crio> [since] [tail]` — 容器运行时日志
+- `collect_gpu_diagnostics.sh [gpu_index|all] [dmesg_since_seconds]` — GPU 健康状态、温度/功耗/ECC/进程/拓扑
+- `check_gpu_xid_errors.sh [hours]` — Xid 错误检查与分类（硬件/驱动/应用/用户）
 
 使用方式：先用 `read_file` 读取脚本内容，再通过远程 Shell 下发执行。
 
