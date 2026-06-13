@@ -634,3 +634,158 @@ def check_webhook_status(cluster_name: str) -> str:
         "get", "validatingwebhookconfigurations", "-o", "wide",
     ], timeout=10)
     return f"## MutatingWebhookConfigurations\n{mutating}\n\n## ValidatingWebhookConfigurations\n{validating}"
+
+
+# ═══════════════ etcd ═══════════════
+
+_ETCDCTL_FLAGS = (
+    "--cacert=/etc/kubernetes/pki/etcd/ca.crt "
+    "--cert=/etc/kubernetes/pki/etcd/server.crt "
+    "--key=/etc/kubernetes/pki/etcd/server.key "
+    "--endpoints=https://127.0.0.1:2379"
+)
+
+
+def _etcd_exec(cluster_name: str, etcdctl_args: str, timeout: int = 15) -> str:
+    """Execute etcdctl in the first available etcd pod."""
+    # Find an etcd pod
+    pods_raw = _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system",
+        "-l", "component=etcd",
+        "-o", "jsonpath={.items[0].metadata.name}",
+    ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        pods_raw = _kubectl(cluster_name, [
+            "get", "pods", "-n", "kube-system",
+            "-l", "app=etcd",
+            "-o", "jsonpath={.items[0].metadata.name}",
+        ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        return "[etcd pod not found in kube-system]"
+    pod = pods_raw.strip()
+
+    cmd = f"etcdctl {etcdctl_args}"
+    return _kubectl(cluster_name, [
+        "exec", pod, "-n", "kube-system", "--", "sh", "-c", cmd,
+    ], timeout=timeout)
+
+
+@tool
+def get_etcd_status(cluster_name: str) -> str:
+    """Get etcd cluster status: pod health, member list, leader info.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    parts = []
+
+    # Pod status
+    pods = _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system",
+        "-l", "component=etcd", "-o", "wide",
+    ], timeout=10)
+    if not pods or "[kubectl error" in pods:
+        pods = _kubectl(cluster_name, [
+            "get", "pods", "-n", "kube-system",
+            "-l", "app=etcd", "-o", "wide",
+        ], timeout=10)
+    parts.append(f"## etcd Pods\n{pods}")
+
+    # Member list
+    members = _etcd_exec(cluster_name, f"{_ETCDCTL_FLAGS} member list", timeout=10)
+    parts.append(f"## etcd Members\n{members}")
+
+    # Endpoint status
+    status = _etcd_exec(cluster_name, f"{_ETCDCTL_FLAGS} endpoint status --write-out=table", timeout=15)
+    parts.append(f"## Endpoint Status\n{status}")
+
+    return "\n\n".join(parts)
+
+
+@tool
+def get_etcd_logs(cluster_name: str, tail_lines: int = 200,
+                  since_minutes: int = 0) -> str:
+    """Get recent logs from all etcd pods.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        tail_lines: number of recent log lines per pod (default 200).
+        since_minutes: if > 0, fetch logs from last N minutes.
+    """
+    pods_raw = _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system",
+        "-l", "component=etcd", "-o", "name",
+    ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        pods_raw = _kubectl(cluster_name, [
+            "get", "pods", "-n", "kube-system",
+            "-l", "app=etcd", "-o", "name",
+        ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        return "[etcd pods not found]"
+
+    pod_names = [p.strip().replace("pod/", "") for p in pods_raw.splitlines() if p.strip()]
+    parts = []
+    for pn in pod_names:
+        if since_minutes > 0:
+            log = _kubectl(cluster_name, [
+                "logs", pn, "-n", "kube-system",
+                f"--since={since_minutes}m", "--timestamps",
+            ], timeout=20)
+        else:
+            log = _kubectl(cluster_name, [
+                "logs", pn, "-n", "kube-system",
+                f"--tail={tail_lines}", "--timestamps",
+            ], timeout=20)
+        parts.append(f"## {pn}\n{log}")
+    return "\n\n".join(parts)
+
+
+@tool
+def check_etcd_health(cluster_name: str) -> str:
+    """Check etcd endpoint health, alarm list, and Raft leader changes.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    parts = []
+
+    # Endpoint health
+    health = _etcd_exec(cluster_name, f"{_ETCDCTL_FLAGS} endpoint health", timeout=10)
+    parts.append(f"## Endpoint Health\n{health}")
+
+    # Alarms
+    alarms = _etcd_exec(cluster_name, f"{_ETCDCTL_FLAGS} alarm list", timeout=10)
+    parts.append(f"## Alarms\n{alarms}")
+
+    # Leader changes counter (from metrics)
+    leader_changes = _etcd_exec(
+        cluster_name,
+        f"{_ETCDCTL_FLAGS} endpoint status --write-out=json 2>/dev/null | "
+        "grep -o '\"leader\":[0-9]*' | head -5",
+        timeout=10,
+    )
+    parts.append(f"## Leader IDs\n{leader_changes}")
+
+    return "\n\n".join(parts)
+
+
+@tool
+def get_etcd_metrics(cluster_name: str) -> str:
+    """Get key etcd metrics: disk backend commit duration, Raft proposal duration, WAL fsync.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    metrics_cmd = (
+        "curl -s http://localhost:2379/metrics 2>/dev/null | "
+        "grep -E 'etcd_disk_backend_commit_duration_seconds_bucket|"
+        "etcd_disk_wal_fsync_duration_seconds_bucket|"
+        "etcd_network_peer_round_trip_time_seconds_bucket|"
+        "etcd_server_leader_changes_seen_total|"
+        "etcd_server_has_leader|"
+        "etcd_server_proposals_failed_total|"
+        "etcd_server_heartbeat_send_failures_total' | "
+        "grep -v '#' | head -30"
+    )
+    return _etcd_exec(cluster_name, metrics_cmd, timeout=15)

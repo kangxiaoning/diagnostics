@@ -42,6 +42,10 @@ from diagnostics.tools.kubernetes_live_tools import (
     get_pod_restart_counts,
     check_certificate_expiry,
     check_webhook_status,
+    check_etcd_health,
+    get_etcd_logs,
+    get_etcd_metrics,
+    get_etcd_status,
 )
 from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
@@ -75,6 +79,7 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         get_node_conditions, get_network_policies, check_rbac_permissions,
         get_pod_restart_counts,
         check_certificate_expiry, check_webhook_status,
+        get_etcd_status, get_etcd_logs, check_etcd_health, get_etcd_metrics,
         *extra_tools,
     ]
 
@@ -94,4 +99,5 @@ def get_k8s_live_tools() -> list[Any]:
         get_node_conditions, get_network_policies, check_rbac_permissions,
         get_pod_restart_counts,
         check_certificate_expiry, check_webhook_status,
+        get_etcd_status, get_etcd_logs, check_etcd_health, get_etcd_metrics,
     ]

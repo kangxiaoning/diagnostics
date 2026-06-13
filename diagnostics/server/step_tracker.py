@@ -113,6 +113,10 @@ TOOL_LABELS: dict[str, str] = {
     "get_pod_restart_counts": "查看Pod重启计数",
     "check_certificate_expiry": "检查证书过期",
     "check_webhook_status": "检查Webhook配置",
+    "get_etcd_status": "查看etcd状态",
+    "get_etcd_logs": "查看etcd日志",
+    "check_etcd_health": "检查etcd健康",
+    "get_etcd_metrics": "查看etcd指标",
 }
 
 
