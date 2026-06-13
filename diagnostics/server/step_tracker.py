@@ -107,6 +107,10 @@ TOOL_LABELS: dict[str, str] = {
     "list_helm_releases": "列出Helm部署",
     "get_helm_release_history": "查看Helm部署历史",
     "get_helm_release_values": "查看Helm部署参数",
+    "get_node_conditions": "查看节点状态概览",
+    "get_network_policies": "查看网络策略",
+    "check_rbac_permissions": "查看RBAC权限",
+    "get_pod_restart_counts": "查看Pod重启计数",
 }
 
 

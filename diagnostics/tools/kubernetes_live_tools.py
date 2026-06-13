@@ -498,3 +498,107 @@ def get_helm_release_values(cluster_name: str, release_name: str,
 
     return "[No values found]"
 
+
+# ═══════════════ Node Conditions ═══════════════
+
+@tool
+def get_node_conditions(cluster_name: str) -> str:
+    """Get a quick overview of all node conditions (Ready, MemoryPressure, DiskPressure, PIDPressure).
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    return _kubectl(cluster_name, [
+        "get", "nodes",
+        "-o", "custom-columns="
+        "NAME:.metadata.name,"
+        "READY:.status.conditions[?(@.type==\"Ready\")].status,"
+        "MEMORY:.status.conditions[?(@.type==\"MemoryPressure\")].status,"
+        "DISK:.status.conditions[?(@.type==\"DiskPressure\")].status,"
+        "PID:.status.conditions[?(@.type==\"PIDPressure\")].status,"
+        "NETWORK:.status.conditions[?(@.type==\"NetworkUnavailable\")].status,"
+        "VERSION:.status.nodeInfo.kubeletVersion,"
+        "AGE:.metadata.creationTimestamp",
+    ], timeout=15)
+
+
+# ═══════════════ Network Policy ═══════════════
+
+@tool
+def get_network_policies(cluster_name: str, namespace: str = "") -> str:
+    """List NetworkPolicies affecting pod-to-pod communication.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = ["get", "networkpolicies", "-o", "wide"]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    return _kubectl(cluster_name, args, timeout=15)
+
+
+# ═══════════════ RBAC ═══════════════
+
+@tool
+def check_rbac_permissions(cluster_name: str, namespace: str = "") -> str:
+    """List RBAC roles, rolebindings, and clusterroles to debug permission issues.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: namespace to check. If empty, shows cluster-scoped bindings only.
+    """
+    parts = []
+    if namespace:
+        roles = _kubectl(cluster_name, ["get", "roles,rolebindings", "-n", namespace, "-o", "wide"], timeout=10)
+        parts.append(f"## Namespace {namespace}\n{roles}")
+    crb = _kubectl(cluster_name, ["get", "clusterrolebindings", "-o", "wide"], timeout=10)
+    parts.append(f"## ClusterRoleBindings\n{crb}")
+    return "\n\n".join(parts)
+
+
+# ═══════════════ Pod Restart Summary ═══════════════
+
+@tool
+def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
+    """Get pods with high restart counts (>=5 restarts), sorted by restart count.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+        namespace: optional namespace filter. If empty, shows all namespaces.
+    """
+    args = [
+        "get", "pods",
+        "-o", "custom-columns="
+        "NAMESPACE:.metadata.namespace,"
+        "NAME:.metadata.name,"
+        "RESTARTS:.status.containerStatuses[*].restartCount,"
+        "STATUS:.status.phase,"
+        "NODE:.spec.nodeName",
+        "--sort-by=.status.containerStatuses[*].restartCount",
+    ]
+    if namespace:
+        args.extend(["-n", namespace])
+    else:
+        args.append("--all-namespaces")
+    raw = _kubectl(cluster_name, args, timeout=15)
+    lines = raw.splitlines()
+    if len(lines) <= 1:
+        return raw
+    header = lines[0]
+    # Filter rows with restart count >= 5
+    high_restarts = []
+    for line in lines[1:]:
+        parts_line = line.split()
+        # restart count is the 3rd column (after namespace, name)
+        try:
+            restarts = sum(int(r) for r in parts_line[2].split(",") if r.isdigit())
+            if restarts >= 5:
+                high_restarts.append(f"{line}  (total: {restarts})")
+        except (ValueError, IndexError):
+            continue
+    if high_restarts:
+        return f"{header}\n" + "\n".join(high_restarts[-20:]) + f"\n(Showing pods with ≥5 restarts, last 20)"
+    return f"{header}\n(No pods with ≥5 restarts)"

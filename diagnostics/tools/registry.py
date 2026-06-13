@@ -36,6 +36,10 @@ from diagnostics.tools.kubernetes_live_tools import (
     list_clusters,
     list_helm_releases,
     list_namespace_resources,
+    check_rbac_permissions,
+    get_network_policies,
+    get_node_conditions,
+    get_pod_restart_counts,
 )
 from diagnostics.tools.kubernetes_tools import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 from diagnostics.tools.network_tools import check_network
@@ -66,6 +70,8 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         get_configmap, list_namespace_resources, get_pv_pvc_status, get_ingress_status,
         get_coredns_logs, describe_coredns,
         list_helm_releases, get_helm_release_history, get_helm_release_values,
+        get_node_conditions, get_network_policies, check_rbac_permissions,
+        get_pod_restart_counts,
         *extra_tools,
     ]
 
@@ -82,4 +88,6 @@ def get_k8s_live_tools() -> list[Any]:
         get_configmap, list_namespace_resources, get_pv_pvc_status, get_ingress_status,
         get_coredns_logs, describe_coredns,
         list_helm_releases, get_helm_release_history, get_helm_release_values,
+        get_node_conditions, get_network_policies, check_rbac_permissions,
+        get_pod_restart_counts,
     ]
