@@ -602,3 +602,35 @@ def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
     if high_restarts:
         return f"{header}\n" + "\n".join(high_restarts[-20:]) + f"\n(Showing pods with ≥5 restarts, last 20)"
     return f"{header}\n(No pods with ≥5 restarts)"
+
+
+# ═══════════════ Certificate & Security ═══════════════
+
+@tool
+def check_certificate_expiry(cluster_name: str) -> str:
+    """Check TLS certificate expiry for kube-apiserver, kubelet, and etcd.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+
+    Note: Placeholder — integrate with your certificate inspection API.
+    """
+    return "[PLACEHOLDER] Certificate expiry check — implement via your cert inspection API."
+
+
+@tool
+def check_webhook_status(cluster_name: str) -> str:
+    """List MutatingWebhookConfigurations and ValidatingWebhookConfigurations.
+
+    Use when Pod creation/update is unexpectedly blocked or modified.
+
+    Args:
+        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    """
+    mutating = _kubectl(cluster_name, [
+        "get", "mutatingwebhookconfigurations", "-o", "wide",
+    ], timeout=10)
+    validating = _kubectl(cluster_name, [
+        "get", "validatingwebhookconfigurations", "-o", "wide",
+    ], timeout=10)
+    return f"## MutatingWebhookConfigurations\n{mutating}\n\n## ValidatingWebhookConfigurations\n{validating}"

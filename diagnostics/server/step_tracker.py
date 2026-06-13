@@ -111,6 +111,8 @@ TOOL_LABELS: dict[str, str] = {
     "get_network_policies": "查看网络策略",
     "check_rbac_permissions": "查看RBAC权限",
     "get_pod_restart_counts": "查看Pod重启计数",
+    "check_certificate_expiry": "检查证书过期",
+    "check_webhook_status": "检查Webhook配置",
 }
 
 
