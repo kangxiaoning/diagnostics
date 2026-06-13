@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -17,7 +16,6 @@ _cluster_servers: dict[str, str] = {}
 
 
 def _load_cluster_servers() -> dict[str, str]:
-    """Parse DIAGNOSTICS_K8S_SERVERS env var into {cluster_name: apiserver_url} dict."""
     global _cluster_servers
     if _cluster_servers:
         return _cluster_servers
@@ -35,7 +33,6 @@ def _load_cluster_servers() -> dict[str, str]:
 
 
 def _get_apiserver_url(cluster_name: str) -> str:
-    """Get the kube-apiserver URL for a given cluster."""
     servers = _load_cluster_servers()
     url = servers.get(cluster_name)
     if not url:
@@ -49,26 +46,17 @@ def _get_apiserver_url(cluster_name: str) -> str:
 
 def _kubectl(cluster_name: str, args: list[str],
              timeout: int = 30, input_text: str | None = None) -> str:
-    """Run a kubectl command against the specified cluster's API server.
-
-    All commands use --server for direct API server access (no kubeconfig required).
-    """
     server_url = _get_apiserver_url(cluster_name)
     cmd = [
-        "kubectl",
-        "--server", server_url,
-        "--insecure-skip-tls-verify",
-        *args,
+        "kubectl", "--server", server_url,
+        "--insecure-skip-tls-verify", *args,
     ]
     logger.info("[cluster=%s] kubectl %s", cluster_name, " ".join(args))
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+            cmd, capture_output=True, text=True, timeout=timeout,
             input=input_text,
-            env={**os.environ, "KUBECONFIG": "/dev/null"},  # force --server usage
+            env={**os.environ, "KUBECONFIG": "/dev/null"},
         )
         if result.returncode != 0:
             return f"[kubectl error (exit {result.returncode})]\n{result.stderr.strip()}"
@@ -76,72 +64,51 @@ def _kubectl(cluster_name: str, args: list[str],
     except subprocess.TimeoutExpired:
         return f"[kubectl timed out after {timeout}s]"
     except FileNotFoundError:
-        return "[kubectl not found on PATH — install kubectl to enable live cluster diagnostics]"
+        return "[kubectl not found on PATH]"
 
 
-# ═══════════════ Public tools ═══════════════
-
+# ═══════════════ Discovery ═══════════════
 
 @tool
 def list_clusters() -> str:
-    """List all configured Kubernetes cluster names.
-
-    Use this FIRST before any other K8s tool to discover valid cluster_name values.
-    """
+    """List all configured Kubernetes cluster names. Call this FIRST."""
     servers = _load_cluster_servers()
     if not servers:
         return "No clusters configured. Set DIAGNOSTICS_K8S_SERVERS env var."
-    lines = ["## Configured Clusters"]
-    for name, url in servers.items():
-        lines.append(f"- `{name}` → {url}")
-    return "\n".join(lines)
+    return "\n".join(f"- `{n}` → {u}" for n, u in servers.items())
 
 
 @tool
 def get_namespaces(cluster_name: str) -> str:
-    """List all namespaces in a Kubernetes cluster.
-
-    Use this to discover valid namespace values BEFORE calling tools that require a namespace.
-
-    Args:
-        cluster_name: cluster name from list_clusters().
-    """
+    """List all namespaces in a cluster. Call before tools that need namespace."""
     return _kubectl(cluster_name, ["get", "namespaces", "-o", "wide"], timeout=10)
 
 
+# ═══════════════ Overview ═══════════════
+
 @tool
 def get_cluster_overview(cluster_name: str) -> str:
-    """Get high-level overview of a Kubernetes cluster: nodes, pods, namespaces.
-
-    Args:
-        cluster_name: cluster name (e.g., "prod-cluster", "staging").
-                      Must be configured in DIAGNOSTICS_K8S_SERVERS env var.
-    """
+    """Get high-level cluster overview: nodes, non-running pods, namespace count."""
     nodes = _kubectl(cluster_name, ["get", "nodes", "-o", "wide"])
     pods = _kubectl(cluster_name, ["get", "pods", "--all-namespaces",
-                                     "--field-selector=status.phase!=Running,status.phase!=Succeeded",
-                                     "-o", "wide"])
+                     "--field-selector=status.phase!=Running,status.phase!=Succeeded",
+                     "-o", "wide"])
     ns_count = _kubectl(cluster_name, ["get", "namespaces", "--no-headers"])
     parts = [
         f"## Cluster: {cluster_name}",
         f"### Nodes\n{nodes}",
-        f"### Non-Running Pods (all namespaces)\n{pods or '(all pods Running or Succeeded)'}",
+        f"### Non-Running Pods\n{pods or '(all Running or Succeeded)'}",
         f"### Namespace count\n{len(ns_count.splitlines()) if ns_count else 0}",
     ]
     return "\n\n".join(parts)
 
 
+# ═══════════════ Pod Tools ═══════════════
+
 @tool
 def get_pod_logs(cluster_name: str, namespace: str,
                  pod_name: str, tail_lines: int = 200) -> str:
-    """Retrieve recent logs from a specific pod.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        tail_lines: number of recent log lines to fetch (default 200).
-    """
+    """Retrieve recent pod logs."""
     return _kubectl(cluster_name, [
         "logs", pod_name, "-n", namespace,
         f"--tail={tail_lines}", "--timestamps",
@@ -149,14 +116,38 @@ def get_pod_logs(cluster_name: str, namespace: str,
 
 
 @tool
-def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
-    """Get full describe output for a pod — events, conditions, container statuses, volumes.
+def get_pod_logs_since(cluster_name: str, namespace: str,
+                       pod_name: str, minutes: int = 5) -> str:
+    """Retrieve pod logs from the last N minutes."""
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        f"--since={minutes}m", "--timestamps",
+    ], timeout=20)
 
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-    """
+
+@tool
+def get_pod_logs_lines(cluster_name: str, namespace: str,
+                       pod_name: str, head_lines: int = 50) -> str:
+    """Retrieve the last N lines of pod logs."""
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--tail", str(head_lines),
+    ], timeout=20)
+
+
+@tool
+def get_pod_previous_logs(cluster_name: str, namespace: str,
+                          pod_name: str, tail_lines: int = 200) -> str:
+    """Retrieve logs from the PREVIOUS (crashed) container instance."""
+    return _kubectl(cluster_name, [
+        "logs", pod_name, "-n", namespace,
+        "--previous", f"--tail={tail_lines}", "--timestamps",
+    ], timeout=20)
+
+
+@tool
+def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
+    """Get full describe output for a pod."""
     return _kubectl(cluster_name, [
         "describe", "pod", pod_name, "-n", namespace,
     ], timeout=15)
@@ -164,13 +155,7 @@ def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
 
 @tool
 def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
-    """Get Kubernetes events related to a specific pod.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-    """
+    """Get events related to a specific pod."""
     return _kubectl(cluster_name, [
         "get", "events", "-n", namespace,
         "--field-selector", f"involvedObject.name={pod_name}",
@@ -179,49 +164,33 @@ def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
 
 
 @tool
-def get_node_info(cluster_name: str, node_name: str) -> str:
-    """Get detailed information about a Kubernetes node — conditions, capacity, allocatable, system info.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        node_name: node name.
-    """
-    return _kubectl(cluster_name, [
-        "describe", "node", node_name,
-    ], timeout=15)
-
-
-@tool
 def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
-    """Get recent cluster-wide or namespace-scoped warning events.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter. If empty, returns events across all namespaces.
-    """
+    """Get recent cluster-wide or namespace-scoped events (last 30)."""
     args = ["get", "events", "--sort-by=.lastTimestamp"]
     if namespace:
         args.extend(["-n", namespace])
     else:
         args.append("--all-namespaces")
     raw = _kubectl(cluster_name, args, timeout=15)
-    # Return only the last 30 lines (most recent events)
     lines = raw.splitlines()
-    if len(lines) > 31:  # header + 30 events
-        header = lines[0]
-        recent = lines[-30:]
-        return header + "\n" + "\n".join(recent) + f"\n... (showing last 30 of {len(lines)-1} events)"
+    if len(lines) > 31:
+        return lines[0] + "\n" + "\n".join(lines[-30:]) + f"\n... (last 30 of {len(lines)-1})"
     return raw
 
 
+# ═══════════════ Node Tools ═══════════════
+
+@tool
+def get_node_info(cluster_name: str, node_name: str) -> str:
+    """Get detailed node information."""
+    return _kubectl(cluster_name, ["describe", "node", node_name], timeout=15)
+
+
+# ═══════════════ Resource Usage ═══════════════
+
 @tool
 def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
-    """Get resource usage (CPU/Memory) of pods via kubectl top (requires metrics-server).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter. If empty, returns across all namespaces.
-    """
+    """Get pod CPU/Memory usage (requires metrics-server)."""
     args = ["top", "pods"]
     if namespace:
         args.extend(["-n", namespace])
@@ -232,45 +201,28 @@ def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
 
 @tool
 def get_node_resource_usage(cluster_name: str) -> str:
-    """Get resource usage (CPU/Memory) of all nodes via kubectl top (requires metrics-server).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-    """
+    """Get node CPU/Memory usage (requires metrics-server)."""
     return _kubectl(cluster_name, ["top", "nodes"], timeout=20)
 
 
+# ═══════════════ API & Resources ═══════════════
+
 @tool
 def get_api_resources(cluster_name: str) -> str:
-    """List all API resources available on the cluster (CRDs, native resources).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-    """
+    """List all API resources on the cluster (incl. CRDs)."""
     return _kubectl(cluster_name, ["api-resources", "--sort-by=name"], timeout=15)
 
 
 @tool
 def get_api_versions(cluster_name: str) -> str:
-    """List all API group versions supported by the cluster.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-    """
+    """List all API group versions supported by the cluster."""
     return _kubectl(cluster_name, ["api-versions"], timeout=15)
 
 
 @tool
 def get_resource_yaml(cluster_name: str, resource_type: str,
                       resource_name: str, namespace: str = "") -> str:
-    """Get the full YAML manifest of any Kubernetes resource.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        resource_type: resource type (e.g., deploy, svc, elbsvc, daemonset, configmap).
-        resource_name: resource name (e.g., vpc-cni, my-service).
-        namespace: Kubernetes namespace. Leave empty for cluster-scoped resources.
-    """
+    """Get full YAML of any resource (e.g. get_resource_yaml('prod','deploy','vpc-cni','kube-system'))."""
     args = ["get", resource_type, resource_name, "-o", "yaml"]
     if namespace:
         args.extend(["-n", namespace])
@@ -278,226 +230,30 @@ def get_resource_yaml(cluster_name: str, resource_type: str,
 
 
 @tool
-def get_pod_previous_logs(cluster_name: str, namespace: str,
-                          pod_name: str, tail_lines: int = 200) -> str:
-    """Retrieve logs from the PREVIOUS crashed container instance.
-
-    Use this when a container has restarted and you need logs from before the restart.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        tail_lines: number of recent log lines to fetch (default 200).
-    """
-    return _kubectl(cluster_name, [
-        "logs", pod_name, "-n", namespace,
-        "--previous", f"--tail={tail_lines}", "--timestamps",
-    ], timeout=20)
-
-
-@tool
-def get_system_pods(cluster_name: str) -> str:
-    """Get status of all system pods in kube-system namespace.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-    """
-    return _kubectl(cluster_name, [
-        "get", "pods", "-n", "kube-system", "-o", "wide",
-    ], timeout=15)
-
-
-@tool
-def describe_controller(cluster_name: str, resource_type: str,
-                        resource_name: str, namespace: str = "") -> str:
-    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        resource_type: controller type (deploy, statefulset, ds, rs).
-        resource_name: controller name.
-        namespace: Kubernetes namespace.
-    """
-    args = ["describe", resource_type, resource_name]
-    if namespace:
-        args.extend(["-n", namespace])
-    return _kubectl(cluster_name, args, timeout=15)
-
-
-@tool
-def check_service_endpoints(cluster_name: str, service_name: str,
-                            namespace: str = "default") -> str:
-    """Check whether a Service has healthy endpoints backing it.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        service_name: service name.
-        namespace: Kubernetes namespace (default "default").
-    """
-    svc = _kubectl(cluster_name, [
-        "get", "svc", service_name, "-n", namespace, "-o", "wide",
-    ], timeout=10)
-    ep = _kubectl(cluster_name, [
-        "get", "endpointslices", "-n", namespace,
-        "-l", f"kubernetes.io/service-name={service_name}",
-    ], timeout=10)
-    return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
-
-
-@tool
-def get_configmap(cluster_name: str, configmap_name: str,
-                  namespace: str = "default") -> str:
-    """Get the content of a ConfigMap (keys and values).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        configmap_name: ConfigMap name.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
-    ], timeout=10)
-
-
-@tool
-def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
-    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "all", "-n", namespace, "-o", "wide",
-    ], timeout=15)
-
-
-@tool
-def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
-    """Get PersistentVolume and PersistentVolumeClaim status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
-    """
-    pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
-    pvc_args = ["get", "pvc"]
-    if namespace:
-        pvc_args.extend(["-n", namespace])
-    else:
-        pvc_args.append("--all-namespaces")
-    pvc = _kubectl(cluster_name, pvc_args, timeout=10)
-    return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
-
-
-@tool
-def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
-    """Get Ingress resources and their backend status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter. If empty, shows all namespaces.
-    """
-    args = ["get", "ingress", "-o", "wide"]
-    if namespace:
-        args.extend(["-n", namespace])
-    else:
-        args.append("--all-namespaces")
-    return _kubectl(cluster_name, args, timeout=10)
-
-
-@tool
-def get_pod_logs_since(cluster_name: str, namespace: str,
-                       pod_name: str, minutes: int = 5) -> str:
-    """Retrieve pod logs from the last N minutes.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        minutes: fetch logs from the last N minutes (default 5).
-    """
-    return _kubectl(cluster_name, [
-        "logs", pod_name, "-n", namespace,
-        f"--since={minutes}m", "--timestamps",
-    ], timeout=20)
-
-
-@tool
-def get_pod_logs_lines(cluster_name: str, namespace: str,
-                       pod_name: str, head_lines: int = 50) -> str:
-    """Retrieve the first N lines of pod logs.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        head_lines: number of lines to fetch from the beginning of the log (default 50).
-    """
-    return _kubectl(cluster_name, [
-        "logs", pod_name, "-n", namespace,
-        "--tail", str(head_lines),
-    ], timeout=20)
-
-
-@tool
 def explain_resource(cluster_name: str, resource_path: str,
                      recursive: bool = False) -> str:
-    """Get documentation and field descriptions for a Kubernetes resource via kubectl explain.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        resource_path: resource path (e.g., pods.spec.containers, deployment.spec.template).
-        recursive: if True, show full field tree recursively.
-    """
+    """Get field documentation via kubectl explain."""
     args = ["explain", resource_path]
     if recursive:
         args.append("--recursive")
     return _kubectl(cluster_name, args, timeout=15)
 
 
-@tool
-def get_pod_previous_logs(cluster_name: str, namespace: str,
-                          pod_name: str, tail_lines: int = 200) -> str:
-    """Retrieve logs from the PREVIOUS crashed container instance.
-
-    Use this when a container has restarted and you need logs from before the restart.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        tail_lines: number of recent log lines to fetch (default 200).
-    """
-    return _kubectl(cluster_name, [
-        "logs", pod_name, "-n", namespace,
-        "--previous", f"--tail={tail_lines}", "--timestamps",
-    ], timeout=20)
-
+# ═══════════════ System Pods ═══════════════
 
 @tool
 def get_system_pods(cluster_name: str) -> str:
-    """Get status of all system pods in kube-system namespace.
+    """Get all system pods in kube-system namespace."""
+    return _kubectl(cluster_name, ["get", "pods", "-n", "kube-system", "-o", "wide"], timeout=15)
 
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-    """
-    return _kubectl(cluster_name, [
-        "get", "pods", "-n", "kube-system", "-o", "wide",
-    ], timeout=15)
 
+# ═══════════════ Controllers ═══════════════
 
 @tool
 def describe_controller(cluster_name: str, resource_type: str,
                         resource_name: str, namespace: str = "") -> str:
-    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        resource_type: controller type (deploy, statefulset, ds, rs).
-        resource_name: controller name.
-        namespace: Kubernetes namespace.
+    """Describe a controller (deployment, statefulset, daemonset, replicaset).
+    Use full resource_type names: deployment not deploy, daemonset not ds.
     """
     args = ["describe", resource_type, resource_name]
     if namespace:
@@ -505,80 +261,45 @@ def describe_controller(cluster_name: str, resource_type: str,
     return _kubectl(cluster_name, args, timeout=15)
 
 
+# ═══════════════ Services ═══════════════
+
 @tool
 def check_service_endpoints(cluster_name: str, service_name: str,
                             namespace: str = "default") -> str:
-    """Check whether a Service has healthy endpoints backing it.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        service_name: service name.
-        namespace: Kubernetes namespace (default "default").
-    """
-    svc = _kubectl(cluster_name, [
-        "get", "svc", service_name, "-n", namespace, "-o", "wide",
-    ], timeout=10)
-    ep = _kubectl(cluster_name, [
-        "get", "endpointslices", "-n", namespace,
-        "-l", f"kubernetes.io/service-name={service_name}",
-    ], timeout=10)
+    """Check whether a Service has healthy endpoints."""
+    svc = _kubectl(cluster_name, ["get", "svc", service_name, "-n", namespace, "-o", "wide"], timeout=10)
+    ep = _kubectl(cluster_name, ["get", "endpointslices", "-n", namespace,
+                   "-l", f"kubernetes.io/service-name={service_name}"], timeout=10)
     return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
 
+
+# ═══════════════ Config & Resources ═══════════════
 
 @tool
 def get_configmap(cluster_name: str, configmap_name: str,
                   namespace: str = "default") -> str:
-    """Get the content of a ConfigMap (keys and values).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        configmap_name: ConfigMap name.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
-    ], timeout=10)
+    """Get ConfigMap content."""
+    return _kubectl(cluster_name, ["get", "configmap", configmap_name, "-n", namespace, "-o", "yaml"], timeout=10)
 
 
 @tool
 def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
-    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "all", "-n", namespace, "-o", "wide",
-    ], timeout=15)
+    """List all resources in a namespace."""
+    return _kubectl(cluster_name, ["get", "all", "-n", namespace, "-o", "wide"], timeout=15)
 
 
 @tool
 def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
-    """Get PersistentVolume and PersistentVolumeClaim status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
-    """
+    """Get PV/PVC status."""
     pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
-    pvc_args = ["get", "pvc"]
-    if namespace:
-        pvc_args.extend(["-n", namespace])
-    else:
-        pvc_args.append("--all-namespaces")
+    pvc_args = ["get", "pvc"] + (["-n", namespace] if namespace else ["--all-namespaces"])
     pvc = _kubectl(cluster_name, pvc_args, timeout=10)
     return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
 
 
 @tool
 def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
-    """Get Ingress resources and their backend status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter. If empty, shows all namespaces.
-    """
+    """Get Ingress resources and backend status."""
     args = ["get", "ingress", "-o", "wide"]
     if namespace:
         args.extend(["-n", namespace])
@@ -587,131 +308,64 @@ def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
     return _kubectl(cluster_name, args, timeout=10)
 
 
-@tool
-def get_pod_previous_logs(cluster_name: str, namespace: str,
-                          pod_name: str, tail_lines: int = 200) -> str:
-    """Retrieve logs from the PREVIOUS crashed container instance.
-
-    Use this when a container has restarted and you need logs from before the restart.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace of the pod.
-        pod_name: pod name.
-        tail_lines: number of recent log lines to fetch (default 200).
-    """
-    return _kubectl(cluster_name, [
-        "logs", pod_name, "-n", namespace,
-        "--previous", f"--tail={tail_lines}", "--timestamps",
-    ], timeout=20)
-
+# ═══════════════ CoreDNS ═══════════════
 
 @tool
-def get_system_pods(cluster_name: str) -> str:
-    """Get status of all system pods in kube-system namespace.
+def get_coredns_logs(cluster_name: str, tail_lines: int = 200,
+                     since_minutes: int = 0) -> str:
+    """Get logs from all CoreDNS pods in kube-system.
 
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
+    CoreDNS runs as a deployment in kube-system with label k8s-app=kube-dns.
+    Use this when DNS resolution failures are suspected.
     """
-    return _kubectl(cluster_name, [
-        "get", "pods", "-n", "kube-system", "-o", "wide",
+    pods_raw = _kubectl(cluster_name, [
+        "get", "pods", "-n", "kube-system",
+        "-l", "k8s-app=kube-dns", "-o", "name",
+    ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        pods_raw = _kubectl(cluster_name, [
+            "get", "pods", "-n", "kube-system",
+            "-l", "app=coredns", "-o", "name",
+        ], timeout=10)
+    if not pods_raw or "[kubectl error" in pods_raw:
+        return "[CoreDNS pods not found in kube-system]"
+
+    pod_names = [p.strip().replace("pod/", "") for p in pods_raw.splitlines() if p.strip()]
+    parts = []
+    for pn in pod_names:
+        if since_minutes > 0:
+            log = _kubectl(cluster_name, [
+                "logs", pn, "-n", "kube-system",
+                f"--since={since_minutes}m", "--timestamps",
+            ], timeout=20)
+        else:
+            log = _kubectl(cluster_name, [
+                "logs", pn, "-n", "kube-system",
+                f"--tail={tail_lines}", "--timestamps",
+            ], timeout=20)
+        parts.append(f"## {pn}\n{log}")
+
+    deploy = _kubectl(cluster_name, [
+        "get", "deployment", "coredns", "-n", "kube-system", "-o", "wide",
+    ], timeout=10)
+    parts.insert(0, f"## CoreDNS Deployment\n{deploy}")
+    return "\n\n".join(parts)
+
+
+@tool
+def describe_coredns(cluster_name: str) -> str:
+    """Describe CoreDNS deployment and show Corefile ConfigMap in kube-system."""
+    deploy = _kubectl(cluster_name, [
+        "describe", "deployment", "coredns", "-n", "kube-system",
     ], timeout=15)
-
-
-@tool
-def describe_controller(cluster_name: str, resource_type: str,
-                        resource_name: str, namespace: str = "") -> str:
-    """Describe a Kubernetes controller (deployment, statefulset, daemonset, replicaset).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        resource_type: controller type (deploy, statefulset, ds, rs).
-        resource_name: controller name.
-        namespace: Kubernetes namespace.
-    """
-    args = ["describe", resource_type, resource_name]
-    if namespace:
-        args.extend(["-n", namespace])
-    return _kubectl(cluster_name, args, timeout=15)
-
-
-@tool
-def check_service_endpoints(cluster_name: str, service_name: str,
-                            namespace: str = "default") -> str:
-    """Check whether a Service has healthy endpoints backing it.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        service_name: service name.
-        namespace: Kubernetes namespace (default "default").
-    """
+    cm = _kubectl(cluster_name, [
+        "get", "configmap", "coredns", "-n", "kube-system", "-o", "yaml",
+    ], timeout=10)
     svc = _kubectl(cluster_name, [
-        "get", "svc", service_name, "-n", namespace, "-o", "wide",
+        "get", "svc", "kube-dns", "-n", "kube-system", "-o", "wide",
     ], timeout=10)
-    ep = _kubectl(cluster_name, [
-        "get", "endpointslices", "-n", namespace,
-        "-l", f"kubernetes.io/service-name={service_name}",
-    ], timeout=10)
-    return f"## Service\n{svc}\n\n## EndpointSlices\n{ep}"
-
-
-@tool
-def get_configmap(cluster_name: str, configmap_name: str,
-                  namespace: str = "default") -> str:
-    """Get the content of a ConfigMap (keys and values).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        configmap_name: ConfigMap name.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "configmap", configmap_name, "-n", namespace, "-o", "yaml",
-    ], timeout=10)
-
-
-@tool
-def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
-    """List all Kubernetes resources in a namespace (pods, svc, deploy, ingress, etc.).
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: Kubernetes namespace (default "default").
-    """
-    return _kubectl(cluster_name, [
-        "get", "all", "-n", namespace, "-o", "wide",
-    ], timeout=15)
-
-
-@tool
-def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
-    """Get PersistentVolume and PersistentVolumeClaim status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter for PVCs. If empty, shows all namespaces.
-    """
-    pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
-    pvc_args = ["get", "pvc"]
-    if namespace:
-        pvc_args.extend(["-n", namespace])
-    else:
-        pvc_args.append("--all-namespaces")
-    pvc = _kubectl(cluster_name, pvc_args, timeout=10)
-    return f"## PersistentVolumes\n{pv}\n\n## PersistentVolumeClaims\n{pvc}"
-
-
-@tool
-def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
-    """Get Ingress resources and their backend status.
-
-    Args:
-        cluster_name: cluster name configured in DIAGNOSTICS_K8S_SERVERS.
-        namespace: optional namespace filter. If empty, shows all namespaces.
-    """
-    args = ["get", "ingress", "-o", "wide"]
-    if namespace:
-        args.extend(["-n", namespace])
-    else:
-        args.append("--all-namespaces")
-    return _kubectl(cluster_name, args, timeout=10)
+    return (
+        f"## CoreDNS Deployment\n{deploy}\n\n"
+        f"## kube-dns Service\n{svc}\n\n"
+        f"## Corefile ConfigMap\n{cm}"
+    )

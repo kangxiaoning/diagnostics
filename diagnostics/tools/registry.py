@@ -9,6 +9,7 @@ from diagnostics.tools.gpu_tools import check_gpu_health, check_gpu_memory, chec
 from diagnostics.tools.kubernetes_live_tools import (
     check_service_endpoints,
     describe_controller,
+    describe_coredns,
     describe_pod,
     explain_resource,
     get_api_resources,
@@ -16,6 +17,7 @@ from diagnostics.tools.kubernetes_live_tools import (
     get_cluster_events,
     get_cluster_overview,
     get_configmap,
+    get_coredns_logs,
     get_ingress_status,
     get_namespaces,
     get_node_info,
@@ -85,6 +87,8 @@ def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         list_namespace_resources,
         get_pv_pvc_status,
         get_ingress_status,
+        get_coredns_logs,
+        describe_coredns,
         *extra_tools,
     ]
 
@@ -116,4 +120,6 @@ def get_k8s_live_tools() -> list[Any]:
         list_namespace_resources,
         get_pv_pvc_status,
         get_ingress_status,
+        get_coredns_logs,
+        describe_coredns,
     ]

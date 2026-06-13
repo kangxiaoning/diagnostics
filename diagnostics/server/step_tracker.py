@@ -102,6 +102,8 @@ TOOL_LABELS: dict[str, str] = {
     "get_ingress_status": "查看Ingress状态",
     "list_clusters": "列出配置的集群",
     "get_namespaces": "列出命名空间",
+    "get_coredns_logs": "查看CoreDNS日志",
+    "describe_coredns": "查看CoreDNS详情",
 }
 
 
