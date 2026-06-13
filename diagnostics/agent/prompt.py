@@ -256,6 +256,18 @@ Kubernetes 层：
 
 辅助：
 - `list_diagnostic_capabilities()` — 列出所有工具及用途
+- `read_file` — 读取诊断脚本内容（如 `/agent_data/scripts/collect_node_diagnostics.sh`）
+
+### 远程节点诊断脚本
+
+以下脚本位于 `/agent_data/scripts/`，通过远程 Shell 功能下发到目标节点执行，用于从节点上收集运行时日志和关键指标：
+
+- `collect_node_diagnostics.sh <all|kubelet|kube-proxy|runtime> [since] [tail]` — 综合入口，自动检测运行时
+- `collect_kubelet_logs.sh [since] [tail]` — kubelet 日志（含 PLEG/OOM/eviction 过滤）
+- `collect_kube_proxy_logs.sh [since] [tail]` — kube-proxy 日志（含 iptables/ipvs 模式检测）
+- `collect_runtime_logs.sh <docker|containerd|kata|crio> [since] [tail]` — 容器运行时日志
+
+**使用方式**：当需要从节点收集底层日志时，先用 `read_file` 读取脚本内容，再通过远程 Shell 功能下发到目标节点执行。`collect_node_diagnostics.sh all` 会自动检测容器运行时类型并收集所有组件日志。
 
 ### 实时 K8s 诊断工具（直接访问 kube-apiserver）
 
