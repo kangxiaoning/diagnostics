@@ -18,6 +18,21 @@
 
 ---
 
+### 2026-06-14 prod-cluster — conntrack 表满 → 节点消失 → Pod 大量驱逐
+
+- **现象**：worker-5/worker-8 节点几分钟内先后 NotReady 后从集群列表消失，30+ Pod 被驱逐，CoreDNS 解析偶发超时
+- **排查路径**：get_cluster_overview → check_kubernetes_nodes → check_kubernetes_control_plane → check_network → check_etcd_health → 委派 network-expert + k8s-node-expert
+- **根因**：worker-5/worker-8 主机 `nf_conntrack_max` 上限耗尽，内核丢弃 kubelet 心跳包导致节点失联
+- **特征信号**：
+  - dmesg 中 `nf_conntrack: table full, dropping packet`（直接证据）
+  - 节点从 API server 节点列表中完全消失（非 NotReady）
+  - CoreDNS 解析偶发超时（DNS UDP 包被内核丢弃）
+  - 控制面全部 Healthy + etcd NOSPACE 为 WARNING 级别 → 排除控制面故障
+- **关联复发**：与 2026-06-06 跨层故障链中的 conntrack 模式一致，但本次节点完全脱离集群（更严重）
+- **关键教训**：集群稳定运行 8 个月后连接数累积可触发 conntrack 满；节点消失（非 NotReady）是 conntrack 满的严重级联结果；etcd NOSPACE 告警需独立处理，与 conntrack 满无直接因果
+
+---
+
 ### 2026-06-06 Spring Boot OOMKilled — limit 过小非泄漏
 - **现象**：ACK 集群 java-backend Pod 频繁 OOMKilled 重启（每小时 10+ 次），memory limit=512Mi，用户不确定是泄漏还是 limit 太小
 - **排查路径**：check_kubernetes_pods → check_kubernetes_nodes → check_memory → check_processes → memory-expert 深度分析

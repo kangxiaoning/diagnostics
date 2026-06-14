@@ -15,6 +15,35 @@ const toolPopup = document.getElementById("toolPopup");
 const toolPopupTitle = document.getElementById("toolPopupTitle");
 const toolPopupBody = document.getElementById("toolPopupBody");
 const toolPopupClose = document.getElementById("toolPopupClose");
+const skillsBar = document.getElementById("skillsBar");
+const skillSuggestions = document.getElementById("skillSuggestions");
+
+// ═══════════════════ Skills Registry (fetched from API) ═══════════════════
+let SKILLS = [];
+let skillIdx = new Map();
+let skillsLoaded = false;
+let activeSkills = [];
+
+async function loadSkills() {
+  try {
+    const resp = await fetch("/api/skills");
+    if (!resp.ok) { console.warn("Skills API returned", resp.status); return; }
+    const data = await resp.json();
+    SKILLS = data.map(s => ({
+      id: s.id,
+      label: s.name || s.id,
+      desc: s.description || "",
+      category: s.category || "other",
+    }));
+    skillIdx = new Map(SKILLS.map(s => [s.id, s]));
+    skillsLoaded = true;
+    console.log("Skills loaded:", SKILLS.length);
+  } catch (e) {
+    console.warn("Failed to load skills from API:", e);
+  }
+}
+// Load skills at page init
+loadSkills();
 
 // ═══════════════════ State ═══════════════════
 let sessionId = localStorage.getItem("diagnostics.sessionId") || null;
@@ -60,7 +89,7 @@ document.addEventListener("mousemove", (e) => {
   if (!isResizing) return;
   const appRect = document.querySelector(".app").getBoundingClientRect();
   const pct = ((e.clientX - appRect.left) / appRect.width) * 100;
-  const clamped = Math.max(25, Math.min(75, pct));
+  const clamped = Math.max(15, Math.min(75, pct));
   chatPanel.style.width = clamped + "%";
 });
 
@@ -75,15 +104,187 @@ document.addEventListener("mouseup", () => {
   }
 });
 
+// ═══════════════════ Skills Bar & / command ═══════════════════
+
+function renderSkillsBar() {
+  skillsBar.innerHTML = "";
+  for (const sk of activeSkills) {
+    const tag = document.createElement("span");
+    tag.className = "skill-tag";
+    tag.innerHTML = `<span>/${sk.id}</span><span class="skill-remove" data-sid="${sk.id}">✕</span>`;
+    tag.querySelector(".skill-remove").addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeSkill(sk.id);
+    });
+    skillsBar.appendChild(tag);
+  }
+  if (activeSkills.length === 0) {
+    skillsBar.style.display = "none";
+  } else {
+    skillsBar.style.display = "flex";
+  }
+}
+
+function addSkill(skillId) {
+  const sk = skillIdx.get(skillId);
+  if (!sk || activeSkills.find(s => s.id === skillId)) return;
+  activeSkills.push(sk);
+  renderSkillsBar();
+  closeSuggestions();
+}
+
+function removeSkill(skillId) {
+  activeSkills = activeSkills.filter(s => s.id !== skillId);
+  renderSkillsBar();
+}
+
+let _activeIndex = -1;
+let _filteredSkills = [];
+
+function _selectSkillByIndex(idx) {
+  if (idx >= 0 && idx < _filteredSkills.length) {
+    const s = _filteredSkills[idx];
+    addSkill(s.id);
+    const val = inputEl.value;
+    const pos = inputEl.selectionStart;
+    const beforeSlash = val.lastIndexOf("/", pos - 1);
+    if (beforeSlash >= 0) {
+      _skillSelecting = true;
+      inputEl.value = val.slice(0, beforeSlash) + val.slice(pos);
+      inputEl.selectionStart = inputEl.selectionEnd = beforeSlash;
+    }
+    inputEl.focus();
+    closeSuggestions();
+  }
+}
+
+function _highlightItem(idx) {
+  _activeIndex = idx;
+  const items = skillSuggestions.querySelectorAll(".skill-item");
+  items.forEach((el, i) => el.classList.toggle("active", i === idx));
+  if (idx >= 0 && items[idx]) {
+    items[idx].scrollIntoView({ block: "nearest" });
+  }
+}
+
+function openSuggestions(filterText) {
+  if (!skillsLoaded) {
+    loadSkills().then(() => {
+      if (skillsLoaded) openSuggestions(filterText);
+    });
+    return;
+  }
+  const ft = (filterText || "").toLowerCase();
+  _filteredSkills = ft
+    ? SKILLS.filter(s => s.id.includes(ft) || s.label.includes(ft) || s.desc.includes(ft))
+    : SKILLS;
+  _activeIndex = -1;
+  skillSuggestions.innerHTML = "";
+  if (_filteredSkills.length === 0 && ft) {
+    skillSuggestions.classList.remove("open");
+    return;
+  }
+  for (let i = 0; i < _filteredSkills.length; i++) {
+    const s = _filteredSkills[i];
+    const item = document.createElement("div");
+    item.className = "skill-item";
+    item.dataset.index = i;
+    item.innerHTML = `<span class="skill-name">/${s.id}</span><span class="skill-desc">${esc(s.desc)}</span>`;
+    item.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      _selectSkillByIndex(i);
+    });
+    // Highlight on hover
+    item.addEventListener("mouseenter", () => _highlightItem(i));
+    skillSuggestions.appendChild(item);
+  }
+
+  // Position below the current slash in the textarea
+  const textareaRect = inputEl.getBoundingClientRect();
+  const wrapperRect = inputEl.parentElement.getBoundingClientRect();
+  skillSuggestions.style.top = (textareaRect.top - wrapperRect.top + 28) + "px";
+  skillSuggestions.style.left = (textareaRect.left - wrapperRect.left) + "px";
+  skillSuggestions.style.width = Math.min(textareaRect.width, 360) + "px";
+
+  skillSuggestions.classList.add("open");
+}
+
+function closeSuggestions() {
+  skillSuggestions.classList.remove("open");
+  _activeIndex = -1;
+}
+
+// Handle / command: detect "/" in input and show skill suggestions
+let _skillSelecting = false;
+
+inputEl.addEventListener("input", () => {
+  if (_skillSelecting) { _skillSelecting = false; return; }
+
+  const val = inputEl.value;
+  const pos = inputEl.selectionStart;
+  // Find the last / before the cursor
+  const lastSlash = val.lastIndexOf("/", pos - 1);
+  if (lastSlash >= 0 && val[lastSlash] === "/") {
+    const afterSlash = val.slice(lastSlash + 1, pos);
+    if (!afterSlash.includes(" ")) {
+      openSuggestions(afterSlash);
+      return;
+    }
+  }
+  closeSuggestions();
+});
+
+// Keyboard navigation: Up/Down/Enter/Escape
+inputEl.addEventListener("keydown", (e) => {
+  if (!skillSuggestions.classList.contains("open")) return;
+  const len = _filteredSkills.length;
+  if (len === 0) return;
+
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    _highlightItem(Math.min(_activeIndex + 1, len - 1));
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    _highlightItem(Math.max(_activeIndex - 1, 0));
+  } else if (e.key === "Enter") {
+    if (_activeIndex >= 0 && _activeIndex < len) {
+      e.preventDefault();
+      _selectSkillByIndex(_activeIndex);
+    }
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeSuggestions();
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!skillSuggestions.contains(e.target) && e.target !== inputEl) {
+    closeSuggestions();
+  }
+});
+
+function buildSkillPrefix() {
+  if (activeSkills.length === 0) return "";
+  return activeSkills.map(s => `@skill:${s.id}`).join(" ") + " ";
+}
+
 // ═══════════════════ Form submit ═══════════════════
 formEl.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const prompt = inputEl.value.trim();
-  if (!prompt || controller) return;
+  const rawPrompt = inputEl.value.trim();
+  if (!rawPrompt || controller) return;
 
-  appendMsg("user", prompt);
+  const skillPrefix = buildSkillPrefix();
+  const prompt = skillPrefix + rawPrompt;
+  const displayText = activeSkills.length > 0
+    ? activeSkills.map(s => `/${s.id}`).join(" ") + "\n" + rawPrompt
+    : rawPrompt;
+
+  appendMsg("user", displayText);
   inputEl.value = "";
   inputEl.style.height = "auto";
+  activeSkills = [];
+  renderSkillsBar();
   resetGraph();
   toolPopup.classList.add("hidden");
   thinkSections = [];

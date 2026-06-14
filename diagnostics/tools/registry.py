@@ -1,11 +1,11 @@
-"""Tool registry — production tools (live K8s)."""
+"""Tool registry — production tools (live)."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
 
-from diagnostics.tools.kubernetes_live_tools import (
+from diagnostics.tools.live.kubernetes import (
     check_etcd_health,
     check_rbac_permissions,
     check_service_endpoints,

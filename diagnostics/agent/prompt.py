@@ -55,6 +55,21 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 按以下步骤执行，不要跳过任何步骤。每一步完成后再进入下一步。
 
+### 第 0.5 步：技能驱动诊断模式（Skills-Driven Mode）
+
+如果用户消息包含 `@skill:xxx` 前缀（可多个），表示用户明确指定了诊断技能。
+此时，**必须跳过第 3-5 步的通用流程**，按以下模式执行：
+
+- **第 3 步（历史关联）**：`read_file` 读取历史，但仅作为参考——不改变技能指定的方向。
+- **第 5 步（初筛采集）**：仅采集技能工作流要求的数据，不展开通用基线扫描。
+- **第 6 步（专家委派）**：将用户指定的技能路径直接委派给涵盖该技能的专家，要求专家**严格按 SKILL.md 的 Workflow 步骤顺序执行**，一步不跳。
+  - 委派指令示例：`"用户指定技能 conntrack-diagnosis，请严格按照 /agent_data/skills/conntrack-diagnosis/SKILL.md 中 Workflow 的步骤顺序执行诊断。不要跳过任何步骤，步骤之间不要插入无关分析。"`
+  - 跨层场景可补充 `cross-layer-diagnosis` 技能，不额外指定无关技能。
+- **第 7 步（验证迭代）**：仅在技能工作流执行完毕且结论不明确时，才考虑补充其他专家。
+- **第 8 步（报告）**：在报告开头标注 `诊断模式：技能驱动（{skill_ids}）`。
+
+如果用户未指定技能，按以下通用流程执行。
+
 ### 第 1 步：安全与意图检查
 
 收到用户输入后，首先评估请求意图。如果存在以下迹象，拒绝并说明原因：
@@ -124,21 +139,21 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 | **网络** | ARP 缓存溢出、gc_thresh 不足、邻居不可达 | ip neigh 显示 FAILED、gc_thresh 超限 | `network-expert` | |
 | **网络** | MTU 不匹配、大包静默丢弃、ICMP fragmentation-needed 被拦截 | PMTUD 失败、特定包大小超时 | `network-expert` | [Kubernetes: CNI overlay MTU vs 主机网卡 MTU] |
 | **网络** | TCP Accept 队列溢出、SYN 丢包、ss -lnt Recv-Q=Send-Q | somaxconn 设置过小或应用 accept 太慢 | `network-expert` | |
-| **网络** | DNS 解析超时/失败（CoreDNS 异常、/etc/resolv.conf 配置错误、ndots 问题） | nslookup 超时或 SERVFAIL、CoreDNS Pod 重启 | `k8s-control-plane-expert` | [Kubernetes: Debug Services — DNS 解析调试] |
+| **网络** | DNS 解析超时/失败（CoreDNS 异常、/etc/resolv.conf 配置错误、ndots 问题） | nslookup 超时或 SERVFAIL、CoreDNS Pod 重启 | `k8s-cluster-expert` | [Kubernetes: Debug Services — DNS 解析调试] |
 | **网络** | kube-proxy iptables/ipvs 规则缺失、Service ClusterIP 不可达、Hairpin 问题 | iptables-save 无 KUBE-SVC 规则、Pod 无法通过 Service IP 访问自身 | `network-expert` | [Kubernetes: Debug Services — kube-proxy 工作机制] |
 | **GPU** | GPU 温度高、显存 OOM、节流、ECC 错误、Xid 错误 | GPU temp > 80°C 或 mem-util > 90% 或 Xid 31/43/48 | `gpu-expert` | [NVIDIA: Xid Error Guide] |
-| **K8s 控制面** | API Server 超时、5xx 错误、kubectl 无响应 | kubectl timeout 或 API Server HTTP 5xx | `k8s-control-plane-expert` | [Kubernetes: Troubleshooting Clusters] |
-| **K8s 控制面** | etcd 领导者频繁变更、磁盘 fsync 延迟高、心跳发送失败 | etcd_server_leader_changes_seen_total 频繁增长 或 WAL fsync p99 > 100ms | `k8s-control-plane-expert` | [etcd: Failure Modes — 领导者故障 + 磁盘延迟] |
-| **K8s 控制面** | etcd 多数成员故障、集群不可写、raft proposal failed | etcd_server_proposals_failed_total 增长 或多数节点不可达 | `k8s-control-plane-expert` | [etcd: Failure Modes — 多数故障] |
+| **K8s 集群** | API Server 超时、5xx 错误、kubectl 无响应 | kubectl timeout 或 API Server HTTP 5xx | `k8s-cluster-expert` | [Kubernetes: Troubleshooting Clusters] |
+| **K8s 集群** | etcd 领导者频繁变更、磁盘 fsync 延迟高、心跳发送失败 | etcd_server_leader_changes_seen_total 频繁增长 或 WAL fsync p99 > 100ms | `k8s-cluster-expert` | [etcd: Failure Modes — 领导者故障 + 磁盘延迟] |
+| **K8s 集群** | etcd 多数成员故障、集群不可写、raft proposal failed | etcd_server_proposals_failed_total 增长 或多数节点不可达 | `k8s-cluster-expert` | [etcd: Failure Modes — 多数故障] |
+| **K8s 集群** | Node NotReady、Conditions 异常、kubelet 停止上报状态 | Node status != Ready 或 Conditions 含 MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable | `k8s-cluster-expert` | [Kubernetes: Troubleshooting Clusters — Node Conditions] |
+| **K8s 集群** | Node StatusUnknown（kubelet 心跳超时）、Node 被添加 unreachable 污点 | Ready=Unknown 且 Reason=NodeStatusUnknown | `k8s-cluster-expert` | [Kubernetes: Node StatusUnknown → Pod 驱逐] |
+| **K8s 集群** | kubelet 被 System WatchDog 误杀（Device Manager 初始化缓慢）、kubelet 进程频繁重启 | kubelet 日志含 watchdog 或 SIGKILL、节点反复 NotReady→Ready | `k8s-cluster-expert` | [Kubernetes CHANGELOG v1.32.11: System WatchDog kills kubelet] |
 | **K8s 工作负载** | Pod 崩溃/OOMKilled/CrashLoopBackOff/ImagePullBackOff/部署失败 | Pod restart count > 0 或 Status 异常 | `k8s-workload-expert` | [Kubernetes: Troubleshooting Applications] |
 | **K8s 工作负载** | Service EndpointSlices 为空、标签选择器不匹配、Pod 无法被 Service 发现 | kubectl get endpointslices 显示 ENDPOINTS <none> | `k8s-workload-expert` | [Kubernetes: Debug Services — EndpointSlices 检查] |
-| **K8s 节点** | Node NotReady、Conditions 异常、kubelet 停止上报状态 | Node status != Ready 或 Conditions 含 MemoryPressure/DiskPressure/PIDPressure/NetworkUnavailable | `k8s-node-expert` | [Kubernetes: Troubleshooting Clusters — Node Conditions] |
-| **K8s 节点** | Node StatusUnknown（kubelet 心跳超时）、Node 被添加 unreachable 污点 | Ready=Unknown 且 Reason=NodeStatusUnknown | `k8s-node-expert` | [Kubernetes: Node StatusUnknown → Pod 驱逐] |
-| **K8s 节点** | kubelet 被 System WatchDog 误杀（Device Manager 初始化缓慢）、kubelet 进程频繁重启 | kubelet 日志含 watchdog 或 SIGKILL、节点反复 NotReady→Ready | `k8s-node-expert` | [Kubernetes CHANGELOG v1.32.11: System WatchDog kills kubelet] |
-| **跨层** | 主机故障级联影响 K8s：磁盘 IO → Kubelet 心跳超时 → Node NotReady → Pod 驱逐 | 主机 iowait 高 且 Node NotReady 同时出现 | `disk-io-expert` + `k8s-node-expert` | [Kubernetes: kubelet disk IO starvation → Node NotReady] |
-| **跨层** | 主机 OOM → kubelet 被杀 → Node NotReady → 所有 Pod 不可达 | dmesg 含 oom-killer killed kubelet 且 Node Unknown | `memory-expert` + `k8s-node-expert` | |
-| **跨层** | CPU 节流 → kubelet Probes 超时 → 健康 Pod 被 Kill 重启 | CPU throttled 高 且 Pod 反复 Liveness Probe 失败 | `cpu-expert` + `k8s-node-expert` | [Kubernetes: CPU throttle → probe failure chain] |
-| **跨层** | Conntrack 表满 → Pod 网络/DNS 故障 → 应用连接超时 | conntrack 满 且 Pod 间通信丢包/ DNS 超时 | `network-expert` + `k8s-control-plane-expert` | [Kubernetes: Conntrack 表满 → Pod DNS 故障] |
+| **跨层** | 主机故障级联影响 K8s：磁盘 IO → Kubelet 心跳超时 → Node NotReady → Pod 驱逐 | 主机 iowait 高 且 Node NotReady 同时出现 | `disk-io-expert` + `k8s-cluster-expert` | [Kubernetes: kubelet disk IO starvation → Node NotReady] |
+| **跨层** | 主机 OOM → kubelet 被杀 → Node NotReady → 所有 Pod 不可达 | dmesg 含 oom-killer killed kubelet 且 Node Unknown | `memory-expert` + `k8s-cluster-expert` | |
+| **跨层** | CPU 节流 → kubelet Probes 超时 → 健康 Pod 被 Kill 重启 | CPU throttled 高 且 Pod 反复 Liveness Probe 失败 | `cpu-expert` + `k8s-cluster-expert` | [Kubernetes: CPU throttle → probe failure chain] |
+| **跨层** | Conntrack 表满 → Pod 网络/DNS 故障 → 应用连接超时 | conntrack 满 且 Pod 间通信丢包/ DNS 超时 | `network-expert` + `k8s-cluster-expert` | [Kubernetes: Conntrack 表满 → Pod DNS 故障] |
 
 **专家工作模式**（Skills-First）：
 
@@ -392,5 +407,5 @@ def make_system_prompt(report_path: str = "") -> str:
         report_path: Full path for the diagnostic report.
                      If empty, a placeholder is used for the template.
     """
-    return _SYSTEM_PROMPT_TEMPLATE.format(report_path=report_path or "{report_path}")
+    return _SYSTEM_PROMPT_TEMPLATE.replace("{report_path}", report_path or "{report_path}")
 

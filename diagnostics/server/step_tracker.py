@@ -26,10 +26,17 @@ def format_tool_args(args: dict, tool_name: str = "") -> str:
                 items.append(str(t)[:40])
         suffix = f" +{len(todos)-3}" if len(todos) > 3 else ""
         return "; ".join(items) + suffix
-    # Path/file: show basename for readability
+    # Path/file: show basename for readability.
+    # For skills paths, include parent dir to distinguish which skill is being read.
     path = args.get("path") or args.get("file_path") or args.get("filename")
     if isinstance(path, str) and path.strip():
-        return path.rsplit("/", 1)[-1] if "/" in path else path
+        if "/" in path:
+            basename = path.rsplit("/", 1)[-1]
+            parent = path.rsplit("/", 2)[-2] if path.count("/") >= 2 else ""
+            if "/skills/" in path and parent:
+                return f"{parent}/{basename}"
+            return basename
+        return path
     # Namespace
     ns = args.get("namespace")
     if isinstance(ns, str) and ns.strip():

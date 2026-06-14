@@ -1,11 +1,19 @@
-"""System overview, CPU, memory, and process diagnostic tools."""
+"""Mock host-level diagnostic tools — CPU, memory, disk, network, processes, and system overview.
+
+One-to-one correspondence: live/hosts.py
+"""
 
 from langchain_core.tools import tool
 
-from diagnostics.tools.data import (
-    cpu_data, memory_data, processes_data, _load_avg,
+from diagnostics.tools.mock.data import (
+    _load_avg,
+    cpu_data,
+    disk_data,
+    memory_data,
+    network_data,
+    processes_data,
 )
-from diagnostics.tools.scenarios import AVAILABLE_SCENARIOS, _active_scenario
+from diagnostics.tools.mock.scenarios import AVAILABLE_SCENARIOS, _active_scenario
 
 
 @tool
@@ -36,6 +44,18 @@ def check_cpu() -> str:
 def check_memory() -> str:
     """Check memory usage, swap, and /proc/meminfo highlights."""
     return memory_data(_active_scenario)
+
+
+@tool
+def check_disk() -> str:
+    """Check disk IO performance, utilization, latency (iostat), and filesystem usage (df)."""
+    return disk_data(_active_scenario)
+
+
+@tool
+def check_network() -> str:
+    """Check network connections (ss), interface stats, errors, drops, and TCP retransmits."""
+    return network_data(_active_scenario)
 
 
 @tool

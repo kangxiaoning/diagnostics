@@ -18,6 +18,7 @@ from diagnostics.agent.streaming import stream_agent_events
 from diagnostics.config import STATIC_DIR, Settings
 from diagnostics.server.schemas import ChatRequest
 from diagnostics.server.sessions import SessionStore
+from diagnostics.server.skills_db import get_all_skills, init_db, sync_skills_from_disk
 from diagnostics.server.sse import sse
 from diagnostics.server.step_tracker import TreeBuilder
 
@@ -28,6 +29,10 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     settings = settings or Settings.from_env()
     agent = agent or build_agent(settings)
     sessions = SessionStore()
+
+    # Initialize skills database on startup
+    init_db()
+    sync_skills_from_disk()
 
     app = FastAPI(title=settings.app_title)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -44,6 +49,11 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
             "base_url": settings.base_url,
             "api_key_configured": str(settings.api_key_configured).lower(),
         }
+
+    @app.get("/api/skills")
+    async def list_skills() -> list[dict[str, str]]:
+        """Return all diagnostic skills for the frontend / command picker."""
+        return get_all_skills()
 
     @app.post("/api/sessions/{session_id}/cancel")
     async def cancel_session(session_id: str) -> dict[str, str]:

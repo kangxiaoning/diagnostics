@@ -43,7 +43,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 /* ════════════════ Layout ════════════════ */
 .app { display: flex; height: 100vh; }
 #chatPanel {
-  width: 50%; flex-shrink: 0; min-width: 360px; max-width: 60%;
+  width: 30%; flex-shrink: 0; min-width: 320px; max-width: 80%;
   display: flex; flex-direction: column;
   background: var(--surface);
   border-right: 1px solid var(--border);
@@ -418,5 +418,52 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+/* ════════════════ Skills Picker ( / command ) ════════════════ */
+.skills-bar {
+  padding: 8px 24px 0;
+  display: flex; gap: 6px; flex-wrap: wrap;
+  align-items: center;
+}
+.skills-bar .skill-tag {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 3px 10px; border-radius: 12px;
+  font-size: 11px; font-weight: 500;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid rgba(94,106,210,0.15);
+  cursor: pointer; user-select: none;
+  transition: background 0.15s;
+}
+.skills-bar .skill-tag:hover { background: rgba(94,106,210,0.15); }
+.skills-bar .skill-tag .skill-remove {
+  font-size: 14px; line-height: 1; margin-left: 2px;
+  opacity: 0.5; cursor: pointer;
+}
+.skills-bar .skill-tag .skill-remove:hover { opacity: 1; }
+.skill-suggestions {
+  display: none; position: absolute; z-index: 100;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+  max-height: 240px; overflow-y: auto; min-width: 280px;
+}
+.skill-suggestions.open { display: block; }
+.skill-suggestions .skill-item {
+  padding: 8px 12px; font-size: 12px; cursor: pointer;
+  display: flex; align-items: center; gap: 8px;
+}
+.skill-suggestions .skill-item:hover, .skill-suggestions .skill-item.active {
+  background: var(--accent-soft);
+}
+.skill-suggestions .skill-item .skill-name {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--accent); font-weight: 600;
+  white-space: nowrap; flex-shrink: 0;
+}
+.skill-suggestions .skill-item .skill-desc {
+  font-size: 11px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.composer-wrapper { position: relative; }
 
 @media (max-width: 860px) { .graph { display: none; } }

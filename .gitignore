@@ -6,3 +6,7 @@ __pycache__/
 .idea/
 log/*
 !log/.gitkeep
+agent_data/skills.db
+agent_data/reports/
+MILESTONES.md
+SYSTEM_DESIGN.md

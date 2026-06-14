@@ -33,16 +33,14 @@
         <div id="messages" class="messages"></div>
 
         <form id="chatForm" class="composer">
-          <textarea id="promptInput" rows="8" autocomplete="off"
-            placeholder="输入诊断问题，例如：
-【诊断对象】ACK 集群 prod-cluster / namespace default / deployment java-backend
-【故障时段】2026-06-06 14:30 起
-【运行负载】Spring Boot 应用，单 Pod memory limit=512Mi
-
-deployment java-backend 从下午 2 点半开始频繁重启，每小时重启 10+ 次，
-describe 显示 OOMKilled，但设置的 memory limit 是 512Mi，
-不确定是代码内存泄漏还是 limit 设太小。"
-            required></textarea>
+          <div class="skills-bar" id="skillsBar"></div>
+          <div class="composer-wrapper">
+            <textarea id="promptInput" rows="3" autocomplete="off"
+              placeholder="输入诊断问题，按 / 选择技能进行定向诊断
+例如：集群 prod-us-east worker-5 和 worker-8 变成 NotReady，Pod 被驱逐"
+              required></textarea>
+            <div class="skill-suggestions" id="skillSuggestions"></div>
+          </div>
           <div class="composer-actions">
             <span class="composer-hint">⌘↵ 发送 · 描述你观察到的症状，Agent 将逐步采集数据并给出诊断</span>
             <button id="actionBtn" type="submit" title="发送 (⌘↵)">

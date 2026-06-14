@@ -355,15 +355,27 @@ Events: Node worker-2 status is Unknown. Kubelet stopped posting node status.
 dmesg: oom-killer killed process kubelet (Virt:4194304kB, RSS:245760kB)
 说明: 系统OOM Killer终止了kubelet进程，节点失联，所有Pod状态Unknown"""
     if scenario == "conntrack_table_full":
-        return """NAMESPACE  NAME                    READY STATUS   RESTARTS AGE
-default    api-gateway-abc12       1/1   Running 5        2d (频繁重启!)
-default    api-gateway-def34       1/1   Running 3        2d (频繁重启!)
-default    nginx-7d8b-jkl78        1/1   Running 0        3d
-kube-system coredns-6d4b-mnp90     1/1   Running 0        7d
-Events: api-gateway: Readiness probe failed (DNS lookup timeout 5s)
-Events: api-gateway: Liveness probe failed (connection refused after conntrack drop)
-dmesg: nf_conntrack: table full (131072/131072 entries), dropping packet
-说明: conntrack表满导致UDP DNS查询和TCP连接被内核丢弃→探针超时→Pod重启"""
+        return """NAMESPACE  NAME                    READY STATUS             RESTARTS AGE
+default    api-gateway-abc12       0/1   CrashLoopBackOff   5        2d (DNS超时→探针失败!)
+default    api-gateway-def34       0/1   CrashLoopBackOff   3        2d (DNS超时→探针失败!)
+default    user-service-xyz12      0/1   Unknown            0        2d (worker-5上, 因Node NotReady被驱逐!)
+default    user-service-xyz34      1/1   Running            0        2d (worker-1上, 正常)
+default    order-service-pqr99     0/1   Unknown            0        5d (worker-8上, 因Node NotReady被驱逐!)
+default    order-service-pqr77     1/1   Running            0        5d (worker-4上, 正常)
+default    payment-svc-lmn45       0/1   Unknown            0        3d (worker-5上, 因Node NotReady被驱逐!)
+default    notification-svc-cde89  0/1   Unknown            0        1d (worker-8上, 因Node NotReady被驱逐!)
+default    nginx-7d8b-jkl78        1/1   Running            0        3d
+kube-system coredns-6d4b-xyz11     1/1   Running            0        7d (worker-1, 正常)
+kube-system coredns-6d4b-abc99     0/1   Unknown            0        7d (worker-5上, 失联!)
+kube-system coredns-6d4b-def88     0/1   Unknown            0        7d (worker-8上, 失联!)
+api-gateway Events: State=CrashLoopBackOff LastState=Terminated(exit:143, SIGTERM)
+  Readiness probe failed: DNS lookup timeout (5s) for backend.default.svc
+  Liveness probe failed: connection refused after conntrack drop
+worker-5/8 Events: Node NotReady — kubelet unreachable (connection tracking table full)
+  nf_conntrack: table full (131072/131072 entries) dropping packet
+  Total pods evicted: 30+ (all pods on worker-5 and worker-8)
+说明: conntrack表满导致UDP DNS查询被内核丢弃→CoreDNS DNS超时→探针失败→Pod重启
+  同时conntrack表满也阻塞kubelet到API Server的心跳→worker-5/8 节点NotReady→Pod批量驱逐"""
     if scenario == "cpu_throttle_probe_failure":
         return """NAMESPACE  NAME                    READY STATUS             RESTARTS AGE
 default    java-backend-abc12      1/1   Running            8        2d (频繁重启!)
@@ -461,11 +473,23 @@ worker-2      NotReady   20%  95%  Ready=Unknown(Reason:NodeStatusUnknown)
                                    Kubelet last heartbeat: 5m12s ago (长时间失联!)
 说明: worker-2 Kubelet被OOM Killer终止，节点完全失联，所有条件Unknown"""
     if scenario == "conntrack_table_full":
-        return """NAME          STATUS  CPU% MEM% CONDITIONS
-master-1      Ready   30%  50%  -
-worker-1      Ready   45%  55%  NetworkUnavailable=False
-worker-2      Ready   35%  52%  NetworkUnavailable=True (conntrack table full!)
-说明: 节点表面Ready，但NetworkUnavailable因conntrack表满被标记—需查看dmesg"""
+        return """NAME          STATUS     CPU% MEM% CONDITIONS
+master-1      Ready      30%  50%  -
+worker-1      Ready      45%  55%  -
+worker-2      Ready      40%  52%  -
+worker-3      Ready      38%  50%  -
+worker-4      Ready      42%  58%  -
+worker-5      NotReady   35%  62%  Ready=Unknown(Reason:NodeStatusUnknown)
+                                   NetworkUnavailable=Unknown
+                                   Kubelet stopped posting node status (conntrack table full!)
+worker-6      Ready      32%  48%  -
+worker-7      Ready      36%  54%  -
+worker-8      NotReady   28%  60%  Ready=Unknown(Reason:NodeStatusUnknown)
+                                   NetworkUnavailable=Unknown
+                                   Kubelet stopped posting node status (conntrack table full!)
+说明: worker-5和worker-8 NotReady—conntrack表满阻塞kubelet到API Server心跳
+  2个CoreDNS副本(位于worker-5/8)失联，DNS可用副本从3降至1→间歇超时
+  30+个Pod被驱逐(NodeController eviction after 5min timeout)"""
     if scenario == "cpu_throttle_probe_failure":
         return """NAME          STATUS  CPU% MEM% CONDITIONS
 master-1      Ready   30%  50%  -

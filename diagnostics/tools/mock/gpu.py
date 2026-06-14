@@ -1,13 +1,16 @@
-"""GPU diagnostic tools: health, memory, and utilization."""
+"""Mock GPU diagnostic tools — health, memory, and utilization.
+
+One-to-one correspondence: live/gpu.py
+"""
 
 from langchain_core.tools import tool
 
-from diagnostics.tools.data import (
+from diagnostics.tools.mock.data import (
     gpu_health_data,
     gpu_memory_data,
     gpu_utilization_data,
 )
-from diagnostics.tools.scenarios import _active_scenario
+from diagnostics.tools.mock.scenarios import _active_scenario
 
 
 @tool
