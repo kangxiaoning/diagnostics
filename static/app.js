@@ -199,10 +199,10 @@ function openSuggestions(filterText) {
     skillSuggestions.appendChild(item);
   }
 
-  // Position below the current slash in the textarea
+  // Position below the textarea so it doesn't cover the input
   const textareaRect = inputEl.getBoundingClientRect();
   const wrapperRect = inputEl.parentElement.getBoundingClientRect();
-  skillSuggestions.style.top = (textareaRect.top - wrapperRect.top + 28) + "px";
+  skillSuggestions.style.top = (textareaRect.bottom - wrapperRect.top + 2) + "px";
   skillSuggestions.style.left = (textareaRect.left - wrapperRect.left) + "px";
   skillSuggestions.style.width = Math.min(textareaRect.width, 360) + "px";
 
