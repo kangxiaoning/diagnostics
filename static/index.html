@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
     <title>Diagnostics</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
@@ -36,8 +37,8 @@
           <div class="skills-bar" id="skillsBar"></div>
           <div class="composer-wrapper">
             <textarea id="promptInput" rows="3" autocomplete="off"
-              placeholder="输入诊断问题，按 / 选择技能进行定向诊断
-例如：集群 prod-us-east worker-5 和 worker-8 变成 NotReady，Pod 被驱逐"
+              placeholder="输入故障现象，按 / 选择诊断技能
+例如：prod-us-east 集群 worker-5/8 NotReady，Pod 被驱逐，dmesg 显示 conntrack table full"
               required></textarea>
             <div class="skill-suggestions" id="skillSuggestions"></div>
           </div>

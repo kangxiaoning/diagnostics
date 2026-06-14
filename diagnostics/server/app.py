@@ -37,6 +37,10 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     app = FastAPI(title=settings.app_title)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    @app.get("/favicon.ico")
+    async def favicon():
+        return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+
     @app.get("/")
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")

@@ -237,7 +237,8 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .composer textarea::placeholder {
-  color: var(--text-3); font-size: 12px; line-height: 1.8; white-space: pre-line;
+  color: var(--text-3); font-size: 12px; line-height: 1.8;
+  white-space: pre-wrap; overflow-wrap: break-word; word-break: break-word;
 }
 .composer-actions {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;

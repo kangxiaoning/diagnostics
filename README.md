@@ -1,6 +1,6 @@
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
-一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 8 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
+一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 7 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 3:7 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
 
 ![界面截图 1](static/1.png)
 ![界面截图 2](static/2.png)
@@ -36,8 +36,10 @@
   - [诊断树可视化](#诊断树可视化)
   - [思考过程折叠面板](#思考过程折叠面板)
   - [工具详情弹窗](#工具详情弹窗)
+- [技能选择器](#技能选择器)
 - [项目结构](#项目结构)
 - [配置](#配置)
+- [License](#license)
 
 ## 架构概览
 
@@ -612,12 +614,11 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
 
 使用 `deepagents` 的 `create_deep_agent()` 构建主 Agent，核心配置如下：
 
-- **8 个 Subagent**（系统层 + K8s 组件层）：
+- **7 个 Subagent**（系统层 + K8s 层）：
   - 系统层：`cpu-expert`, `memory-expert`, `disk-io-expert`, `network-expert`, `gpu-expert`
-  - K8s 组件层（按 Kubernetes 官方排障模型拆分）：
-    - `k8s-control-plane-expert` — API Server、etcd、scheduler、controller-manager
-    - `k8s-workload-expert` — Pod 生命周期、OOMKilled、资源限制
-    - `k8s-node-expert` — 节点状态、kubelet、压力驱逐
+  - K8s 层（二合一，遵循 Kubernetes 控制面/数据面边界）：
+    - `k8s-cluster-expert` — 集群基础设施：控制面 + 节点 + CoreDNS + etcd + 跨层级联
+    - `k8s-workload-expert` — 工作负载：Pod/Deployment/Service/Helm 应用层诊断
 - **双层存储 Backend**：`CompositeBackend` — `/agent_data/` 路径 Route 到 `FilesystemBackend`（虚拟文件系统，支持 `read_file`/`write_file`/`edit_file`），其他使用 `StateBackend`（内存 State）。所有诊断报告通过此 Backend 写入 `reports/` 目录层级归档。
 - **报告目录初始化**：`build_agent()` 时自动创建 `agent_data/reports/hosts/` 和 `agent_data/reports/kubernetes/` 目录，确保 Agent 首次写入就绪。
 - **Memory 与 Skill 加载**：
@@ -787,6 +788,21 @@ msg-bubble
 - 执行 Status（pending / running / completed / error）
 - Tool Call ID（用于调试追踪）
 
+## 技能选择器
+
+在输入框中输入 `/` 即可调出技能列表，支持键盘导航和模糊搜索：
+
+![技能选择](static/select-skill.png)
+
+- **`/`** — 弹出全部 19 个诊断技能
+- **继续输入** — 实时过滤，按 ID/名称/描述模糊匹配
+- **`↓` `↑`** — 键盘上下选择
+- **`Enter`** — 确认选中
+- **`Esc`** — 关闭列表
+- **选中后** — 以 `@skill:xxx` 前缀注入消息，触发技能驱动诊断模式（严格按 SKILL.md Workflow 步骤执行）
+
+技能数据来自 SQLite 数据库，服务启动时自动从 `agent_data/skills/*/SKILL.md` 同步。
+
 ## 项目结构
 
 ```
@@ -806,16 +822,23 @@ diagnostics/
 │   │   ├── schemas.py               # ChatRequest 模型
 │   │   ├── sessions.py              # 内存会话存储
 │   │   ├── sse.py                   # SSE 格式化
-│   │   └── step_tracker.py          # TreeBuilder: 树构建器 + 工具标签映射
+│   │   ├── step_tracker.py          # TreeBuilder: 树构建器 + 工具标签映射
+│   │   └── skills_db.py             # SQLite 技能数据库
 │   └── tools/
-│       ├── data.py                  # 按场景组织的 Mock 诊断数据
-│       ├── scenarios.py             # 21个诊断场景管理
+│       ├── __init__.py
 │       ├── registry.py              # 工具注册表
-│       ├── system_tools.py          # CPU/内存/进程工具
-│       ├── storage_tools.py         # 磁盘IO工具
-│       ├── network_tools.py         # 网络诊断工具
-│       ├── gpu_tools.py             # GPU诊断工具
-│       └── kubernetes_tools.py      # K8s ControlPlane/Pod/Node诊断工具
+│       ├── live/                    # 生产环境工具
+│       │   ├── hosts.py             # 主机级诊断
+│       │   ├── gpu.py               # GPU诊断
+│       │   ├── kubernetes.py        # K8s kubectl工具
+│       │   └── scripts/             # 12个诊断Shell脚本
+│       └── mock/                    # 本地测试工具（与live一一对应）
+│           ├── data.py              # 场景数据工厂
+│           ├── scenarios.py         # 场景管理
+│           ├── hosts.py             # 主机级Mock工具
+│           ├── gpu.py               # GPU Mock工具
+│           ├── kubernetes.py        # K8s Mock工具
+│           └── registry.py          # Mock工具注册
 ├── agent_data/
 │   ├── AGENTS.md                    # 诊断方法论（全局记忆）
 │   ├── LEARNINGS.md                 # 历史经验（Agent自动更新，跨实体通用模式）
@@ -827,7 +850,8 @@ diagnostics/
 ├── static/
 │   ├── index.html                   # 双栏布局页面
 │   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格多轮折叠块
-│   └── styles.css                   # 完整设计系统
+│   ├── styles.css                   # 完整设计系统
+│   └── favicon.svg                  # 站点图标
 └── log/                             # 日志目录
 ```
 
@@ -842,3 +866,7 @@ diagnostics/
 | `DIAGNOSTICS_API_KEY` | `lm-studio` | API 密钥（也支持 `LM_STUDIO_API_KEY`、`LM_API_TOKEN`） |
 | `DIAGNOSTICS_TEMPERATURE` | `0.2` | LLM 温度参数 |
 | `DIAGNOSTICS_MAX_HISTORY_MESSAGES` | `16` | 上下文窗口大小 |
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
