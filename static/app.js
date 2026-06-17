@@ -55,6 +55,9 @@ let activeAnswerBody = null;
 let activeCursor = null;
 let answerRawText = "";
 let userScrolledUp = false;
+let _lastActivity = Date.now();
+let _stalenessTimer = null;
+const STALE_THRESHOLD_MS = 25_000;  // warn after 25s of silence
 
 // ── Graph state ──
 const GRAPH = {
@@ -72,6 +75,299 @@ inputEl.addEventListener("input", () => {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 140) + "px";
 });
 
+// ═══════════════════ History ═══════════════════
+const historyBarList = document.getElementById("historyBarList");
+const historyViewer = document.getElementById("historyViewer");
+const historyBack = document.getElementById("historyBack");
+const historyViewerTitle = document.getElementById("historyViewerTitle");
+const historyReport = document.getElementById("historyReport");
+const historyGraph = document.getElementById("historyGraph");
+const historyNodes = document.getElementById("historyNodes");
+const historyEdges = document.getElementById("historyEdges");
+
+// Load history list on page load
+loadHistoryList();
+
+historyBack.addEventListener("click", () => {
+  historyViewer.classList.add("hidden");
+  _historyGraph = null;
+  clearTimeout(_historyDrawTimer);
+  graphCanvas.style.display = "";
+  graphEmpty.style.display = GRAPH.hasContent ? "none" : "";
+  // Refresh main graph edges after layout
+  if (GRAPH.hasContent) {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => drawAllEdges());
+    });
+  }
+});
+
+async function loadHistoryList() {
+  historyBarList.innerHTML = '<div class="history-item-placeholder">加载中...</div>';
+  try {
+    const resp = await fetch("/api/history");
+    if (!resp.ok) throw new Error("Failed");
+    const data = await resp.json();
+    if (data.length === 0) {
+      historyBarList.innerHTML = '<div class="history-item-placeholder">暂无历史记录</div>';
+      return;
+    }
+    historyBarList.innerHTML = "";
+    for (const item of data) {
+      const div = document.createElement("div");
+      div.className = "history-bar-item";
+      const dur = item.duration_secs ? Math.round(item.duration_secs) + "s" : "";
+      const tools = item.event_counts?.tool_start || 0;
+      const toolsStr = item.duration_secs !== null ? ` · ${tools} tools` : "";
+      const fname = (item.report_file || "").split("/").pop() || "";
+      div.innerHTML = `
+        <div class="history-bar-item-title" title="${esc(item.entity_type + '/' + item.entity_name + ' — ' + fname)}">${esc(fname)}</div>
+        <div class="history-bar-item-meta">${esc(item.entity_type || "")}/${esc(item.entity_name || "")} · ${dur}${toolsStr}</div>
+      `;
+      div.addEventListener("click", () => openHistory(item));
+      historyBarList.appendChild(div);
+    }
+  } catch (e) {
+    historyBarList.innerHTML = '<div class="history-item-placeholder" style="color:var(--red)">加载失败</div>';
+  }
+}
+
+async function openHistory(item) {
+  console.log("openHistory called, report_file:", item.report_file);
+  historyViewer.classList.remove("hidden");
+  const durText = item.duration_secs ? ` · ${Math.round(item.duration_secs)}s` : "";
+  historyViewerTitle.textContent = `${item.entity_type}/${item.entity_name}${durText}`;
+  graphCanvas.style.display = "none";
+
+  // Load report
+  historyReport.innerHTML = '<p style="color:var(--text-3)">加载报告...</p>';
+  try {
+    console.log("Fetching report:", item.report_file);
+    const url = `/api/report/${encodeURI(item.report_file || "")}`;
+    const resp = await fetch(url);
+    console.log("Report fetch status:", resp.status, resp.ok);
+    if (resp.ok) {
+      const data = await resp.json();
+      console.log("Report loaded, chars:", (data.content || "").length);
+      historyReport.innerHTML = renderMarkdown(data.content || "");
+    } else {
+      const errText = await resp.text().catch(() => "");
+      console.warn("Report not found:", resp.status, errText);
+      historyReport.innerHTML = '<p style="color:var(--text-3)">报告未生成</p>';
+    }
+  } catch (e) {
+    console.error("Report fetch error:", e);
+    historyReport.innerHTML = '<p style="color:var(--red)">加载失败: ' + esc(String(e).slice(0, 80)) + '</p>';
+  }
+
+  // Render graph from saved tree (or show empty state)
+  console.log("tree steps:", item.tree?.steps?.length);
+  if (item.tree?.steps?.length) {
+    renderHistoryGraph(item.tree.steps);
+  } else {
+    historyNodes.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:12px"><p>无诊断过程数据<br>（此报告为功能上线前生成）</p></div>';
+  }
+}
+
+function renderHistoryGraph(steps) {
+  historyNodes.innerHTML = "";
+  historyEdges.innerHTML = "";
+
+  // Build a temporary graph from saved steps
+  // Saved JSON uses Python snake_case; normalize to camelCase for
+  // _buildLevelsFrom / createNodeDOM which expect parentId, nodeType, etc.
+  const hg = { nodes: new Map(), edges: [], nodeOrder: [], hasContent: true };
+  for (const s of steps) {
+    const parentIds = s.parent_ids || (s.parent_id ? [s.parent_id] : []);
+    hg.nodes.set(s.id, {
+      id: s.id,
+      title: s.title,
+      parentId: s.parent_id || null,
+      parentIds: parentIds,
+      status: "completed",
+      nodeType: s.node_type || "tool",
+      description: s.description || "",
+      detail: s.detail || "",
+      toolName: s.tool_name || "",
+      toolArgs: s.tool_args || "",
+      el: null,
+    });
+    hg.nodeOrder.push(s.id);
+    for (const pid of parentIds) {
+      if (pid) hg.edges.push({ from: pid, to: s.id });
+    }
+  }
+
+  // Swap GRAPH to the history graph so buildLevels/renderTree use it
+  const origMap = GRAPH.nodes, origOrder = GRAPH.nodeOrder, origEdges = GRAPH.edges, origHas = GRAPH.hasContent;
+  GRAPH.nodes = hg.nodes;
+  GRAPH.nodeOrder = hg.nodeOrder;
+  GRAPH.edges = hg.edges;
+  GRAPH.hasContent = true;
+
+  // Swap DOM refs so renderTree draws into history DOM
+  const origNodes = graphNodes, origEdgesRef = graphEdges;
+
+  // Temporarily override: closures capture the variable, need to use Object.defineProperty or a getter
+  // Actually, since graphNodes/graphEdges are const DOM refs, we can't reassign them.
+  // Use a different approach: call the render functions directly with the history graph.
+  _renderTreeTo(hg.nodes, hg.nodeOrder, hg.edges, historyNodes, historyEdges);
+
+  GRAPH.nodes = origMap;
+  GRAPH.nodeOrder = origOrder;
+  GRAPH.edges = origEdges;
+  GRAPH.hasContent = origHas;
+
+  // Draw edges into history SVG
+  drawHistoryEdges(hg);
+}
+
+// Standalone tree renderer for history (doesn't rely on globals)
+function _renderTreeTo(nodes, nodeOrder, edges, targetNodes, targetEdges) {
+  targetNodes.innerHTML = "";
+  const levels = _buildLevelsFrom(nodes, nodeOrder, edges);
+
+  const container = document.createElement("div");
+  container.className = "tree-container";
+
+  for (let li = 0; li < levels.length; li++) {
+    const level = levels[li];
+    const levelEl = document.createElement("div");
+    levelEl.className = "tree-level";
+
+    for (const nodeId of level) {
+      const node = nodes.get(nodeId);
+      if (!node) continue;
+      const el = createNodeDOM(node);
+      levelEl.appendChild(el);
+      node.el = el;
+    }
+    container.appendChild(levelEl);
+    if (li < levels.length - 1) {
+      const cn = document.createElement("div");
+      cn.className = "tree-connector";
+      container.appendChild(cn);
+    }
+  }
+  targetNodes.appendChild(container);
+  targetEdges.innerHTML = "";
+}
+
+function _buildLevelsFrom(nodes, nodeOrder, edges) {
+  const levels = [];
+  const visited = new Set();
+  const roots = [];
+  for (const id of nodeOrder) {
+    const node = nodes.get(id);
+    if (node && !node.parentId) roots.push(id);
+  }
+  if (roots.length === 0 && nodeOrder.length > 0) roots.push(nodeOrder[0]);
+  const queue = [...roots];
+  for (const r of roots) visited.add(r);
+  levels.push([...roots]);
+
+  while (queue.length > 0) {
+    const currentLevel = [...queue];
+    queue.length = 0;
+    const nextLevel = [];
+    for (const parentId of currentLevel) {
+      for (const id of nodeOrder) {
+        if (visited.has(id)) continue;
+        const node = nodes.get(id);
+        if (!node) continue;
+        if ((node.parentIds || []).includes(parentId) || node.parentId === parentId) {
+          nextLevel.push(id);
+          visited.add(id);
+        }
+      }
+    }
+    if (nextLevel.length === 0) break;
+    levels.push([...new Set(nextLevel)]);
+    queue.push(...nextLevel);
+  }
+  return levels;
+}
+
+let _historyGraph = null;   // reference to current history graph for redraws
+let _historyDrawTimer = null;
+
+function drawHistoryEdges(g) {
+  _historyGraph = g;
+  clearTimeout(_historyDrawTimer);
+  _historyDrawTimer = setTimeout(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => _redrawHistoryEdges());
+    });
+  }, 5);
+}
+
+function _redrawHistoryEdges() {
+  const g = _historyGraph;
+  if (!g) return;
+  const svg = historyEdges;
+  const graphEl = document.getElementById("historyGraph");
+  const gr = graphEl.getBoundingClientRect();
+  if (gr.width === 0 || gr.height === 0) {
+    // DOM not laid out yet — retry next frame
+    requestAnimationFrame(() => _redrawHistoryEdges());
+    return;
+  }
+  const sx = graphEl.scrollLeft, sy = graphEl.scrollTop;
+  svg.setAttribute("viewBox", `0 0 ${graphEl.scrollWidth} ${graphEl.scrollHeight}`);
+  svg.setAttribute("width", graphEl.scrollWidth);
+  svg.setAttribute("height", graphEl.scrollHeight);
+
+  let totalW = 0, count = 0;
+  for (const n of g.nodes.values()) {
+    if (n.el) { totalW += n.el.getBoundingClientRect().width; count++; }
+  }
+  const avgW = count > 0 ? totalW / count : 200;
+  const scale = avgW / 200;
+  const arrowW = Math.round(5 * scale), arrowH = Math.round(4 * scale), refX = Math.round(4.2 * scale);
+  const baseSw = Math.max(1.2, 1.6 * scale);
+
+  let content = `<defs>
+    <marker id="historyArrow" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${refX}" refY="${arrowH/2}" orient="auto">
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#4ade80"/>
+    </marker>
+  </defs>`;
+
+  for (const edge of g.edges) {
+    const fn = g.nodes.get(edge.from), tn = g.nodes.get(edge.to);
+    if (!fn?.el || !tn?.el) continue;
+    const fr = fn.el.getBoundingClientRect(), tr = tn.el.getBoundingClientRect();
+    if (fr.width === 0 || tr.width === 0) continue;
+    // For history, all nodes are "completed" → green edges
+    const strokeColor = "#4ade80";
+    const x1 = fr.left - gr.left + fr.width / 2 + sx;
+    const y1 = fr.bottom - gr.top + sy;
+    const x2 = tr.left - gr.left + tr.width / 2 + sx;
+    const y2 = tr.top - gr.top + sy;
+    const midY1 = y1 + Math.max(20, (y2 - y1) * 0.35);
+    const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
+    content += `<path
+      d="M${x1},${y1} C${x1},${midY1} ${x2},${midY2} ${x2},${y2}"
+      stroke="${strokeColor}" stroke-width="${baseSw.toFixed(1)}"
+      fill="none" stroke-linecap="round" marker-end="url(#historyArrow)"/>`;
+  }
+  svg.innerHTML = content;
+}
+
+// Redraw history edges on resize or scroll
+window.addEventListener("resize", () => {
+  if (_historyGraph) {
+    clearTimeout(_historyDrawTimer);
+    _historyDrawTimer = setTimeout(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => _redrawHistoryEdges());
+      });
+    }, 8);
+  }
+});
+document.getElementById("historyGraph")?.addEventListener("scroll", () => {
+  if (_historyGraph) _redrawHistoryEdges();
+});
+
 // ── Resizer (draggable divider) ──
 const chatPanel = document.getElementById("chatPanel");
 const resizer = document.getElementById("resizer");
@@ -85,22 +381,59 @@ resizer.addEventListener("mousedown", (e) => {
   e.preventDefault();
 });
 
+// ── History Resizer (draggable divider between report & graph) ──
+const historyResizer = document.getElementById("historyResizer");
+let isHistoryResizing = false;
+
+if (historyResizer) {
+  historyResizer.addEventListener("mousedown", (e) => {
+    isHistoryResizing = true;
+    historyResizer.classList.add("active");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+}
+
+// ── Unified mousemove for both resizers ──
 document.addEventListener("mousemove", (e) => {
-  if (!isResizing) return;
-  const appRect = document.querySelector(".app").getBoundingClientRect();
-  const pct = ((e.clientX - appRect.left) / appRect.width) * 100;
-  const clamped = Math.max(15, Math.min(75, pct));
-  chatPanel.style.width = clamped + "%";
+  if (isHistoryResizing) {
+    const bodyRect = document.querySelector(".history-viewer-body").getBoundingClientRect();
+    const pct = ((e.clientX - bodyRect.left) / bodyRect.width) * 100;
+    const clamped = Math.max(20, Math.min(80, pct));
+    historyReport.style.flex = `0 0 ${clamped}%`;
+    historyGraph.style.flex = `0 0 ${100 - clamped}%`;
+  }
+  if (isResizing) {
+    const appRect = document.querySelector(".app").getBoundingClientRect();
+    const pct = ((e.clientX - appRect.left) / appRect.width) * 100;
+    const clamped = Math.max(15, Math.min(75, pct));
+    chatPanel.style.width = clamped + "%";
+  }
 });
 
+// ── Unified mouseup for both resizers ──
 document.addEventListener("mouseup", () => {
-  if (!isResizing) return;
-  isResizing = false;
-  resizer.classList.remove("active");
-  document.body.style.cursor = "";
-  document.body.style.userSelect = "";
-  if (GRAPH.hasContent) {
-    requestAnimationFrame(() => drawAllEdges());
+  if (isHistoryResizing) {
+    isHistoryResizing = false;
+    historyResizer.classList.remove("active");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    clearTimeout(_historyDrawTimer);
+    _historyDrawTimer = setTimeout(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => _redrawHistoryEdges());
+      });
+    }, 8);
+  }
+  if (isResizing) {
+    isResizing = false;
+    resizer.classList.remove("active");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    if (GRAPH.hasContent) {
+      requestAnimationFrame(() => drawAllEdges());
+    }
   }
 });
 
@@ -368,7 +701,28 @@ async function readSSE(body) {
   }
 }
 
+function _touchActivity() {
+  _lastActivity = Date.now();
+  setGraphStatus("running");
+}
+
+function _startStalenessCheck() {
+  if (_stalenessTimer) clearInterval(_stalenessTimer);
+  _touchActivity();
+  _stalenessTimer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - _lastActivity) / 1000);
+    if (elapsed >= STALE_THRESHOLD_MS / 1000) {
+      setGraphStatus("stale", `无新数据 ${elapsed}s`);
+    }
+  }, 3000);
+}
+
+function _stopStalenessCheck() {
+  if (_stalenessTimer) { clearInterval(_stalenessTimer); _stalenessTimer = null; }
+}
+
 function parseSSE(raw) {
+  _touchActivity();
   const lines = raw.split("\n");
   const ev = lines.find((l) => l.startsWith("event: "));
   const da = lines.find((l) => l.startsWith("data: "));
@@ -397,18 +751,28 @@ function parseSSE(raw) {
       break;
     case "agent_end":
       break;
+    case "heartbeat":
+      // System alive — reset staleness counter, show round info
+      _touchActivity();
+      if (payload.round) {
+        setGraphStatus("running", `第${payload.round}轮 · 等待中`);
+      }
+      break;
     case "done":
+      _stopStalenessCheck();
       setStatus("ready");
       finalizeGraph();
       finishStreamUI("done");
       break;
     case "error":
+      _stopStalenessCheck();
       appendEvent(payload.message);
       setStatus("error");
       setGraphStatus("idle");
       finishStreamUI("error");
       break;
     case "cancelled":
+      _stopStalenessCheck();
       setStatus("ready");
       setGraphStatus("idle");
       finishStreamUI("cancelled");
@@ -903,7 +1267,10 @@ function finalizeGraph() {
 
 function renderMarkdown(text) {
   if (!text) return "";
-  let out = text;
+  // Sanitize raw text BEFORE markdown processing so that
+  // user-supplied <tags> never reach innerHTML.  Markdown
+  // sigils (# * ` etc.) are untouched by escNoBr.
+  let out = escNoBr(text);
 
   // ── Phase 1: block-level elements ──
 
@@ -933,7 +1300,38 @@ function renderMarkdown(text) {
   // Blockquote > (processed before escNoBr)
   out = out.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
 
-  // ── Phase 2: lists — process lines into <ul>/<ol> blocks ──
+  // ── Phase 2: tables — detect consecutive |...| lines ──
+  {
+    const lines = out.split('\n');
+    let i = 0;
+    const result = [];
+    while (i < lines.length) {
+      // Try to match a table: at least 2 consecutive |...| lines
+      const tableStart = i;
+      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) i++;
+      const tableLines = lines.slice(tableStart, i);
+      if (tableLines.length === 0) {
+        // No pipe line here — pass through and advance
+        result.push(lines[i]);
+        i++;
+      } else if (tableLines.length >= 2 && tableLines[1].trim().match(/^\|[-: |]+\|$/)) {
+        // Valid table: [header, separator, ...rows]
+        const headerCells = tableLines[0].trim().split('|').filter(c => c.trim() !== '').map(c => `<th>${c.trim()}</th>`);
+        const headerRow = `<tr>${headerCells.join('')}</tr>`;
+        const dataRows = tableLines.slice(2).map(line => {
+          const cells = line.trim().split('|').filter(c => c !== '').map(c => `<td>${c.trim()}</td>`);
+          return `<tr>${cells.join('')}</tr>`;
+        });
+        result.push(`<table><thead>${headerRow}</thead><tbody>${dataRows.join('')}</tbody></table>`);
+      } else {
+        // Pipe line(s) but not a valid table — push back
+        for (const l of tableLines) result.push(l);
+      }
+    }
+    out = result.join('\n');
+  }
+
+  // ── Phase 3: lists — process lines into <ul>/<ol> blocks ──
   const lines = out.split('\n');
   let inUl = false, inOl = false;
   for (let i = 0; i < lines.length; i++) {
@@ -953,12 +1351,13 @@ function renderMarkdown(text) {
   if (inOl) lines[lines.length - 1] += '</ol>';
   out = lines.join('\n');
 
-  // ── Phase 3: paragraphs and cleanup ──
-  // Escape remaining special chars
-  out = escNoBr(out);
+  // ── Phase 4: paragraphs and cleanup ──
+  // (raw text already sanitized at entry point)
 
   // Double newline → paragraph break
   out = out.replace(/\n\n+/g, '</p><p>');
+  // Remaining single \n → line break (GFM-style)
+  out = out.replace(/\n/g, '<br>');
   out = '<p>' + out + '</p>';
 
   // Clean up empty paragraphs and artifacts
@@ -970,6 +1369,8 @@ function renderMarkdown(text) {
   out = out.replace(/(<\/pre>)<\/p>/g, '$1');
   out = out.replace(/<p>(<blockquote>)/g, '$1');
   out = out.replace(/(<\/blockquote>)<\/p>/g, '$1');
+  out = out.replace(/<p>(<table>)/g, '$1');
+  out = out.replace(/(<\/table>)<\/p>/g, '$1');
   out = out.replace(/<p>(<h[123]>)/g, '$1');
   out = out.replace(/(<\/h[123]>)<\/p>/g, '$1');
 
@@ -1043,6 +1444,7 @@ function appendEvent(text) {
 function setRunning(running) {
   inputEl.disabled = running;
   if (running) {
+    _startStalenessCheck();
     actionBtn.classList.add("running");
     actionBtn.innerHTML = '<span>停止</span>';
     actionBtn.disabled = false;
@@ -1050,6 +1452,7 @@ function setRunning(running) {
     setStatus("running");
     setGraphStatus("running");
   } else {
+    _stopStalenessCheck();
     actionBtn.classList.remove("running");
     actionBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg><span>发送</span>';
     actionBtn.disabled = false;
@@ -1063,8 +1466,9 @@ function setStatus(state) {
   statusLabel.className = "status-text" + (state === "running" ? " running" : state === "error" ? " error" : "");
 }
 
-function setGraphStatus(state) {
-  graphStatus.textContent = { idle: "等待任务", running: "执行中", done: "已完成" }[state] || state;
+function setGraphStatus(state, msg) {
+  const text = msg || { idle: "等待任务", running: "执行中", done: "已完成" }[state] || state;
+  graphStatus.textContent = text;
   graphStatus.className = "graph-status " + state;
 }
 

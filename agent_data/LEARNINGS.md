@@ -21,15 +21,29 @@
 ### 2026-06-14 prod-cluster — conntrack 表满 → 节点消失 → Pod 大量驱逐
 
 - **现象**：worker-5/worker-8 节点几分钟内先后 NotReady 后从集群列表消失，30+ Pod 被驱逐，CoreDNS 解析偶发超时
-- **排查路径**：get_cluster_overview → check_kubernetes_nodes → check_kubernetes_control_plane → check_network → check_etcd_health → 委派 network-expert + k8s-node-expert
+- **排查路径**：get_cluster_overview → check_kubernetes_nodes → check_kubernetes_control_plane → check_network → check_etcd_health → 委派 network-expert + k8s-cluster-expert
 - **根因**：worker-5/worker-8 主机 `nf_conntrack_max` 上限耗尽，内核丢弃 kubelet 心跳包导致节点失联
 - **特征信号**：
   - dmesg 中 `nf_conntrack: table full, dropping packet`（直接证据）
   - 节点从 API server 节点列表中完全消失（非 NotReady）
   - CoreDNS 解析偶发超时（DNS UDP 包被内核丢弃）
   - 控制面全部 Healthy + etcd NOSPACE 为 WARNING 级别 → 排除控制面故障
-- **关联复发**：与 2026-06-06 跨层故障链中的 conntrack 模式一致，但本次节点完全脱离集群（更严重）
+- **关联复发**：与 2026-06-16 prod-us-east conntrack 故障模式一致，同一根因复发
 - **关键教训**：集群稳定运行 8 个月后连接数累积可触发 conntrack 满；节点消失（非 NotReady）是 conntrack 满的严重级联结果；etcd NOSPACE 告警需独立处理，与 conntrack 满无直接因果
+
+### 2026-06-16 prod-us-east — conntrack 表满 → 节点脱离集群 → Pod 大量驱逐（复发，修复待执行）
+
+- **现象**：worker-5/worker-8 节点几分钟内先后 NotReady 后脱离集群，30+ Pod 被驱逐，生产服务不可用
+- **排查路径**：get_cluster_overview → check_kubernetes_nodes → check_kubernetes_control_plane → check_etcd_health → check_network → 委派 network-expert（conntrack-diagnosis）+ k8s-cluster-expert（cross-layer-diagnosis）
+- **根因**：`nf_conntrack_max` 默认值过低 + `nf_conntrack_tcp_timeout_established` 默认 5 天 → 连接缓慢累积 8 个月后耗尽
+- **特征信号**：
+  - dmesg 中 `nf_conntrack: table full, dropping packet`（直接证据）
+  - 节点完全脱离集群（非 NotReady）
+  - CoreDNS 解析偶发超时（DNS UDP 包被 conntrack 丢弃）
+  - 控制面 Healthy + etcd NOSPACE WARNING → 排除控制面故障
+- **关联复发**：与 2026-06-14 prod-cluster conntrack 故障模式一致，同一根因在不同集群复发
+- **关键教训**：生产集群部署时必须提前调优 conntrack 参数（nf_conntrack_max ≥ 524288，tcp_timeout ≤ 7200），不能依赖默认值；连接数累积是渐进式故障，监控告警需在达到 80% 时触发
+- **修复状态**：conntrack 参数修复和 etcd NOSPACE 处理待执行
 
 ---
 

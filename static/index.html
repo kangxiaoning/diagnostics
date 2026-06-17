@@ -31,6 +31,16 @@
             placeholder="主机名 或 集群名（如 server01, prod-cluster）" />
         </div>
 
+        <!-- History reports list (top-left, always visible) -->
+        <div class="history-bar" id="historyBar">
+          <div class="history-bar-header">
+            <h3>历史报告</h3>
+          </div>
+          <div class="history-bar-list" id="historyBarList">
+            <div class="history-item-placeholder">加载中...</div>
+          </div>
+        </div>
+
         <div id="messages" class="messages"></div>
 
         <form id="chatForm" class="composer">
@@ -79,6 +89,22 @@
             <button id="toolPopupClose" class="popup-close">&times;</button>
           </div>
           <div class="tool-popup-body" id="toolPopupBody"></div>
+        </div>
+
+        <!-- History Viewer (replaces graph area when viewing history) -->
+        <div id="historyViewer" class="history-viewer hidden">
+          <div class="history-viewer-header">
+            <button id="historyBack" class="history-back-btn">◀ 返回</button>
+            <span id="historyViewerTitle"></span>
+          </div>
+          <div class="history-viewer-body">
+            <div class="history-report" id="historyReport"></div>
+            <div class="history-resizer" id="historyResizer"></div>
+            <div class="history-graph" id="historyGraph">
+              <svg class="graph-edges" id="historyEdges"></svg>
+              <div class="graph-nodes" id="historyNodes"></div>
+            </div>
+          </div>
         </div>
       </aside>
     </div>

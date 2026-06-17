@@ -18,6 +18,14 @@
   - [报告命名规范](#报告命名规范)
   - [历史关联流程](#历史关联流程)
   - [关键实现](#关键实现)
+  - [历史诊断流程图持久化](#历史诊断流程图持久化)
+  - [设计动机](#设计动机-1)
+  - [数据结构](#数据结构)
+  - [关键实现](#关键实现-1)
+  - [API 端点](#api-端点)
+  - [前端数据流转](#前端数据流转)
+  - [历史报告页面 UI](#历史报告页面-ui)
+  - [Markdown 渲染](#markdown-渲染)
 - [动态诊断图：原理与实现](#动态诊断图原理与实现)
   - [设计哲学](#设计哲学)
   - [核心数据结构](#核心数据结构)
@@ -199,6 +207,130 @@ Frontend 选择实体类型 + 输入实体名
 - `prompt.py` 中报告路径用 `{report_path}` 占位，`make_system_prompt(report_path)` 在每次请求时格式化模板
 - `factory.py` 的 `build_agent()` 接受可选 `system_prompt` 参数，按请求动态构建 Agent
 - 文件名使用 `日期-时间-UUID` 格式，避免依赖 LLM 的症状总结，保证唯一且可追溯
+
+### 历史诊断流程图持久化
+
+除报告文本外，每次诊断的**完整执行树（流程图数据）**也随报告一同保存，支持事后回放诊断过程。
+
+#### 设计动机
+
+实时诊断图在 Page 刷新后即丢失——运维人员需要在事后复盘诊断路径、对比不同时间的诊断策略，或在报告页面中直观查看 Agent 的执行链路。因此诊断树数据结构在诊断结束时与报告一同序列化归档。
+
+#### 数据结构
+
+报告目录中同时存在两种文件：
+
+```
+agent_data/reports/kubernetes/prod-us-east/
+├── 2026-06-17-201851-6bc163c0.md              # Markdown 诊断报告
+└── 2026-06-17-201851-6bc163c0.result.json     # 诊断流程图 + 元数据
+```
+
+`result.json` 格式：
+
+```json
+{
+  "entity_type": "kubernetes",
+  "entity_name": "prod-us-east",
+  "duration_secs": 126.5,
+  "assistant_text_chars": 4793,
+  "event_counts": { "text_delta": 810, "tool_start": 44, "tool_end": 44 },
+  "report_file": "kubernetes/prod-us-east/2026-06-17-201851-6bc163c0.md",
+  "tree": {
+    "steps": [
+      {
+        "id": "n1",
+        "title": "第1轮智能分析",
+        "parent_id": null,
+        "parent_ids": [],
+        "status": "completed",
+        "node_type": "phase",
+        "description": "",
+        "tool_name": "",
+        "tool_args": ""
+      }
+    ]
+  }
+}
+```
+
+#### 关键实现
+
+**1. 序列化（`app.py` → `_save_result()`）**
+
+诊断流结束时，`TreeBuilder` 的完整节点数据通过 `_serialize_tree()` 提取为可序列化的字典列表，字段 `status` 和 `node_type` 取其 `.value`（字符串），与 Markdown 报告一起写入文件系统：
+
+```python
+def _save_result(report_path, tree, entity_type, entity_name, duration, ...):
+    data = {
+        "entity_type": entity_type,
+        "entity_name": entity_name,
+        "duration_secs": round(duration, 1),
+        "event_counts": dict(event_counters),
+        "tree": {"steps": _serialize_tree(tree)},
+    }
+    result_path = stem.with_suffix(".result.json")
+    result_path.write_text(json.dumps(data, ensure_ascii=False))
+```
+
+**2. API 端点**
+
+| 端点 | 用途 | 返回 |
+|---|---|---|
+| `GET /api/history` | 扫描 `reports/` 目录，列出所有历史会话 | 列表（含 `entity_type`、`entity_name`、`duration_secs`、`tree` 等） |
+| `GET /api/history/{result_file}` | 获取单个会话的完整诊断树 | `result.json` 全部内容 |
+| `GET /api/report/{report_file:path}` | 获取 Markdown 报告原文 | `{ "content": "..." }` |
+
+历史列表同时涵盖有 `result.json` 的完整记录和仅有 `.md` 的旧格式报告（后者无诊断图），按时间倒序排列。
+
+**3. 前端数据流转**
+
+历史页面的渲染分为两个独立过程：
+
+```
+用户点击历史条目
+  → openHistory(item)
+    ├── GET /api/report/{report_file} → renderMarkdown() → 左侧报告面板
+    └── item.tree.steps → renderHistoryGraph() → 右侧诊断图
+```
+
+诊断树的反序列化需要注意字段命名转换——后端 Python 使用 `snake_case`（`parent_id`、`node_type`、`tool_name`），前端 JS 使用 `camelCase`（`parentId`、`nodeType`、`toolName`）。`renderHistoryGraph()` 在构建历史图节点时显式映射：
+
+```javascript
+hg.nodes.set(s.id, {
+  id: s.id,
+  title: s.title,
+  parentId: s.parent_id || null,    // ← 蛇形→驼峰
+  parentIds: parentIds,
+  nodeType: s.node_type || "tool",  // ← 蛇形→驼峰
+  toolName: s.tool_name || "",      // ← 蛇形→驼峰
+  toolArgs: s.tool_args || "",
+  status: "completed",              // ← 历史节点统一标记为已完成
+  ...
+});
+```
+
+**4. 历史报告页面 UI**
+
+进入历史页面后，右侧原"执行过程"面板切换为历史查看器：
+
+- **顶部工具栏**：返回按钮 + 诊断标题（实体类型/名称 · 耗时）
+- **左半区**：Markdown 报告，支持标题、粗斜体、代码块、表格、有序/无序列表、引用块等完整 GFM 语法渲染，行内单个换行自动转为 `<br>`
+- **右半区**：诊断流程图，使用与实时诊断共用的 BFS 层级布局、`createNodeDOM()` 节点渲染和 SVG 贝塞尔曲线边线绘制。所有节点绿色标记为"已完成"状态
+- **拖拽分割线**：支持拖动中间分割条调整左右面板比例（20%–80%）
+
+**5. Markdown 渲染**
+
+`renderMarkdown()` 是共享函数，同时服务于实时诊断和历史报告。它按四阶段处理：
+
+| 阶段 | 处理内容 | 示例 |
+|---|---|---|
+| Phase 1 | 代码块、行内代码、标题（h1-h3）、粗体、斜体、链接、引用块 | `` `code` `` → `<code>`, `# Title` → `<h1>` |
+| Phase 2 | 表格检测 | `\| A \| B \|` 连续行 → `<table><thead><tbody>` |
+| Phase 3 | 有序/无序列表 | `- item` → `<ul><li>`, `1. item` → `<ol><li>` |
+| Phase 4 | 段落包裹、换行处理、标签清理 | `\n\n` → `</p><p>`, `\n` → `<br>` |
+
+输入文本在 Phase 1 之前先经 `escNoBr()` 转义 `<` `>` `&` `"` 防止 XSS 注入。
 
 ---
 

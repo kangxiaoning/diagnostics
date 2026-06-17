@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 def format_tool_args(args: dict, tool_name: str = "") -> str:
-    """Format tool arguments for display. Shows key values like paths, namespaces."""
+    """Format tool arguments for display. Shows all meaningful key-value pairs."""
     if not args:
-        logger.debug("format_tool_args: empty args for '%s'", tool_name)
         return ""
     logger.debug("format_tool_args: tool='%s' args=%s", tool_name, args)
+
     # Write_todos: summarize task list
     todos = args.get("todos")
     if isinstance(todos, list) and todos:
@@ -26,24 +26,39 @@ def format_tool_args(args: dict, tool_name: str = "") -> str:
                 items.append(str(t)[:40])
         suffix = f" +{len(todos)-3}" if len(todos) > 3 else ""
         return "; ".join(items) + suffix
-    # Path/file: show basename for readability.
-    # For skills paths, include parent dir to distinguish which skill is being read.
-    path = args.get("path") or args.get("file_path") or args.get("filename")
-    if isinstance(path, str) and path.strip():
-        if "/" in path:
-            basename = path.rsplit("/", 1)[-1]
-            parent = path.rsplit("/", 2)[-2] if path.count("/") >= 2 else ""
-            if "/skills/" in path and parent:
-                return f"{parent}/{basename}"
-            return basename
-        return path
-    # Namespace
-    ns = args.get("namespace")
-    if isinstance(ns, str) and ns.strip():
-        return ns
-    # Generic fallback
-    parts = [str(v).strip() for v in args.values() if str(v).strip() and str(v).strip() != "{}"]
-    return ", ".join(parts)
+
+    # Show all args as key=value, excluding technical/empty ones
+    skip_keys = {"output_mode", "limit", "tail_lines", "head_lines", "since_minutes",
+                 "max_revisions", "recursive", "revision",
+                 "old_str", "new_str", "content",
+                 "instructions", "prompt"}
+    parts = []
+    for k, v in args.items():
+        if k in skip_keys:
+            continue
+        sv = str(v).strip()
+        if not sv or sv == "{}":
+            continue
+        # For skills paths: show parent/basename
+        if k in ("path", "file_path", "filename") and "/skills/" in sv:
+            sv = sv.rsplit("/", 2)[-2] + "/" + sv.rsplit("/", 1)[-1]
+        elif k in ("path", "file_path", "filename") and "/" in sv:
+            sv = sv.rsplit("/", 1)[-1]
+        # For task description: show first meaningful sentence
+        if k == "description" and tool_name == "task":
+            first_line = sv.split("\n")[0].strip()
+            if first_line.startswith("请") or first_line.startswith("用户"):
+                sv = first_line[:50] + ("..." if len(first_line) > 50 else "")
+            else:
+                continue  # skip if no useful first line
+        elif k == "description":
+            continue  # skip for non-task tools
+        # Truncate long values
+        if len(sv) > 40:
+            sv = sv[:37] + "..."
+        parts.append(f"{k}={sv}")
+
+    return ", ".join(parts) if parts else ""
 
 
 class StepStatus(Enum):
@@ -289,10 +304,28 @@ class TreeBuilder:
         """Update tool name/args for an existing tool node when streaming args arrive."""
         for node in self.nodes.values():
             if node.node_type == NodeType.TOOL and node.detail == tc_id:
-                if not node.tool_args and args:
-                    node.tool_args = format_tool_args(args, tool_name)
+                changed = False
+                if args:
+                    formatted = format_tool_args(args, tool_name)
+                    if formatted and formatted != node.tool_args:
+                        node.tool_args = formatted
+                        changed = True
                     if tool_name:
                         node.tool_name = tool_name
+                    # For task delegations: show expert name + instruction snippet
+                    if tool_name == "task" and args.get("subagent_type"):
+                        sub = args["subagent_type"]
+                        desc = args.get("description", "")
+                        first_line = desc.split("\n")[0].strip()[:60] if desc else ""
+                        new_desc = None
+                        if first_line and (first_line.startswith("请") or first_line.startswith("用户")):
+                            new_desc = f"委派给 {sub}: {first_line}"
+                        elif not node.description:
+                            new_desc = f"委派给 {sub}"
+                        if new_desc and new_desc != node.description:
+                            node.description = new_desc
+                            changed = True
+                if changed:
                     return [self._snapshot_event()]
         return []
 

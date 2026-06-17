@@ -600,7 +600,12 @@ _NETWORK_POLICIES: dict[str, str] = {
 @tool
 def list_clusters() -> str:
     """List all configured Kubernetes cluster names. Call this FIRST."""
-    return "Available clusters:\n- `prod-cluster` → https://172.16.0.1:6443\n- `staging` → https://10.0.0.1:6443"
+    return (
+        "Available clusters:\n"
+        "- `prod-us-east` → https://172.16.0.1:6443 (10 worker nodes, 30+ pods)\n"
+        "- `prod-cluster` → https://172.16.0.2:6443\n"
+        "- `staging` → https://10.0.0.1:6443"
+    )
 
 
 @tool
@@ -629,12 +634,11 @@ def get_cluster_overview(cluster_name: str) -> str:
     """Get high-level cluster overview: nodes, non-running pods, namespace count."""
     from diagnostics.tools.mock.data import kubernetes_nodes_data, kubernetes_pods_data
 
-    _ = cluster_name
     scenario = _active_scenario
     nodes = kubernetes_nodes_data(scenario)
     pods = kubernetes_pods_data(scenario)
     return (
-        f"## Cluster: prod-cluster\n\n"
+        f"## Cluster: {cluster_name}\n\n"
         f"### Nodes\n{nodes}\n\n"
         f"### Pods (including non-Running)\n{pods}\n\n"
         f"### Namespace count\n8"

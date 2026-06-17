@@ -290,6 +290,7 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
         base_url=settings.base_url,
         api_key=settings.api_key,
         temperature=settings.temperature,
+        model_kwargs={"tool_choice": "auto"},
     )
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"

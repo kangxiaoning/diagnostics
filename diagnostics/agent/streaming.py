@@ -242,7 +242,34 @@ async def stream_agent_events(
             done, pending = await asyncio.wait(
                 {get_task, cancel_task},
                 return_when=asyncio.FIRST_COMPLETED,
+                timeout=30.0,  # heartbeat: log if nothing happens for 30s
             )
+
+            # Timeout — neither task completed.
+            # IMPORTANT: do NOT drain get_task! Cancelling asyncio.Queue.get()
+            # permanently loses the item. Instead, keep get_task alive and
+            # wait for it below. Only drain cancel_task.
+            if not done:
+                for task in pending:
+                    if task is cancel_task:
+                        await _drain(task)
+                logger.info(
+                    "[session=%s] Waiting for response... "
+                    "(round=%d, tools_active=%d, tools_done=%d)",
+                    session_id, state.round_number,
+                    len(state.active_tools) - len(state.done_tools),
+                    len(state.done_tools),
+                )
+                yield AgentEvent("heartbeat", {
+                    "session_id": session_id,
+                    "round": state.round_number,
+                    "tools_active": len(state.active_tools) - len(state.done_tools),
+                    "tools_done": len(state.done_tools),
+                })
+                # Fall through to wait for get_task without timeout
+                done = {get_task}
+                pending = set()
+
             for task in pending:
                 await _drain(task)
 
