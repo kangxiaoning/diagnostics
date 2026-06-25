@@ -24,22 +24,6 @@ def _make_tool_label(name: str) -> str:
     return _TOOL_LABELS.get(name, name)
 
 
-def _make_tool_description(name: str, args: dict[str, Any]) -> str:
-    """Generate a tool description from label and arguments when LLM doesn't provide one."""
-    label = _TOOL_LABELS.get(name, name)
-    if args:
-        # Pick the most descriptive arg value
-        for key in ("subagent_type", "path", "namespace", "profile", "filename"):
-            val = args.get(key)
-            if isinstance(val, str) and val.strip():
-                return f"{label}({val})"
-        # Generic: first non-empty string value
-        for v in args.values():
-            if isinstance(v, str) and v.strip() and v.strip() != "{}":
-                return f"{label}({v})"
-    return label
-
-
 def _parse_file_path(text: str) -> str:
     """Extract file path from LLM text.
 
@@ -177,13 +161,8 @@ class _EventState:
     seen_agents: set[str] = field(default_factory=set)
     coordinator_started: bool = False
     round_number: int = 1
-    _think_tag_buf: str = ""
+    _plan_tag_buf: str = ""
     _has_reasoning: bool = False
-    # <step> tag parsing state
-    _step_tag_buf: str = ""
-    _pending_step_descriptions: list[str] = field(default_factory=list)
-    # Accumulated think text for fallback description extraction
-    _accumulated_think: list[str] = field(default_factory=list)
     _current_round_started: bool = True  # first round hasn't started yet
     # Map tool_call_id → subagent_name for phase routing
     _task_call_id_to_name: dict[str, str] = field(default_factory=dict)
@@ -211,7 +190,7 @@ async def stream_agent_events(
         try:
             async for raw in agent.astream(
                 {"messages": messages},
-                stream_mode=["messages", "updates"],
+                stream_mode=["messages", "updates", "custom"],
                 subgraphs=True,
             ):
                 await chunk_queue.put(raw)
@@ -372,77 +351,20 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 logger.debug("[round=%d] LLM chunk: %d chars, first 200: %r",
                              state.round_number, len(text), text[:200])
 
-                # ②a  Parse <step> tags FIRST from raw text — before think/answer split.
-                #     This ensures step descriptions are captured regardless of whether
-                #     the LLM puts <step> inside or outside <think> blocks.
-                prev_step_count = len(state._pending_step_descriptions)
-                clean_text = _parse_step_tags(text, state)
-                new_steps_added = len(state._pending_step_descriptions) > prev_step_count
-
-                # ②b  Then split think/answer from the cleaned text
-                think_text, answer_text = _parse_think_tags(clean_text, state)
-
-                if think_text or answer_text:
-                    logger.debug("[round=%d] Parsed: think=%d chars (%.80r) answer=%d chars (%.80r)",
-                                 state.round_number,
-                                 len(think_text), think_text[:80] if think_text else "",
-                                 len(answer_text), answer_text[:80] if answer_text else "")
-
-                # Determine default phase: subagents use name-based routing,
-                # main agent uses think/answer split
                 subagent_phase = _subagent_phase(path, state) if not is_coordinator else None
 
-                if think_text:
-                    state._has_reasoning = True
-                    state._accumulated_think.append(think_text)
-                    phase = subagent_phase or "thinking"
+                if is_coordinator and not subagent_phase:
+                    state._coordinator_text.append((text, state.round_number))
                     events.append(AgentEvent("text_delta", {
-                        "text": think_text, "path": path,
-                        "round": state.round_number, "phase": phase,
+                        "text": text, "path": path,
+                        "round": state.round_number, "phase": "thinking",
                     }))
-
-                if answer_text:
-                    phase = subagent_phase or "answering"
+                else:
                     events.append(AgentEvent("text_delta", {
-                        "text": answer_text, "path": path,
-                        "round": state.round_number, "phase": phase,
+                        "text": text, "path": path,
+                        "round": state.round_number,
+                        "phase": subagent_phase or "answering",
                     }))
-                elif not think_text and not clean_text.strip() and new_steps_added:
-                    # Step tags were parsed — emit the NEW steps as text so
-                    # frontend think sections have content for each round.
-                    new_steps = state._pending_step_descriptions[prev_step_count:]
-                    step_text = "\n".join(new_steps)
-                    if step_text.strip():
-                        state._accumulated_think.append(step_text)
-                        # Also buffer for per-round filtering in _finalize
-                        if is_coordinator and not subagent_phase:
-                            state._coordinator_text.append((step_text, state.round_number))
-                            events.append(AgentEvent("text_delta", {
-                                "text": step_text, "path": path,
-                                "round": state.round_number, "phase": "thinking",
-                            }))
-                        elif not is_coordinator:
-                            events.append(AgentEvent("text_delta", {
-                                "text": step_text, "path": path,
-                                "round": state.round_number,
-                                "phase": subagent_phase or "answering",
-                            }))
-                elif not think_text and clean_text.strip():
-                    # No think tags at all — route by agent.
-                    # For coordinator: emit to thinking so the frontend
-                    # creates per-round sections. Buffer for final answer.
-                    phase = subagent_phase or "answering"
-                    if is_coordinator and not subagent_phase:
-                        state._coordinator_text.append((clean_text, state.round_number))
-                        events.append(AgentEvent("text_delta", {
-                            "text": clean_text, "path": path,
-                            "round": state.round_number, "phase": "thinking",
-                        }))
-                    else:
-                        events.append(AgentEvent("text_delta", {
-                            "text": clean_text, "path": path,
-                            "round": state.round_number, "phase": phase,
-                        }))
 
             # ③ Process tool calls — both main agent and subagent.
             #    Subagent tool calls show the expert's diagnostic work in the tree.
@@ -504,13 +426,6 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 logger.info("[round=%d] → mapped call_id=%s → '%s'",
                                             state.round_number, tc_id, subagent)
 
-                # Build descriptions: pop from <step> tags first,
-                # fall back to extracting from accumulated think text
-                tool_count = len([tc for tc in tc_list
-                                  if _extract_tool_id(tc) and _extract_tool_name(tc)])
-                step_descs = _build_tool_descriptions(state, tool_count)
-
-                idx = 0
                 for tc in tc_list:
                     tc_id = _extract_tool_id(tc)
                     tc_name = _extract_tool_name(tc)
@@ -537,49 +452,24 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 "name": tc_name, "args": tc_args,
                                 "label": label, "path": path,
                             }
-                            description = step_descs[idx] if idx < len(step_descs) else ""
-                            idx += 1
+                            # Task delegation fallback when args are empty
                             if tc_name == "task" and not tc_args:
-                                # Parse expert name from ALL available text sources
-                                sources = [description] + state._pending_step_descriptions[-2:] + list(state._accumulated_think[-3:])
-                                if text:
-                                    sources.append(text)  # raw LLM chunk (may contain "委派 XXX")
-                                fallback_text = " ".join(s for s in sources if s)
-                                expert, task_desc = _parse_task_delegation(fallback_text)
+                                expert = _extract_expert_from_text(text)
                                 if expert:
                                     tc_args = {"subagent_type": expert}
-                                    if task_desc:
-                                        description = task_desc
-                                logger.info("[round=%d] task delegation parsed: expert=%s, sources=%d, from_text=%.80s",
-                                            state.round_number, expert, len([s for s in sources if s]),
-                                            fallback_text[:80])
                             elif tc_name in ("read_file", "write_file", "edit_file") and not tc_args:
-                                # Parse file path from step description
-                                path = _parse_file_path(description)
-                                if path:
-                                    tc_args = {"path": path}
-                                    description = f"操作: {path}"
-                                    logger.info("[round=%d] %s parsed: path=%s",
-                                                state.round_number, tc_name, path)
-                            if not description:
-                                if tc_name == "task":
-                                    sub = tc_args.get("subagent_type", "")
-                                    description = f"委派给 {sub}" if sub else ""
-                                else:
-                                    description = _make_tool_description(tc_name, tc_args)
-                                logger.warning("[round=%d] No description for '%s', "
-                                             "generated from args: %r",
-                                             state.round_number, label, description[:80])
+                                fp = _parse_file_path("")
+                                if fp:
+                                    tc_args = {"path": fp}
                             events.append(AgentEvent("tool_start", {
                                 "id": tc_id, "name": tc_name, "args": tc_args,
                                 "label": label, "path": path,
                                 "round": state.round_number,
-                                "description": description,
+                                "description": "",
                             }))
                             # Emit tool call to the current round's think section
-                            step_info = description or label
                             events.append(AgentEvent("text_delta", {
-                                "text": f"\n\n🔧 {step_info}",
+                                "text": f"\n\n🔧 {label}",
                                 "path": path,
                                 "round": state.round_number,
                                 "phase": "thinking",
@@ -663,226 +553,46 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     logger.info("[round=%d] Structured response received", state.round_number)
                     events.append(AgentEvent("structured_response", _serialize_sr(sr)))
 
+                # 🔑 Detect diagnosis ledger updates via custom stream
+                # DiagnosisLedgerMiddleware emits ledger snapshots via stream_writer
+                # when commit_hypotheses/select_path/record_finding tools fire.
+                if isinstance(value, dict) and "_diagnosis_ledger" in value:
+                    ledger = value["_diagnosis_ledger"]
+                    if ledger and isinstance(ledger, dict):
+                        logger.info("[round=%d] Diagnosis ledger updated (state): phase=%s, hypotheses=%d",
+                                    state.round_number,
+                                    ledger.get("current_phase", "?"),
+                                    len(ledger.get("hypotheses", {})))
+                        events.append(AgentEvent("ledger_snapshot", {
+                            "ledger": _sanitize_ledger_for_event(ledger),
+                            "round": state.round_number,
+                        }))
+
+    elif mode == "custom":
+        # Custom stream events — used by DiagnosisLedgerMiddleware to emit
+        # ledger snapshots via stream_writer.
+        if isinstance(data, dict) and data.get("type") == "ledger_snapshot":
+            ledger = data.get("ledger")
+            if ledger and isinstance(ledger, dict):
+                logger.info("[round=%d] Diagnosis ledger updated (custom): phase=%s, hypotheses=%d",
+                            state.round_number,
+                            ledger.get("current_phase", "?"),
+                            len(ledger.get("hypotheses", {})))
+                events.append(AgentEvent("ledger_snapshot", {
+                    "ledger": _sanitize_ledger_for_event(ledger),
+                    "round": state.round_number,
+                }))
+
     return events
 
 
-def _route_answer_text(text: str, path: list[str], state: _EventState,
-                       events: list[AgentEvent]) -> None:
-    """Parse <step> tags from text and emit remaining text as text_delta."""
-    remaining = _parse_step_tags(text, state)
-
-    if remaining.strip():
-        events.append(AgentEvent("text_delta", {
-            "text": remaining, "path": path,
-            "round": state.round_number, "phase": "answering",
-        }))
-
-
-def _build_tool_descriptions(state: _EventState, tool_count: int) -> list[str]:
-    """Build descriptions for upcoming tool calls.
-
-    Priority:
-      1. Pop from <step> tags parsed by LLM
-      2. Extract from accumulated think text per tool
-      3. Generate from tool name + args (if available in active_tools)
-    """
-    descs: list[str] = []
-
-    # ① Consume <step> tags first
-    from_step = 0
-    for _ in range(tool_count):
-        if state._pending_step_descriptions:
-            descs.append(state._pending_step_descriptions.pop(0))
-            from_step += 1
-
-    # ② For remaining slots, extract from accumulated think text
-    remaining = tool_count - len(descs)
-    from_think = 0
-    if remaining > 0:
-        for i in range(remaining):
-            desc = _extract_tool_desc_from_text(state, i, remaining)
-            if desc:
-                descs.append(desc)
-                from_think += 1
-
-    # ③ Log what we got
-    think_text = "".join(state._accumulated_think)
-    logger.info("[round=%d] Descriptions built: %d tools, %d from <step>, %d from think "
-               "(think_text=%d chars: %r)",
-               state.round_number, tool_count, from_step, from_think,
-               len(think_text), think_text[:120] if think_text else "(empty)")
-    state._accumulated_think = []
-
-    return descs
-
-
-def _extract_tool_desc_from_text(state: _EventState,
-                                 tool_index: int, total_tools: int) -> str:
-    """Extract a tool description from the accumulated think text.
-
-    For the FIRST tool of a round, take the last sentence of the think text
-    (which usually states the immediate next action).
-    For subsequent tools, try to find multi-step indicators.
-    """
-    full_text = "".join(state._accumulated_think).strip()
-    if not full_text:
-        return ""
-
-    # Split into sentences by Chinese/English punctuation
-    sentences = _split_sentences(full_text)
-    if not sentences:
-        return ""
-
-    if total_tools == 1:
-        # Single tool: use the last substantive sentence
-        for s in reversed(sentences):
-            if len(s) > 6:
-                return s[:100]
-
-    # Multiple tools: try to find action items
-    # Look for numbered items, "需要/首先/然后/其次/接着/最后" patterns
-    action_keywords = ["需要", "首先", "然后", "其次", "接着", "最后",
-                       "检查", "执行", "查看", "采集", "读取", "排查",
-                       "运行", "确认", "验证", "获取", "诊断"]
-    action_sentences = [s for s in sentences
-                        if any(kw in s for kw in action_keywords) and len(s) > 4]
-
-    if len(action_sentences) >= total_tools:
-        return action_sentences[tool_index][:100]
-
-    # As fallback for multi-tool with index > 0, use the sentence before last
-    if tool_index > 0 and len(sentences) >= 2:
-        return sentences[-2][:100]
-
-    # Use last long sentence
-    for s in reversed(sentences):
-        if len(s) > 6:
-            return s[:100]
-
-    return sentences[-1][:100] if sentences else ""
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into cleaned sentences."""
-    import re
-    parts = re.split(r'[。；\n]', text)
-    return [s.strip() for s in parts if s.strip()]
-
-
-# ════════════════ Tag parsers ════════════════
-
-def _parse_think_tags(text: str, state: _EventState) -> tuple[str, str]:
-    """Parse <think>...</think> or <Thinking>...</Thinking> tags."""
-    state._think_tag_buf += text
-    open_tags = ["<think>", "<Thinking>", "<thinking>"]
-    close_tags = ["</think>", "</Thinking>", "</thinking>"]
-
-    think_parts: list[str] = []
-    answer_parts: list[str] = []
-    buf = state._think_tag_buf
-    found_any_tag = False
-
-    while buf:
-        best_start, best_open, best_close = -1, "", ""
-        for ot, ct in zip(open_tags, close_tags):
-            idx = buf.find(ot)
-            if idx != -1 and (best_start == -1 or idx < best_start):
-                best_start, best_open, best_close = idx, ot, ct
-
-        if best_start == -1:
-            longest_partial = max(
-                (_partial_tag_suffix(buf, ot) for ot in open_tags), default=0)
-            if longest_partial:
-                prefix = buf[:-longest_partial]
-                if prefix:
-                    answer_parts.append(prefix)
-                state._think_tag_buf = buf[-longest_partial:]
-            else:
-                if not found_any_tag:
-                    state._think_tag_buf = ""
-                    return "", ""
-                answer_parts.append(buf)
-                state._think_tag_buf = ""
-            break
-
-        found_any_tag = True
-        if best_start > 0:
-            answer_parts.append(buf[:best_start])
-
-        end_idx = buf.find(best_close, best_start + len(best_open))
-        if end_idx == -1:
-            state._think_tag_buf = buf[best_start:]
-            break
-
-        content = buf[best_start + len(best_open):end_idx]
-        think_parts.append(content)
-        buf = buf[end_idx + len(best_close):]
-        state._think_tag_buf = buf
-
-    if not state._think_tag_buf:
-        state._think_tag_buf = ""
-
-    return "".join(think_parts), "".join(answer_parts)
-
-
-def _parse_step_tags(text: str, state: _EventState) -> str:
-    """Parse <step>...</step> tags, accumulate descriptions, return clean text.
-
-    Called on raw text BEFORE think/answer split, so <step> tags are captured
-    regardless of whether the LLM places them inside or outside <think> blocks.
-    """
+def _extract_expert_from_text(text: str) -> str:
+    """Try to extract subagent name from raw LLM text."""
     if not text:
-        return text
-    state._step_tag_buf += text
-    buf = state._step_tag_buf
-    open_tag = "<step>"
-    close_tag = "</step>"
-    clean_parts: list[str] = []
-    found_count = 0
-
-    while buf:
-        start_idx = buf.find(open_tag)
-        if start_idx == -1:
-            partial = _partial_tag_suffix(buf, open_tag)
-            if partial:
-                clean_parts.append(buf[:-partial])
-                state._step_tag_buf = buf[-partial:]
-            else:
-                clean_parts.append(buf)
-                state._step_tag_buf = ""
-            break
-
-        if start_idx > 0:
-            clean_parts.append(buf[:start_idx])
-
-        end_idx = buf.find(close_tag, start_idx + len(open_tag))
-        if end_idx == -1:
-            state._step_tag_buf = buf[start_idx:]
-            break
-
-        content = buf[start_idx + len(open_tag):end_idx].strip()
-        if content:
-            state._pending_step_descriptions.append(content)
-            found_count += 1
-        buf = buf[end_idx + len(close_tag):]
-        state._step_tag_buf = buf
-
-    if found_count:
-        logger.info("[round=%d] Parsed %d <step> tag(s), total pending=%d",
-                     state.round_number, found_count,
-                     len(state._pending_step_descriptions))
-
-    if not state._step_tag_buf:
-        state._step_tag_buf = ""
-
-    return "".join(clean_parts)
-
-
-def _partial_tag_suffix(buffer: str, token: str) -> int:
-    for length in range(min(len(buffer), len(token) - 1), 0, -1):
-        if token.startswith(buffer[-length:]):
-            return length
-    return 0
+        return ""
+    import re
+    m = re.search(r'委派\s+([a-z][\w-]*)', text)
+    return m.group(1) if m else ""
 
 
 def _serialize_sr(sr: Any) -> dict[str, Any]:
@@ -894,6 +604,12 @@ def _serialize_sr(sr: Any) -> dict[str, Any]:
     elif isinstance(sr, dict):
         return sr
     return {"value": str(sr)}
+
+
+def _sanitize_ledger_for_event(ledger: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal fields from the ledger before sending to frontend."""
+    internal_keys = {"_inconclusive_streak", "_backtrack_count"}
+    return {k: v for k, v in ledger.items() if k not in internal_keys}
 
 
 # ════════════════ ToolMessage handling ════════════════
@@ -916,29 +632,20 @@ def _summarize_output(output: str, max_len: int = 80) -> str:
 def _finalize(state: _EventState) -> list[AgentEvent]:
     events: list[AgentEvent] = []
 
-    # Emit the final answer body: only text from the LAST round.
-    # Intermediate reasoning and step descriptions belong in per-round
-    # think sections, not in the answer-body.
+    # Emit final answer body from the LAST round's accumulated text.
     if state._coordinator_text:
         last_round = state._coordinator_text[-1][1] if state._coordinator_text else 0
         report_parts = [t for t, r in state._coordinator_text if r == last_round]
         report = "".join(report_parts).strip()
         if report:
             events.append(AgentEvent("text_delta", {
-                "text": report[-3000:],
+                "text": report,
                 "path": ["coordinator"], "round": state.round_number,
                 "phase": "answering",
             }))
-    elif state._think_tag_buf.strip():
+    elif state._plan_tag_buf.strip():
         events.append(AgentEvent("text_delta", {
-            "text": state._think_tag_buf,
-            "path": ["coordinator"], "round": state.round_number,
-            "phase": "answering",
-        }))
-    elif "".join(state._accumulated_think).strip():
-        report = "".join(state._accumulated_think).strip()
-        events.append(AgentEvent("text_delta", {
-            "text": f"\n## 诊断报告\n\n{report[-2000:]}",
+            "text": state._plan_tag_buf,
             "path": ["coordinator"], "round": state.round_number,
             "phase": "answering",
         }))

@@ -66,7 +66,6 @@ const GRAPH = {
   nodeOrder: [],          // ordered list of node ids
   hasContent: false,
 };
-let _edgeDrawTimer = null;  // debounce rapid snapshot arrivals
 
 // ═══════════════════ Init ═══════════════════
 toolPopupClose.addEventListener("click", () => toolPopup.classList.add("hidden"));
@@ -166,6 +165,17 @@ async function openHistory(item) {
     renderHistoryGraph(item.tree.steps);
   } else {
     historyNodes.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:12px"><p>无诊断过程数据<br>（此报告为功能上线前生成）</p></div>';
+  }
+
+  // Render hypothesis tree from saved ledger (if present)
+  if (item.ledger) {
+    currentLedger = item.ledger;
+    renderHypothesisTree(item.ledger);
+    const hypCount = Object.keys(item.ledger.hypotheses || {}).length;
+    if (hypCount > 0 && hypothesisBadge) {
+      hypothesisBadge.textContent = hypCount;
+      hypothesisBadge.classList.remove("hidden");
+    }
   }
 }
 
@@ -747,6 +757,9 @@ function parseSSE(raw) {
     case "tree_snapshot":
       onTreeSnapshot(payload);
       break;
+    case "ledger_snapshot":
+      onLedgerSnapshot(payload);
+      break;
     case "agent_start":
       break;
     case "agent_end":
@@ -1023,16 +1036,13 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Debounced edge draw: cancel any pending draw before scheduling.
-  // Double rAF ensures DOM layout before reading getBoundingClientRect.
-  clearTimeout(_edgeDrawTimer);
-  _edgeDrawTimer = setTimeout(() => {
+  // Edge draw with double-rAF to ensure DOM layout before reading
+  // getBoundingClientRect. No timeout — edges appear immediately.
+  requestAnimationFrame(() => {
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        drawAllEdges();
-      });
+      drawAllEdges();
     });
-  }, 5);
+  });
 
   requestAnimationFrame(() => {
     graphCanvas.scrollTop = graphCanvas.scrollHeight;
@@ -1204,7 +1214,12 @@ function drawAllEdges() {
     const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
 
     let strokeSw, color, dash, extraStyle;
-    if (toNode.status === "running") {
+    // Tool→Phase edges: the tool (parent) is always completed when a new
+    // Phase is created — use green to show the transition is done.
+    const isToolToPhase = (fromNode.nodeType === "tool" && toNode.nodeType === "phase");
+    if (isToolToPhase) {
+      strokeSw = baseSw; color = "#4ade80"; dash = ""; extraStyle = "";
+    } else if (toNode.status === "running") {
       strokeSw = accentSw; color = "#6c8cff";
       dash = 'stroke-dasharray="6 3"';
       extraStyle = 'filter="url(#edgeGlow)"';
@@ -1487,3 +1502,163 @@ function escNoBr(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+// ═══════════════════ Hypothesis Tree ═══════════════════
+
+let currentLedger = null;
+const tabExecution = document.getElementById("tabExecution");
+const tabHypothesis = document.getElementById("tabHypothesis");
+const hypothesisBadge = document.getElementById("hypothesisBadge");
+const hypothesisTree = document.getElementById("hypothesisTree");
+const hypothesisEmpty = document.getElementById("hypothesisEmpty");
+
+// Tab switching
+tabExecution.addEventListener("click", () => switchTab("execution"));
+tabHypothesis.addEventListener("click", () => switchTab("hypothesis"));
+
+function switchTab(tab) {
+  document.querySelectorAll(".graph-tab").forEach((t) => t.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+  if (tab === "execution") {
+    tabExecution.classList.add("active");
+    document.querySelector('[data-panel="execution"]').classList.add("active");
+  } else {
+    tabHypothesis.classList.add("active");
+    document.querySelector('[data-panel="hypothesis"]').classList.add("active");
+    hypothesisBadge?.classList.add("hidden");
+  }
+}
+
+function onLedgerSnapshot(payload) {
+  const ledger = payload.ledger;
+  if (!ledger) return;
+  currentLedger = ledger;
+
+  // Show badge on hypothesis tab
+  const hypCount = Object.keys(ledger.hypotheses || {}).length;
+  if (hypCount > 0 && hypothesisBadge) {
+    hypothesisBadge.textContent = hypCount;
+    hypothesisBadge.classList.remove("hidden");
+  }
+
+  // Auto-switch to hypothesis tab on first hypothesis
+  if (hypCount === 1 && !currentLedger._userSwitchedAway) {
+    // Don't auto-switch; let user decide. Just show badge.
+  }
+
+  renderHypothesisTree(ledger);
+}
+
+function renderHypothesisTree(ledger) {
+  if (!ledger) return;
+  const hypotheses = ledger.hypotheses || {};
+  const rootIds = ledger.root_hypothesis_ids || [];
+
+  if (rootIds.length === 0) {
+    if (hypothesisEmpty) hypothesisEmpty.style.display = "flex";
+    if (hypothesisTree) hypothesisTree.innerHTML = "";
+    return;
+  }
+  if (hypothesisEmpty) hypothesisEmpty.style.display = "none";
+
+  let html = "";
+
+  // Phase banner
+  const phase = ledger.current_phase || "understand";
+  const round = ledger.current_round || 0;
+  const activePath = ledger.active_path || [];
+  const phaseLabels = {
+    understand: "理解故障",
+    hypothesize: "形成假设",
+    verify: "验证假设",
+    evaluate: "评估路径",
+    skill_verify: "技能验证",
+    backtrack: "回溯",
+    report: "生成报告",
+  };
+  html += `<div class="hyp-phase-banner">`;
+  html += `阶段: <strong>${esc(phaseLabels[phase] || phase)}</strong> · 步骤: ${round}`;
+  if (activePath.length > 0) {
+    html += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
+  }
+  if (ledger.root_cause) {
+    html += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
+  }
+  html += `</div>`;
+
+  // Render tree recursively
+  for (const hid of rootIds) {
+    html += renderHypothesisNode(hypotheses[hid], hypotheses, 0);
+  }
+
+  if (hypothesisTree) hypothesisTree.innerHTML = html;
+}
+
+function renderHypothesisNode(node, allHypotheses, depth) {
+  if (!node) return "";
+  const status = node.status || "pending";
+  const prob = node.probability || 0;
+  const selected = node.selected;
+  const isFocus = selected && status === "verifying";
+
+  let cls = `hyp-node ${status}`;
+  if (selected) cls += " selected";
+
+  let html = `<div class="${cls}">`;
+
+  // Header: ID + status + probability bar + statement
+  html += `<div class="hyp-header">`;
+  html += `<span class="hyp-id">${esc(node.id)}</span>`;
+  html += `<span class="hyp-status ${status}">${esc(status)}</span>`;
+  html += `<div class="hyp-prob-bar"><div class="hyp-prob-fill" style="width:${prob}%"></div></div>`;
+  html += `<span class="hyp-prob-text">${prob}%</span>`;
+  if (selected) html += `<span class="hyp-star">★</span>`;
+  if (isFocus) html += `<span class="hyp-focus-tag">← 当前聚焦</span>`;
+  html += `</div>`;
+
+  // Statement
+  html += `<div class="hyp-statement">${esc(node.statement)}</div>`;
+
+  // Evidence
+  if (node.evidence && node.evidence.length > 0) {
+    html += `<div class="hyp-evidence">`;
+    for (const ev of node.evidence) {
+      const evCls = ev.supports ? "support" : "refute";
+      const src = ev.source || "";
+      html += `<div class="hyp-evidence-item ${evCls}">${esc(ev.summary || "")}`;
+      if (src) html += ` <span style="opacity:0.6">(${esc(src)})</span>`;
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Verification tools
+  if (node.verification_tools && node.verification_tools.length > 0) {
+    html += `<div class="hyp-tools">🔧 ${esc(node.verification_tools.join(", "))}</div>`;
+  }
+
+  // Rationale (for refuted/confirmed/deprioritized)
+  if (node.rationale && status !== "pending" && status !== "verifying") {
+    html += `<div class="hyp-evidence-item" style="margin-top:4px;font-size:11px;color:var(--text-2)">`;
+    html += `理由: ${esc(node.rationale)}</div>`;
+  }
+
+  html += `</div>`; // close hyp-node
+
+  // Children
+  if (node.sub_hypothesis_ids && node.sub_hypothesis_ids.length > 0) {
+    html += `<div class="hyp-children">`;
+    for (const sid of node.sub_hypothesis_ids) {
+      html += renderHypothesisNode(allHypotheses[sid], allHypotheses, depth + 1);
+    }
+    html += `</div>`;
+  }
+
+  return html;
+}
+
+// Track if user manually switched away from hypothesis tab
+tabExecution?.addEventListener("click", () => {
+  if (currentLedger) currentLedger._userSwitchedAway = true;
+});
+

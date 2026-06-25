@@ -598,17 +598,6 @@ _NETWORK_POLICIES: dict[str, str] = {
 # ═══════════════════════════════════════════════════════════════════
 
 @tool
-def list_clusters() -> str:
-    """List all configured Kubernetes cluster names. Call this FIRST."""
-    return (
-        "Available clusters:\n"
-        "- `prod-us-east` → https://172.16.0.1:6443 (10 worker nodes, 30+ pods)\n"
-        "- `prod-cluster` → https://172.16.0.2:6443\n"
-        "- `staging` → https://10.0.0.1:6443"
-    )
-
-
-@tool
 def get_namespaces(cluster_name: str) -> str:
     """List all namespaces in a cluster. Call before tools that need namespace."""
     _ = cluster_name

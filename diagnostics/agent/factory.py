@@ -10,6 +10,8 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from langchain.chat_models import init_chat_model
 
 from diagnostics.agent.prompt import make_system_prompt
+from diagnostics.agent.ledger import DiagnosisLedgerState
+from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -35,6 +37,16 @@ _REPORT_DIRS = [
 for _d in _REPORT_DIRS:
     _d.mkdir(parents=True, exist_ok=True)
 
+# Common return format suffix for all subagents — enables Coordinator to
+# parse expert results into structured record_finding calls.
+_EXPERT_RETURN_SUFFIX = (
+    "\n\n返回格式（严格遵循）:\n"
+    "- 假设验证: {confirmed|refuted|inconclusive}\n"
+    "- 关键证据: 1~3条，每条标注数据来源\n"
+    "- 根因判断: 如已定位根因则陈述，否则说明还需什么数据\n"
+    "- 置信度: {高|中|低} + 百分比"
+)
+
 
 def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
     """Define specialized diagnostic subagents with domain-specific skills.
@@ -58,7 +70,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "First, use your cpu-diagnosis skill to follow the structured CPU diagnostic workflow. "
                 "If the skill's tools are insufficient, use check_cpu and check_processes to dig deeper. "
                 "Classify whether bottleneck is compute-bound, IO-wait-bound, or scheduler-bound. "
-                "Return under 150 words: key findings, hypothesis, confidence (high/medium/low)."
+                "Return under 150 words." + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_cpu, check_processes],
             "skills": [
@@ -78,6 +90,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "If the skill's tools are insufficient, use check_memory and check_processes to dig deeper. "
                 "Identify native memory leaks (RSS >> heap limit) and swap pressure. "
                 "Return under 150 words: key findings, root cause hypothesis, fix recommendation."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_memory, check_processes],
             "skills": [
@@ -98,6 +111,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "Analyze %util, await, svctm, aqu-sz from iostat. High %util + high await = saturation. "
                 "Determine if bottleneck is read or write bound. "
                 "Return under 100 words: severity, root cause, which processes affected."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_disk],
             "skills": ["/agent_data/skills/disk-io-diagnosis/"],
@@ -118,6 +132,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "softirq-starvation, kernel-parameter-drops, tcp-listen-overflow, grpc-connection-leak). "
                 "If skills are insufficient, use check_network and check_processes to dig deeper. "
                 "Return under 150 words: key findings, root cause, recommended fix."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_network, check_processes],
             "skills": [
@@ -145,6 +160,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "Check health first (temperature, throttling, ECC, PCIe), then memory (OOM, leaks), "
                 "then utilization (compute vs memory bandwidth). "
                 "Return under 150 words: bottleneck type, affected GPU, recommended action."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
                 check_gpu_health,
@@ -206,6 +222,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "\n"
                 "Return under 200 words: affected infrastructure component, root cause "
                 "with evidence chain, impact scope (nodes/pods affected), recovery steps."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
                 check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods,
@@ -266,6 +283,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "Return under 200 words: root cause type (app/infra), affected resources, "
                 "evidence chain, fix with specific values (e.g., 'increase memory limit "
                 "from 512Mi to 768Mi'), rollback plan if applicable."
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_kubernetes_pods, check_kubernetes_nodes, *k8s_tools],
             "skills": [
@@ -277,8 +295,13 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
     ]
 
 
-def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (),
-                system_prompt: str | None = None):
+def build_agent(
+    settings: Settings | None = None,
+    extra_tools: Sequence[Any] = (),
+    system_prompt: str | None = None,
+    report_path: str = "",
+    ledger_path: str = "",
+):
     settings = settings or Settings.from_env()
 
     # Disable stream chunk timeout for local LLMs (LM Studio)
@@ -300,10 +323,13 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
     else:
         tools = get_mock_tools(extra_tools)
 
+    # Diagnosis ledger middleware — maintains hypothesis tree in agent state
+    ledger_middleware = DiagnosisLedgerMiddleware(ledger_path=ledger_path)
+
     return create_deep_agent(
         model=model,
         tools=tools,
-        system_prompt=system_prompt or make_system_prompt(),
+        system_prompt=system_prompt or make_system_prompt(report_path, ledger_path),
         backend=CompositeBackend(
             default=StateBackend(),
             routes={"/agent_data/": FilesystemBackend(
@@ -313,4 +339,6 @@ def build_agent(settings: Settings | None = None, extra_tools: Sequence[Any] = (
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=_build_subagents(mode),
+        middleware=[ledger_middleware],
+        state_schema=DiagnosisLedgerState,
     )

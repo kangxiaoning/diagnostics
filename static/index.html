@@ -70,10 +70,18 @@
       <!-- Right: Graph -->
       <aside class="graph">
         <header class="graph-header">
-          <h2>执行过程</h2>
+          <div class="graph-tabs">
+            <button class="graph-tab active" id="tabExecution" data-tab="execution">诊断执行树</button>
+            <button class="graph-tab" id="tabHypothesis" data-tab="hypothesis">
+              假设树
+              <span class="tab-badge hidden" id="hypothesisBadge">0</span>
+            </button>
+          </div>
           <span id="graphStatus" class="graph-status idle">等待任务</span>
         </header>
-        <div id="graphCanvas" class="graph-canvas">
+
+        <!-- Tab: Execution Tree (existing) -->
+        <div id="graphCanvas" class="graph-canvas tab-panel active" data-panel="execution">
           <svg id="graphEdges" class="graph-edges"></svg>
           <div id="graphNodes" class="graph-nodes"></div>
           <div id="graphEmpty" class="graph-empty">
@@ -83,6 +91,18 @@
             <p>发送诊断请求后<br>Agent 执行流程将在此动态展示</p>
           </div>
         </div>
+
+        <!-- Tab: Hypothesis Tree (new) -->
+        <div id="hypothesisCanvas" class="graph-canvas tab-panel" data-panel="hypothesis">
+          <div id="hypothesisEmpty" class="graph-empty">
+            <div class="graph-empty-icon">
+              <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><path d="M24 6v36M6 24h36" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="24" cy="24" r="6" stroke="currentColor" stroke-width="2"/></svg>
+            </div>
+            <p>诊断开始后<br>假设推理树将在此动态展示</p>
+          </div>
+          <div id="hypothesisTree" class="hypothesis-tree"></div>
+        </div>
+
         <div id="toolPopup" class="tool-popup hidden">
           <div class="tool-popup-header">
             <span id="toolPopupTitle"></span>

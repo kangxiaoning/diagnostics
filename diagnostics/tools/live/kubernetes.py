@@ -70,15 +70,6 @@ def _kubectl(cluster_name: str, args: list[str],
 # ═══════════════ Discovery ═══════════════
 
 @tool
-def list_clusters() -> str:
-    """List all configured Kubernetes cluster names. Call this FIRST."""
-    servers = _load_cluster_servers()
-    if not servers:
-        return "No clusters configured. Set DIAGNOSTICS_K8S_SERVERS env var."
-    return "\n".join(f"- `{n}` → {u}" for n, u in servers.items())
-
-
-@tool
 def get_namespaces(cluster_name: str) -> str:
     """List all namespaces in a cluster. Call before tools that need namespace."""
     return _kubectl(cluster_name, ["get", "namespaces", "-o", "wide"], timeout=10)

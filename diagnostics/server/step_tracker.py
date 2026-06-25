@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -10,54 +9,15 @@ logger = logging.getLogger(__name__)
 
 
 def format_tool_args(args: dict, tool_name: str = "") -> str:
-    """Format tool arguments for display. Shows all meaningful key-value pairs."""
+    """Format tool arguments for display."""
     if not args:
         return ""
-    logger.debug("format_tool_args: tool='%s' args=%s", tool_name, args)
-
-    # Write_todos: summarize task list
-    todos = args.get("todos")
-    if isinstance(todos, list) and todos:
-        items = []
-        for t in todos[:3]:
-            if isinstance(t, dict):
-                items.append(t.get("content", "")[:40])
-            else:
-                items.append(str(t)[:40])
-        suffix = f" +{len(todos)-3}" if len(todos) > 3 else ""
-        return "; ".join(items) + suffix
-
-    # Show all args as key=value, excluding technical/empty ones
-    skip_keys = {"output_mode", "limit", "tail_lines", "head_lines", "since_minutes",
-                 "max_revisions", "recursive", "revision",
-                 "old_str", "new_str", "content",
-                 "instructions", "prompt"}
     parts = []
     for k, v in args.items():
-        if k in skip_keys:
-            continue
         sv = str(v).strip()
         if not sv or sv == "{}":
             continue
-        # For skills paths: show parent/basename
-        if k in ("path", "file_path", "filename") and "/skills/" in sv:
-            sv = sv.rsplit("/", 2)[-2] + "/" + sv.rsplit("/", 1)[-1]
-        elif k in ("path", "file_path", "filename") and "/" in sv:
-            sv = sv.rsplit("/", 1)[-1]
-        # For task description: show first meaningful sentence
-        if k == "description" and tool_name == "task":
-            first_line = sv.split("\n")[0].strip()
-            if first_line.startswith("请") or first_line.startswith("用户"):
-                sv = first_line[:50] + ("..." if len(first_line) > 50 else "")
-            else:
-                continue  # skip if no useful first line
-        elif k == "description":
-            continue  # skip for non-task tools
-        # Truncate long values
-        if len(sv) > 40:
-            sv = sv[:37] + "..."
         parts.append(f"{k}={sv}")
-
     return ", ".join(parts) if parts else ""
 
 
@@ -93,7 +53,7 @@ TOOL_LABELS: dict[str, str] = {
     "read_todos": "查看任务清单",
     "task": "委派专家诊断",
     "read_file": "读取文件内容",
-    "write_file": "写入诊断记录",
+    "write_file": "写入文件",
     "edit_file": "编辑文件内容",
     "ls": "浏览文件目录",
     "glob": "搜索匹配文件",
@@ -122,7 +82,6 @@ TOOL_LABELS: dict[str, str] = {
     "list_namespace_resources": "列出命名空间资源",
     "get_pv_pvc_status": "查看PV/PVC状态",
     "get_ingress_status": "查看Ingress状态",
-    "list_clusters": "列出配置的集群",
     "get_namespaces": "列出命名空间",
     "get_coredns_logs": "查看CoreDNS日志",
     "describe_coredns": "查看CoreDNS详情",
@@ -139,6 +98,12 @@ TOOL_LABELS: dict[str, str] = {
     "get_etcd_logs": "查看etcd日志",
     "check_etcd_health": "检查etcd健康",
     "get_etcd_metrics": "查看etcd指标",
+    # Ledger management tools
+    "commit_hypotheses": "提交诊断假设",
+    "select_path": "选择诊断路径",
+    "record_finding": "记录验证结论",
+    # Summarization
+    "compact_conversation": "压缩对话历史",
 }
 
 
@@ -188,6 +153,8 @@ class TreeBuilder:
     _current_response_text: list[str] = field(default_factory=list)
     _round_descriptions: dict[int, str] = field(default_factory=dict)
     _current_round: int = 0
+    _phase_precreated: bool = False  # True when next phase was created ahead of LLM tokens
+    _last_phase_is_orphan: bool = False  # True when precreated phase has never received tools
 
     # ── Public API ──
 
@@ -206,7 +173,11 @@ class TreeBuilder:
         result: list[dict[str, Any]] = []
         if round_num > 0 and round_num != self._current_round:
             self._current_round = round_num
-            self._create_next_phase()
+            if not self._phase_precreated:
+                self._create_next_phase()
+            else:
+                self._phase_precreated = False
+                self._last_phase_is_orphan = False  # activated by a real round
             self.state = "thinking"
             result.append(self._snapshot_event())
 
@@ -230,10 +201,10 @@ class TreeBuilder:
             self.state = "executing"
             self._flush_think()
 
+        # A precreated (orphan) phase now has real tools — it's consumed.
+        self._last_phase_is_orphan = False
+
         parent_id = self._current_phase_id
-        parent = self.nodes.get(parent_id)
-        if parent and parent.status == StepStatus.RUNNING:
-            parent.status = StepStatus.COMPLETED
 
         created_ids: list[str] = []
 
@@ -294,10 +265,13 @@ class TreeBuilder:
             return []
 
         self._flush_think()
-        # Next phase is created on the next LLM invocation (round change in handle_token),
-        # not here. This way each phase spans the full LLM interaction round.
-        self.state = "answering"
-        logger.info("Tree: all tools done, state -> answering")
+        # Create the next phase immediately so the frontend always sees
+        # a RUNNING phase — no gap between tool completion and next LLM round.
+        self._create_next_phase()
+        self._phase_precreated = True
+        self._last_phase_is_orphan = True
+        self.state = "thinking"
+        logger.info("Tree: all tools done, next phase precreated")
         return [self._snapshot_event()]
 
     def update_tool_args(self, tc_id: str, tool_name: str, args: dict) -> list[dict[str, Any]]:
@@ -335,6 +309,10 @@ class TreeBuilder:
             node = self.nodes[current_id]
             if node.node_type == NodeType.PHASE:
                 if node.status == StepStatus.RUNNING:
+                    # If this phase was precreated but never consumed by a real
+                    # round (no tools added), rename it to indicate completion.
+                    if self._last_phase_is_orphan:
+                        node.title = "诊断完成"
                     node.status = StepStatus.COMPLETED
 
         for node in self.nodes.values():
@@ -352,13 +330,21 @@ class TreeBuilder:
         self.state = "done"
         return fallback + [self._snapshot_event()]
 
-    # ── Phase creation (LLM-driven descriptions) ──
+    # ── Phase creation ──
 
     def _create_next_phase(self) -> str:
+        # Mark previous phase as completed before creating the new one.
+        # This ensures there is always exactly one RUNNING Phase on the tree.
+        prev_id = self._current_phase_id
+        if prev_id and prev_id in self.nodes:
+            prev = self.nodes[prev_id]
+            if prev.node_type == NodeType.PHASE and prev.status == StepStatus.RUNNING:
+                prev.status = StepStatus.COMPLETED
+
         parent_ids = list(dict.fromkeys(self._last_tool_child_ids))
         parent_ids = [pid for pid in parent_ids if pid in self.nodes]
         if not parent_ids:
-            parent_ids = [self._current_phase_id]
+            parent_ids = [prev_id]
 
         phase_count = sum(
             1 for n in self.nodes.values() if n.node_type == NodeType.PHASE
@@ -366,52 +352,29 @@ class TreeBuilder:
         round_num = phase_count + 1
         title = f"第{round_num}轮智能分析"
 
-        description = self._extract_phase_description() or ""
-
         nid = self._next_id()
         phase = TreeNode(
             nid, title, parent_ids[0],
             StepStatus.RUNNING, NodeType.PHASE,
             parent_ids=parent_ids,
-            description=description,
         )
         self._add_node(phase)
         self._current_phase_id = nid
         self._last_tool_child_ids = []
-        logger.info("Tree: phase '%s' (id=%s, parents=%s, desc=%r)",
-                     title, nid, parent_ids, description[:60])
+        logger.info("Tree: phase '%s' (id=%s, parents=%s)", title, nid, parent_ids)
         return nid
 
     def _create_first_phase(self) -> str:
-        description = self._extract_phase_description() or ""
         nid = self._next_id()
         phase = TreeNode(
             nid, "第1轮智能分析", None,
             StepStatus.RUNNING, NodeType.PHASE,
             parent_ids=[],
-            description=description,
         )
         self._add_node(phase)
         self._current_phase_id = nid
-        logger.info("Tree: phase '第1轮智能分析' (id=%s, desc=%r)", nid, description[:60])
+        logger.info("Tree: phase '第1轮智能分析' (id=%s)", nid)
         return nid
-
-    def _extract_phase_description(self) -> str:
-        """Extract phase description from LLM's think text."""
-        if self.think_segments:
-            text = self.think_segments[-1]
-        elif self.think_buffer:
-            text = "".join(self.think_buffer)
-        else:
-            return ""
-        if text.strip():
-            sentences = re.split(r'[。；\n]', text)
-            for s in sentences:
-                s = s.strip()
-                if len(s) > 4:
-                    return s[:80]
-            return text.strip()[:80]
-        return ""
 
     # ── Helpers ──
 

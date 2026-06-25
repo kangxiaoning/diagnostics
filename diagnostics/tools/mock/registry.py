@@ -48,7 +48,6 @@ from diagnostics.tools.mock.kubernetes import (
     get_pod_restart_counts,
     get_pv_pvc_status,
     get_system_pods,
-    list_clusters,
     list_helm_releases,
     list_namespace_resources,
 )
@@ -72,7 +71,6 @@ def get_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         check_kubernetes_pods,
         check_kubernetes_nodes,
         check_kubernetes_control_plane,
-        list_clusters,
         get_namespaces,
         get_cluster_overview,
         get_pod_logs,
@@ -115,7 +113,6 @@ def get_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
 def get_k8s_mock_tools() -> list[Any]:
     """Return only K8s-specific mock tools (for subagent injection)."""
     return [
-        list_clusters,
         get_namespaces,
         get_cluster_overview,
         get_pod_logs,

@@ -47,7 +47,6 @@ from diagnostics.tools.live.kubernetes import (
     get_pv_pvc_status,
     get_resource_yaml,
     get_system_pods,
-    list_clusters,
     list_helm_releases,
     list_namespace_resources,
 )
@@ -66,7 +65,6 @@ __all__ = [
     "check_gpu_memory",
     "check_gpu_utilization",
     # Kubernetes
-    "list_clusters",
     "get_namespaces",
     "get_cluster_overview",
     "get_pod_logs",

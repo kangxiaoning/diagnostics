@@ -16,6 +16,29 @@ logger = logging.getLogger(__name__)
 TRACES_DIR = Path(__file__).resolve().parent.parent.parent / "agent_data" / "traces"
 
 
+def _render_trace_hypothesis(
+    lines: list[str],
+    hypotheses: dict,
+    hid: str,
+    indent: int,
+) -> None:
+    """Recursively render a hypothesis node for the trace file."""
+    node = hypotheses.get(hid)
+    if not node:
+        return
+    prefix = "  " * indent
+    star = " ★" if node.get("selected") else ""
+    status = node.get("status", "pending")
+    prob = node.get("probability", 0)
+    stmt = node.get("statement", "")
+    lines.append(f"{prefix}- `{hid}` [{status} p={prob}%]{star} {stmt}")
+    for ev in node.get("evidence", []):
+        tag = "支持" if ev.get("supports") else "反驳"
+        lines.append(f"{prefix}  - ({tag}) {ev.get('summary', '')[:100]}")
+    for sid in node.get("sub_hypothesis_ids", []):
+        _render_trace_hypothesis(lines, hypotheses, sid, indent + 1)
+
+
 class TraceWriter:
     """Persist diagnostic traces: user input → LLM text → tool calls → results.
 
@@ -40,6 +63,7 @@ class TraceWriter:
         self._llm_buffer: list[str] = []          # accumulate streaming chunks
         self._llm_header_inserted: bool = False   # "### LLM 输出" header flag
         self._tool_result_slots: dict[int, list[str]] = {}
+        self._ledger_sections: list[str] = []     # hypothesis tree snapshots
 
     # ── Public API ──
 
@@ -113,6 +137,32 @@ class TraceWriter:
                 _fix_slots_after_insert(self._tool_result_slots, idx, 2)
                 return
 
+    def ledger_update(self, ledger: dict) -> None:
+        """Record a diagnosis ledger snapshot (hypothesis tree evolution).
+
+        Called when commit_hypotheses / select_path / record_finding fires.
+        Accumulates compact snapshots that are appended to the trace on finalize.
+        """
+        if not ledger or not isinstance(ledger, dict):
+            return
+        phase = ledger.get("current_phase", "?")
+        round_num = ledger.get("current_round", 0)
+        active = ledger.get("active_path", [])
+        hypotheses = ledger.get("hypotheses", {})
+        root_ids = ledger.get("root_hypothesis_ids", [])
+
+        lines = [f"### 📋 台账更新 (步骤 {round_num}, 阶段: {phase})"]
+        if active:
+            lines.append(f"**活动路径**: {' → '.join(active)}")
+        if root_ids:
+            lines.append("**假设树**:")
+            for hid in root_ids:
+                _render_trace_hypothesis(lines, hypotheses, hid, 0)
+        if ledger.get("root_cause"):
+            lines.append(f"**🎯 根因**: {ledger['root_cause']}")
+
+        self._ledger_sections.append("\n".join(lines))
+
     def finalize(self) -> None:
         self._flush_llm_buffer()
         for idx in list(self._tool_result_slots):
@@ -123,6 +173,12 @@ class TraceWriter:
                 self._tool_result_slots.pop(idx, None)
         duration = (datetime.now(timezone.utc) - self._started_at).total_seconds()
         self._lines.insert(1, f"**耗时**: {duration:.1f}s\n")
+        # Append hypothesis tree evolution if any
+        if self._ledger_sections:
+            self._lines.append("\n## 假设树演变\n")
+            for section in self._ledger_sections:
+                self._lines.append(section)
+                self._lines.append("")
         self._lines.append(
             f"\n---\n*追踪文件自动生成于 "
             f"{datetime.now(timezone.utc).isoformat()}*"

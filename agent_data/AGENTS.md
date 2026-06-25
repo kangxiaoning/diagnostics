@@ -1,13 +1,9 @@
-## 诊断方法论
+## 补充思维模型
 
-- **USE 方法**（Utilization - Saturation - Errors）：
-  针对每种资源按顺序检查利用率、饱和度和错误。
-- **分层诊断**（Layered Diagnosis）：
-  从 OS 层（CPU/内存/磁盘）→ 内核层（网络栈/文件系统）→ 运行时层（containerd/kubelet）→ 集群层（etcd/apiserver）→ 应用层（Pod/进程）
-  逐层排查，下层问题会向上传导。
-- **先 overview 后 drill-down**：必须从 get_system_overview() 开始，不要跳过整体视图。
-- **交叉验证**：单一工具的数据不可信，至少两个工具的数据互相佐证。
-- **逐轮递进**：每轮聚焦一个假设，验证后进入下一轮。不要一次性调用所有工具。
+诊断流程由系统指令中的假设驱动循环控制。以下模型用于辅助故障识别和假设形成：
+
+- **USE 方法**：针对每种资源按利用率→饱和度→错误顺序检查。
+- **分层诊断**：OS层 → 内核层 → 运行时层 → 集群层 → 应用层，下层问题向上传导。
 
 ## K8s 组件故障速查
 
@@ -77,11 +73,3 @@
 | Pod 卡在 ContainerCreating | 镜像拉取失败 \| containerd 异常 | `container-runtime-diagnosis` |
 | DNS SERVFAIL 或 NXDOMAIN | CoreDNS RBAC \| Corefile 配置 | `coredns-diagnosis` |
 | containerd `failed to create shim task` | runc/OCI 错误 | `container-runtime-diagnosis` |
-
-## 输出风格
-
-- 面向运维工程师，中文回答，结构清晰
-- 先给结论（最可能的根因），再列证据链
-- 提供可操作的建议而非理论分析
-- 每轮诊断控制在 3 个工具调用以内
-- 识别到特定模式后，查阅对应的 Skill 获取标准诊断流程

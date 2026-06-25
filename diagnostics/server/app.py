@@ -121,6 +121,18 @@ def _make_report_path(entity_type: str, entity_name: str) -> str:
     return f"/agent_data/reports/{entity_type}/{safe_entity}/{ts}-{uid}.md"
 
 
+def _make_ledger_path(report_path: str) -> str:
+    """Generate a ledger JSON path matching the report path prefix.
+
+    e.g. /agent_data/reports/.../2026-06-25-103000-a1b2c3d4.md
+      → /agent_data/traces/2026-06-25-103000-a1b2c3d4-ledger.json
+    """
+    if not report_path:
+        return ""
+    stem = report_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]  # 2026-06-25-103000-a1b2c3d4
+    return f"/agent_data/traces/{stem}-ledger.json"
+
+
 def _save_result(
     report_path: str,
     tree: TreeBuilder,
@@ -129,11 +141,16 @@ def _save_result(
     duration: float,
     event_counters: dict[str, int],
     assistant_text_chars: int,
+    ledger: dict[str, Any] | None = None,
+    content: str = "",
 ) -> None:
-    """Save diagnostic result: tree graph + metadata as JSON alongside the report."""
+    """Save diagnostic result: tree graph + metadata + ledger as JSON, report as .md."""
     stem = report_path.rsplit(".", 1)[0] if report_path.endswith(".md") else report_path
+    report_dir = Path(ROOT_DIR / stem.lstrip("/")).parent
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save .result.json (tree + metadata)
     result_path = Path(ROOT_DIR / stem.lstrip("/")).with_suffix(".result.json")
-    result_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, Any] = {
         "entity_type": entity_type,
         "entity_name": entity_name,
@@ -142,8 +159,16 @@ def _save_result(
         "event_counts": dict(event_counters),
         "tree": {"steps": _serialize_tree(tree)},
     }
+    if ledger:
+        data["ledger"] = ledger
     result_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     logger.info("Result saved to %s", result_path)
+
+    # Save .md (report content)
+    if content:
+        md_path = Path(ROOT_DIR / stem.lstrip("/")).with_suffix(".md")
+        md_path.write_text(content, encoding="utf-8")
+        logger.info("Report saved to %s", md_path)
 
 
 def _serialize_tree(tree: TreeBuilder) -> list[dict[str, Any]]:
@@ -237,14 +262,21 @@ async def _chat_event_stream(
     state.running = True
     state.cancel_event = asyncio.Event()
 
-    # ── Generate report path and build agent with formatted prompt ──
+    # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
-    agent = agent_factory(settings, system_prompt=make_system_prompt(report_path))
+    ledger_path = _make_ledger_path(report_path)
+    agent = agent_factory(
+        settings,
+        system_prompt=make_system_prompt(report_path, ledger_path),
+        report_path=report_path,
+        ledger_path=ledger_path,
+    )
 
     state.messages.append(HumanMessage(content=request.message))
     state.messages = state.messages[-settings.max_history_messages :]
     assistant_text: list[str] = []
     tree = TreeBuilder()
+    latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
 
     logger.info("[session=%s] Chat stream started, message=%r",
                 session_id, request.message[:120])
@@ -360,6 +392,11 @@ async def _chat_event_stream(
                 logger.info("[session=%s] Structured response received", session_id)
                 yield sse("structured_response", event.payload)
 
+            elif event.name == "ledger_snapshot":
+                latest_ledger = event.payload.get("ledger")
+                trace.ledger_update(latest_ledger)
+                yield sse("ledger_snapshot", event.payload)
+
         # Finalize tree
         for snap in tree.finalize():
             if snap.get("type") == "tree_snapshot":
@@ -383,7 +420,8 @@ async def _chat_event_stream(
                     session_id, elapsed, dict(event_counters), len(content))
         _save_result(report_path, tree,
                      request.entity_type, request.entity_name,
-                     elapsed, event_counters, len(content))
+                     elapsed, event_counters, len(content),
+                     ledger=latest_ledger, content=content)
         trace.finalize()
         yield sse("done", {"session_id": session_id})
 

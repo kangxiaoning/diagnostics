@@ -42,7 +42,6 @@ from diagnostics.tools.live.kubernetes import (
     get_pv_pvc_status,
     get_resource_yaml,
     get_system_pods,
-    list_clusters,
     list_helm_releases,
     list_namespace_resources,
 )
@@ -51,7 +50,7 @@ from diagnostics.tools.live.kubernetes import (
 def get_agent_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
     """Return production diagnostic tools (live K8s)."""
     return [
-        list_clusters, get_namespaces, get_cluster_overview,
+        get_namespaces, get_cluster_overview,
         get_pod_logs, get_pod_logs_since, get_pod_logs_lines, get_pod_previous_logs,
         describe_pod, get_pod_events, get_node_info, get_cluster_events,
         get_pod_resource_usage, get_node_resource_usage,
