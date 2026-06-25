@@ -323,15 +323,18 @@ async def _chat_event_stream(
                 elif isinstance(path_val, str) and path_val == "coordinator":
                     assistant_text.append(event.payload["text"])
                     trace.llm_text(event.payload.get("round", 0), event.payload["text"])
-                # Feed text tokens to tree with round number.
-                # Round changes detected here drive phase creation — one phase
-                # per LLM invocation.
+                # Feed text tokens to tree for think/answer buffer.
                 for tok_evt in tree.handle_token(
                     event.payload.get("text", ""),
-                    round_num=event.payload.get("round", 0),
                 ):
                     if tok_evt.get("type") == "tree_snapshot":
                         yield sse("tree_snapshot", tok_evt)
+
+            elif event.name == "round_start":
+                # New LLM round → create a new Phase node in the tree
+                for snap in tree.handle_round_start(event.payload.get("round", 0)):
+                    if snap.get("type") == "tree_snapshot":
+                        yield sse("tree_snapshot", snap)
 
             elif event.name == "tool_start":
                 description = event.payload.get("description", "")

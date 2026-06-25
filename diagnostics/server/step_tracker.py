@@ -153,8 +153,6 @@ class TreeBuilder:
     _current_response_text: list[str] = field(default_factory=list)
     _round_descriptions: dict[int, str] = field(default_factory=dict)
     _current_round: int = 0
-    _phase_precreated: bool = False  # True when next phase was created ahead of LLM tokens
-    _last_phase_is_orphan: bool = False  # True when precreated phase has never received tools
 
     # ── Public API ──
 
@@ -166,31 +164,32 @@ class TreeBuilder:
         return [self._snapshot_event()]
 
     def handle_token(self, text: str, round_num: int = 0) -> list[dict[str, Any]]:
-        """Feed a text token. Creates a new phase when the LLM round changes."""
+        """Feed a text token for think/answer buffer. Phase creation is driven
+        by handle_round_start (round-start events from LangGraph)."""
         if self.state == "done":
             return []
-
-        result: list[dict[str, Any]] = []
-        if round_num > 0 and round_num != self._current_round:
-            self._current_round = round_num
-            if not self._phase_precreated:
-                self._create_next_phase()
-            else:
-                self._phase_precreated = False
-                self._last_phase_is_orphan = False  # activated by a real round
-            self.state = "thinking"
-            result.append(self._snapshot_event())
 
         self._current_response_text.append(text)
         if self.state in ("thinking", "executing"):
             self.think_buffer.append(text)
-            result.append({"type": "think_token", "text": text})
-            return result
+            return [{"type": "think_token", "text": text}]
         if self.state == "answering":
             self.answer_buffer.append(text)
-            result.append({"type": "token", "text": text})
-            return result
-        return result
+            return [{"type": "token", "text": text}]
+        return []
+
+    def handle_round_start(self, round_num: int) -> list[dict[str, Any]]:
+        """Create a new phase for an upcoming LLM round.
+        Called when LangGraph enters the model node for round 2+."""
+        if self.state == "done":
+            return []
+        if round_num <= self._current_round:
+            return []
+        self._current_round = round_num
+        self._create_next_phase()
+        self.state = "thinking"
+        logger.info("Tree: round %d started, phase created", round_num)
+        return [self._snapshot_event()]
 
     def handle_tool_call(self, tool_calls: list[dict]) -> list[dict[str, Any]]:
         new_calls = self._filter_new(tool_calls)
@@ -200,9 +199,6 @@ class TreeBuilder:
         if self.state in ("thinking", "answering"):
             self.state = "executing"
             self._flush_think()
-
-        # A precreated (orphan) phase now has real tools — it's consumed.
-        self._last_phase_is_orphan = False
 
         parent_id = self._current_phase_id
 
@@ -265,13 +261,14 @@ class TreeBuilder:
             return []
 
         self._flush_think()
-        # Create the next phase immediately so the frontend always sees
-        # a RUNNING phase — no gap between tool completion and next LLM round.
-        self._create_next_phase()
-        self._phase_precreated = True
-        self._last_phase_is_orphan = True
+        # Mark current phase completed. Next phase is created by
+        # handle_round_start when LangGraph enters the next model node.
+        if self._current_phase_id and self._current_phase_id in self.nodes:
+            node = self.nodes[self._current_phase_id]
+            if node.node_type == NodeType.PHASE and node.status == StepStatus.RUNNING:
+                node.status = StepStatus.COMPLETED
         self.state = "thinking"
-        logger.info("Tree: all tools done, next phase precreated")
+        logger.info("Tree: all tools done, phase completed")
         return [self._snapshot_event()]
 
     def update_tool_args(self, tc_id: str, tool_name: str, args: dict) -> list[dict[str, Any]]:
@@ -304,20 +301,25 @@ class TreeBuilder:
         return []
 
     def finalize(self) -> list[dict[str, Any]]:
-        current_id = self._current_phase_id
-        if current_id in self.nodes:
-            node = self.nodes[current_id]
-            if node.node_type == NodeType.PHASE:
-                if node.status == StepStatus.RUNNING:
-                    # If this phase was precreated but never consumed by a real
-                    # round (no tools added), rename it to indicate completion.
-                    if self._last_phase_is_orphan:
-                        node.title = "诊断完成"
-                    node.status = StepStatus.COMPLETED
-
+        # Mark all running nodes completed
         for node in self.nodes.values():
             if node.status == StepStatus.RUNNING:
                 node.status = StepStatus.COMPLETED
+
+        # Create "诊断完成" node — connected to last round's tools (or last phase)
+        parent_ids = list(dict.fromkeys(self._last_tool_child_ids))
+        parent_ids = [pid for pid in parent_ids if pid in self.nodes]
+        if not parent_ids and self._current_phase_id:
+            parent_ids = [self._current_phase_id]
+
+        nid = self._next_id()
+        done = TreeNode(
+            nid, "诊断完成", parent_ids[0] if parent_ids else None,
+            StepStatus.COMPLETED, NodeType.PHASE,
+            parent_ids=parent_ids,
+        )
+        self._add_node(done)
+        self._current_phase_id = nid
 
         self._flush_think()
 

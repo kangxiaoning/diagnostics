@@ -326,6 +326,10 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 state._last_node_type = "model"
                 logger.info("[round=%d] New model invocation detected",
                             state.round_number)
+                # Notify the tree to create a new Phase for this round
+                events.append(AgentEvent("round_start", {
+                    "round": state.round_number,
+                }))
         elif is_coordinator and node_type == "tools":
             state._last_node_type = "tools"
 
