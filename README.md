@@ -81,6 +81,54 @@ flowchart LR
 | 可视化 | SVG 边线 + 自定义 BFS 层级布局 |
 | 运行环境 | `uvicorn` ASGI 服务器 |
 
+## Hypothesis-Driven Diagnosis Ledger
+
+诊断 Agent 采用**假设驱动诊断机制**：维护结构化的诊断台账（Diagnosis Ledger），通过假设形成 → 验证 → 评估 → 报告的核心循环逐步逼近根因，而非固定步骤数的线性流程。
+
+### 核心概念
+
+| 概念 | 说明 |
+|------|------|
+| **DiagnosisLedger** | 诊断台账 — 持久化在 LangGraph State 中的结构化诊断记忆 |
+| **Hypothesis Tree** | 假设树 — 最多 3 个/层，支持多级子假设深化 |
+| **Active Path** | 活动路径 — 当前探索路径栈，支持回溯 |
+| **Phase** | 诊断阶段 — `understand` → `hypothesize` → `verify` → `evaluate` → `report` → `backtrack` |
+| **Exit Conditions** | 退出条件 — 根因确认(p≥80%) / 假设穷尽 / 证据饱和(3×inconclusive) |
+
+### 数据流
+
+```
+awrap_model_call (每次LLM调用前)
+  ├── 获取当前 ledger (self._current_ledger > request.state > new_ledger)
+  ├── render_ledger_context() → 注入 system message
+  └── 等待 LLM 响应 → ExtendedModelResponse → 同步回 state
+
+awrap_tool_call (每次工具调用后)
+  ├── 诊断工具 → 自动记录证据到活动假设
+  ├── record_round() 记录步骤
+  └── 台账工具 → 持久化 + stream_writer 推送 ledger_snapshot
+```
+
+### 三个台账管理工具
+
+| 工具 | 调用阶段 | 作用 |
+|------|---------|------|
+| `commit_hypotheses` | HYPOTHESIZE | 提交 ≤3 个假设（按概率降序），自动选择最高概率进入 verifying |
+| `select_path` | EVALUATE | 选择 1 条路径深入，未选中自动 deprioritized（可回溯） |
+| `record_finding` | VERIFY 后 | 记录 confirmed/refuted/inconclusive，自动检查退出条件 |
+
+### 前端假设树
+
+右侧面板提供"执行树"和"假设树"两个标签页。假设树实时渲染假设节点的层级结构：状态、概率条、支持/反驳证据、验证工具，以及"当前聚焦"标记。
+
+### 退出条件（进入 REPORT 的判定）
+
+满足以下任一即进入报告阶段，不依赖固定步骤数：
+1. **根因确认**：某假设 confirmed 且 probability≥80%，假设已足够具体
+2. **假设穷尽**：所有可探索路径（含回溯）都 refuted/dead_end
+3. **证据饱和**：连续 3 次 record_finding 返回 inconclusive
+4. **无合理假设**：EVALUATE 阶段无法提出合理的新假设
+
 ## 快速开始
 
 ```bash
