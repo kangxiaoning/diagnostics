@@ -64,6 +64,14 @@ def _sanitize_ledger(ledger: dict) -> dict:
     return {k: v for k, v in ledger.items() if k not in internal_keys}
 
 
+def _paths_match(tool_path: str, report_path: str) -> bool:
+    """Check if tool_path targets the same file as report_path."""
+    if not tool_path or not report_path:
+        return False
+    # Normalise: strip leading /, compare tails (tool may use relative or absolute)
+    return tool_path.lstrip("/").rstrip("/") == report_path.lstrip("/").rstrip("/")
+
+
 # ── Pydantic schemas for tool inputs ──
 
 class HypothesisSpec(BaseModel):
@@ -123,8 +131,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     state_schema = DiagnosisLedgerState
 
-    def __init__(self, ledger_path: str = "") -> None:
+    def __init__(self, ledger_path: str = "", report_path: str = "") -> None:
         self.ledger_path = ledger_path
+        self.report_path = report_path
         self._current_ledger: DiagnosisLedger | None = None
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
@@ -228,6 +237,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     })
             except Exception:
                 pass  # stream_writer not available in all contexts
+
+        # Capture report content when write_file writes to the pre-generated
+        # report path — emit for frontend answer-body without text parsing.
+        if tool_name == "write_file" and self.report_path:
+            file_path = tool_args.get("file_path") or tool_args.get("path") or ""
+            if file_path and _paths_match(file_path, self.report_path):
+                content = tool_args.get("content") or tool_args.get("text") or ""
+                if content:
+                    try:
+                        sw = getattr(request.runtime, "stream_writer", None)
+                        if sw:
+                            sw({
+                                "type": "report_content",
+                                "content": content,
+                            })
+                    except Exception:
+                        pass
 
         return result
 

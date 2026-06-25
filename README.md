@@ -1,3 +1,4 @@
+故障报告好像包含了think-body内容，按预期故障报告是基于前面所有分析形成的最终报告，请分析原因并解决。
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
 一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 7 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 3:7 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
@@ -444,81 +445,60 @@ graph TD
 ```mermaid
 stateDiagram-v2
     [*] --> init : TreeBuilder created
-    init --> thinking : start() — Create first Phase
-    thinking --> thinking : handle_token() — Accumulate text (same Round)
+    init --> thinking : start() / handle_round_start() — Create Phase
+    thinking --> thinking : handle_token() — Accumulate LLM text
     thinking --> executing : handle_tool_call() — LLM issues Tool Call
     executing --> executing : handle_update() — Tools completing
-    executing --> thinking : handle_token() — New LLM call (Round++)
-    executing --> answering : handle_update() — All tools done
-    answering --> executing : handle_tool_call() — Additional Tool Call
-    answering --> done : finalize() — Stream ends, mark all done
-    thinking --> done : finalize() — No tool calls, end directly
+    executing --> thinking : handle_round_start() — New Round starts
+    executing --> thinking : handle_update() — All tools done, Phase completed
+    thinking --> done : finalize() — Stream ends, create "诊断完成"
+    executing --> done : finalize()
 ```
 
 **State 转换要点**：
-- `thinking`：LLM 正在流式输出文本，`handle_token()` 检测 Round 变化时自动创建新 Phase
+- `thinking`：LLM 正在流式输出文本，Phase 为 RUNNING
 - `executing`：Tool 正在执行，`handle_tool_call()` 在当前 Phase 下挂载 Tool 子节点
-- `answering`：Coordinator 进入报告生成阶段，`_finalize()` 将 Buffer 文本写入回答区
-- 新 Phase 在下一 Round LLM 调用时由 `handle_token()` 的 Round 变化触发，而非在 Tool 完成时创建
+- 新 Phase 由 `handle_round_start()` 创建——当 LangGraph 进入下一轮 model 节点时触发
+- 诊断结束由 `finalize()` 显式创建 **"诊断完成"** 终态节点
 
 ### Phase（Round）创建策略
 
-整个诊断由多个 **Round** 组成，每 Round 对应一次 LangGraph **model 节点进入**。`streaming.py` 通过 `metadata["langgraph_node"]` 检测节点转换，递增 `round_number`。
+整个诊断由多个 **Round** 组成，每 Round 对应一次 LangGraph **model 节点进入**。Phase 创建采用**事件驱动**模式，不再依赖 token 流检测：
 
 ```mermaid
 flowchart TD
-    START["Agent Start"] -->|"stream_mode=messages"| M1["model node (#1)"]
-    M1 -->|"round_number = 1<br/>Create Round 1 Phase"| T1["tools node<br/>Execute Tool Calls"]
-    T1 -->|"Tools return"| M2["model node (#2)"]
-    M2 -->|"round_number = 2<br/>Create Round 2 Phase"| T2["tools node"]
+    START["Agent Start"] -->|tree.start()| P1["Phase 1 RUNNING"]
+    START -->|"LangGraph stream"| M1["model node (#1)"]
+    M1 -->|"LLM text + tool_calls"| T1["tools node → tool_end"]
+    T1 -->|"Tools return, next model entry"| M2["model node (#2)"]
+    M2 -->|"round_start event"| P2["Phase 1 COMPLETED<br/>Phase 2 RUNNING"]
+    M2 --> T2["tools node"]
     T2 -->|"..."| MN["model node (#N)"]
-    MN -->|"round_number = N<br/>Create Round N Phase"| END["Stream End"]
-
-    M1 -.->|"tree.start()"| P1["Phase: Round 1"]
-    M2 -.->|"handle_token() detects Round change"| P2["Phase: Round 2"]
-    MN -.->|"handle_token()"| PN["Phase: Round N"]
+    MN -->|"round_start event"| PN["Phase N RUNNING"]
+    MN -->|"Stream End"| END["finalize() → '诊断完成'"]
 ```
 
-**Round 检测机制**：`streaming.py` 通过 LangGraph 流式 metadata 中的 `langgraph_node` 字段判断当前节点类型。Coordinator 每次进入 `"model"` 节点即表示一次新的 LLM 调用，`round_number` 在首次 text token 处理前递增。Frontend 通过 `payload.round` 对比当前折叠块的 `sec.round` 判断是否进入新 Round。
+**关键流程**：
+1. `streaming.py` 检测到 LangGraph `tools → model` 节点转换 → emit `round_start` 事件
+2. `app.py` 收到 `round_start` → `tree.handle_round_start(N)` → Phase N-1 COMPLETED + Phase N RUNNING
+3. Phase 创建与 LLM 调用 1:1 对应，语义清晰
 
-**关键：parent_ids 继承**
+**parent_ids 继承**：新 Phase 的 `parent_ids` 指向上一 Round 所有 Tool 子节点，形成 BFS 层级布局中的因果链连线。
 
-```python
-def _create_next_phase(self) -> str:
-    # 新 Phase 的 parent_ids 指向上一 Round 的所有 Tool 子节点
-    parent_ids = list(dict.fromkeys(self._last_tool_child_ids)) or [self._current_phase_id]
-    ...
-    phase = TreeNode(nid, title, parent_ids[0],
-                     parent_ids=parent_ids, ...)
+### 报告内容分发
+
+报告通过 **`write_file` 捕获**机制分发，而非文本解析：
+
+```
+LLM → write_file(report_path, content="# 故障诊断报告...")
+  → middleware 检测 write_file 命中 report_path
+    → stream_writer → custom event "report_content"
+      → streaming.py → text_delta(phase="answering")
+        → 前端 answer-body
+        → app.py report_text → .md 文件（仅报告）
 ```
 
-这意味着在 BFS 层级布局中，第 N Round 的 Phase 节点会和第 N-1 Round 的所有 Tool 节点产生父子连线，形成清晰的因果链可视化。
-
-### 节点描述：完全由 LLM 驱动
-
-这是本项目区别于硬编码流程图方案的核心设计。节点描述（`description` 字段）的来源优先级：
-
-1. **`<step>` Tag**（最高优先级）：LLM 在思考过程中使用 `<step>检查 CPU 使用率和负载均衡</step>` 声明即将执行的操作。`streaming.py` 的 `_parse_step_tags()` 在所有文本处理**之前**提取这些描述，存入 `_pending_step_descriptions` 队列。
-
-2. **思考文本提取**（次优先级）：当 `<step>` Tag 不足时，`_build_tool_descriptions()` 从 LLM 的累积思考文本中按语义模式提取：
-   - 多 Tool 场景：搜索包含"检查/执行/查看/采集/读取/排查"等动作关键词的句子
-   - 单 Tool 场景：取最后一句话
-
-3. **Tool 参数回退**（兜底）：如果 LLM 未提供任何描述，用 Tool 名称和参数生成（如 `check_cpu(profile="default")`）。
-
-```python
-# streaming.py: _process_chunk 中的处理顺序
-text = _extract_text(message)
-
-# ① 首先从原始文本解析 <step> Tag
-clean_text = _parse_step_tags(text, state)
-
-# ② 然后解析 <think> Tag，区分思考/回答
-think_text, answer_text = _parse_think_tags(clean_text, state)
-
-# ③ 当 LLM 发出 tool_call 时，消费 pending_step_descriptions
-step_descs = _build_tool_descriptions(state, tool_count)
-```
+`assistant_text`（全量文本）用于 Agent 跨会话记忆；`report_text`（仅 answering）用于持久化 `.md` 文件。
 
 ## 数据流路径
 
@@ -614,7 +594,9 @@ step_descs = _build_tool_descriptions(state, tool_count)
 | SSE Event | 触发时机 | Frontend 行为 |
 |---|---|---|
 | `session` | 连接建立 | 保存 session_id |
-| `text_delta` | LLM 输出文本 / Tool Result | phase=thinking → 追加到 "第N轮智能分析" 折叠块（含 🔧📊）；phase=answering → 追加到诊断报告区 |
+| `text_delta` | LLM 输出文本 / Tool Result / write_file 报告 | phase=thinking → 追加到 "第N轮智能分析" 折叠块；phase=answering → 追加到诊断报告区 |
+| `round_start` | LangGraph 进入新 model 节点 | → `handle_round_start()` 创建新 Phase |
+| `ledger_snapshot` | 台账工具调用后 | 更新假设树面板 |
 | `tree_snapshot` | 树结构发生变化 | **完全重建诊断树**：重新计算 BFS 层级、渲染节点、绘制 SVG 边线 |
 | `tool_start` | LLM 发出 Tool Call | 信息性 Event（树由 tree_snapshot 驱动） |
 | `tool_end` | Tool 执行完毕 | 信息性 Event（树由 tree_snapshot 驱动） |
@@ -995,7 +977,9 @@ diagnostics/
 │   ├── agent/
 │   │   ├── factory.py               # create_deep_agent() 构建主Agent+子代理
 │   │   ├── prompt.py                # 中文系统提示词
-│   │   ├── streaming.py             # 事件流处理：标签解析、阶段路由、工具描述提取
+│   │   ├── streaming.py             # 事件流处理：阶段路由、工具分组、台账事件分发
+│   │   ├── ledger.py                # 诊断台账：假设树、证据链、阶段推导、退出条件
+│   │   ├── ledger_middleware.py      # 台账中间件：上下文注入、write_file报告捕获
 │   │   └── consolidation.py         # 学习记忆整理
 │   ├── server/
 │   │   ├── app.py                   # FastAPI：SSE端点 + 取消 + 树快照协调

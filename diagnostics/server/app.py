@@ -275,6 +275,7 @@ async def _chat_event_stream(
     state.messages.append(HumanMessage(content=request.message))
     state.messages = state.messages[-settings.max_history_messages :]
     assistant_text: list[str] = []
+    report_text: list[str] = []   # only answering-phase text → .md file
     tree = TreeBuilder()
     latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
 
@@ -317,12 +318,16 @@ async def _chat_event_stream(
             if event.name == "text_delta":
                 yield sse("text_delta", event.payload)
                 path_val = event.payload.get("path", [])
-                if isinstance(path_val, list) and len(path_val) > 0 and path_val[0] == "coordinator":
+                is_coordinator = (
+                    (isinstance(path_val, list) and len(path_val) > 0 and path_val[0] == "coordinator")
+                    or (isinstance(path_val, str) and path_val == "coordinator")
+                )
+                if is_coordinator:
                     assistant_text.append(event.payload["text"])
                     trace.llm_text(event.payload.get("round", 0), event.payload["text"])
-                elif isinstance(path_val, str) and path_val == "coordinator":
-                    assistant_text.append(event.payload["text"])
-                    trace.llm_text(event.payload.get("round", 0), event.payload["text"])
+                    # Separate report content (answering phase) for .md file
+                    if event.payload.get("phase") == "answering":
+                        report_text.append(event.payload["text"])
                 # Feed text tokens to tree for think/answer buffer.
                 for tok_evt in tree.handle_token(
                     event.payload.get("text", ""),
@@ -418,13 +423,16 @@ async def _chat_event_stream(
             state.messages.append(AIMessage(content=content))
             state.messages = state.messages[-settings.max_history_messages :]
 
+        # Report .md file: only answering-phase text (captured from write_file)
+        report_content = "".join(report_text).strip()
+
         elapsed = time.monotonic() - t_start
-        logger.info("[session=%s] Stream completed in %.1fs, events: %s, assistant_text=%d chars",
-                    session_id, elapsed, dict(event_counters), len(content))
+        logger.info("[session=%s] Stream completed in %.1fs, events: %s, assistant_text=%d chars, report=%d chars",
+                    session_id, elapsed, dict(event_counters), len(content), len(report_content))
         _save_result(report_path, tree,
                      request.entity_type, request.entity_name,
                      elapsed, event_counters, len(content),
-                     ledger=latest_ledger, content=content)
+                     ledger=latest_ledger, content=report_content)
         trace.finalize()
         yield sse("done", {"session_id": session_id})
 

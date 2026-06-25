@@ -324,7 +324,10 @@ def build_agent(
         tools = get_mock_tools(extra_tools)
 
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state
-    ledger_middleware = DiagnosisLedgerMiddleware(ledger_path=ledger_path)
+    ledger_middleware = DiagnosisLedgerMiddleware(
+        ledger_path=ledger_path,
+        report_path=report_path,
+    )
 
     return create_deep_agent(
         model=model,

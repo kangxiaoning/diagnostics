@@ -574,18 +574,30 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
 
     elif mode == "custom":
         # Custom stream events — used by DiagnosisLedgerMiddleware to emit
-        # ledger snapshots via stream_writer.
-        if isinstance(data, dict) and data.get("type") == "ledger_snapshot":
-            ledger = data.get("ledger")
-            if ledger and isinstance(ledger, dict):
-                logger.info("[round=%d] Diagnosis ledger updated (custom): phase=%s, hypotheses=%d",
-                            state.round_number,
-                            ledger.get("current_phase", "?"),
-                            len(ledger.get("hypotheses", {})))
-                events.append(AgentEvent("ledger_snapshot", {
-                    "ledger": _sanitize_ledger_for_event(ledger),
-                    "round": state.round_number,
-                }))
+        # ledger snapshots and report content via stream_writer.
+        if isinstance(data, dict):
+            if data.get("type") == "ledger_snapshot":
+                ledger = data.get("ledger")
+                if ledger and isinstance(ledger, dict):
+                    logger.info("[round=%d] Diagnosis ledger updated (custom): phase=%s, hypotheses=%d",
+                                state.round_number,
+                                ledger.get("current_phase", "?"),
+                                len(ledger.get("hypotheses", {})))
+                    events.append(AgentEvent("ledger_snapshot", {
+                        "ledger": _sanitize_ledger_for_event(ledger),
+                        "round": state.round_number,
+                    }))
+            elif data.get("type") == "report_content":
+                content = data.get("content", "")
+                if content:
+                    logger.info("[round=%d] Report content captured from write_file (%d chars)",
+                                state.round_number, len(content))
+                    events.append(AgentEvent("text_delta", {
+                        "text": content,
+                        "path": ["coordinator"],
+                        "round": state.round_number,
+                        "phase": "answering",
+                    }))
 
     return events
 
@@ -636,18 +648,10 @@ def _summarize_output(output: str, max_len: int = 80) -> str:
 def _finalize(state: _EventState) -> list[AgentEvent]:
     events: list[AgentEvent] = []
 
-    # Emit final answer body from the LAST round's accumulated text.
-    if state._coordinator_text:
-        last_round = state._coordinator_text[-1][1] if state._coordinator_text else 0
-        report_parts = [t for t, r in state._coordinator_text if r == last_round]
-        report = "".join(report_parts).strip()
-        if report:
-            events.append(AgentEvent("text_delta", {
-                "text": report,
-                "path": ["coordinator"], "round": state.round_number,
-                "phase": "answering",
-            }))
-    elif state._plan_tag_buf.strip():
+    # Report content is captured from write_file via custom stream event
+    # and emitted as text_delta(phase="answering") during streaming.
+    # Fallback: if no report was captured, use plan_tag_buf if available.
+    if state._plan_tag_buf.strip():
         events.append(AgentEvent("text_delta", {
             "text": state._plan_tag_buf,
             "path": ["coordinator"], "round": state.round_number,
