@@ -598,6 +598,19 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         "round": state.round_number,
                         "phase": "answering",
                     }))
+            # ── Custom events from middleware hooks ──
+            elif data.get("type") == "round_transition":
+                # Emitted by before_model hook in DiagnosisLedgerMiddleware.
+                # More reliable round detection than node-transition heuristic.
+                new_round = data.get("round", 0)
+                if new_round > state.round_number:
+                    state.round_number = new_round
+                    logger.info("[round=%d] Round transition from before_model hook",
+                                state.round_number)
+                events.append(AgentEvent("round_transition", data))
+            elif data.get("type") in ("tool_executing", "tool_completed"):
+                # Precise tool timing from awrap_tool_call
+                events.append(AgentEvent(data["type"], data))
 
     return events
 

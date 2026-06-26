@@ -135,11 +135,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self.ledger_path = ledger_path
         self.report_path = report_path
         self._current_ledger: DiagnosisLedger | None = None
+        self._model_call_count: int = 0
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
             self._make_record_finding_tool(),
         ]
+
+    # ── Round detection via before_model hook ──
+
+    async def before_model(self, state, runtime) -> None:
+        """Detect new LLM rounds and emit round_transition via stream_writer.
+
+        This is more reliable than the streaming.py node-transition heuristic
+        because it fires at the middleware level, independent of LangGraph's
+        internal node naming.
+        """
+        self._model_call_count += 1
+        try:
+            sw = getattr(runtime, "stream_writer", None)
+            if sw:
+                sw({
+                    "type": "round_transition",
+                    "round": self._model_call_count,
+                })
+        except Exception:
+            pass  # stream_writer not available in all contexts
 
     # ── Context injection ──
 
@@ -185,6 +206,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_name = request.tool_call.get("name", "")
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
+
+        # Emit precise tool timing events via stream_writer
+        sw = getattr(request.runtime, "stream_writer", None)
+        if sw:
+            try:
+                sw({
+                    "type": "tool_executing",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                })
+            except Exception:
+                pass
 
         result = await handler(request)
 
@@ -254,6 +287,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             })
                     except Exception:
                         pass
+
+        # Emit tool completion timing
+        if sw:
+            try:
+                sw({
+                    "type": "tool_completed",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                })
+            except Exception:
+                pass
 
         return result
 

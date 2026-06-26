@@ -291,12 +291,16 @@ async def _chat_event_stream(
     )
     trace.start(user_message=request.message)
 
+    def _tree_sse(snap: dict[str, Any]) -> str:
+        """Dispatch tree event with correct SSE type (snapshot or delta)."""
+        return sse(snap.get("type", "tree_snapshot"), snap)
+
     try:
         yield sse("session", {"session_id": session_id})
 
         # Initialize tree with root node
         for snap in tree.start():
-            yield sse("tree_snapshot", snap)
+            yield _tree_sse(snap)
 
         async for event in stream_agent_events(
             agent=agent,
@@ -307,8 +311,7 @@ async def _chat_event_stream(
             if event.name in ("cancelled", "error"):
                 logger.warning("[session=%s] Stream interrupted: %s", session_id, event.name)
                 for snap in tree.finalize():
-                    if snap["type"] == "tree_snapshot":
-                        yield sse("tree_snapshot", snap)
+                    yield _tree_sse(snap)
                 trace.finalize()
                 yield sse(event.name, event.payload)
                 return
@@ -332,14 +335,13 @@ async def _chat_event_stream(
                 for tok_evt in tree.handle_token(
                     event.payload.get("text", ""),
                 ):
-                    if tok_evt.get("type") == "tree_snapshot":
-                        yield sse("tree_snapshot", tok_evt)
+                    if tok_evt.get("type") in ("tree_snapshot", "tree_delta"):
+                        yield _tree_sse(tok_evt)
 
             elif event.name == "round_start":
                 # New LLM round → create a new Phase node in the tree
                 for snap in tree.handle_round_start(event.payload.get("round", 0)):
-                    if snap.get("type") == "tree_snapshot":
-                        yield sse("tree_snapshot", snap)
+                    yield _tree_sse(snap)
 
             elif event.name == "tool_start":
                 description = event.payload.get("description", "")
@@ -352,8 +354,7 @@ async def _chat_event_stream(
                     "description": description,
                 }]
                 for snap in tree.handle_tool_call(tool_calls):
-                    if snap.get("type") == "tree_snapshot":
-                        yield sse("tree_snapshot", snap)
+                    yield _tree_sse(snap)
 
                 # Trace: tool start
                 from diagnostics.server.step_tracker import format_tool_args
@@ -367,13 +368,12 @@ async def _chat_event_stream(
                 yield sse("tool_start", event.payload)
 
             elif event.name == "tool_end":
-                # Feed tool completion to tree
+                # Feed tool completion to tree (now emits delta, not full snapshot)
                 for snap in tree.handle_update(
                     {"tool_call_id": event.payload["id"]},
                     namespace=["tools"],
                 ):
-                    if snap.get("type") == "tree_snapshot":
-                        yield sse("tree_snapshot", snap)
+                    yield _tree_sse(snap)
 
                 # Trace: tool result
                 trace.tool_end(
@@ -390,8 +390,7 @@ async def _chat_event_stream(
                     event.payload.get("name", ""),
                     event.payload.get("args", {}),
                 ):
-                    if snap.get("type") == "tree_snapshot":
-                        yield sse("tree_snapshot", snap)
+                    yield _tree_sse(snap)
 
             elif event.name in ("agent_start", "agent_end"):
                 yield sse(event.name, event.payload)
@@ -405,10 +404,24 @@ async def _chat_event_stream(
                 trace.ledger_update(latest_ledger)
                 yield sse("ledger_snapshot", event.payload)
 
+            # Custom events from middleware hooks (before_model / awrap_tool_call)
+            elif event.name == "round_transition":
+                # before_model hook: new LLM round detected by middleware
+                for snap in tree.handle_round_start(event.payload.get("round", 0)):
+                    yield _tree_sse(snap)
+
+            elif event.name == "tool_executing":
+                # awrap_tool_call: tool about to run (precise timing)
+                yield sse("tool_executing", event.payload)
+
+            elif event.name == "tool_completed":
+                # awrap_tool_call: tool just finished (precise timing)
+                yield sse("tool_completed", event.payload)
+
         # Finalize tree
         for snap in tree.finalize():
-            if snap.get("type") == "tree_snapshot":
-                yield sse("tree_snapshot", snap)
+            if snap.get("type") in ("tree_snapshot", "tree_delta"):
+                yield _tree_sse(snap)
             elif snap.get("type") == "token":
                 # Fallback answer text from tree — emit as answering phase
                 yield sse("text_delta", {
@@ -440,8 +453,7 @@ async def _chat_event_stream(
         logger.info("[session=%s] Stream cancelled by server", session_id)
         state.cancel_event.set()
         for snap in tree.finalize():
-            if snap.get("type") == "tree_snapshot":
-                yield sse("tree_snapshot", snap)
+            yield _tree_sse(snap)
         trace.finalize()
         return
     except Exception as exc:
@@ -449,8 +461,7 @@ async def _chat_event_stream(
         logger.exception("[session=%s] Stream error after %.1fs: %s",
                          session_id, elapsed, exc)
         for snap in tree.finalize():
-            if snap.get("type") == "tree_snapshot":
-                yield sse("tree_snapshot", snap)
+            yield _tree_sse(snap)
         trace.finalize()
         yield sse(
             "error",

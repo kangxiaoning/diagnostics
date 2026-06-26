@@ -226,14 +226,14 @@ class TreeBuilder:
         self._current_response_text = []
         logger.info("Tree: +%d tool nodes under %s (accumulated: %d)",
                      len(new_calls), parent_id, len(self._last_tool_child_ids))
-        return [self._snapshot_event()]
+        return [self._delta_event(created_ids)]
 
     def handle_update(self, _data: dict, namespace: list[str]) -> list[dict[str, Any]]:
         if not self._is_tool_update(_data, namespace):
             return []
 
         tc_id = _data.get("tool_call_id", "")
-        changed = False
+        changed_ids: list[str] = []
 
         if tc_id:
             for node in self.nodes.values():
@@ -241,24 +241,25 @@ class TreeBuilder:
                         node.detail == tc_id and
                         node.status == StepStatus.RUNNING):
                     node.status = StepStatus.COMPLETED
-                    changed = True
+                    changed_ids.append(node.id)
                     break
 
-        if not changed:
+        if not changed_ids:
             for node in self.nodes.values():
                 if node.node_type == NodeType.TOOL and node.status == StepStatus.RUNNING:
                     node.status = StepStatus.COMPLETED
-                    changed = True
+                    changed_ids.append(node.id)
+                    break
+
+        if not changed_ids:
+            return []
 
         has_running = any(
             n.node_type == NodeType.TOOL and n.status == StepStatus.RUNNING
             for n in self.nodes.values()
         )
         if has_running:
-            return [self._snapshot_event()]
-
-        if not changed:
-            return []
+            return [self._delta_event(updated=changed_ids)]
 
         self._flush_think()
         # Mark current phase completed. Next phase is created by
@@ -267,9 +268,10 @@ class TreeBuilder:
             node = self.nodes[self._current_phase_id]
             if node.node_type == NodeType.PHASE and node.status == StepStatus.RUNNING:
                 node.status = StepStatus.COMPLETED
+                changed_ids.append(node.id)
         self.state = "thinking"
         logger.info("Tree: all tools done, phase completed")
-        return [self._snapshot_event()]
+        return [self._delta_event(updated=changed_ids)]
 
     def update_tool_args(self, tc_id: str, tool_name: str, args: dict) -> list[dict[str, Any]]:
         """Update tool name/args for an existing tool node when streaming args arrive."""
@@ -297,7 +299,7 @@ class TreeBuilder:
                             node.description = new_desc
                             changed = True
                 if changed:
-                    return [self._snapshot_event()]
+                    return [self._delta_event(updated=[node.id])]
         return []
 
     def finalize(self) -> list[dict[str, Any]]:
@@ -402,27 +404,57 @@ class TreeBuilder:
 
     # ── Helpers ──
 
+    def _node_to_dict(self, node: TreeNode) -> dict[str, Any]:
+        return {
+            "id": node.id,
+            "title": node.title,
+            "parent_id": node.parent_id,
+            "parent_ids": node.parent_ids or ([node.parent_id] if node.parent_id else []),
+            "status": node.status.value,
+            "node_type": node.node_type.value,
+            "detail": node.detail,
+            "description": node.description,
+            "tool_name": node.tool_name,
+            "tool_args": node.tool_args,
+        }
+
     def _snapshot_event(self) -> dict[str, Any]:
+        """Full tree snapshot — used for structural changes (new phase, finalize)."""
         return {
             "type": "tree_snapshot",
             "steps": [
-                {
-                    "id": node.id,
-                    "title": node.title,
-                    "parent_id": node.parent_id,
-                    "parent_ids": node.parent_ids or ([node.parent_id] if node.parent_id else []),
-                    "status": node.status.value,
-                    "node_type": node.node_type.value,
-                    "detail": node.detail,
-                    "description": node.description,
-                    "tool_name": node.tool_name,
-                    "tool_args": node.tool_args,
-                }
+                self._node_to_dict(self.nodes[nid])
                 for nid in self.node_order
                 if nid in self.nodes
-                for node in [self.nodes[nid]]
             ],
         }
+
+    def _delta_event(
+        self,
+        added: list[str] | None = None,
+        updated: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Incremental tree delta — only changed nodes.
+
+        Frontend merges delta into existing graph state.
+        Significantly reduces SSE payload vs full snapshot.
+        """
+        result: dict[str, Any] = {"type": "tree_delta"}
+        if added:
+            result["added"] = [
+                self._node_to_dict(self.nodes[nid])
+                for nid in added if nid in self.nodes
+            ]
+        if updated:
+            result["updated"] = [
+                {"id": nid, "status": self.nodes[nid].status.value,
+                 "detail": self.nodes[nid].detail,
+                 "tool_args": self.nodes[nid].tool_args,
+                 "description": self.nodes[nid].description,
+                 "title": self.nodes[nid].title}
+                for nid in updated if nid in self.nodes
+            ]
+        return result
 
     def _add_node(self, node: TreeNode) -> None:
         if node.parent_id and not node.parent_ids:

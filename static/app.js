@@ -749,6 +749,9 @@ function parseSSE(raw) {
     case "tree_snapshot":
       onTreeSnapshot(payload);
       break;
+    case "tree_delta":
+      onTreeDelta(payload);
+      break;
     case "ledger_snapshot":
       onLedgerSnapshot(payload);
       break;
@@ -1017,6 +1020,84 @@ function onTreeSnapshot(payload) {
     renderTree();
   } else {
     // Only edges or status changed — redraw edges without full DOM rebuild
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => drawAllEdges());
+    });
+  }
+}
+
+// ═══════════════════ Tree Delta Handler (Incremental) ═══════════════════
+
+function onTreeDelta(payload) {
+  if (!payload) return;
+
+  GRAPH.hasContent = true;
+  graphEmpty.style.display = "none";
+  setGraphStatus("running");
+
+  let structureChanged = false;
+
+  // Process added nodes
+  if (payload.added) {
+    for (const step of payload.added) {
+      const parentIds = step.parent_ids || (step.parent_id ? [step.parent_id] : []);
+      GRAPH.nodes.set(step.id, {
+        id: step.id,
+        title: step.title,
+        parentId: step.parent_id,
+        parentIds: parentIds,
+        status: step.status,
+        nodeType: step.node_type,
+        detail: step.detail || "",
+        description: step.description || "",
+        toolName: step.tool_name || "",
+        toolArgs: step.tool_args || "",
+        el: null,
+      });
+      GRAPH.nodeOrder.push(step.id);
+      structureChanged = true;
+    }
+  }
+
+  // Process updated nodes (status / detail / args / description changes)
+  if (payload.updated) {
+    for (const upd of payload.updated) {
+      const existing = GRAPH.nodes.get(upd.id);
+      if (!existing) continue;
+      let domDirty = false;
+      if (upd.status && upd.status !== existing.status) {
+        existing.status = upd.status;
+        domDirty = true;
+      }
+      if (upd.detail !== undefined && upd.detail !== existing.detail) {
+        existing.detail = upd.detail;
+        domDirty = true;
+      }
+      if (upd.tool_args !== undefined && upd.tool_args !== existing.toolArgs) {
+        existing.toolArgs = upd.tool_args;
+        domDirty = true;
+      }
+      if (upd.description !== undefined && upd.description !== existing.description) {
+        existing.description = upd.description;
+        domDirty = true;
+      }
+      if (upd.title !== undefined && upd.title !== existing.title) {
+        existing.title = upd.title;
+        domDirty = true;
+      }
+      if (domDirty && existing.el) {
+        const newEl = createNodeDOM(existing);
+        existing.el.replaceWith(newEl);
+        existing.el = newEl;
+      }
+    }
+  }
+
+  if (structureChanged) {
+    // New nodes added — full re-render for correct BFS layout
+    renderTree();
+  } else {
+    // Only status updates — redraw edges without DOM rebuild
     requestAnimationFrame(() => {
       requestAnimationFrame(() => drawAllEdges());
     });
