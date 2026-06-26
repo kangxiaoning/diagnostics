@@ -1107,10 +1107,25 @@ function onTreeDelta(payload) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => drawAllEdges());
     });
+    _scheduleEdgeSafetyNet();
   }
 }
 
 // ═══════════════════ Tree Rendering (Top-Down) ═══════════════════
+
+// Debounced safety-net: guarantees drawAllEdges() fires within 120ms
+// even if the browser skips or delays requestAnimationFrame callbacks
+// (e.g. heavy rendering, background tab, GPU throttle).
+let _edgeSafetyTimer = 0;
+function _scheduleEdgeSafetyNet() {
+  clearTimeout(_edgeSafetyTimer);
+  _edgeSafetyTimer = setTimeout(() => {
+    // Only draw if we have nodes with DOM elements
+    if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
+      drawAllEdges();
+    }
+  }, 120);
+}
 
 function renderTree() {
   graphNodes.innerHTML = "";
@@ -1149,12 +1164,14 @@ function renderTree() {
   graphNodes.appendChild(container);
 
   // Edge draw with double-rAF to ensure DOM layout before reading
-  // getBoundingClientRect. No timeout — edges appear immediately.
+  // getBoundingClientRect.  A setTimeout safety-net guarantees edges
+  // appear even if the browser throttles or skips rAF callbacks.
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       drawAllEdges();
     });
   });
+  _scheduleEdgeSafetyNet();
 
   // Only auto-scroll if user hasn't scrolled up manually
   if (!graphUserScrolled) {
