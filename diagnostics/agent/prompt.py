@@ -52,7 +52,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 - 调用 `get_system_overview()` 建立基线
 - 根据故障场景并行补充 1~3 个最相关的检查（如 K8s 场景 `check_kubernetes_nodes`、`get_cluster_events`；主机场景 `check_cpu`、`check_memory`）
 - 无依赖关系的工具应并行调用
-- 完成 → 调用 `commit_hypotheses` 提交初始假设
+- **完成 → 必须立即调用 `commit_hypotheses` 提交初始假设**，不得重复调用同一类采集工具
+- `commit_hypotheses` 是推进诊断阶段的唯一入口，未调用则系统将强制推进并警告
 
 #### 阶段 2: HYPOTHESIZE（形成假设）
 
@@ -67,7 +68,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 - **自行验证 vs 委派专家的判断**：
   - 可自行验证：单一工具输出可直接判断（如 `check_memory` 显示 available < 10%）
   - 应委派专家：需要领域技能工作流、多步骤专用工具序列、跨层数据关联
-- 委派时在 `task` 指令中明确"验证假设X"，传入假设上下文和验证目标
+- 委派时在 `task` 指令中明确“验证假设X”，传入假设上下文和验证目标
+  - **委派描述里只描述症状、假设内容和期望结论，禁止引用 `/proc/**`、`/sys/**`、`/var/log/**` 等主机路径——subagent 无法访问这些路径，引用只会诱导 subagent 误用本地文件工具**
 - 可按需 `read_file` 加载 SKILL.md 指导验证
 - 调用验证该假设所需的核心工具（1~3个），无依赖关系的并行调用
 - 收到结果后 → 调用 `record_finding` 记录结论
@@ -77,11 +79,12 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 - 评估本层所有假设的验证结果
 - 调用 `select_path` 选择1条最接近根因的路径深入
-- 退出条件判断：
-  - 根因确认（p≥80%且足够具体）→ 进入 REPORT
-  - 需深化 → 在 confirmed 假设下进入 HYPOTHESIZE
-  - 全部 refuted + 可回溯 → BACKTRACK 回溯
-  - 假设穷尽 → 进入 REPORT（标注假设穷尽）
+- **退出条件（满足任一即行动，不依赖固定步骤数）**：
+  1. **根因确认**：某假设 confirmed 且 p≥80%，且足够具体（无需再细分子假设）→ 进入 REPORT
+  2. **需深化**：confirmed 假设需进一步细分 → 在该假设下进入 HYPOTHESIZE
+  3. **全部 refuted + 可回溯** → BACKTRACK 回溯次优路径
+  4. **假设穷尽**：所有路径 refuted/dead_end，无新假设 → 进入 REPORT（标注假设穷尽）
+  5. **证据饱和**：连续3次 record_finding 返回 inconclusive → 进入 REPORT
 
 #### 阶段 5: REPORT（生成报告）
 
@@ -136,13 +139,6 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 - 选择次优的 deprioritized 假设重新进入 VERIFY
 - 台账的 active_path 栈自动支持回溯
 
-### 退出条件（进入 REPORT 的判定）
-
-满足以下任一条件即进入 REPORT，不依赖固定步骤数：
-1. **根因确认**：某假设 confirmed 且 probability≥80%，且该假设已足够具体（不可再合理细分为子假设）
-2. **假设穷尽**：所有可探索路径（含回溯后的 deprioritized）都已 refuted/dead_end，无新假设可提出
-3. **证据饱和**：连续3次 record_finding 返回 inconclusive，且无法基于现有证据提出新假设
-4. **无合理假设**：EVALUATE 阶段无法在任何层级提出合理的新假设
 </diagnostic_flow>
 
 <tool_evolution>
@@ -186,6 +182,11 @@ K8s 工具的参数需要从集群实时获取，不能臆造：
 ### 禁用工具
 
 `execute` — **禁止使用**。诊断过程只读优先，不执行任意 Shell 命令。
+
+### write_todos 调用规范
+
+`write_todos` 用于更新诊断计划步骤状态。**同一步骤内只调用一次**；
+不要在同一轮内先以 `status=in_progress` 调用，再以 `status=completed` 调用——结果已知时直接用最终状态一次性提交。
 
 ### 本地文件工具的使用边界（重要）
 
@@ -267,7 +268,11 @@ SKILL_VERIFY (按 SKILL.md Workflow 步骤):
   → check_kubernetes_nodes()
   → record_finding(H1, "confirmed", "worker-5/8 NodeStatusUnknown, kubelet心跳超时", 92)
 
-EVALUATE → 退出条件1(根因确认): H1 confirmed p=92% → REPORT
+EVALUATE:
+  H1 confirmed p=92%，根因足够具体，满足退出条件1
+  → select_path(H1, "conntrack表满已确认，根因具体，进入REPORT")
+
+REPORT → 退出条件1(根因确认): H1 confirmed p=92%
   报告开头: "诊断模式：技能驱动（conntrack-diagnosis）"
   → write_file("{report_path}", 诊断报告)
   → write_file("{ledger_path}", 台账JSON)
