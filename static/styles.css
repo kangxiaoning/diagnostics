@@ -128,7 +128,14 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   background: var(--surface-2); color: var(--text);
   border: 1px solid var(--border-soft); padding: 10px 14px;
 }
-.msg.assistant .msg-bubble:has(.think-section) { padding: 0; }
+.msg.assistant .msg-bubble:has(.think-section) {
+  padding: 0;
+  /* Fix the bubble at max-width so think-body doesn't resize as content
+     streams in.  Without this the bubble shrink-wraps to the short
+     think-toggle label and expands when the think-body opens, causing
+     visible width jitter during streaming. */
+  width: 88%;
+}
 .msg.user .msg-bubble {
   background: var(--accent); color: #fff; padding: 10px 14px;
 }
