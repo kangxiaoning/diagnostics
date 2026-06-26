@@ -1010,7 +1010,7 @@ diagnostics/
 │   ├── reports/                     # 持久化报告归档（分层级）
 │   │   ├── hosts/                   # 主机故障报告
 │   │   └── kubernetes/              # K8s 集群故障报告（含 GPU）
-│   └── test_cases/                  # 验证测试用例
+├── test_cases/                       # 验证测试用例（不在agent文件系统中）
 ├── static/
 │   ├── index.html                   # 双栏布局页面
 │   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格多轮折叠块

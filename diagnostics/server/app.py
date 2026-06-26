@@ -439,12 +439,18 @@ async def _chat_event_stream(
     except asyncio.CancelledError:
         logger.info("[session=%s] Stream cancelled by server", session_id)
         state.cancel_event.set()
+        for snap in tree.finalize():
+            if snap.get("type") == "tree_snapshot":
+                yield sse("tree_snapshot", snap)
         trace.finalize()
         return
     except Exception as exc:
         elapsed = time.monotonic() - t_start
         logger.exception("[session=%s] Stream error after %.1fs: %s",
                          session_id, elapsed, exc)
+        for snap in tree.finalize():
+            if snap.get("type") == "tree_snapshot":
+                yield sse("tree_snapshot", snap)
         trace.finalize()
         yield sse(
             "error",

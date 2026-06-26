@@ -306,6 +306,28 @@ class TreeBuilder:
             if node.status == StepStatus.RUNNING:
                 node.status = StepStatus.COMPLETED
 
+        # If the last phase has no tool children (text-only wrap-up round),
+        # rename it to "诊断完成" instead of appending a redundant node.
+        current_id = self._current_phase_id
+        if current_id and current_id in self.nodes:
+            last = self.nodes[current_id]
+            if last.node_type == NodeType.PHASE:
+                has_children = any(
+                    n.node_type == NodeType.TOOL and
+                    (n.parent_id == current_id or (n.parent_ids and current_id in n.parent_ids))
+                    for n in self.nodes.values()
+                )
+                if not has_children:
+                    last.title = "诊断完成"
+                    self._flush_think()
+                    fallback: list[dict[str, Any]] = []
+                    if not self.answer_buffer:
+                        fb = "".join(self.think_segments)
+                        if fb.strip():
+                            fallback.append({"type": "token", "text": fb})
+                    self.state = "done"
+                    return fallback + [self._snapshot_event()]
+
         # Create "诊断完成" node — connected to last round's tools (or last phase)
         parent_ids = list(dict.fromkeys(self._last_tool_child_ids))
         parent_ids = [pid for pid in parent_ids if pid in self.nodes]
