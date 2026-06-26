@@ -1155,9 +1155,14 @@ function _watchReflowThenDraw(sentinelEl) {
   }
   if (!sentinelEl) return;
 
-  // If already has height (unlikely but possible), draw immediately.
+  // If already has height, wait one rAF to let the full layout settle
+  // (other nodes may still be reflowing due to the new node's size impact)
+  // before drawing edges.
   if (sentinelEl.getBoundingClientRect().height > 0) {
-    drawAllEdges();
+    requestAnimationFrame(() => {
+      clearTimeout(_edgeSafetyTimer);
+      drawAllEdges();
+    });
     return;
   }
 
@@ -1169,7 +1174,9 @@ function _watchReflowThenDraw(sentinelEl) {
         obs.disconnect();
         _edgeReflowObserver = null;
         clearTimeout(_edgeSafetyTimer); // cancel safety-net — not needed
-        drawAllEdges();
+        // One rAF to let sibling/ancestor layout settle after this node
+        // got its height, then draw.
+        requestAnimationFrame(() => drawAllEdges());
         return;
       }
     }
