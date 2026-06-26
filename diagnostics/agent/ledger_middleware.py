@@ -144,12 +144,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     # ── Round detection via before_model hook ──
 
-    async def before_model(self, state, runtime) -> None:
+    def before_model(self, state, runtime) -> None:
         """Detect new LLM rounds and emit round_transition via stream_writer.
 
         This is more reliable than the streaming.py node-transition heuristic
         because it fires at the middleware level, independent of LangGraph's
         internal node naming.
+
+        IMPORTANT: this hook MUST be synchronous (not async).  AgentMiddleware
+        hooks like before_model / after_model / before_agent are invoked by
+        LangGraph as sync callables; declaring them async returns a coroutine
+        object which triggers InvalidUpdateError.
         """
         self._model_call_count += 1
         try:
