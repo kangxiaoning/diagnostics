@@ -39,12 +39,17 @@ for _d in _REPORT_DIRS:
 
 # Common return format suffix for all subagents — enables Coordinator to
 # parse expert results into structured record_finding calls.
+# Suffix appended to every subagent system_prompt.
+# Covers: tool boundary, no-ledger-tool rule, and structured return format.
+# NOTE: each subagent's own "返回不超过150字" line is removed; this suffix
+# provides the canonical return format so there is no duplication.
 _EXPERT_RETURN_SUFFIX = (
-    "\n\n**工具使用边界（严格遵守）**: "
-    "`read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/**`，"
-    "禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。"
-    "远程主机数据必须通过专用诊断工具（如 `check_network`、`get_node_diagnostics`）获取。"
-    "\n\n返回格式（严格遵循）:\n"
+    "\n\n**工具使用边界（严格遵守）**:\n"
+    "- `read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/**`，"
+    "禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
+    "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
+    "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "\n**返回格式（严格遵循，不超过 150 字）**:\n"
     "- 假设验证: {confirmed|refuted|inconclusive}\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
     "- 根因判断: 如已定位根因则陈述，否则说明还需什么数据\n"
@@ -66,8 +71,8 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "cpu-expert",
             "description": (
-                "Analyzes CPU utilization, load averages, iowait, and process D-states. "
-                "Use when load average exceeds CPU cores or iowait exceeds 30%."
+                "分析 CPU 利用率、负载均值、iowait 和进程 D 状态。"
+                "适用场景：负载均值超过 CPU 核数，或 iowait 超过 30%。"
             ),
             "system_prompt": (
                 "你是 CPU 诊断专家。\n"
@@ -75,7 +80,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "1. 优先使用 cpu-diagnosis 技能执行结构化 CPU 诊断流程。\n"
                 "2. 如技能工具不足，使用 check_cpu 和 check_processes 深入分析。\n"
                 "3. 判断瓶颈类型：计算密集、IO 等待或调度竞争。\n"
-                "返回不超过 150 字：瓶颈类型、关键进程、修复建议。" + _EXPERT_RETURN_SUFFIX
+                + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_cpu, check_processes],
             "skills": [
@@ -86,8 +91,8 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "memory-expert",
             "description": (
-                "Diagnoses memory leaks, OOM risks, and swap thrashing. "
-                "Use when memory is exhausted, RSS grows unbounded, or swap usage increases."
+                "诊断内存泄漏、OOM 风险和 Swap 抖动。"
+                "适用场景：内存耗尽、RSS 无限增长或 Swap 使用率持续上升。"
             ),
             "system_prompt": (
                 "你是内存诊断专家。\n"
@@ -95,7 +100,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "1. 优先使用 memory-diagnosis 技能执行结构化内存诊断流程。\n"
                 "2. 如技能工具不足，使用 check_memory 和 check_processes 深入分析。\n"
                 "3. 识别原生内存泄漏（RSS >> heap limit）和 Swap 压力。\n"
-                "返回不超过 150 字：关键发现、根因假设、修复建议。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_memory, check_processes],
@@ -107,8 +111,8 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "disk-io-expert",
             "description": (
-                "Investigates disk IO saturation and storage latency. "
-                "Use when iowait exceeds 30% or apps report slow disk operations."
+                "排查磁盘 IO 饱和和存储延迟。"
+                "适用场景：iowait 超过 30%，或应用报告磁盘操作缓慢。"
             ),
             "system_prompt": (
                 "你是存储 IO 性能诊断专家。\n"
@@ -117,7 +121,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "2. 如技能工具不足，使用 check_disk 深入分析。\n"
                 "3. 分析 iostat 的 %util、await、svctm、aqu-sz；高 %util + 高 await = IO 饱和。\n"
                 "4. 判断瓶颈是读密集还是写密集。\n"
-                "返回不超过 150 字：严重程度、根因、受影响进程。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_disk],
@@ -126,10 +129,9 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "network-expert",
             "description": (
-                "Diagnoses TCP retransmits, packet loss, connection saturation, "
-                "CLOSE-WAIT leaks, interface errors, and kernel network issues "
-                "(ARP cache, conntrack, MTU, softirq, TCP queue overflow, gRPC leaks). "
-                "Use when network latency or drops are suspected."
+                "诊断 TCP 重传、丢包、连接饱和、CLOSE-WAIT 泄漏、网卡错误及内核网络问题"
+                "（ARP 缓存、conntrack 表满、MTU 错配、软中断、TCP 队列溢出、gRPC 连接泄漏）。"
+                "适用场景：怀疑网络延迟或丢包时。"
             ),
             "system_prompt": (
                 "你是网络诊断专家。\n"
@@ -141,7 +143,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "   kernel-parameter-drops（内核参数丢包）、tcp-listen-overflow（TCP 队列溢出）、\n"
                 "   grpc-connection-leak（gRPC 连接泄漏）。\n"
                 "3. 如技能工具不足，使用 check_network 和 check_processes 深入分析。\n"
-                "返回不超过 150 字：关键发现、根因、修复建议。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_network, check_processes],
@@ -159,8 +160,8 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "gpu-expert",
             "description": (
-                "Diagnoses GPU CUDA OOM, thermal/power throttling, utilization gaps, "
-                "and ECC errors. Use for GPU-intensive workloads."
+                "诊断 GPU CUDA OOM、温度/功率限速、利用率异常和 ECC 错误。"
+                "适用场景：GPU 密集型工作负载出现异常时。"
             ),
             "system_prompt": (
                 "你是 GPU 诊断专家。\n"
@@ -168,7 +169,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "1. 优先使用 gpu-diagnosis 技能执行结构化 GPU 诊断流程。\n"
                 "2. 如技能工具不足，使用 check_gpu_health、check_gpu_memory、check_gpu_utilization 深入分析。\n"
                 "3. 检查顺序：健康状态（温度、限速、ECC、PCIe）→ 显存（OOM、泄漏）→ 利用率（计算 vs 带宽）。\n"
-                "返回不超过 150 字：瓶颈类型、受影响 GPU、修复建议。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
@@ -195,15 +195,13 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "k8s-cluster-expert",
             "description": (
-                "Diagnoses Kubernetes cluster infrastructure health: API Server, etcd, "
-                "scheduler, controller-manager, CoreDNS, node conditions (NotReady, "
-                "MemoryPressure, DiskPressure, PIDPressure), kubelet failures, node "
-                "evictions, RBAC, certificates, webhooks, network policies, and PV/PVC. "
-                "Use when kubectl times out, API Server returns 5xx, nodes are NotReady, "
-                "or cluster-wide events indicate infrastructure degradation. "
-                "For host-to-K8s cascading failures (e.g., host disk IO → kubelet "
-                "heartbeat timeout → Node NotReady → Pod eviction), use cross-layer "
-                "diagnosis to trace the chain."
+                "诊断 Kubernetes 集群基础设施健康状态：API Server、etcd、scheduler、controller-manager、"
+                "CoreDNS、节点状态（NotReady、MemoryPressure、DiskPressure、PIDPressure）、"
+                "kubelet 故障、节点驱逐、RBAC、证书、webhook、网络策略、PV/PVC。"
+                "适用场景：kubectl 超时、API Server 返回 5xx、节点 NotReady，"
+                "或集群范围事件显示基础设施劣化时。"
+                "主机级联故障（如主机 IO → kubelet 心跳超时 → 节点 NotReady → Pod 驱逐），"
+                "使用 cross-layer-diagnosis 追踪故障链。"
             ),
             "system_prompt": (
                 "你是 Kubernetes 集群基础设施诊断专家。\n"
@@ -217,7 +215,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "- 区分集群基础设施根因与工作负载症状。\n"
                 "- 节点 NotReady 时，判断是主机层（磁盘/CPU/内存/网络）还是 K8s 层（kubelet 崩溃/配置）导致。\n"
                 "- 评估影响范围：受影响节点数和工作负载数。\n"
-                "返回不超过 150 字：受影响基础设施组件、证据链根因、影响范围（节点/Pod 数）、恢复步骤。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
@@ -236,17 +233,12 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         {
             "name": "k8s-workload-expert",
             "description": (
-                "Diagnoses Kubernetes workload issues: Pod crashes (OOMKilled, "
-                "CrashLoopBackOff, Error, ImagePullBackOff), Deployment/StatefulSet "
-                "rollout failures, Service endpoint problems (no healthy backends, "
-                "label selector mismatch), Ingress routing failures, Helm release "
-                "failures, container runtime errors, and resource misconfiguration "
-                "(limits too low, requests not set, probes misconfigured). "
-                "Use when Pods are crashing, restarting, failing to start, or "
-                "traffic is not reaching workloads. "
-                "Only invoke AFTER cluster-expert confirms infrastructure is healthy, "
-                "unless symptoms clearly point to application-level issues "
-                "(e.g., OOMKilled with sufficient node memory, ImagePullBackOff)."
+                "诊断 Kubernetes 工作负载问题：Pod 崩溃（OOMKilled、CrashLoopBackOff、Error、ImagePullBackOff）、"
+                "Deployment/StatefulSet 发布失败、Service 端点问题（无健康后端、标签选择器不匹配）、"
+                "Ingress 路由失败、Helm 发布失败、容器运行时错误、资源配置错误（limit 过低、requests 未设置、探针配置错误）。"
+                "适用场景：Pod 崩溃/重启/启动失败，或流量无法到达工作负载时。"
+                "优先在 k8s-cluster-expert 确认基础设施健康后调用，"
+                "除非症状明确指向应用层（如节点内存充足时 OOMKilled、ImagePullBackOff）。"
             ),
             "system_prompt": (
                 "你是 Kubernetes 工作负载诊断专家。\n"
@@ -263,7 +255,6 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "- Service 不可达：检查 EndpointSlices、标签选择器、就绪探针。\n"
                 "- Helm 升级失败：对比版本值和 Pod spec 变化。\n"
                 "- 给出具体修复方案（如将 memory limit 从 512Mi 调整为 768Mi）。\n"
-                "返回不超过 150 字：根因类型（应用/基础设施）、受影响资源、证据链、修复方案（含具体值）、回滚计划。"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [check_kubernetes_pods, check_kubernetes_nodes, *k8s_tools],
