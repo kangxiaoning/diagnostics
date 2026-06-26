@@ -1135,6 +1135,7 @@ function onTreeDelta(payload) {
 // Falls back to a 300ms safety-net for background tabs / GPU stall.
 let _edgeSafetyTimer = 0;
 let _edgeReflowObserver = null;
+let _edgePostPaintTimer = 0;
 
 function _scheduleEdgeSafetyNet() {
   clearTimeout(_edgeSafetyTimer);
@@ -1146,6 +1147,8 @@ function _scheduleEdgeSafetyNet() {
 }
 
 // Watch a sentinel element; fire drawAllEdges() once it has height > 0.
+// Uses double-rAF to ensure the browser has fully laid out ALL new DOM
+// nodes (not just the sentinel) before computing edge coordinates.
 function _watchReflowThenDraw(sentinelEl) {
   // Disconnect any previous observer first.
   if (_edgeReflowObserver) {
@@ -1154,13 +1157,15 @@ function _watchReflowThenDraw(sentinelEl) {
   }
   if (!sentinelEl) return;
 
-  // If already has height, wait one rAF to let the full layout settle
-  // (other nodes may still be reflowing due to the new node's size impact)
-  // before drawing edges.
+  // If already has height, wait two rAFs:
+  //   rAF-1: browser computes layout for all nodes
+  //   rAF-2: layout is stable, draw edges with correct coordinates
   if (sentinelEl.getBoundingClientRect().height > 0) {
     requestAnimationFrame(() => {
-      clearTimeout(_edgeSafetyTimer);
-      drawAllEdges();
+      requestAnimationFrame(() => {
+        clearTimeout(_edgeSafetyTimer);
+        drawAllEdges();
+      });
     });
     return;
   }
@@ -1173,9 +1178,11 @@ function _watchReflowThenDraw(sentinelEl) {
         obs.disconnect();
         _edgeReflowObserver = null;
         clearTimeout(_edgeSafetyTimer); // cancel safety-net — not needed
-        // One rAF to let sibling/ancestor layout settle after this node
-        // got its height, then draw.
-        requestAnimationFrame(() => drawAllEdges());
+        // Double rAF: first frame lets sibling/ancestor layout settle,
+        // second frame ensures all coordinates are stable.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => drawAllEdges());
+        });
         return;
       }
     }
@@ -1226,6 +1233,16 @@ function renderTree() {
   // Safety-net (300ms) fires if ResizeObserver never reports height > 0.
   _scheduleEdgeSafetyNet();
   _watchReflowThenDraw(lastEl);
+
+  // Post-paint stability redraw: ensures edges are correct after the
+  // browser has fully painted the new DOM tree. Covers the gap between
+  // the initial rAF-based draw and the 300ms safety-net.
+  clearTimeout(_edgePostPaintTimer);
+  _edgePostPaintTimer = setTimeout(() => {
+    if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
+      drawAllEdges();
+    }
+  }, 150);
 
   // Only auto-scroll if user hasn't scrolled up manually
   if (!graphUserScrolled) {
