@@ -1377,11 +1377,16 @@ function drawAllEdges() {
     </filter>
   </defs>`;
 
+  let skippedNoEl = [], skippedZeroH = [], drawn = 0;
+
   for (const edge of GRAPH.edges) {
     const fromNode = GRAPH.nodes.get(edge.from);
     const toNode = GRAPH.nodes.get(edge.to);
     if (!fromNode || !toNode) continue;
-    if (!fromNode.el || !toNode.el) continue;
+    if (!fromNode.el || !toNode.el) {
+      skippedNoEl.push(`${edge.from}->${edge.to}(fromEl=${!!fromNode?.el},toEl=${!!toNode?.el})`);
+      continue;
+    }
 
     const fromRect = fromNode.el.getBoundingClientRect();
     const toRect = toNode.el.getBoundingClientRect();
@@ -1392,10 +1397,12 @@ function drawAllEdges() {
     // Re-watch the zero-height node so drawAllEdges retries immediately
     // once that node's reflow completes (instead of waiting 300ms).
     if (fromRect.height === 0 || toRect.height === 0) {
+      skippedZeroH.push(`${edge.from}(h=${fromRect.height.toFixed(1)})->${edge.to}(h=${toRect.height.toFixed(1)})`);
       const zeroEl = fromRect.height === 0 ? fromNode.el : toNode.el;
       _watchReflowThenDraw(zeroEl);
       continue;
     }
+    drawn++;
 
     // Account for scroll offset so edges follow nodes
     const x1 = fromRect.left - canvasRect.left + fromRect.width / 2 + sx;
@@ -1432,6 +1439,15 @@ function drawAllEdges() {
   }
 
   svg.innerHTML = svgContent;
+
+  // Diagnostic log — always visible so we can catch missing-edge issues
+  if (skippedNoEl.length > 0 || skippedZeroH.length > 0) {
+    console.warn(`[drawAllEdges] drawn=${drawn} skippedNoEl=${skippedNoEl.length} skippedZeroH=${skippedZeroH.length}`,
+      skippedNoEl.length ? '\nnoEl:' + skippedNoEl.join(', ') : '',
+      skippedZeroH.length ? '\nzeroH:' + skippedZeroH.join(', ') : '');
+  } else {
+    console.debug(`[drawAllEdges] drawn=${drawn} total edges=${GRAPH.edges.length}`);
+  }
 }
 
 // Debounced edge redraw via RAF
