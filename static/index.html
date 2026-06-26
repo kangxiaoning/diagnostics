@@ -71,11 +71,13 @@
       <aside class="graph">
         <header class="graph-header">
           <div class="graph-tabs">
-            <button class="graph-tab active" id="tabExecution" data-tab="execution">诊断执行树</button>
+            <button id="historyBack" class="history-back-btn hidden">◀ 返回</button>
+            <button class="graph-tab active" id="tabExecution" data-tab="execution">诊断过程</button>
             <button class="graph-tab" id="tabHypothesis" data-tab="hypothesis">
-              假设树
+              推理过程
               <span class="tab-badge hidden" id="hypothesisBadge">0</span>
             </button>
+            <span id="historyViewerTitle" class="history-info hidden"></span>
           </div>
           <span id="graphStatus" class="graph-status idle">等待任务</span>
         </header>
@@ -94,11 +96,12 @@
 
         <!-- Tab: Hypothesis Tree (new) -->
         <div id="hypothesisCanvas" class="graph-canvas tab-panel" data-panel="hypothesis">
+          <svg id="hypothesisEdges" class="graph-edges"></svg>
           <div id="hypothesisEmpty" class="graph-empty">
             <div class="graph-empty-icon">
               <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><path d="M24 6v36M6 24h36" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="24" cy="24" r="6" stroke="currentColor" stroke-width="2"/></svg>
             </div>
-            <p>诊断开始后<br>假设推理树将在此动态展示</p>
+            <p>诊断开始后<br>推理过程将在此动态展示</p>
           </div>
           <div id="hypothesisTree" class="hypothesis-tree"></div>
         </div>
@@ -111,19 +114,27 @@
           <div class="tool-popup-body" id="toolPopupBody"></div>
         </div>
 
-        <!-- History Viewer (replaces graph area when viewing history) -->
+        <!-- History Viewer (overlays tab-panel area; tabs stay visible above) -->
         <div id="historyViewer" class="history-viewer hidden">
-          <div class="history-viewer-header">
-            <button id="historyBack" class="history-back-btn">◀ 返回</button>
-            <span id="historyViewerTitle"></span>
-          </div>
-          <div class="history-viewer-body">
+          <!-- Execution tab content (report + graph) -->
+          <div class="history-viewer-body" id="historyViewerBody">
             <div class="history-report" id="historyReport"></div>
             <div class="history-resizer" id="historyResizer"></div>
             <div class="history-graph" id="historyGraph">
               <svg class="graph-edges" id="historyEdges"></svg>
               <div class="graph-nodes" id="historyNodes"></div>
             </div>
+          </div>
+          <!-- Hypothesis tab content (reasoning tree) -->
+          <div class="history-hypothesis-canvas" id="historyHypothesisCanvas">
+            <svg class="graph-edges" id="historyHypothesisEdges"></svg>
+            <div id="historyHypothesisEmpty" class="graph-empty">
+              <div class="graph-empty-icon">
+                <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><path d="M24 6v36M6 24h36" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="24" cy="24" r="6" stroke="currentColor" stroke-width="2"/></svg>
+              </div>
+              <p>该报告无推理过程数据</p>
+            </div>
+            <div id="historyHypothesisTree" class="hypothesis-tree"></div>
           </div>
         </div>
       </aside>

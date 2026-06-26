@@ -466,24 +466,25 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   font-size: 11px; color: var(--text-3); padding: 6px 10px;
 }
 
-/* ════════════════ History Viewer (right panel, full-screen history) ════════════════ */
+/* ════════════════ History Viewer (overlays tab-panel area; tabs stay visible) ════════════════ */
 .history-viewer {
-  position: absolute; inset: 56px 0 0 0; z-index: 50;
+  position: absolute; inset: 36px 0 0 0; z-index: 50;
   background: var(--bg); display: flex; flex-direction: column;
 }
 .history-viewer.hidden { display: none; }
-.history-viewer-header {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 16px; border-bottom: 1px solid var(--border);
-  background: var(--surface); flex-shrink: 0;
-}
-.history-viewer-header span { font-size: 12px; color: var(--text-2); flex: 1; }
 .history-back-btn {
   padding: 3px 10px; border: 1px solid var(--border);
   border-radius: 8px; font-size: 11px; cursor: pointer;
   color: var(--text-2); background: var(--surface);
+  margin-right: 8px; flex-shrink: 0;
 }
 .history-back-btn:hover { border-color: var(--accent); color: var(--accent); }
+.history-back-btn.hidden { display: none; }
+.history-info {
+  font-size: 12px; color: var(--text-2); margin-left: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.history-info.hidden { display: none; }
 .history-viewer-body {
   flex: 1; display: flex; overflow: hidden;
 }
@@ -515,6 +516,14 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   flex: 1; min-width: 0; overflow: auto; position: relative;
   padding: 24px 16px; min-height: 0;
 }
+
+/* History hypothesis canvas (full-width panel, replaces body when active) */
+.history-hypothesis-canvas {
+  display: none; position: absolute; inset: 0;
+  overflow: auto; padding: 16px; min-height: 0;
+}
+.history-viewer.history-tab-active .history-viewer-body { display: none; }
+.history-viewer.history-tab-active .history-hypothesis-canvas { display: block; }
 
 /* ════════════════ Skills Picker ( / command ) ════════════════ */
 .skills-bar {
@@ -594,6 +603,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* Hypothesis tree nodes */
 .hypothesis-tree {
+  position: relative; z-index: 2;
   padding: 16px; overflow-y: auto; height: 100%;
 }
 .hyp-node {
@@ -642,9 +652,12 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   overflow: hidden; min-width: 60px; max-width: 120px;
 }
 .hyp-prob-fill {
-  height: 100%; background: var(--accent); border-radius: 3px;
-  transition: width 0.3s;
+  height: 100%; border-radius: 3px;
+  transition: width 0.3s, background 0.3s;
 }
+.hyp-prob-fill.high { background: #2d8a3e; }
+.hyp-prob-fill.med  { background: #e6a817; }
+.hyp-prob-fill.low  { background: #c0392b; }
 .hyp-prob-text {
   font-size: 11px; font-weight: 600; color: var(--text-2);
   flex-shrink: 0; min-width: 32px; text-align: right;
@@ -659,9 +672,13 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 }
 
 .hyp-evidence {
-  margin-top: 6px; padding-left: 12px;
+  margin-top: 6px;
+}
+.hyp-evidence-list {
+  padding-left: 12px;
   border-left: 2px solid var(--border);
 }
+.hyp-evidence-list.hidden { display: none; }
 .hyp-evidence-item {
   font-size: 11px; color: var(--text-2); line-height: 1.5;
   margin-bottom: 2px;
@@ -669,13 +686,45 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 .hyp-evidence-item.support::before { content: "✓ "; color: #2d8a3e; font-weight: 700; }
 .hyp-evidence-item.refute::before { content: "✗ "; color: #c0392b; font-weight: 700; }
 
+.hyp-rationale {
+  margin-top: 4px; font-size: 11px; color: var(--text-2);
+  padding: 4px 8px; background: var(--bg-2); border-radius: 4px;
+  line-height: 1.4;
+}
+
 .hyp-tools {
   font-size: 10px; color: var(--text-2); margin-top: 4px;
   font-family: var(--font-mono);
 }
 .hyp-children {
   margin-left: 20px; margin-top: 6px;
+}
+.hyp-children-list {
   border-left: 1px dashed var(--border); padding-left: 8px;
+  margin-top: 4px;
+}
+.hyp-children-list.hidden { display: none; }
+
+/* Hypothesis SVG edges */
+.hyp-edge { transition: opacity 0.2s; }
+
+.hyp-collapse-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: 11px; color: var(--text-3); padding: 2px 4px 2px 16px;
+  border-radius: 3px; transition: color 0.15s, background 0.15s;
+  font-family: inherit; user-select: none;
+  position: relative;
+}
+.hyp-collapse-btn::before {
+  content: '▾'; position: absolute; left: 2px; top: 50%;
+  transform: translateY(-50%); font-size: 10px; line-height: 1;
+}
+.hyp-evidence.collapsed > .hyp-collapse-btn::before,
+.hyp-children.collapsed > .hyp-collapse-btn::before {
+  content: '▸';
+}
+.hyp-collapse-btn:hover {
+  color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .hyp-phase-banner {
