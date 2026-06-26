@@ -1055,6 +1055,12 @@ function onTreeDelta(payload) {
         el: null,
       });
       GRAPH.nodeOrder.push(step.id);
+      // Register parent→child edges immediately so drawAllEdges can draw
+      // them on the very next renderTree() call without waiting for a
+      // full tree_snapshot.
+      for (const pid of parentIds) {
+        if (pid) GRAPH.edges.push({ from: pid, to: step.id });
+      }
       structureChanged = true;
     }
   }
