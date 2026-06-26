@@ -102,6 +102,7 @@ TOOL_LABELS: dict[str, str] = {
     "commit_hypotheses": "提交诊断假设",
     "select_path": "选择诊断路径",
     "record_finding": "记录验证结论",
+    "backtrack": "回溯假设路径",
     # Summarization
     "compact_conversation": "压缩对话历史",
 }

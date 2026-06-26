@@ -31,6 +31,7 @@ from diagnostics.agent.ledger import (
     DiagnosisLedgerState,
     add_evidence_to_active,
     add_hypotheses,
+    backtrack,
     check_exit_conditions,
     derive_phase,
     ledger_to_json,
@@ -54,7 +55,7 @@ _SCAFFOLDING_TOOLS = frozenset({
 
 # Ledger management tools (handled by this middleware)
 _LEDGER_TOOLS = frozenset({
-    "commit_hypotheses", "select_path", "record_finding",
+    "commit_hypotheses", "select_path", "record_finding", "backtrack",
 })
 
 
@@ -140,6 +141,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
             self._make_record_finding_tool(),
+            self._make_backtrack_tool(),
         ]
 
     # ── Round detection via before_model hook ──
@@ -157,6 +159,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         object which triggers InvalidUpdateError.
         """
         self._model_call_count += 1
+        # Sync current_round in ledger with actual LLM call count so that
+        # round numbers reflect LLM invocations, not individual tool calls.
+        if self._current_ledger is not None:
+            self._current_ledger["current_round"] = self._model_call_count
         try:
             sw = getattr(runtime, "stream_writer", None)
             if sw:
@@ -451,6 +457,47 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             args_schema=RecordFindingInput,
         )
 
+    # ── Tool: backtrack ──
+
+    def _make_backtrack_tool(self) -> StructuredTool:
+        mw = self
+
+        async def _run() -> str:
+            ledger = mw._current_ledger
+            if ledger is None:
+                return "错误: 诊断台账不存在"
+
+            new_active_id = backtrack(ledger)
+            if new_active_id is None:
+                ledger["current_phase"] = "report"
+                mw._persist_ledger(ledger)
+                mw._current_ledger = ledger
+                return (
+                    "回溯失败: 没有可回溯的假设，所有路径已穷尽。\n"
+                    "已进入 REPORT 阶段，请基于现有证据生成诊断报告。"
+                )
+
+            ledger["current_phase"] = derive_phase(ledger)
+            new_active = ledger["hypotheses"][new_active_id]
+            mw._persist_ledger(ledger)
+            mw._current_ledger = ledger
+
+            return (
+                f"已回溯到: {new_active_id} {new_active['statement']}\n"
+                f"活动路径: {' → '.join(ledger['active_path'])}\n"
+                f"当前阶段: {ledger['current_phase']}"
+            )
+
+        return StructuredTool.from_function(
+            name="backtrack",
+            description=(
+                "回溯到最近的 deprioritized 或 pending 假设重新验证"
+                "（BACKTRACK 阶段必须调用，或在 EVALUATE 阶段全部 refuted 时调用）。"
+                "如果没有可回溯的假设，自动进入 REPORT 阶段。"
+            ),
+            coroutine=_run,
+        )
+
     # ── Persistence ──
 
     def _persist_ledger(self, ledger: DiagnosisLedger) -> None:
@@ -459,7 +506,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             return
         try:
             import pathlib
-            path = pathlib.Path(self.ledger_path.lstrip("/"))
+            path = pathlib.Path(self.ledger_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(ledger_to_json(ledger), encoding="utf-8")
             logger.debug("Ledger persisted to %s", self.ledger_path)

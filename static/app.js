@@ -84,16 +84,22 @@ const historyReport = document.getElementById("historyReport");
 const historyGraph = document.getElementById("historyGraph");
 const historyNodes = document.getElementById("historyNodes");
 const historyEdges = document.getElementById("historyEdges");
+const historyHypothesisCanvas = document.getElementById("historyHypothesisCanvas");
+const historyHypothesisTree = document.getElementById("historyHypothesisTree");
+const historyHypothesisEdges = document.getElementById("historyHypothesisEdges");
+const historyHypothesisEmpty = document.getElementById("historyHypothesisEmpty");
 
 // Load history list on page load
 loadHistoryList();
 
 historyBack.addEventListener("click", () => {
   historyViewer.classList.add("hidden");
+  historyViewer.classList.remove("history-tab-active");
+  historyBack.classList.add("hidden");
+  historyViewerTitle.classList.add("hidden");
   _historyGraph = null;
+  _historyLedger = null;
   clearTimeout(_historyDrawTimer);
-  graphCanvas.style.display = "";
-  graphEmpty.style.display = GRAPH.hasContent ? "none" : "";
   // Refresh main graph edges after layout
   if (GRAPH.hasContent) {
     requestAnimationFrame(() => {
@@ -135,9 +141,11 @@ async function loadHistoryList() {
 async function openHistory(item) {
   console.log("openHistory called, report_file:", item.report_file);
   historyViewer.classList.remove("hidden");
+  historyViewer.classList.remove("history-tab-active");
+  historyBack.classList.remove("hidden");
+  historyViewerTitle.classList.remove("hidden");
   const durText = item.duration_secs ? ` · ${Math.round(item.duration_secs)}s` : "";
   historyViewerTitle.textContent = `${item.entity_type}/${item.entity_name}${durText}`;
-  graphCanvas.style.display = "none";
 
   // Load report
   historyReport.innerHTML = '<p style="color:var(--text-3)">加载报告...</p>';
@@ -177,6 +185,12 @@ async function openHistory(item) {
       hypothesisBadge.textContent = hypCount;
       hypothesisBadge.classList.remove("hidden");
     }
+    // Render history-specific hypothesis tree
+    _renderHistoryHypothesis(item.ledger);
+  } else {
+    _historyLedger = null;
+    if (historyHypothesisEmpty) historyHypothesisEmpty.style.display = "flex";
+    if (historyHypothesisTree) historyHypothesisTree.innerHTML = "";
   }
 }
 
@@ -301,6 +315,7 @@ function _buildLevelsFrom(nodes, nodeOrder, edges) {
 
 let _historyGraph = null;   // reference to current history graph for redraws
 let _historyDrawTimer = null;
+let _historyLedger = null;  // reference to current history ledger for hypothesis view
 
 function drawHistoryEdges(g) {
   _historyGraph = g;
@@ -1244,6 +1259,19 @@ function renderTree() {
     }
   }, 150);
 
+  // ── Synchronous edge drawing (primary path) ──
+  // drawAllEdges() internally calls getBoundingClientRect() on every node,
+  // which triggers a synchronous forced reflow.  This guarantees correct
+  // coordinates within the SAME frame as the DOM rebuild, eliminating the
+  // async gap that caused edges to be deferred / cancelled by consecutive
+  // renderTree() calls.
+  // Skip when the tab is hidden — all heights would be 0 and the SVG would
+  // be cleared.  The async safety-nets above handle the visibility-change
+  // redraw correctly.
+  if (!document.hidden && GRAPH.edges.length > 0) {
+    drawAllEdges();
+  }
+
   // Only auto-scroll if user hasn't scrolled up manually
   if (!graphUserScrolled) {
     requestAnimationFrame(() => {
@@ -1482,6 +1510,12 @@ graphCanvas.addEventListener("scroll", () => {
 graphCanvas.addEventListener("scroll", () => {
   const dist = graphCanvas.scrollHeight - graphCanvas.scrollTop - graphCanvas.clientHeight;
   graphUserScrolled = dist > 80;
+});
+// Redraw edges when the tab becomes visible (covers hidden-tab skip in renderTree)
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && GRAPH.hasContent && GRAPH.edges.length > 0) {
+    drawAllEdges();
+  }
 });
 
 function resetGraph() {
@@ -1764,11 +1798,37 @@ function escNoBr(s) {
 // ═══════════════════ Hypothesis Tree ═══════════════════
 
 let currentLedger = null;
+let _userSwitchedAway = false;  // Track if user manually switched tab
+const _hypCollapsedEvidence = new Set();  // hypothesis IDs with collapsed evidence
+const _hypCollapsedChildren = new Set();  // hypothesis IDs with collapsed children
+
 const tabExecution = document.getElementById("tabExecution");
 const tabHypothesis = document.getElementById("tabHypothesis");
 const hypothesisBadge = document.getElementById("hypothesisBadge");
 const hypothesisTree = document.getElementById("hypothesisTree");
 const hypothesisEmpty = document.getElementById("hypothesisEmpty");
+const hypothesisEdges = document.getElementById("hypothesisEdges");
+const hypothesisCanvas = document.getElementById("hypothesisCanvas");
+
+// Status labels (Chinese)
+const STATUS_LABELS = {
+  pending: "待验证",
+  verifying: "验证中",
+  confirmed: "已确认",
+  refuted: "已排除",
+  deprioritized: "已降级",
+  dead_end: "死胡同",
+};
+
+const PHASE_LABELS = {
+  understand: "理解故障",
+  hypothesize: "形成假设",
+  verify: "验证假设",
+  evaluate: "评估路径",
+  skill_verify: "技能验证",
+  backtrack: "回溯",
+  report: "生成报告",
+};
 
 // Tab switching
 tabExecution.addEventListener("click", () => switchTab("execution"));
@@ -1776,14 +1836,35 @@ tabHypothesis.addEventListener("click", () => switchTab("hypothesis"));
 
 function switchTab(tab) {
   document.querySelectorAll(".graph-tab").forEach((t) => t.classList.remove("active"));
-  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
   if (tab === "execution") {
     tabExecution.classList.add("active");
-    document.querySelector('[data-panel="execution"]').classList.add("active");
+    hypothesisBadge?.classList.remove("hidden");
+    if (historyViewer && !historyViewer.classList.contains("hidden")) {
+      // In history mode: show execution panel, hide hypothesis panel
+      historyViewer.classList.remove("history-tab-active");
+      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+      document.querySelector('[data-panel="execution"]').classList.add("active");
+      // Redraw history execution edges
+      if (_historyGraph) _scheduleHistoryEdgeRedraw();
+    } else {
+      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+      document.querySelector('[data-panel="execution"]').classList.add("active");
+    }
   } else {
     tabHypothesis.classList.add("active");
-    document.querySelector('[data-panel="hypothesis"]').classList.add("active");
     hypothesisBadge?.classList.add("hidden");
+    if (historyViewer && !historyViewer.classList.contains("hidden")) {
+      // In history mode: show history hypothesis panel, hide execution panel
+      historyViewer.classList.add("history-tab-active");
+      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+      // Redraw history hypothesis edges after panel becomes visible
+      if (_historyLedger) _scheduleHistoryHypEdgeRedraw();
+    } else {
+      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+      document.querySelector('[data-panel="hypothesis"]').classList.add("active");
+      // Redraw edges — the panel was display:none, so prior coordinates were zero
+      if (currentLedger) _scheduleHypEdgeRedraw();
+    }
   }
 }
 
@@ -1792,21 +1873,34 @@ function onLedgerSnapshot(payload) {
   if (!ledger) return;
   currentLedger = ledger;
 
-  // Show badge on hypothesis tab
   const hypCount = Object.keys(ledger.hypotheses || {}).length;
   if (hypCount > 0 && hypothesisBadge) {
     hypothesisBadge.textContent = hypCount;
     hypothesisBadge.classList.remove("hidden");
   }
 
-  // Auto-switch to hypothesis tab on first hypothesis
-  if (hypCount === 1 && !currentLedger._userSwitchedAway) {
-    // Don't auto-switch; let user decide. Just show badge.
-  }
-
   renderHypothesisTree(ledger);
 }
 
+// ── Probability color helper ──
+function _probClass(prob) {
+  if (prob >= 70) return "high";
+  if (prob >= 40) return "med";
+  return "low";
+}
+
+// ── Node fingerprint for incremental diff ──
+function _nodeFingerprint(node) {
+  return [
+    node.status, node.probability, node.selected,
+    (node.evidence || []).length,
+    (node.verification_tools || []).length,
+    (node.sub_hypothesis_ids || []).length,
+    node.statement, node.rationale,
+  ].join("|");
+}
+
+// ── Render full tree ──
 function renderHypothesisTree(ledger) {
   if (!ledger) return;
   const hypotheses = ledger.hypotheses || {};
@@ -1819,37 +1913,112 @@ function renderHypothesisTree(ledger) {
   }
   if (hypothesisEmpty) hypothesisEmpty.style.display = "none";
 
-  let html = "";
-
   // Phase banner
   const phase = ledger.current_phase || "understand";
   const round = ledger.current_round || 0;
   const activePath = ledger.active_path || [];
-  const phaseLabels = {
-    understand: "理解故障",
-    hypothesize: "形成假设",
-    verify: "验证假设",
-    evaluate: "评估路径",
-    skill_verify: "技能验证",
-    backtrack: "回溯",
-    report: "生成报告",
-  };
-  html += `<div class="hyp-phase-banner">`;
-  html += `阶段: <strong>${esc(phaseLabels[phase] || phase)}</strong> · 步骤: ${round}`;
+  let bannerHtml = `<div class="hyp-phase-banner">`;
+  bannerHtml += `阶段: <strong>${esc(PHASE_LABELS[phase] || phase)}</strong> · 步骤: ${round}`;
   if (activePath.length > 0) {
-    html += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
+    bannerHtml += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
   }
   if (ledger.root_cause) {
-    html += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
+    bannerHtml += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
   }
-  html += `</div>`;
+  bannerHtml += `</div>`;
 
-  // Render tree recursively
+  // Build tree HTML
+  let treeHtml = "";
   for (const hid of rootIds) {
-    html += renderHypothesisNode(hypotheses[hid], hypotheses, 0);
+    treeHtml += renderHypothesisNode(hypotheses[hid], hypotheses, 0);
   }
 
-  if (hypothesisTree) hypothesisTree.innerHTML = html;
+  if (!hypothesisTree) return;
+
+  // ── Incremental update: diff against existing DOM ──
+  const existingBanner = hypothesisTree.querySelector(".hyp-phase-banner");
+  const bannerChanged = !existingBanner || existingBanner.outerHTML !== bannerHtml;
+  if (bannerChanged) {
+    if (existingBanner) {
+      existingBanner.outerHTML = bannerHtml;
+    } else {
+      hypothesisTree.insertAdjacentHTML("afterbegin", bannerHtml);
+    }
+  }
+
+  // Build a map of currently rendered node elements by data-hid
+  const renderedNodes = new Map();
+  hypothesisTree.querySelectorAll(".hyp-node[data-hid]").forEach((el) => {
+    renderedNodes.set(el.dataset.hid, el);
+  });
+
+  // Collect all hypothesis IDs from the new tree
+  const newHids = new Set(Object.keys(hypotheses));
+
+  // Remove nodes that no longer exist
+  for (const [hid, el] of renderedNodes) {
+    if (!newHids.has(hid)) {
+      // Remove the node and its children container
+      const childrenEl = el.nextElementSibling;
+      if (childrenEl && childrenEl.classList.contains("hyp-children")) {
+        childrenEl.remove();
+      }
+      el.remove();
+      renderedNodes.delete(hid);
+    }
+  }
+
+  // Re-render full tree HTML and use it to patch existing nodes
+  const tempDiv = document.createElement("div");
+  tempDiv.innerHTML = treeHtml;
+
+  for (const newEl of tempDiv.querySelectorAll(".hyp-node[data-hid]")) {
+    const hid = newEl.dataset.hid;
+    const existing = renderedNodes.get(hid);
+    const node = hypotheses[hid];
+    if (!node) continue;
+
+    if (existing) {
+      // Check if node content changed
+      const oldFp = existing.dataset.fp || "";
+      const newFp = _nodeFingerprint(node);
+      if (oldFp !== newFp) {
+        existing.outerHTML = newEl.outerHTML;
+      }
+      // Also update children container if sub_hypothesis_ids changed
+      const existChildren = existing.nextElementSibling;
+      const newChildren = newEl.nextElementSibling;
+      if (existChildren && existChildren.classList.contains("hyp-children") &&
+          newChildren && newChildren.classList.contains("hyp-children")) {
+        if (existChildren.innerHTML !== newChildren.innerHTML) {
+          existChildren.innerHTML = newChildren.innerHTML;
+        }
+      }
+    }
+  }
+
+  // If the overall structure changed (new nodes added or removed),
+  // fall back to full replacement to maintain correct ordering
+  const existingHids = new Set(renderedNodes.keys());
+  const structureChanged = newHids.size !== existingHids.size ||
+    [...newHids].some(h => !existingHids.has(h));
+
+  if (structureChanged) {
+    // Full rebuild — preserve collapse state via the Sets
+    hypothesisTree.innerHTML = bannerHtml + treeHtml;
+  }
+
+  // Auto-collapse evidence for refuted/deprioritized/dead_end nodes
+  for (const hid of newHids) {
+    const node = hypotheses[hid];
+    if (!node) continue;
+    if (["refuted", "deprioritized", "dead_end"].includes(node.status)) {
+      _hypCollapsedChildren.add(hid);
+    }
+  }
+  _applyCollapseState();
+  // Draw SVG edges after DOM settles
+  _scheduleHypEdgeRedraw();
 }
 
 function renderHypothesisNode(node, allHypotheses, depth) {
@@ -1858,17 +2027,22 @@ function renderHypothesisNode(node, allHypotheses, depth) {
   const prob = node.probability || 0;
   const selected = node.selected;
   const isFocus = selected && status === "verifying";
+  const probCls = _probClass(prob);
+  const evCollapsed = _hypCollapsedEvidence.has(node.id);
+  const chCollapsed = _hypCollapsedChildren.has(node.id);
 
   let cls = `hyp-node ${status}`;
   if (selected) cls += " selected";
+  if (isFocus) cls += " focus";
 
-  let html = `<div class="${cls}">`;
+  const fp = _nodeFingerprint(node);
+  let html = `<div class="${cls}" data-hid="${esc(node.id)}" data-fp="${esc(fp)}">`;
 
   // Header: ID + status + probability bar + statement
   html += `<div class="hyp-header">`;
   html += `<span class="hyp-id">${esc(node.id)}</span>`;
-  html += `<span class="hyp-status ${status}">${esc(status)}</span>`;
-  html += `<div class="hyp-prob-bar"><div class="hyp-prob-fill" style="width:${prob}%"></div></div>`;
+  html += `<span class="hyp-status ${status}">${esc(STATUS_LABELS[status] || status)}</span>`;
+  html += `<div class="hyp-prob-bar"><div class="hyp-prob-fill ${probCls}" style="width:${prob}%"></div></div>`;
   html += `<span class="hyp-prob-text">${prob}%</span>`;
   if (selected) html += `<span class="hyp-star">★</span>`;
   if (isFocus) html += `<span class="hyp-focus-tag">← 当前聚焦</span>`;
@@ -1877,9 +2051,13 @@ function renderHypothesisNode(node, allHypotheses, depth) {
   // Statement
   html += `<div class="hyp-statement">${esc(node.statement)}</div>`;
 
-  // Evidence
-  if (node.evidence && node.evidence.length > 0) {
-    html += `<div class="hyp-evidence">`;
+  // Evidence (with collapse toggle)
+  const evCount = (node.evidence || []).length;
+  if (evCount > 0) {
+    html += `<div class="hyp-evidence${evCollapsed ? " collapsed" : ""}" data-ev-for="${esc(node.id)}">`;
+    html += `<button class="hyp-collapse-btn" data-action="toggle-evidence" data-hid="${esc(node.id)}">`;
+    html += `证据 (${evCount})</button>`;
+    html += `<div class="hyp-evidence-list${evCollapsed ? " hidden" : ""}">`;
     for (const ev of node.evidence) {
       const evCls = ev.supports ? "support" : "refute";
       const src = ev.source || "";
@@ -1887,7 +2065,7 @@ function renderHypothesisNode(node, allHypotheses, depth) {
       if (src) html += ` <span style="opacity:0.6">(${esc(src)})</span>`;
       html += `</div>`;
     }
-    html += `</div>`;
+    html += `</div></div>`;
   }
 
   // Verification tools
@@ -1895,28 +2073,267 @@ function renderHypothesisNode(node, allHypotheses, depth) {
     html += `<div class="hyp-tools">🔧 ${esc(node.verification_tools.join(", "))}</div>`;
   }
 
-  // Rationale (for refuted/confirmed/deprioritized)
+  // Rationale (for terminal states)
   if (node.rationale && status !== "pending" && status !== "verifying") {
-    html += `<div class="hyp-evidence-item" style="margin-top:4px;font-size:11px;color:var(--text-2)">`;
-    html += `理由: ${esc(node.rationale)}</div>`;
+    html += `<div class="hyp-rationale">理由: ${esc(node.rationale)}</div>`;
   }
 
   html += `</div>`; // close hyp-node
 
-  // Children
-  if (node.sub_hypothesis_ids && node.sub_hypothesis_ids.length > 0) {
-    html += `<div class="hyp-children">`;
+  // Children (with collapse toggle)
+  const childCount = (node.sub_hypothesis_ids || []).length;
+  if (childCount > 0) {
+    html += `<div class="hyp-children${chCollapsed ? " collapsed" : ""}" data-ch-for="${esc(node.id)}">`;
+    html += `<button class="hyp-collapse-btn" data-action="toggle-children" data-hid="${esc(node.id)}">`;
+    html += `子假设 (${childCount})</button>`;
+    html += `<div class="hyp-children-list${chCollapsed ? " hidden" : ""}">`;
     for (const sid of node.sub_hypothesis_ids) {
       html += renderHypothesisNode(allHypotheses[sid], allHypotheses, depth + 1);
     }
-    html += `</div>`;
+    html += `</div></div>`;
   }
 
   return html;
 }
 
+// ── Hypothesis tree SVG edge drawing ──
+
+function drawHypothesisEdges(opts) {
+  const canvas = opts?.canvas || hypothesisCanvas;
+  const svg = opts?.svg || hypothesisEdges;
+  const tree = opts?.tree || hypothesisTree;
+  const ledger = opts?.ledger || currentLedger;
+  const markerPrefix = opts?.markerPrefix || 'hyp';
+  if (!canvas || !svg || !ledger) return;
+  const hypotheses = ledger.hypotheses || {};
+  const activePath = new Set(ledger.active_path || []);
+
+  const sx = canvas.scrollLeft;
+  const sy = canvas.scrollTop;
+  const canvasRect = canvas.getBoundingClientRect();
+  const sw = canvas.scrollWidth;
+  const sh = canvas.scrollHeight;
+
+  svg.setAttribute("viewBox", `0 0 ${sw} ${sh}`);
+  svg.setAttribute("width", sw);
+  svg.setAttribute("height", sh);
+
+  // SVG defs: arrow markers
+  const arrowW = 5, arrowH = 4, arrowRefX = 4.2;
+  let svgContent = `<defs>
+    <marker id="${markerPrefix}Arrow" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#8e94a8"/>
+    </marker>
+    <marker id="${markerPrefix}ArrowActive" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#6c8cff"/>
+    </marker>
+    <marker id="${markerPrefix}ArrowConfirmed" markerWidth="${arrowW}" markerHeight="${arrowH}" refX="${arrowRefX}" refY="${arrowH/2}" orient="auto">
+      <polygon points="0,0 ${arrowW},${arrowH/2} 0,${arrowH}" fill="#2d8a3e"/>
+    </marker>
+  </defs>`;
+
+  let drawn = 0;
+
+  for (const [hid, node] of Object.entries(hypotheses)) {
+    if (!node.parent_id) continue;
+    const parentEl = tree.querySelector(`.hyp-node[data-hid="${node.parent_id}"]`);
+    const childEl = tree.querySelector(`.hyp-node[data-hid="${hid}"]`);
+    if (!parentEl || !childEl) continue;
+
+    // Skip hidden (collapsed) nodes
+    if (childEl.closest(".hidden")) continue;
+
+    const pRect = parentEl.getBoundingClientRect();
+    const cRect = childEl.getBoundingClientRect();
+    if (pRect.height === 0 || cRect.height === 0) continue;
+
+    // Coordinates relative to canvas + scroll
+    const x1 = pRect.left - canvasRect.left + pRect.width / 2 + sx;
+    const y1 = pRect.bottom - canvasRect.top + sy;
+    const x2 = cRect.left - canvasRect.left + cRect.width / 2 + sx;
+    const y2 = cRect.top - canvasRect.top + sy;
+
+    const gap = Math.abs(y2 - y1);
+    const midY1 = y1 + Math.max(12, gap * 0.35);
+    const midY2 = y2 - Math.max(12, gap * 0.35);
+
+    // Determine edge style based on node & path status
+    const isOnActivePath = activePath.has(hid) && activePath.has(node.parent_id);
+    const childStatus = node.status || "pending";
+
+    let stroke, strokeW, dash, marker;
+    if (isOnActivePath) {
+      stroke = "#6c8cff"; strokeW = 2; dash = ""; marker = `url(#${markerPrefix}ArrowActive)`;
+    } else if (childStatus === "confirmed") {
+      stroke = "#2d8a3e"; strokeW = 1.6; dash = ""; marker = `url(#${markerPrefix}ArrowConfirmed)`;
+    } else if (childStatus === "refuted" || childStatus === "dead_end") {
+      stroke = "#c0392b"; strokeW = 1.2; dash = 'stroke-dasharray="4 3"'; marker = `url(#${markerPrefix}Arrow)`;
+    } else if (childStatus === "deprioritized") {
+      stroke = "#8e94a8"; strokeW = 1; dash = 'stroke-dasharray="3 3"'; marker = `url(#${markerPrefix}Arrow)`;
+    } else {
+      stroke = "#8e94a8"; strokeW = 1.4; dash = ""; marker = `url(#${markerPrefix}Arrow)`;
+    }
+
+    svgContent += `<path d="M${x1},${y1} C${x1},${midY1} ${x2},${midY2} ${x2},${y2}"
+      stroke="${stroke}" stroke-width="${strokeW}" ${dash}
+      fill="none" stroke-linecap="round" marker-end="${marker}"
+      class="hyp-edge"/>`;
+    drawn++;
+  }
+
+  svg.innerHTML = svgContent;
+  console.debug(`[drawHypothesisEdges] drawn=${drawn}`);
+}
+
+// Debounced edge redraw via RAF
+let _hypEdgeRafId = 0;
+function _scheduleHypEdgeRedraw() {
+  cancelAnimationFrame(_hypEdgeRafId);
+  _hypEdgeRafId = requestAnimationFrame(() => {
+    requestAnimationFrame(() => drawHypothesisEdges());
+  });
+}
+
+// History hypothesis edge redraw via RAF
+let _histHypEdgeRafId = 0;
+function _scheduleHistoryHypEdgeRedraw() {
+  cancelAnimationFrame(_histHypEdgeRafId);
+  _histHypEdgeRafId = requestAnimationFrame(() => {
+    requestAnimationFrame(() => drawHypothesisEdges({
+      canvas: historyHypothesisCanvas,
+      svg: historyHypothesisEdges,
+      tree: historyHypothesisTree,
+      ledger: _historyLedger,
+      markerPrefix: 'histHyp',
+    }));
+  });
+}
+
+// ── Render history hypothesis tree into history viewer ──
+function _renderHistoryHypothesis(ledger) {
+  _historyLedger = ledger;
+  if (!historyHypothesisTree || !historyHypothesisCanvas) return;
+
+  const hypotheses = ledger.hypotheses || {};
+  const rootIds = ledger.root_hypothesis_ids || [];
+
+  if (rootIds.length === 0) {
+    if (historyHypothesisEmpty) historyHypothesisEmpty.style.display = "flex";
+    historyHypothesisTree.innerHTML = "";
+    return;
+  }
+  if (historyHypothesisEmpty) historyHypothesisEmpty.style.display = "none";
+
+  // Phase banner
+  const phase = ledger.current_phase || "understand";
+  const round = ledger.current_round || 0;
+  const activePath = ledger.active_path || [];
+  let bannerHtml = `<div class="hyp-phase-banner">`;
+  bannerHtml += `阶段: <strong>${esc(PHASE_LABELS[phase] || phase)}</strong> · 步骤: ${round}`;
+  if (activePath.length > 0) {
+    bannerHtml += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
+  }
+  if (ledger.root_cause) {
+    bannerHtml += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
+  }
+  bannerHtml += `</div>`;
+
+  // Build tree HTML
+  let treeHtml = "";
+  for (const hid of rootIds) {
+    treeHtml += renderHypothesisNode(hypotheses[hid], hypotheses, 0);
+  }
+
+  historyHypothesisTree.innerHTML = bannerHtml + treeHtml;
+  _applyCollapseState(historyHypothesisTree);
+  _scheduleHistoryHypEdgeRedraw();
+}
+
+// Redraw on scroll / resize
+if (hypothesisCanvas) {
+  hypothesisCanvas.addEventListener("scroll", () => {
+    if (currentLedger) _scheduleHypEdgeRedraw();
+  });
+}
+if (historyHypothesisCanvas) {
+  historyHypothesisCanvas.addEventListener("scroll", () => {
+    if (_historyLedger) _scheduleHistoryHypEdgeRedraw();
+  });
+}
+window.addEventListener("resize", () => {
+  if (currentLedger) _scheduleHypEdgeRedraw();
+  if (_historyLedger) _scheduleHistoryHypEdgeRedraw();
+});
+
+// ── Apply collapse state to DOM (after incremental update) ──
+function _applyCollapseState(treeEl) {
+  const tree = treeEl || hypothesisTree;
+  if (!tree) return;
+  for (const hid of _hypCollapsedEvidence) {
+    const el = tree.querySelector(`[data-ev-for="${hid}"]`);
+    if (el) {
+      el.classList.add("collapsed");
+      const list = el.querySelector(".hyp-evidence-list");
+      if (list) list.classList.add("hidden");
+    }
+  }
+  for (const hid of _hypCollapsedChildren) {
+    const el = tree.querySelector(`[data-ch-for="${hid}"]`);
+    if (el) {
+      el.classList.add("collapsed");
+      const list = el.querySelector(".hyp-children-list");
+      if (list) list.classList.add("hidden");
+    }
+  }
+}
+
+// ── Collapse click handler (shared between main and history trees) ──
+function _handleHypothesisCollapse(e, redrawFn) {
+  const btn = e.target.closest(".hyp-collapse-btn");
+  if (!btn) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  const hid = btn.dataset.hid;
+  const action = btn.dataset.action;
+  if (action === "toggle-evidence") {
+    if (_hypCollapsedEvidence.has(hid)) _hypCollapsedEvidence.delete(hid);
+    else _hypCollapsedEvidence.add(hid);
+    const container = btn.closest(".hyp-evidence");
+    if (container) {
+      const list = container.querySelector(".hyp-evidence-list");
+      const isCollapsed = container.classList.toggle("collapsed");
+      if (list) list.classList.toggle("hidden", isCollapsed);
+      redrawFn();
+    }
+  } else if (action === "toggle-children") {
+    if (_hypCollapsedChildren.has(hid)) _hypCollapsedChildren.delete(hid);
+    else _hypCollapsedChildren.add(hid);
+    const container = btn.closest(".hyp-children");
+    if (container) {
+      const list = container.querySelector(".hyp-children-list");
+      const isCollapsed = container.classList.toggle("collapsed");
+      if (list) list.classList.toggle("hidden", isCollapsed);
+      redrawFn();
+    }
+  }
+  return true;
+}
+
+// ── Event delegation for collapse/expand clicks (main tree) ──
+if (hypothesisTree) {
+  hypothesisTree.addEventListener("click", (e) => {
+    _handleHypothesisCollapse(e, _scheduleHypEdgeRedraw);
+  });
+}
+// ── Event delegation for collapse/expand clicks (history tree) ──
+if (historyHypothesisTree) {
+  historyHypothesisTree.addEventListener("click", (e) => {
+    _handleHypothesisCollapse(e, _scheduleHistoryHypEdgeRedraw);
+  });
+}
+
 // Track if user manually switched away from hypothesis tab
 tabExecution?.addEventListener("click", () => {
-  if (currentLedger) currentLedger._userSwitchedAway = true;
+  _userSwitchedAway = true;
 });
 

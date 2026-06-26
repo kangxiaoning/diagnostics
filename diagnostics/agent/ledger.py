@@ -148,15 +148,29 @@ def new_evidence(
 # ── ID generation ──
 
 def _next_hypothesis_id(parent_id: str | None, hypotheses: dict[str, HypothesisNode]) -> str:
-    """Generate next hypothesis ID like H1, H2, H1.1, H1.2."""
+    """Generate next hypothesis ID like H1, H2, H1.1, H1.2.
+
+    Scans existing IDs to avoid collisions when called multiple times
+    for the same parent within a single commit_hypotheses invocation.
+    """
     if parent_id is None:
         existing_top = [h for h in hypotheses.values() if h["parent_id"] is None]
-        return f"H{len(existing_top) + 1}"
+        next_num = len(existing_top) + 1
+        # Avoid collision: skip numbers already taken
+        while f"H{next_num}" in hypotheses:
+            next_num += 1
+        return f"H{next_num}"
     parent = hypotheses.get(parent_id)
     if parent is None:
-        return f"H1"
+        return "H1"
     count = len(parent.get("sub_hypothesis_ids", []))
-    return f"{parent_id}.{count + 1}"
+    candidate = f"{parent_id}.{count + 1}"
+    # Avoid collision: increment suffix until unique
+    suffix = count + 1
+    while candidate in hypotheses:
+        suffix += 1
+        candidate = f"{parent_id}.{suffix}"
+    return candidate
 
 
 # ── Hypothesis tree operations ──
@@ -291,6 +305,11 @@ def record_finding(
         ledger["_inconclusive_streak"] = 0
     else:  # inconclusive
         ledger["_inconclusive_streak"] += 1
+        # After 3+ consecutive inconclusive, mark as dead_end to break
+        # the verify loop — derive_phase would otherwise keep returning
+        # "verify" because the node status remained "verifying".
+        if ledger["_inconclusive_streak"] >= 3:
+            node["status"] = "dead_end"
 
     if new_insights:
         node["rationale"] = (node.get("rationale", "") + " | 新发现: " + new_insights).strip(" |")
@@ -650,8 +669,12 @@ def record_round(
     key_findings: str = "",
     next_plan: str = "",
 ) -> None:
-    """Record a diagnosis round."""
-    ledger["current_round"] += 1
+    """Record a tool call within the current diagnosis round.
+
+    NOTE: current_round is synced from the middleware's _model_call_count
+    (via before_model hook), NOT incremented here. This ensures round
+    numbers reflect actual LLM invocations, not individual tool calls.
+    """
     focus_id = ledger["active_path"][-1] if ledger["active_path"] else None
     ledger["rounds"].append(RoundRecord(
         round=ledger["current_round"],
