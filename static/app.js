@@ -1121,9 +1121,10 @@ function onTreeDelta(payload) {
 
 // ═══════════════════ Tree Rendering (Top-Down) ═══════════════════
 
-// Debounced safety-net: guarantees drawAllEdges() fires within 120ms
+// Debounced safety-net: guarantees drawAllEdges() fires within 300ms
 // even if the browser skips or delays requestAnimationFrame callbacks
 // (e.g. heavy rendering, background tab, GPU throttle).
+// 300ms gives reflow enough time after innerHTML="" full DOM rebuild.
 let _edgeSafetyTimer = 0;
 function _scheduleEdgeSafetyNet() {
   clearTimeout(_edgeSafetyTimer);
@@ -1132,7 +1133,7 @@ function _scheduleEdgeSafetyNet() {
     if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
       drawAllEdges();
     }
-  }, 120);
+  }, 300);
 }
 
 function renderTree() {
@@ -1338,6 +1339,11 @@ function drawAllEdges() {
 
     const fromRect = fromNode.el.getBoundingClientRect();
     const toRect = toNode.el.getBoundingClientRect();
+
+    // Skip nodes whose layout hasn't been computed yet (reflow not done).
+    // height === 0 means the DOM element exists but getBoundingClientRect
+    // hasn't measured a real height — drawing would produce y=0 coords.
+    if (fromRect.height === 0 || toRect.height === 0) continue;
 
     // Account for scroll offset so edges follow nodes
     const x1 = fromRect.left - canvasRect.left + fromRect.width / 2 + sx;
