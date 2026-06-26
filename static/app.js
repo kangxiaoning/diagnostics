@@ -1049,6 +1049,12 @@ function onTreeDelta(payload) {
   if (payload.added) {
     for (const step of payload.added) {
       const parentIds = step.parent_ids || (step.parent_id ? [step.parent_id] : []);
+      const alreadyExists = GRAPH.nodes.has(step.id);
+      if (alreadyExists) {
+        console.warn(`[onTreeDelta] DUPLICATE node id=${step.id} title="${step.title}" — already in GRAPH.nodes (el=${GRAPH.nodes.get(step.id)?.el ? 'set' : 'null'}), overwriting el=null`);
+      } else {
+        console.debug(`[onTreeDelta] ADD node id=${step.id} title="${step.title}" parent_ids=${JSON.stringify(parentIds)}`);
+      }
       GRAPH.nodes.set(step.id, {
         id: step.id,
         title: step.title,
@@ -1062,12 +1068,16 @@ function onTreeDelta(payload) {
         toolArgs: step.tool_args || "",
         el: null,
       });
-      GRAPH.nodeOrder.push(step.id);
+      if (!alreadyExists) {
+        GRAPH.nodeOrder.push(step.id);
+      }
       // Register parent→child edges immediately so drawAllEdges can draw
       // them on the very next renderTree() call without waiting for a
       // full tree_snapshot.
-      for (const pid of parentIds) {
-        if (pid) GRAPH.edges.push({ from: pid, to: step.id });
+      if (!alreadyExists) {
+        for (const pid of parentIds) {
+          if (pid) GRAPH.edges.push({ from: pid, to: step.id });
+        }
       }
       structureChanged = true;
     }

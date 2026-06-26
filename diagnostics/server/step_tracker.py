@@ -224,9 +224,12 @@ class TreeBuilder:
 
         self._last_tool_child_ids.extend(created_ids)
         self._current_response_text = []
-        logger.info("Tree: +%d tool nodes under %s (accumulated: %d)",
-                     len(new_calls), parent_id, len(self._last_tool_child_ids))
-        return [self._delta_event(created_ids)]
+        logger.info("Tree: +%d tool nodes under %s (accumulated: %d) created_ids=%s",
+                     len(new_calls), parent_id, len(self._last_tool_child_ids), created_ids)
+        delta = self._delta_event(created_ids)
+        logger.debug("Tree: delta event added=%s",
+                     [s.get("id") for s in delta.get("added", [])])
+        return [delta]
 
     def handle_update(self, _data: dict, namespace: list[str]) -> list[dict[str, Any]]:
         if not self._is_tool_update(_data, namespace):
