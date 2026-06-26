@@ -1131,19 +1131,50 @@ function onTreeDelta(payload) {
 
 // ═══════════════════ Tree Rendering (Top-Down) ═══════════════════
 
-// Debounced safety-net: guarantees drawAllEdges() fires within 300ms
-// even if the browser skips or delays requestAnimationFrame callbacks
-// (e.g. heavy rendering, background tab, GPU throttle).
-// 300ms gives reflow enough time after innerHTML="" full DOM rebuild.
+// ResizeObserver-based edge trigger: fires drawAllEdges() as soon as
+// the last newly-created node has a real height (reflow complete).
+// Falls back to a 300ms safety-net for background tabs / GPU stall.
 let _edgeSafetyTimer = 0;
+let _edgeReflowObserver = null;
+
 function _scheduleEdgeSafetyNet() {
   clearTimeout(_edgeSafetyTimer);
   _edgeSafetyTimer = setTimeout(() => {
-    // Only draw if we have nodes with DOM elements
     if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
       drawAllEdges();
     }
   }, 300);
+}
+
+// Watch a sentinel element; fire drawAllEdges() once it has height > 0.
+function _watchReflowThenDraw(sentinelEl) {
+  // Disconnect any previous observer first.
+  if (_edgeReflowObserver) {
+    _edgeReflowObserver.disconnect();
+    _edgeReflowObserver = null;
+  }
+  if (!sentinelEl) return;
+
+  // If already has height (unlikely but possible), draw immediately.
+  if (sentinelEl.getBoundingClientRect().height > 0) {
+    drawAllEdges();
+    return;
+  }
+
+  _edgeReflowObserver = new ResizeObserver((entries, obs) => {
+    for (const entry of entries) {
+      const h = entry.contentRect ? entry.contentRect.height
+                                  : entry.target.getBoundingClientRect().height;
+      if (h > 0) {
+        obs.disconnect();
+        _edgeReflowObserver = null;
+        clearTimeout(_edgeSafetyTimer); // cancel safety-net — not needed
+        drawAllEdges();
+        return;
+      }
+    }
+  });
+  _edgeReflowObserver.observe(sentinelEl);
 }
 
 function renderTree() {
@@ -1156,6 +1187,8 @@ function renderTree() {
   const container = document.createElement("div");
   container.className = "tree-container";
 
+  let lastEl = null; // sentinel: last node element added
+
   for (let li = 0; li < levels.length; li++) {
     const level = levels[li];
     const levelEl = document.createElement("div");
@@ -1167,6 +1200,7 @@ function renderTree() {
       const el = createNodeDOM(node);
       levelEl.appendChild(el);
       node.el = el;
+      lastEl = el;
     }
 
     container.appendChild(levelEl);
@@ -1182,15 +1216,10 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
-  // Edge draw with double-rAF to ensure DOM layout before reading
-  // getBoundingClientRect.  A setTimeout safety-net guarantees edges
-  // appear even if the browser throttles or skips rAF callbacks.
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      drawAllEdges();
-    });
-  });
+  // Use ResizeObserver on the last node to detect reflow completion.
+  // Safety-net (300ms) fires if ResizeObserver never reports height > 0.
   _scheduleEdgeSafetyNet();
+  _watchReflowThenDraw(lastEl);
 
   // Only auto-scroll if user hasn't scrolled up manually
   if (!graphUserScrolled) {
