@@ -1026,11 +1026,10 @@ function onTreeSnapshot(payload) {
   if (structureChanged) {
     renderTree();
   } else {
-    // Only edges or status changed — redraw edges without full DOM rebuild
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => drawAllEdges());
-    });
-    _scheduleEdgeSafetyNet();
+    // No new nodes, but edges were rebuilt from snapshot — must re-render
+    // the tree to reattach all node.el references and recompute coordinates.
+    // Simply redrawing edges with stale el positions produces wrong lines.
+    renderTree();
   }
 }
 
