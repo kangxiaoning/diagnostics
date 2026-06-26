@@ -166,9 +166,8 @@ class _EventState:
     _current_round_started: bool = True  # first round hasn't started yet
     # Map tool_call_id → subagent_name for phase routing
     _task_call_id_to_name: dict[str, str] = field(default_factory=dict)
-    # Track LangGraph node transitions to detect LLM invocation boundaries
-    _last_node_type: str = ""  # "model" or "tools" or empty (initial)
-    _first_model_seen: bool = False
+    # Track LangGraph node type for logging (round detection is in before_model hook)
+    _last_node_type: str = ""
     # Buffer for the final answer body: (text, round_number) tuples.
     # In _finalize, only text from the LAST round is emitted — intermediate
     # reasoning and step descriptions belong in per-round think sections.
@@ -313,25 +312,13 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
         message = data[0] if isinstance(data, tuple) and data else data
         metadata = data[1] if isinstance(data, tuple) and len(data) > 1 else {}
 
-        # ── Detect new LLM invocation via LangGraph node transitions ──
-        # Round increments when coordinator enters the "model" node
-        # (each model-node entry = one LLM call = one round).
+        # ── Node-type tracking (NOT round detection) ──
+        # Round detection is now handled exclusively by the before_model hook
+        # in DiagnosisLedgerMiddleware (emits round_transition via stream_writer).
+        # We only track node_type here for logging/observability purposes.
         node_type = metadata.get("langgraph_node", "")
-        if is_coordinator and node_type == "model":
-            if not state._first_model_seen:
-                state._first_model_seen = True
-                state._last_node_type = "model"
-            elif state._last_node_type != "model":
-                state.round_number += 1
-                state._last_node_type = "model"
-                logger.info("[round=%d] New model invocation detected",
-                            state.round_number)
-                # Notify the tree to create a new Phase for this round
-                events.append(AgentEvent("round_start", {
-                    "round": state.round_number,
-                }))
-        elif is_coordinator and node_type == "tools":
-            state._last_node_type = "tools"
+        if is_coordinator and node_type:
+            state._last_node_type = node_type
 
         msg_type = _message_type(message)
 
