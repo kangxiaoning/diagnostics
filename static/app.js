@@ -1400,14 +1400,27 @@ function renderMarkdown(text) {
   // sigils (# * ` etc.) are untouched by escNoBr.
   let out = escNoBr(text);
 
-  // ── Phase 1: block-level elements ──
-
+  // ── Phase 0: extract & protect code blocks ──
+  // Fenced and inline code are extracted BEFORE other transforms so that
+  // list detection, \n→<br>, etc. never penetrate code content.
+  const codeStore = [];
   // Fenced code blocks ```...```
   out = out.replace(/```(\w*)\r?\n([\s\S]*?)```/g,
-    (_, lang, code) => `<pre><code>${escNoBr(code.trimEnd())}</code></pre>`);
+    (_, lang, code) => {
+      const idx = codeStore.length;
+      // code was already escaped by the outer escNoBr; trimEnd preserves
+      // internal newlines which <pre> renders natively.
+      codeStore.push(`<pre><code>${code.trimEnd()}</code></pre>`);
+      return `\n\x00CB${idx}\x00\n`;
+    });
+  // Inline code `...`
+  out = out.replace(/`([^`]+)`/g, (_, code) => {
+    const idx = codeStore.length;
+    codeStore.push(`<code>${code}</code>`);
+    return `\x00CB${idx}\x00`;
+  });
 
-  // Inline code `...` — process BEFORE bold/italic to avoid conflicts
-  out = out.replace(/`([^`]+)`/g, (_, code) => `<code>${escNoBr(code)}</code>`);
+  // ── Phase 1: block-level elements ──
 
   // Headers
   out = out.replace(/^### (.+)$/gm, '<h3>$1</h3>');
@@ -1434,6 +1447,8 @@ function renderMarkdown(text) {
     let i = 0;
     const result = [];
     while (i < lines.length) {
+      // Skip code-block placeholders
+      if (/^\x00CB\d+\x00$/.test(lines[i].trim())) { result.push(lines[i]); i++; continue; }
       // Try to match a table: at least 2 consecutive |...| lines
       const tableStart = i;
       while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) i++;
@@ -1463,6 +1478,12 @@ function renderMarkdown(text) {
   const lines = out.split('\n');
   let inUl = false, inOl = false;
   for (let i = 0; i < lines.length; i++) {
+    // Skip code-block placeholder lines
+    if (/^\x00CB\d+\x00$/.test(lines[i].trim())) {
+      if (inUl) { lines[i - 1] += '</ul>'; inUl = false; }
+      if (inOl) { lines[i - 1] += '</ol>'; inOl = false; }
+      continue;
+    }
     let m;
     if ((m = lines[i].match(/^[-*] (.+)$/))) {
       if (!inUl) { lines[i] = '<ul><li>' + m[1] + '</li>'; inUl = true; }
@@ -1501,6 +1522,9 @@ function renderMarkdown(text) {
   out = out.replace(/(<\/table>)<\/p>/g, '$1');
   out = out.replace(/<p>(<h[123]>)/g, '$1');
   out = out.replace(/(<\/h[123]>)<\/p>/g, '$1');
+
+  // ── Phase 5: restore protected code blocks ──
+  out = out.replace(/\x00CB(\d+)\x00/g, (_, idx) => codeStore[Number(idx)]);
 
   return out;
 }
