@@ -58,6 +58,7 @@ let userScrolledUp = false;
 let _lastActivity = Date.now();
 let _stalenessTimer = null;
 const STALE_THRESHOLD_MS = 25_000;  // warn after 25s of silence
+let graphUserScrolled = false;  // track if user scrolled graph up
 
 // ── Graph state ──
 const GRAPH = {
@@ -235,7 +236,7 @@ function renderHistoryGraph(steps) {
 // Standalone tree renderer for history (doesn't rely on globals)
 function _renderTreeTo(nodes, nodeOrder, edges, targetNodes, targetEdges) {
   targetNodes.innerHTML = "";
-  const levels = _buildLevelsFrom(nodes, nodeOrder, edges);
+  const levels = buildLevels(nodes, nodeOrder);
 
   const container = document.createElement("div");
   container.className = "tree-container";
@@ -304,11 +305,7 @@ let _historyDrawTimer = null;
 function drawHistoryEdges(g) {
   _historyGraph = g;
   clearTimeout(_historyDrawTimer);
-  _historyDrawTimer = setTimeout(() => {
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => _redrawHistoryEdges());
-    });
-  }, 5);
+  _historyDrawTimer = setTimeout(() => _scheduleHistoryEdgeRedraw(), 5);
 }
 
 function _redrawHistoryEdges() {
@@ -363,19 +360,20 @@ function _redrawHistoryEdges() {
   svg.innerHTML = content;
 }
 
-// Redraw history edges on resize or scroll
+// Debounced history edge redraw via RAF
+let _historyDrawRaf = 0;
+function _scheduleHistoryEdgeRedraw() {
+  cancelAnimationFrame(_historyDrawRaf);
+  _historyDrawRaf = requestAnimationFrame(() => _redrawHistoryEdges());
+}
 window.addEventListener("resize", () => {
   if (_historyGraph) {
     clearTimeout(_historyDrawTimer);
-    _historyDrawTimer = setTimeout(() => {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => _redrawHistoryEdges());
-      });
-    }, 8);
+    _historyDrawTimer = setTimeout(() => _scheduleHistoryEdgeRedraw(), 8);
   }
 });
 document.getElementById("historyGraph")?.addEventListener("scroll", () => {
-  if (_historyGraph) _redrawHistoryEdges();
+  if (_historyGraph) _scheduleHistoryEdgeRedraw();
 });
 
 // ── Resizer (draggable divider) ──
@@ -430,20 +428,14 @@ document.addEventListener("mouseup", () => {
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     clearTimeout(_historyDrawTimer);
-    _historyDrawTimer = setTimeout(() => {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => _redrawHistoryEdges());
-      });
-    }, 8);
+    _historyDrawTimer = setTimeout(() => _scheduleHistoryEdgeRedraw(), 8);
   }
   if (isResizing) {
     isResizing = false;
     resizer.classList.remove("active");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-    if (GRAPH.hasContent) {
-      requestAnimationFrame(() => drawAllEdges());
-    }
+    if (GRAPH.hasContent) _scheduleEdgeRedraw();
   }
 });
 
@@ -966,36 +958,69 @@ function onTreeSnapshot(payload) {
   graphEmpty.style.display = "none";
   setGraphStatus("running");
 
-  // Update graph state from snapshot
-  GRAPH.nodes.clear();
+  const newIds = new Set(payload.steps.map(s => s.id));
+
+  // Remove nodes no longer in snapshot
+  for (const id of [...GRAPH.nodeOrder]) {
+    if (!newIds.has(id)) {
+      const node = GRAPH.nodes.get(id);
+      if (node?.el) node.el.remove();
+      GRAPH.nodes.delete(id);
+    }
+  }
+
+  // Incrementally update/add nodes; rebuild edges from scratch
+  let structureChanged = false;
   GRAPH.edges = [];
   GRAPH.nodeOrder = [];
 
   for (const step of payload.steps) {
-    GRAPH.nodes.set(step.id, {
-      id: step.id,
-      title: step.title,
-      parentId: step.parent_id,
-      parentIds: step.parent_ids || (step.parent_id ? [step.parent_id] : []),
-      status: step.status,
-      nodeType: step.node_type,
-      detail: step.detail || "",
-      description: step.description || "",
-      toolName: step.tool_name || "",
-      toolArgs: step.tool_args || "",
-      el: null,
-    });
     GRAPH.nodeOrder.push(step.id);
+    const parentIds = step.parent_ids || (step.parent_id ? [step.parent_id] : []);
 
-    // Build edges from parent_ids
-    for (const pid of (step.parent_ids || (step.parent_id ? [step.parent_id] : []))) {
-      if (pid) {
-        GRAPH.edges.push({ from: pid, to: step.id });
+    for (const pid of parentIds) {
+      if (pid) GRAPH.edges.push({ from: pid, to: step.id });
+    }
+
+    const existing = GRAPH.nodes.get(step.id);
+    if (existing) {
+      // Update status in-place (avoid full DOM recreation)
+      if (existing.status !== step.status || existing.detail !== (step.detail || "")) {
+        existing.status = step.status;
+        existing.detail = step.detail || "";
+        existing.description = step.description || "";
+        if (existing.el) {
+          const newEl = createNodeDOM(existing);
+          existing.el.replaceWith(newEl);
+          existing.el = newEl;
+        }
       }
+    } else {
+      GRAPH.nodes.set(step.id, {
+        id: step.id,
+        title: step.title,
+        parentId: step.parent_id,
+        parentIds: parentIds,
+        status: step.status,
+        nodeType: step.node_type,
+        detail: step.detail || "",
+        description: step.description || "",
+        toolName: step.tool_name || "",
+        toolArgs: step.tool_args || "",
+        el: null,
+      });
+      structureChanged = true;
     }
   }
 
-  renderTree();
+  if (structureChanged) {
+    renderTree();
+  } else {
+    // Only edges or status changed — redraw edges without full DOM rebuild
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => drawAllEdges());
+    });
+  }
 }
 
 // ═══════════════════ Tree Rendering (Top-Down) ═══════════════════
@@ -1044,63 +1069,61 @@ function renderTree() {
     });
   });
 
-  requestAnimationFrame(() => {
-    graphCanvas.scrollTop = graphCanvas.scrollHeight;
-  });
+  // Only auto-scroll if user hasn't scrolled up manually
+  if (!graphUserScrolled) {
+    requestAnimationFrame(() => {
+      graphCanvas.scrollTop = graphCanvas.scrollHeight;
+    });
+  }
 }
 
-function buildLevels() {
-  // BFS from root to determine levels
-  const levels = [];
-  const visited = new Set();
-  const queue = [];
+function buildLevels(nodes, nodeOrder) {
+  // Accept optional params for reuse with history graph; default to GRAPH globals
+  const _nodes = nodes || GRAPH.nodes;
+  const _nodeOrder = nodeOrder || GRAPH.nodeOrder;
 
-  // Find root nodes (no parent or parent_id is null)
+  // Pre-build parent→children index for O(N) BFS
+  const childrenOf = new Map();
   const roots = [];
-  for (const id of GRAPH.nodeOrder) {
-    const node = GRAPH.nodes.get(id);
+  for (const id of _nodeOrder) {
+    const node = _nodes.get(id);
     if (!node) continue;
     if (!node.parentId) {
       roots.push(id);
     }
+    for (const pid of (node.parentIds || (node.parentId ? [node.parentId] : []))) {
+      if (!pid) continue;
+      if (!childrenOf.has(pid)) childrenOf.set(pid, []);
+      childrenOf.get(pid).push(id);
+    }
   }
 
-  if (roots.length === 0 && GRAPH.nodeOrder.length > 0) {
-    roots.push(GRAPH.nodeOrder[0]);
+  if (roots.length === 0 && _nodeOrder.length > 0) {
+    roots.push(_nodeOrder[0]);
   }
 
-  queue.push(...roots);
-  for (const r of roots) visited.add(r);
-  levels.push([...roots]);
+  const levels = [];
+  const visited = new Set(roots);
+  let queue = [...roots];
+  if (queue.length) levels.push([...roots]);
 
   while (queue.length > 0) {
-    const currentLevel = [...queue];
-    queue.length = 0;
-    const nextLevel = [];
-
-    for (const parentId of currentLevel) {
-      // Find children whose parent_ids include this node
-      for (const id of GRAPH.nodeOrder) {
-        if (visited.has(id)) continue;
-        const node = GRAPH.nodes.get(id);
-        if (!node) continue;
-        if (node.parentIds.includes(parentId) || node.parentId === parentId) {
-          nextLevel.push(id);
-          visited.add(id);
+    const next = [];
+    for (const parentId of queue) {
+      for (const cid of (childrenOf.get(parentId) || [])) {
+        if (!visited.has(cid)) {
+          visited.add(cid);
+          next.push(cid);
         }
       }
     }
-
-    if (nextLevel.length === 0) break;
-
-    // Deduplicate and preserve order
-    const uniqueNext = [...new Set(nextLevel)];
-    levels.push(uniqueNext);
-    queue.push(...uniqueNext);
+    if (next.length === 0) break;
+    levels.push([...new Set(next)]);
+    queue = next;
   }
 
   // Add any remaining unvisited nodes (shouldn't happen normally)
-  for (const id of GRAPH.nodeOrder) {
+  for (const id of _nodeOrder) {
     if (!visited.has(id)) {
       if (levels.length === 0) levels.push([]);
       levels[levels.length - 1].push(id);
@@ -1241,12 +1264,22 @@ function drawAllEdges() {
   svg.innerHTML = svgContent;
 }
 
-// Redraw on resize or scroll
+// Debounced edge redraw via RAF
+let _edgeRafId = 0;
+function _scheduleEdgeRedraw() {
+  cancelAnimationFrame(_edgeRafId);
+  _edgeRafId = requestAnimationFrame(() => drawAllEdges());
+}
 window.addEventListener("resize", () => {
-  if (GRAPH.hasContent) drawAllEdges();
+  if (GRAPH.hasContent) _scheduleEdgeRedraw();
 });
 graphCanvas.addEventListener("scroll", () => {
-  if (GRAPH.hasContent) drawAllEdges();
+  if (GRAPH.hasContent) _scheduleEdgeRedraw();
+});
+// Track if user scrolled graph up (suppresses auto-scroll)
+graphCanvas.addEventListener("scroll", () => {
+  const dist = graphCanvas.scrollHeight - graphCanvas.scrollTop - graphCanvas.clientHeight;
+  graphUserScrolled = dist > 80;
 });
 
 function resetGraph() {
@@ -1261,16 +1294,15 @@ function resetGraph() {
 }
 
 function finalizeGraph() {
-  // Mark all running nodes as completed
+  // Mark all running nodes as completed — update DOM in-place (no recreation)
   for (const [id, node] of GRAPH.nodes) {
     if (node.status === "running") {
       node.status = "completed";
       if (node.el) {
-        node.el.className = `tnode ${node.nodeType === "root" ? "root" : node.nodeType === "phase" ? "phase" : "tool"} completed`;
-        // Re-render the node to update icon
-        const newEl = createNodeDOM(node);
-        node.el.replaceWith(newEl);
-        node.el = newEl;
+        node.el.classList.remove("running", "pulsing");
+        node.el.classList.add("completed");
+        const icon = node.el.querySelector(".phase-icon, .tool-icon");
+        if (icon) icon.textContent = "✓";
       }
     }
   }
