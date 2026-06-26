@@ -1382,7 +1382,13 @@ function drawAllEdges() {
     // Skip nodes whose layout hasn't been computed yet (reflow not done).
     // height === 0 means the DOM element exists but getBoundingClientRect
     // hasn't measured a real height — drawing would produce y=0 coords.
-    if (fromRect.height === 0 || toRect.height === 0) continue;
+    // Re-watch the zero-height node so drawAllEdges retries immediately
+    // once that node's reflow completes (instead of waiting 300ms).
+    if (fromRect.height === 0 || toRect.height === 0) {
+      const zeroEl = fromRect.height === 0 ? fromNode.el : toNode.el;
+      _watchReflowThenDraw(zeroEl);
+      continue;
+    }
 
     // Account for scroll offset so edges follow nodes
     const x1 = fromRect.left - canvasRect.left + fromRect.width / 2 + sx;
