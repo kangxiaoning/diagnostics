@@ -40,6 +40,10 @@ for _d in _REPORT_DIRS:
 # Common return format suffix for all subagents — enables Coordinator to
 # parse expert results into structured record_finding calls.
 _EXPERT_RETURN_SUFFIX = (
+    "\n\n**工具使用边界（严格遵守）**: "
+    "`read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/**`，"
+    "禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。"
+    "远程主机数据必须通过专用诊断工具（如 `check_network`、`get_node_diagnostics`）获取。"
     "\n\n返回格式（严格遵循）:\n"
     "- 假设验证: {confirmed|refuted|inconclusive}\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"

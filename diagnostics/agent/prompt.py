@@ -155,7 +155,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 ### {{日期}} {{场景简述}}
 - **缺失项**：需要但当前无法获取的指标/日志/命令
 - **诊断上下文**：当时在验证什么假设，为什么需要这个数据
-- **建议采集方式**：期望的命令或数据来源（如 /proc/xxx、systemctl status xxx、kubectl logs xxx）
+- **建议采集方式**：期望的命令或数据来源（如 `sysctl net.netfilter.nf_conntrack_max`、`systemctl status xxx`、`kubectl logs xxx`，注意这是描述期望的采集命令，不是可以直接调用的路径）
 - **优先级**：高（阻塞假设验证）/ 中（提升置信度）/ 低（锦上添花）
 ```
 
