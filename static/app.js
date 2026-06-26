@@ -987,11 +987,18 @@ function onTreeSnapshot(payload) {
 
     const existing = GRAPH.nodes.get(step.id);
     if (existing) {
-      // Update status in-place (avoid full DOM recreation)
-      if (existing.status !== step.status || existing.detail !== (step.detail || "")) {
+      // Update in-place (avoid full DOM recreation).
+      // Must check ALL fields that finalize() or delta updates may change —
+      // status, detail, description, AND title (finalize renames the last
+      // phase to "诊断完成" via title mutation).
+      if (existing.status !== step.status ||
+          existing.detail !== (step.detail || "") ||
+          existing.description !== (step.description || "") ||
+          existing.title !== step.title) {
         existing.status = step.status;
         existing.detail = step.detail || "";
         existing.description = step.description || "";
+        existing.title = step.title;
         if (existing.el) {
           const newEl = createNodeDOM(existing);
           existing.el.replaceWith(newEl);
@@ -1023,6 +1030,7 @@ function onTreeSnapshot(payload) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => drawAllEdges());
     });
+    _scheduleEdgeSafetyNet();
   }
 }
 
