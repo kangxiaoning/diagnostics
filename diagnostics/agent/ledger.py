@@ -334,6 +334,12 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
 
 def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     if ledger.get("fault_profile") is None:
+        # Allow only 1 round in understand before forcing hypothesize.
+        # If the LLM has already had a full round to collect data but still
+        # hasn't called commit_hypotheses (fault_profile remains None), force
+        # the phase to hypothesize so it stops re-collecting the same data.
+        if ledger.get("current_round", 0) >= 2:
+            return "hypothesize"
         return "understand"
 
     hypotheses: dict = ledger["hypotheses"]
@@ -379,6 +385,8 @@ def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
 def _derive_skill_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     """Skill mode: UNDERSTAND → SKILL_VERIFY → EVALUATE → REPORT."""
     if ledger.get("fault_profile") is None:
+        if ledger.get("current_round", 0) >= 2:
+            return "skill_verify"
         return "understand"
     # In skill mode, we stay in skill_verify until done
     return "skill_verify"
@@ -560,6 +568,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "- 完成后必须调用 commit_hypotheses 提交初始假设"
         )
     if phase == "hypothesize":
+        # Detect if we were force-promoted (fault_profile still None but round>=2)
+        if ledger.get("fault_profile") is None:
+            return (
+                "【系统强制推进】你已在 UNDERSTAND 阶段停留超过1轮但尚未提交假设。\n"
+                "数据采集已完成，禁止重复调用相同诊断工具。\n"
+                "- 基于上一轮已获取的数据，立即提出最多3个假设（按概率降序）\n"
+                "- 必须立即调用 commit_hypotheses 提交假设，否则诊断无法推进"
+            )
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
             "- 基于当前证据，提出最多3个可能性最大的假设（按概率降序）\n"
