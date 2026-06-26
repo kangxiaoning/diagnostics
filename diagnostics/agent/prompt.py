@@ -193,16 +193,23 @@ K8s 工具的参数需要从集群实时获取，不能臆造：
 `read_file`、`write_file`、`edit_file`、`grep`、`glob`、`ls` 是操作**诊断系统本地文件系统**的工具，
 **不能**用于访问被诊断目标（远程主机/K8s 集群）的文件路径。
 
-合法用途（仅限以下路径）：
-- `/agent_data/**` — 诊断报告、台账、技能文件、知识库
-- 工作流中明确要求的技能文件（如 SKILL.md）
+合法读取用途（仅限以下路径）：
+- `/agent_data/skills/**` — 技能文件（SKILL.md 等）
+- `/agent_data/TOOL_GAPS.md` — 工具缺口记录
+- `/agent_data/AGENTS.md`、`/agent_data/LEARNINGS.md` — 知识库
+
+**禁止读取**（即使在 `/agent_data/` 下也不允许 read_file / grep / glob / ls）：
+- `/agent_data/reports/**` — 历史诊断报告，与当前诊断无关
+- `/agent_data/traces/**` — 历史诊断台账，与当前诊断无关
 
 **严格禁止**用这些工具访问：
-- `/proc/**`、`/sys/**` — 这些是被诊断主机的内核接口，无法远程访问
+- `/proc/**`、`/sys/**` — 被诊断主机的内核接口，无法远程访问
 - `/var/log/**`、`/etc/**` — 被诊断主机的系统路径
 - 任何非 `/agent_data` 开头的系统路径
 
-如需采集远程主机或 K8s 集群的上述数据，必须使用专用的远程诊断工具（如 `check_network`、`get_node_diagnostics` 等），
+**写入例外**：`write_file` 可以将最终报告和台账写入系统指定的 `reports/` 和 `traces/` 路径，但不要读取这些目录下的已有文件。
+
+如需采集远程主机或 K8s 集群的数据，必须使用专用的远程诊断工具（如 `check_network`、`get_node_diagnostics` 等），
 或在工具缺口文件中记录该能力缺失，**不能**用本地文件工具代替。
 </tool_guidance>
 

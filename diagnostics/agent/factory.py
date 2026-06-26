@@ -45,8 +45,9 @@ for _d in _REPORT_DIRS:
 # provides the canonical return format so there is no duplication.
 _EXPERT_RETURN_SUFFIX = (
     "\n\n**工具使用边界（严格遵守）**:\n"
-    "- `read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/**`，"
-    "禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
+    "- `read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/skills/**`（技能文件），"
+    "禁止访问 `/agent_data/reports/**`、`/agent_data/traces/**`（历史诊断数据，与你的任务无关）。\n"
+    "- 禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
     "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
     "\n**返回格式（严格遵循，不超过 150 字）**:\n"
