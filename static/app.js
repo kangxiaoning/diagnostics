@@ -97,9 +97,24 @@ historyBack.addEventListener("click", () => {
   historyViewer.classList.remove("history-tab-active");
   historyBack.classList.add("hidden");
   historyViewerTitle.classList.add("hidden");
+  document.querySelector(".app").classList.remove("history-open");
   _historyGraph = null;
   _historyLedger = null;
   clearTimeout(_historyDrawTimer);
+  // Restore hypothesis badge to live-diagnosis state
+  if (hypothesisBadge) {
+    if (currentLedger) {
+      const liveCount = Object.keys(currentLedger.hypotheses || {}).length;
+      if (liveCount > 0) {
+        hypothesisBadge.textContent = liveCount;
+        hypothesisBadge.classList.remove("hidden");
+      } else {
+        hypothesisBadge.classList.add("hidden");
+      }
+    } else {
+      hypothesisBadge.classList.add("hidden");
+    }
+  }
   // Refresh main graph edges after layout
   if (GRAPH.hasContent) {
     requestAnimationFrame(() => {
@@ -140,6 +155,7 @@ async function loadHistoryList() {
 
 async function openHistory(item) {
   console.log("openHistory called, report_file:", item.report_file);
+  document.querySelector(".app").classList.add("history-open");
   historyViewer.classList.remove("hidden");
   historyViewer.classList.remove("history-tab-active");
   historyBack.classList.remove("hidden");
@@ -177,15 +193,15 @@ async function openHistory(item) {
   }
 
   // Render hypothesis tree from saved ledger (if present)
+  // Only render into history-specific containers — do NOT pollute
+  // currentLedger or the main hypothesisTree (they belong to live diagnosis).
   if (item.ledger) {
-    currentLedger = item.ledger;
-    renderHypothesisTree(item.ledger);
     const hypCount = Object.keys(item.ledger.hypotheses || {}).length;
     if (hypCount > 0 && hypothesisBadge) {
       hypothesisBadge.textContent = hypCount;
       hypothesisBadge.classList.remove("hidden");
     }
-    // Render history-specific hypothesis tree
+    // Render into history-specific hypothesis tree
     _renderHistoryHypothesis(item.ledger);
   } else {
     _historyLedger = null;
@@ -1838,7 +1854,16 @@ function switchTab(tab) {
   document.querySelectorAll(".graph-tab").forEach((t) => t.classList.remove("active"));
   if (tab === "execution") {
     tabExecution.classList.add("active");
-    hypothesisBadge?.classList.remove("hidden");
+    // Show badge only when hypothesis data actually exists
+    if (historyViewer && !historyViewer.classList.contains("hidden")) {
+      // History mode: badge text set by openHistory(), check _historyLedger
+      if (_historyLedger) hypothesisBadge?.classList.remove("hidden");
+    } else {
+      // Live mode: check currentLedger
+      if (currentLedger && Object.keys(currentLedger.hypotheses || {}).length > 0) {
+        hypothesisBadge?.classList.remove("hidden");
+      }
+    }
     if (historyViewer && !historyViewer.classList.contains("hidden")) {
       // In history mode: show execution panel, hide hypothesis panel
       historyViewer.classList.remove("history-tab-active");

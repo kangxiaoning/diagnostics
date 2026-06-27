@@ -55,10 +55,14 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 }
 .resizer::after { content: ''; position: absolute; inset: 0 -3px; }
 .resizer:hover, .resizer.active { background: var(--accent); }
+/* History-open mode: hide left panel, graph fills full width */
+.app.history-open #chatPanel,
+.app.history-open .resizer { display: none; }
 .graph {
   flex: 1; min-width: 320px;
   display: flex; flex-direction: column;
   background: var(--bg); overflow: hidden;
+  position: relative;
 }
 
 /* ════════════════ Chat Header ════════════════ */
@@ -468,7 +472,7 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ════════════════ History Viewer (overlays tab-panel area; tabs stay visible) ════════════════ */
 .history-viewer {
-  position: absolute; inset: 36px 0 0 0; z-index: 50;
+  position: absolute; inset: 56px 0 0 0; z-index: 50;
   background: var(--bg); display: flex; flex-direction: column;
 }
 .history-viewer.hidden { display: none; }
