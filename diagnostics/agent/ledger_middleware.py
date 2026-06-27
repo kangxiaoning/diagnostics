@@ -12,6 +12,8 @@ See: private/HYPOTHESIS_LEDGER_DESIGN.md
 from __future__ import annotations
 
 import logging
+import pathlib
+import re
 from collections.abc import Awaitable, Callable
 
 from langchain.agents.middleware.types import (
@@ -35,6 +37,7 @@ from diagnostics.agent.ledger import (
     check_exit_conditions,
     derive_phase,
     ledger_to_json,
+    new_evidence,
     new_ledger,
     record_finding,
     record_round,
@@ -59,6 +62,55 @@ _LEDGER_TOOLS = frozenset({
 })
 
 
+def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
+    """Extract already-collected evidence from the ledger for subagent injection.
+
+    When a subagent is delegated via task(), it normally sees only the
+    Coordinator's description.  This function extracts the key findings
+    already recorded in the ledger so the subagent can skip redundant
+    tool calls and focus on its specific verification task.
+    """
+    lines: list[str] = []
+
+    # ── Diagnostic tools already called (by Coordinator or prior experts) ──
+    tools_called: set[str] = set()
+    for rd in ledger.get("rounds", []):
+        tools_called.update(rd.get("tools_called", []))
+    diagnostic_tools = sorted(tools_called - _SCAFFOLDING_TOOLS - _LEDGER_TOOLS - {"task"})
+    if diagnostic_tools:
+        lines.append(f"已调用工具: {', '.join(diagnostic_tools)}")
+
+    # ── Evidence already collected per hypothesis ──
+    for hid, h in ledger.get("hypotheses", {}).items():
+        evidence_entries = h.get("evidence", [])
+        if not evidence_entries:
+            continue
+        summaries: list[str] = []
+        for e in evidence_entries:
+            s = e.get("summary", "").strip()
+            if s:
+                # Truncate each evidence entry to keep context compact
+                summaries.append(s[:250])
+        if summaries:
+            status_label = {"confirmed": "✓", "refuted": "✗", "verifying": "⟳"}.get(h["status"], "?")
+            lines.append(f"\n假设 {hid} [{status_label}] {h.get('statement', '')}:")
+            for s in summaries:
+                lines.append(f"  - {s}")
+
+    # ── Expert analysis results ──
+    expert = ledger.get("expert_analysis")
+    if expert:
+        finding = expert.get("finding", "")
+        if finding:
+            lines.append(f"\n已委派专家: {expert.get('expert', '?')} ({expert.get('skill', '?')})")
+            lines.append(f"  结论: {finding[:300]}")
+
+    context = "\n".join(lines)
+    if len(context) > max_chars:
+        context = context[:max_chars] + "\n...(已截断)"
+    return context
+
+
 def _sanitize_ledger(ledger: dict) -> dict:
     """Strip internal fields from ledger before sending to frontend/streaming."""
     internal_keys = {"_inconclusive_streak", "_backtrack_count"}
@@ -71,6 +123,28 @@ def _paths_match(tool_path: str, report_path: str) -> bool:
         return False
     # Normalise: strip leading /, compare tails (tool may use relative or absolute)
     return tool_path.lstrip("/").rstrip("/") == report_path.lstrip("/").rstrip("/")
+
+
+_HYPOTHESIS_ID_PATTERN = re.compile(r'(?:验证)?假设\s*(H\d+(?:\.\d+)?)')
+
+
+def _parse_hypothesis_id_from_description(
+    description: str,
+    hypotheses: dict,
+) -> str | None:
+    """Extract a hypothesis ID from a task() description like '验证假设 H2：...'.
+
+    Returns the matching hypothesis ID if found and present in *hypotheses*,
+    otherwise None.
+    """
+    if not description or not hypotheses:
+        return None
+    match = _HYPOTHESIS_ID_PATTERN.search(description)
+    if match:
+        hid = match.group(1)
+        if hid in hypotheses:
+            return hid
+    return None
 
 
 # ── Pydantic schemas for tool inputs ──
@@ -189,6 +263,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             ledger = new_ledger()
 
         self._current_ledger = ledger
+        # Sync round: before_model may have incremented _model_call_count
+        # before the ledger was available (happens on the very first LLM
+        # call when _current_ledger is still None).
+        if self._current_ledger is not None:
+            self._current_ledger["current_round"] = self._model_call_count
 
         context_block = render_ledger_context(ledger)
         if context_block:
@@ -217,6 +296,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_name = request.tool_call.get("name", "")
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
+
+        # ── Inject ledger context into task() descriptions ──
+        # Subagents normally see only the Coordinator's description and have
+        # no access to the diagnosis ledger.  By appending a summary of
+        # already-collected evidence, the subagent can skip redundant tool
+        # calls and focus on its specific verification task.
+        if tool_name == "task":
+            ledger = self._current_ledger
+            if ledger:
+                ctx = _build_subagent_context(ledger)
+                if ctx:
+                    desc = tool_args.get("description", "")
+                    tool_args["description"] = (
+                        f"{desc}\n\n---\n[已收集的诊断数据 — 无需重复查询]\n{ctx}"
+                    )
+                    try:
+                        request.tool_call["args"] = tool_args
+                    except (TypeError, AttributeError, KeyError):
+                        pass  # request is immutable; proceed without injection
 
         # Emit precise tool timing events via stream_writer
         sw = getattr(request.runtime, "stream_writer", None)
@@ -249,15 +347,40 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         break
 
             source = f"expert:{tool_args.get('subagent_type', '?')}" if tool_name == "task" else f"tool:{tool_name}"
-            summary = (output or "")[:300]
+            summary = output or ""
 
             if summary:
-                add_evidence_to_active(
-                    ledger, source, summary,
-                    supports=True,
-                    tool_call_id=tool_call_id,
-                    tool_name=tool_name,
-                )
+                # ── Hypothesis-aware evidence routing ──
+                # For task() calls, parse the description to find which
+                # hypothesis is being verified (e.g. "验证假设 H2") and
+                # route evidence there.  Fall back to active_path when
+                # the description doesn't mention a specific hypothesis.
+                if tool_name == "task":
+                    target_hid = _parse_hypothesis_id_from_description(
+                        tool_args.get("description", ""),
+                        ledger.get("hypotheses", {}),
+                    )
+                    if target_hid and target_hid in ledger.get("hypotheses", {}):
+                        node = ledger["hypotheses"][target_hid]
+                        node["evidence"].append(new_evidence(
+                            source, summary, supports=True, tool_call_id=tool_call_id,
+                        ))
+                        if tool_name not in node["verification_tools"]:
+                            node["verification_tools"].append(tool_name)
+                    else:
+                        add_evidence_to_active(
+                            ledger, source, summary,
+                            supports=True,
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                        )
+                else:
+                    add_evidence_to_active(
+                        ledger, source, summary,
+                        supports=True,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                    )
 
             record_round(
                 ledger, derive_phase(ledger),
@@ -298,6 +421,38 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             })
                     except Exception:
                         pass
+
+                # Auto-finalize any hypotheses still in "verifying" state
+                # when the report is written.  The LLM may have skipped
+                # record_finding for indirectly refuted hypotheses (e.g.
+                # H2 verification data also disproves H3, but the LLM
+                # jumps directly to REPORT without calling record_finding
+                # on the indirectly refuted hypothesis).
+                if ledger:
+                    hypotheses = ledger.get("hypotheses", {})
+                    finalized_any = False
+                    for hid, node in hypotheses.items():
+                        if node.get("status") == "verifying":
+                            record_finding(
+                                ledger, hid, "refuted",
+                                "诊断报告已生成，该假设在验证其他假设时被间接证据证伪，系统自动终结。",
+                                5,
+                            )
+                            finalized_any = True
+                    if finalized_any:
+                        ledger["current_phase"] = derive_phase(ledger)
+                        self._persist_ledger(ledger)
+                        # Emit final ledger snapshot so the frontend receives
+                        # the correct hypothesis statuses.
+                        try:
+                            sw_snap = getattr(request.runtime, "stream_writer", None)
+                            if sw_snap:
+                                sw_snap({
+                                    "type": "ledger_snapshot",
+                                    "ledger": _sanitize_ledger(ledger),
+                                })
+                        except Exception:
+                            pass
 
         # Emit tool completion timing
         if sw:
@@ -427,13 +582,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 return f"记录失败: {e}"
 
             # Check exit conditions
-            should_exit, reason = check_exit_conditions(ledger)
+            should_exit, reason, confirmed_id = check_exit_conditions(ledger)
+
+            # ── Multi-root: accumulate confirmed root causes ──
+            # When a hypothesis is confirmed, record it in the root_causes list
+            # even if other root hypotheses are still pending.  Only transition
+            # to REPORT when all root hypotheses are resolved.
+            if confirmed_id and "根因確認" not in reason and "根因确认" in reason:
+                # Single-root confirmed → traditional exit path
+                pass
+            if confirmed_id and confirmed_id in ledger.get("hypotheses", {}):
+                node = ledger["hypotheses"][confirmed_id]
+                cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
+                causes: list[str] = ledger.setdefault("root_causes", [])
+                if confirmed_id not in cids:
+                    cids.append(confirmed_id)
+                    causes.append(node["statement"])
+                    # Keep backward-compat fields in sync with first entry
+                    ledger["root_cause"] = causes[0]
+                    ledger["root_cause_hypothesis_id"] = cids[0]
+
             if should_exit:
                 ledger["current_phase"] = "report"
-                if "根因确认" in reason:
-                    node = ledger["hypotheses"][hypothesis_id]
-                    ledger["root_cause"] = node["statement"]
-                    ledger["root_cause_hypothesis_id"] = hypothesis_id
+            elif "部分根因" in reason:
+                # Some roots confirmed, others pending — guide LLM to continue
+                ledger["current_phase"] = "evaluate"
             else:
                 ledger["current_phase"] = derive_phase(ledger)
 
@@ -500,15 +673,27 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     # ── Persistence ──
 
+    # Root of the agent_data/ directory on the real filesystem.
+    # _persist_ledger receives a virtual path (/agent_data/traces/...)
+    # and must map it to the real project directory.
+    _AGENT_DATA_REAL = pathlib.Path(__file__).resolve().parent.parent.parent / "agent_data"
+
     def _persist_ledger(self, ledger: DiagnosisLedger) -> None:
-        """Persist ledger to filesystem (best-effort)."""
+        """Persist ledger to filesystem (best-effort).
+
+        The ledger_path uses a virtual /agent_data/ prefix (matching the
+        FilesystemBackend route).  We resolve it against the real project
+        agent_data/ directory so the file lands in the correct location.
+        """
         if not self.ledger_path:
             return
         try:
-            import pathlib
-            path = pathlib.Path(self.ledger_path)
+            # Convert virtual /agent_data/... to real filesystem path
+            vpath = self.ledger_path
+            real_path = vpath.replace("/agent_data/", str(self._AGENT_DATA_REAL) + "/")
+            path = pathlib.Path(real_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(ledger_to_json(ledger), encoding="utf-8")
-            logger.debug("Ledger persisted to %s", self.ledger_path)
+            logger.debug("Ledger persisted to %s", path)
         except Exception as e:
-            logger.warning("Failed to persist ledger: %s", e)
+            logger.warning("Failed to persist ledger (path=%s): %s", self.ledger_path, e)

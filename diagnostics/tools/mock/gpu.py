@@ -10,7 +10,7 @@ from diagnostics.tools.mock.data import (
     gpu_memory_data,
     gpu_utilization_data,
 )
-from diagnostics.tools.mock.scenarios import _active_scenario
+from diagnostics.tools.mock.scenarios import get_active_scenario
 
 
 @tool
@@ -19,7 +19,7 @@ def check_gpu_health() -> str:
 
     Returns nvidia-smi style output with health indicators.
     """
-    return gpu_health_data(_active_scenario)
+    return gpu_health_data(get_active_scenario())
 
 
 @tool
@@ -28,7 +28,7 @@ def check_gpu_memory() -> str:
 
     Returns GPU memory breakdown and process-level allocation details.
     """
-    return gpu_memory_data(_active_scenario)
+    return gpu_memory_data(get_active_scenario())
 
 
 @tool
@@ -37,4 +37,4 @@ def check_gpu_utilization() -> str:
 
     Returns detailed GPU utilization metrics for performance analysis.
     """
-    return gpu_utilization_data(_active_scenario)
+    return gpu_utilization_data(get_active_scenario())

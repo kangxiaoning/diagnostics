@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -106,6 +107,131 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
         )
 
     return app
+
+
+def _auto_set_scenario(message: str) -> None:
+    """Match user message keywords to mock scenarios for dev testing.
+
+    Called before agent starts in mock mode.  Supports all 18+ scenarios.
+    """
+    msg = message.lower()
+    # ── Dual root cause ──
+    if _kw(msg, "504", "cpu") or _kw(msg, "prod-web-01", "504"):
+        _set("stress_cpu_and_tc_loss"); return
+    if _kw(msg, "api-gateway", "oom") or _kw(msg, "api-gateway", "dns", "内存"):
+        _set("conntrack_and_oom"); return
+    # ── etcd quota near full (matches api-gateway 5xx + restart + DNS + 半年没发布) ──
+    if _kw(msg, "api-gateway", "5xx", "重启", "dns") or \
+       _kw(msg, "api-gateway", "5xx", "重启", "半年") or \
+       _kw(msg, "etcd quota") or _kw(msg, "etcd", "接近上限"):
+        _set("etcd_quota_near_full"); return
+    if _kw(msg, "backend-svc", "dns") or _kw(msg, "backend-svc", "延迟", "磁盘") or \
+       _kw(msg, "外部域名", "解析"):
+        _set("disk_io_and_dns"); return
+    # ── Cascading ──
+    if _kw(msg, "etcd", "oom") or _kw(msg, "etcd", "worker-3") or \
+       _kw(msg, "master-1", "worker-3") or _kw(msg, "表现很乱", "独立问题"):
+        _set("multi_layer_cascading"); return
+    # ── K8s single root cause ──
+    if _kw(msg, "conntrack", "notready") or _kw(msg, "worker-5", "worker-8") or \
+       _kw(msg, "notready", "pod 被驱逐") or _kw(msg, "节点", "notready", "coredns"):
+        _set("conntrack_table_full"); return
+    if _kw(msg, "kubelet", "disk io") or _kw(msg, "node notready", "磁盘") or \
+       _kw(msg, "pod 被驱逐", "磁盘"):
+        _set("kubelet_disk_io_starvation"); return
+    if _kw(msg, "kubelet", "oom") or _kw(msg, "oom kill", "kubelet") or \
+       _kw(msg, "节点 unknown", "内存"):
+        _set("node_oom_kubelet_killed"); return
+    if _kw(msg, "cpu throttl", "探针") or _kw(msg, "健康 pod", "重启") or \
+       _kw(msg, "探针超时", "cpu"):
+        _set("cpu_throttle_probe_failure"); return
+    if _kw(msg, "arp", "溢出") or _kw(msg, "arp", "表满") or \
+       _kw(msg, "跨节点通信", "中断"):
+        _set("arp_cache_full"); return
+    if _kw(msg, "mtu", "不匹配") or _kw(msg, "大包", "丢包") or \
+       _kw(msg, "ping 小包通", "大包不通"):
+        _set("mtu_mismatch"); return
+    if _kw(msg, "软中断", "cpu") or _kw(msg, "ksoftirqd", "高") or \
+       _kw(msg, "ring buffer", "溢出"):
+        _set("softirq_starvation"); return
+    if _kw(msg, "accept 队列", "满") or _kw(msg, "tcp", "间歇超时") or \
+       _kw(msg, "somaxconn"):
+        _set("tcp_accept_overflow"); return
+    if _kw(msg, "容器", "频繁重启") or _kw(msg, "oomkilled", "limit") or \
+       _kw(msg, "crashloopbackoff"):
+        _set("container_crash"); return
+    # ── Host single root cause ──
+    if _kw(msg, "iowait", "高") or _kw(msg, "load avg", "cpu util 低") or \
+       _kw(msg, "负载高", "cpu 低"):
+        _set("high_cpu_iowait"); return
+    if _kw(msg, "内存泄漏") or _kw(msg, "rss", "持续增长") or \
+       _kw(msg, "swap", "增加") or _kw(msg, "swap", "被大量使用") or \
+       _kw(msg, "rss", "从", "涨到"):
+        _set("memory_leak"); return
+    if _kw(msg, "磁盘", "慢") or _kw(msg, "disk io", "瓶颈") or \
+       _kw(msg, "await", "高"):
+        _set("disk_bottleneck"); return
+    if _kw(msg, "网络拥塞") or _kw(msg, "重传", "高") or \
+       _kw(msg, "带宽", "饱和"):
+        _set("network_congestion"); return
+    if _kw(msg, "io", "内存") or _kw(msg, "混合瓶颈"):
+        _set("mixed_io_memory"); return
+    # ── GPU ──
+    if _kw(msg, "gpu", "oom") or _kw(msg, "cuda", "out of memory") or \
+       _kw(msg, "显存", "耗尽"):
+        _set("gpu_oom"); return
+    # ── Additional K8s scenarios ──
+    if _kw(msg, "coredns", "缓存") or _kw(msg, "dns", "错误 ip") or \
+       _kw(msg, "解析到错误"):
+        _set("coredns_cache_poison"); return
+    if _kw(msg, "etcd", "只读") or _kw(msg, "etcd", "多数派") or \
+       _kw(msg, "api server", "降级"):
+        _set("etcd_quorum_loss"); return
+    if _kw(msg, "imagepullbackoff") or _kw(msg, "镜像拉取", "失败") or \
+       _kw(msg, "registry", "限速"):
+        _set("image_pull_backoff"); return
+    if _kw(msg, "磁盘", "写满") or _kw(msg, "var/log", "满") or \
+       _kw(msg, "容器运行时", "崩溃"):
+        _set("disk_full_var_log"); return
+    if _kw(msg, "oom_score") or _kw(msg, "误杀", "kubelet") or \
+       _kw(msg, "oom score", "不当"):
+        _set("oom_score_misconfig"); return
+    if _kw(msg, "inode", "耗尽") or _kw(msg, "磁盘有空间", "创建文件失败") or \
+       _kw(msg, "小文件过多"):
+        _set("fs_inode_exhaustion"); return
+    # ── Additional Host scenarios ──
+    if _kw(msg, "systemd", "nofile") or _kw(msg, "limitnofile") or \
+       _kw(msg, "文件描述符", "截断"):
+        _set("systemd_limit_nofile"); return
+    if _kw(msg, "ebpf", "高") or _kw(msg, "ebpf", "开销") or \
+       _kw(msg, "探针", "过量"):
+        _set("ebpf_probe_overhead"); return
+    if _kw(msg, "swap", "抖动") or _kw(msg, "swap", "频繁") or \
+       _kw(msg, "换入换出"):
+        _set("swap_thrashing"); return
+    # ── Additional dual root cause ──
+    if _kw(msg, "内存泄漏", "磁盘") or _kw(msg, "gc", "频繁", "磁盘", "满") or \
+       _kw(msg, "oom", "日志", "写满"):
+        _set("memory_leak_and_disk_full"); return
+    if _kw(msg, "coredns", "crashloop", "etcd") or \
+       _kw(msg, "dns 失败", "api server 慢") or \
+       _kw(msg, "coredns", "etcd", "切换"):
+        _set("dns_and_etcd"); return
+
+
+def _set(scenario_id: str) -> None:
+    """Set mock scenario with import guard."""
+    try:
+        from diagnostics.tools.mock.scenarios import set_scenario
+        set_scenario(scenario_id)
+        logger.info("Mock scenario auto-set to %r", scenario_id)
+    except Exception:
+        pass
+
+
+def _kw(msg: str, *keywords: str) -> bool:
+    """Check if ALL keywords appear in the message (case-insensitive)."""
+    return all(k.lower() in msg for k in keywords)
 
 
 def _make_report_path(entity_type: str, entity_name: str) -> str:
@@ -262,6 +388,10 @@ async def _chat_event_stream(
     state.running = True
     state.cancel_event = asyncio.Event()
 
+    # ── Auto-match mock scenario from user message (dev mode only) ──
+    if os.getenv("DIAGNOSTICS_MODE", "mock") == "mock":
+        _auto_set_scenario(request.message)
+
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
     ledger_path = _make_ledger_path(report_path)
@@ -278,6 +408,7 @@ async def _chat_event_stream(
     report_text: list[str] = []   # only answering-phase text → .md file
     tree = TreeBuilder()
     latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
+    final_root_cause: str | None = None           # authoritative from structured_response
 
     logger.info("[session=%s] Chat stream started, message=%r",
                 session_id, request.message[:120])
@@ -397,6 +528,7 @@ async def _chat_event_stream(
 
             elif event.name == "structured_response":
                 logger.info("[session=%s] Structured response received", session_id)
+                final_root_cause = event.payload.get("root_cause") or final_root_cause
                 yield sse("structured_response", event.payload)
 
             elif event.name == "ledger_snapshot":
@@ -438,6 +570,15 @@ async def _chat_event_stream(
 
         # Report .md file: only answering-phase text (captured from write_file)
         report_content = "".join(report_text).strip()
+
+        # If structured_response arrived with a root_cause that differs from
+        # the ledger's eagerly-snapshotted value, overwrite it.  The LLM may
+        # change its conclusion between hypothesis confirmation and final report.
+        if final_root_cause and latest_ledger and latest_ledger.get("root_cause") != final_root_cause:
+            logger.info("[session=%s] Overwriting ledger root_cause: %r -> %r",
+                        session_id, latest_ledger.get("root_cause"), final_root_cause)
+            latest_ledger["root_cause"] = final_root_cause
+            yield sse("ledger_snapshot", {"ledger": latest_ledger})
 
         elapsed = time.monotonic() - t_start
         logger.info("[session=%s] Stream completed in %.1fs, events: %s, assistant_text=%d chars, report=%d chars",

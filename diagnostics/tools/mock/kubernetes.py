@@ -17,7 +17,7 @@ from diagnostics.tools.mock.data import (
     kubernetes_nodes_data,
     kubernetes_pods_data,
 )
-from diagnostics.tools.mock.scenarios import _active_scenario
+from diagnostics.tools.mock.scenarios import get_active_scenario
 
 # ═══════════════════════════════════════════════════════════════════
 # Scenario data: Pod Logs
@@ -77,6 +77,71 @@ _POD_LOGS: dict[str, str] = {
         "2026-06-14T07:05:40.000Z INFO  Container restart #18 in CrashLoopBackOff\n"
         "2026-06-14T07:30:00.456Z WARN  DNS resolution timeout for user-service (CoreDNS 1/3 replicas)\n"
         "2026-06-14T07:30:05.789Z ERROR Intermittent DNS failure — 2 CoreDNS on worker-3 lost due to Node NotReady\n"
+    ),
+    "conntrack_and_oom": (
+        "2026-06-14T14:50:00.123Z INFO  api-gateway started, connected to backend\n"
+        "2026-06-14T14:55:00.456Z WARN  Connection timeout to backend-svc (retry 1)\n"
+        "2026-06-14T15:00:00.789Z WARN  DNS lookup timeout for backend.default.svc.cluster.local\n"
+        "2026-06-14T15:03:00.012Z WARN  Heap usage: 5.8GiB / 6.0GiB — near limit (off-heap leak!)\n"
+        "2026-06-14T15:05:00.345Z ERROR java.lang.OutOfMemoryError: Direct buffer memory (RSS=6.4GB)\n"
+        "2026-06-14T15:05:00.456Z FATAL OOM Killer invoked — process 8765 (java) killed\n"
+        "2026-06-14T15:06:00.123Z INFO  api-gateway restarted (RSS climbing again...)\n"
+    ),
+    "disk_io_and_dns": (
+        "2026-06-14T14:58:00.123Z INFO  backend-svc processing requests (P99=200ms)\n"
+        "2026-06-14T15:02:00.456Z WARN  Write I/O timeout (30s) — disk saturated by logrotate\n"
+        "2026-06-14T15:03:00.789Z WARN  Response latency spiked to 5.2s (awaiting disk write)\n"
+        "2026-06-14T15:04:00.012Z ERROR java.net.UnknownHostException: upstream-db.external.com\n"
+        "2026-06-14T15:04:05.345Z ERROR DNS query to 10.0.0.53:53 timed out (upstream DNS offline)\n"
+        "2026-06-14T15:04:10.678Z WARN  Falling back to stale DNS cache entry\n"
+    ),
+    "etcd_quota_near_full": (
+        "2026-06-14T18:00:01.123Z INFO  api-gateway v1.5.2 started on :8080 (last deployed 180d ago)\n"
+        "2026-06-14T18:01:00.456Z INFO  Watcher connected to kube-apiserver OK\n"
+        "2026-06-14T18:02:30.789Z ERROR failed to fetch service backend endpoints: etcdserver: request timed out\n"
+        "2026-06-14T18:02:31.012Z WARN  Readiness check failed: unable to resolve backend.default.svc (DNS timeout)\n"
+        "2026-06-14T18:02:35.456Z ERROR Liveness probe failed: etcd request timeout while listing Service endpoints\n"
+        "2026-06-14T18:02:40.000Z INFO  Container restart triggered by failed probe (exit:1)\n"
+        "2026-06-14T18:03:00.123Z INFO  api-gateway restarted (restart #8 in 2d)\n"
+    ),
+    "oom_score_misconfig": (
+        "2026-06-14T14:30:00.123Z INFO  java-app started successfully on worker-2\n"
+        "2026-06-14T14:30:05.456Z INFO  Processing requests normally...\n"
+        "2026-06-14T15:00:00.789Z WARN  System memory pressure increasing (RSS growing)\n"
+        "2026-06-14T15:05:00.012Z WARN  kubelet connection lost — node worker-2 unreachable\n"
+        "2026-06-14T15:05:05.345Z INFO  Application still running — OOM Killer killed kubelet (PID 3210) instead of java app!\n"
+        "2026-06-14T15:05:10.678Z WARN  oom_score_adj=-500 for kubelet should have protected it — misconfig confirmed\n"
+    ),
+    "memory_leak_and_disk_full": (
+        "2026-06-14T14:50:00.123Z INFO  java-backend started, heap=2Gi, off-heap stable\n"
+        "2026-06-14T14:55:00.456Z WARN  Heap usage: 85% — RSS climbing 5.8GB (off-heap leak suspected)\n"
+        "2026-06-14T15:00:00.789Z ERROR Failed to write to /var/log/app.log: No space left on device\n"
+        "2026-06-14T15:02:00.012Z WARN  Disk full + RSS 6.8GB — approaching double failure\n"
+        "2026-06-14T15:03:00.345Z FATAL OOM Killer invoked — process 8765 (java) killed (RSS=6.8GB)\n"
+        "2026-06-14T15:03:15.678Z ERROR Container OOMKilled — cannot write crash log (disk full!)\n"
+    ),
+    "coredns_cache_poison": (
+        "2026-06-14T10:00:00.123Z INFO  backend-svc started, connecting to upstream\n"
+        "2026-06-14T10:01:00.456Z INFO  Resolved backend-svc.default.svc → 10.0.1.55 OK\n"
+        "2026-06-14T10:30:00.789Z WARN  DNS resolved backend-svc.default.svc → 10.0.1.88 (wrong IP! stale cache entry)\n"
+        "2026-06-14T10:31:00.012Z ERROR Connection refused to 10.0.1.88 — Pod already terminated\n"
+        "2026-06-14T10:32:00.345Z INFO  DNS re-resolved backend-svc → 10.0.1.55 (corrected after cache expiry)\n"
+        "2026-06-14T10:35:00.678Z WARN  DNS again returned stale IP 10.0.1.88 — CoreDNS cache pollution persists\n"
+    ),
+    "dns_and_etcd": (
+        "2026-06-14T09:00:00.123Z INFO  user-svc started, connected to internal services\n"
+        "2026-06-14T09:05:00.456Z WARN  DNS resolution timeout for internal-api.default.svc (5s)\n"
+        "2026-06-14T09:06:00.789Z ERROR Failed to resolve user-service.default.svc: CoreDNS CrashLoopBackOff\n"
+        "2026-06-14T09:07:00.012Z WARN  Reconnected after DNS retry — intermittent failures continue\n"
+        "2026-06-14T09:10:00.345Z ERROR etcd leader changed mid-request — API Server slow\n"
+        "2026-06-14T09:12:00.678Z FATAL liveness probe failed: DNS lookup timeout → container restart #5\n"
+    ),
+    "image_pull_backoff": (
+        "2026-06-14T08:00:00.123Z INFO  new-deploy Pod scheduled on worker-2\n"
+        "2026-06-14T08:00:05.456Z ERROR Failed to pull image \"node:18-alpine\": received unexpected HTTP status: 429 Too Many Requests\n"
+        "2026-06-14T08:01:00.789Z WARN  Image pull rate limit exceeded — Docker Hub free tier limit (100 pulls/6h)\n"
+        "2026-06-14T08:02:00.012Z ERROR ImagePullBackOff — waiting for rate limit reset\n"
+        "2026-06-14T08:05:00.345Z INFO  Retrying image pull... 429 again — rate limit not yet reset\n"
     ),
 }
 
@@ -209,6 +274,135 @@ _POD_DESCRIBE: dict[str, str] = {
         "Events: Warning — BackOff 18x (cgroup OOM: RSS 650MiB > limit 512MiB)\n"
         "        Warning — DNS resolution timeout for user-service (intermittent)\n"
     ),
+    "conntrack_and_oom": (
+        "Name:             api-gateway-abc12\n"
+        "Namespace:        default\n"
+        "Status:           OOMKilled\n"
+        "Containers:\n"
+        "  api-gateway:\n"
+        "    Image: api-gateway:v3.2\n"
+        "    State: Terminated (OOMKilled, ExitCode: 137)\n"
+        "    Restart Count: 8\n"
+        "    Limits: memory=6Gi (host Java RSS=6.4GB due to off-heap leak)\n"
+        "    Last Termination Reason: java invoked oom-killer: total-vm:12849152kB anon-rss:6754304kB\n"
+        "Events: Warning — OOMKilled 8x in 2d (heap=2Gi stable, off-heap climbing 0.2Gi/day)\n"
+        "        Warning — Readiness probe failed: DNS lookup timeout (conntrack UDP drop)\n"
+    ),
+    "disk_io_and_dns": (
+        "Name:             backend-svc-abc12\n"
+        "Namespace:        default\n"
+        "Status:           Running\n"
+        "Containers:\n"
+        "  backend-svc:\n"
+        "    Image: backend-svc:v1.8\n"
+        "    State: Running\n"
+        "    Restart Count: 0\n"
+        "    Limits: memory=1Gi\n"
+        "Events: Warning — Write I/O timeout 30s (disk saturated by logrotate)\n"
+        "        Warning — java.net.UnknownHostException: upstream-db.external.com\n"
+    ),
+    "etcd_quota_near_full": (
+        "Name:             api-gateway-abc12\n"
+        "Namespace:        default\n"
+        "Status:           CrashLoopBackOff\n"
+        "Containers:\n"
+        "  api-gateway:\n"
+        "    Image: registry.example.com/api-gateway:v1.5.2\n"
+        "    State: Waiting (CrashLoopBackOff)\n"
+        "    Last State: Terminated (ExitCode: 1 — Error)\n"
+        "    Restart Count: 8\n"
+        "    Limits: cpu=500m, memory=512Mi\n"
+        "    Requests: cpu=250m, memory=256Mi\n"
+        "    Liveness: http-get :8080/health period=10s timeout=5s failureThreshold=3\n"
+        "    Readiness: http-get :8080/ready period=5s timeout=3s\n"
+        "Conditions: Initialized=True, Ready=False, ContainersReady=False\n"
+        "Events: Warning — Readiness probe failed: context deadline exceeded (etcd timeout)\n"
+        "        Warning — Liveness probe failed: etcd request timeout while listing Service\n"
+        "        Normal  — Killing container (failed probe, exit:1)\n"
+        "说明: api-gateway 因 etcd 写入延迟导致探针超时，不是OOM或CPU问题\n"
+        "      对比multi_layer场景: 此处exit:1(探针失败) vs exit:137(OOMKilled)\n"
+    ),
+    "oom_score_misconfig": (
+        "Name:             java-app-abc12\n"
+        "Namespace:        default\n"
+        "Status:           Running\n"
+        "Containers:\n"
+        "  java-app:\n"
+        "    Image: openjdk:17-slim\n"
+        "    State: Running (Started: 2 days ago)\n"
+        "    Restart Count: 0\n"
+        "    Limits: memory=512Mi\n"
+        "    oom_score_adj: 750 (— 应用反而存活!)\n"
+        "Conditions: Initialized=True, Ready=True, ContainersReady=True (正常!)\n"
+        "Events: Warning — Node worker-2 status Unknown — kubelet killed by OOM Killer\n"
+        "        Warning — kubelet oom_score_adj=-500 but still killed (OOM Killer bug/misconfig)\n"
+        "说明: 应用Pod oom_score_adj=750反而存活，kubelet oom_score_adj=-500却被杀\n"
+        "      OOM Killer 选择逻辑异常—可能的kernel bug或cgroup版本不匹配\n"
+    ),
+    "memory_leak_and_disk_full": (
+        "Name:             java-backend-abc12\n"
+        "Namespace:        default\n"
+        "Status:           OOMKilled\n"
+        "Containers:\n"
+        "  java-backend:\n"
+        "    Image: openjdk:17-slim\n"
+        "    State: Terminated (OOMKilled, ExitCode: 137)\n"
+        "    Last State: Terminated (OOMKilled)\n"
+        "    Restart Count: 8\n"
+        "    Limits: memory=1Gi\n"
+        "    Last Termination Reason: OOMKilled (RSS=6.8GB, heap=2Gi stable, off-heap leak!)\n"
+        "Conditions: Ready=False, ContainersReady=False\n"
+        "Events: Warning — OOMKilled 8x in 2d (off-heap memory leak + disk full!)\n"
+        "        Warning — Failed to write logs: ext4 journal abort (disk full)\n"
+        "说明: 双根因—Java堆外泄漏OOMKilled + 磁盘空间耗尽无法写日志\n"
+    ),
+    "coredns_cache_poison": (
+        "Name:             backend-svc-def34\n"
+        "Namespace:        default\n"
+        "Status:           Running\n"
+        "Containers:\n"
+        "  backend-svc:\n"
+        "    Image: backend-service:v2.0\n"
+        "    State: Running (Started: 2 days ago)\n"
+        "    Restart Count: 0\n"
+        "    Limits: memory=512Mi\n"
+        "Conditions: Initialized=True, Ready=True, ContainersReady=True\n"
+        "Events: Warning — Intermittent connection failure to 10.0.1.88 (stale DNS cache!)\n"
+        "        Warning — DNS resolved to wrong IP — CoreDNS cache returned terminated Pod endpoint\n"
+        "说明: Pod本身健康，但DNS间歇解析到已终止的旧Pod IP→请求路由到错误端点\n"
+    ),
+    "dns_and_etcd": (
+        "Name:             user-svc-abc12\n"
+        "Namespace:        default\n"
+        "Status:           CrashLoopBackOff\n"
+        "Containers:\n"
+        "  user-svc:\n"
+        "    Image: user-service:v1.3\n"
+        "    State: Waiting (CrashLoopBackOff)\n"
+        "    Last State: Terminated (ExitCode: 1 — Error)\n"
+        "    Restart Count: 5\n"
+        "    Limits: memory=256Mi\n"
+        "Conditions: Initialized=True, Ready=False, ContainersReady=False\n"
+        "Events: Warning — liveness probe failed: DNS lookup timeout (CoreDNS CrashLoopBackOff)\n"
+        "        Warning — CrashLoopBackOff #5 in 2d — DNS failure preventing startup\n"
+        "        Warning — etcd leader changed during API Server request\n"
+        "说明: 双根因—CoreDNS CrashLoopBackOff导致DNS解析超时+etcd leader频繁切换\n"
+    ),
+    "image_pull_backoff": (
+        "Name:             new-deploy-abc12\n"
+        "Namespace:        default\n"
+        "Status:           ImagePullBackOff\n"
+        "Containers:\n"
+        "  node-app:\n"
+        "    Image: node:18-alpine\n"
+        "    State: Waiting (ImagePullBackOff)\n"
+        "    Restart Count: 0\n"
+        "Conditions: Initialized=False, Ready=False, ContainersReady=False\n"
+        "Events: Warning — Failed to pull image \"node:18-alpine\": 429 Too Many Requests\n"
+        "        Warning — Image pull rate limit exceeded (Docker Hub free tier)\n"
+        "        Normal  — Pulling image \"node:18-alpine\" (retry #5)\n"
+        "说明: Docker Hub速率限制导致ImagePullBackOff—已有Pod不受影响，仅新Pod受阻\n"
+    ),
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -276,6 +470,75 @@ _POD_EVENTS: dict[str, str] = {
         "30m         Warning   BackOff              CrashLoopBackOff #18 — OOMKilled recurrence\n"
         "25m         Warning   DNSLookupTimeout     Intermittent DNS failure — CoreDNS only 1/3 replicas\n"
     ),
+    "conntrack_and_oom": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-3\n"
+        "2d          Normal    Started              Container started\n"
+        "1h          Warning   OOMKilled            Process java(8765) RSS=6.4GB — OOM Killer invoked\n"
+        "45m         Warning   DNSLookupTimeout     Readiness probe: DNS timeout (conntrack UDP drop)\n"
+        "30m         Warning   BackOff              CrashLoopBackOff #5\n"
+        "15m         Warning   OOMKilled            Repeat kill #8 in 2 days\n"
+    ),
+    "disk_io_and_dns": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-2\n"
+        "2d          Normal    Started              Container started\n"
+        "40m         Warning   IOTimeout            Write I/O timeout 30s (disk saturated)\n"
+        "35m         Warning   DNSResolutionFailed  UnknownHostException: upstream-db.external.com\n"
+    ),
+    "etcd_quota_near_full": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-1\n"
+        "2d          Normal    Started              Container started\n"
+        "3h          Warning   ReadinessProbeFailed Readiness probe HTTP 8080/ready timeout 5s (etcd slow)\n"
+        "2h          Warning   LivenessProbeFailed  Liveness probe HTTP 8080/health timeout 5s (etcd slow)\n"
+        "2h          Normal    Killing              Killing container (failed liveness probe, exit:1)\n"
+        "1h          Warning   ReadinessProbeFailed (repeat — etcd NOSPACE causing API Server write latency)\n"
+        "30m         Warning   BackOff              CrashLoopBackOff #8 — restart triggered by etcd timeout\n"
+        "10m         Normal    Started              Container restarted (last restart #8)\n"
+    ),
+    "oom_score_misconfig": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-2\n"
+        "2d          Normal    Started              Container started (java-app)\n"
+        "35m         Warning   NodeStatusUnknown    Node worker-2 stopped posting status (kubelet killed!)\n"
+        "35m         Warning   OOMKillMisconfig     OOM Killer killed kubelet (oom_score_adj=-500) instead of java-app (oom_score_adj=750)\n"
+        "30m         Warning   NodeUnreachable      Pods on worker-2 unreachable — kubelet process killed by OOM\n"
+    ),
+    "memory_leak_and_disk_full": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-1\n"
+        "2d          Normal    Started              Container started\n"
+        "1h          Warning   MemoryPressure       RSS climbing 5.8→6.8GB (off-heap leak!)\n"
+        "30m         Warning   DiskPressure         /dev/sda1 disk usage 100% — log write failed\n"
+        "15m         Warning   OOMKilled            Process java(8765) RSS=6.8GB — OOM Killer invoked\n"
+        "10m         Warning   BackOff              CrashLoopBackOff #8 (disk full prevents log writes)\n"
+    ),
+    "coredns_cache_poison": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-2\n"
+        "2d          Normal    Started              Container started\n"
+        "1h          Warning   DNSResolutionError   Service resolved to stale IP 10.0.1.88 (Pod already terminated)\n"
+        "45m         Warning   ConnectionRefused    Connection to 10.0.1.88:8080 refused (stale endpoint)\n"
+        "30m         Warning   DNSResolutionError   DNS again returned stale IP — CoreDNS cache pollution persists\n"
+    ),
+    "dns_and_etcd": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "2d          Normal    Scheduled            Assigned to worker-2\n"
+        "2d          Normal    Started              Container started\n"
+        "3h          Warning   DNSLookupTimeout     DNS lookup timeout for internal-api.default.svc\n"
+        "2h          Warning   CrashLoopBackOff     CoreDNS pod CrashLoopBackOff — DNS unavailable\n"
+        "1h          Warning   EtcdLeaderChanged    etcd leader changed during API Server request\n"
+        "30m         Warning   BackOff              CrashLoopBackOff #5 — liveness probe DNS timeout\n"
+    ),
+    "image_pull_backoff": (
+        "LAST SEEN   TYPE      REASON               MESSAGE\n"
+        "30m         Normal    Scheduled            Assigned to worker-2\n"
+        "30m         Warning   Failed               Failed to pull image \"node:18-alpine\": 429 Too Many Requests\n"
+        "25m         Warning   Failed               Image pull rate limit exceeded (Docker Hub free tier: 100 pulls/6h)\n"
+        "20m         Warning   BackOff              Back-off pulling image — waiting for rate limit reset\n"
+        "15m         Warning   Failed               (repeat — rate limit not yet reset)\n"
+    ),
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -329,6 +592,59 @@ _ETCD_STATUS: dict[str, str] = {
         "172.16.0.3:2379   48 MB    298        12556700 (follower)\n"
         "WARNING: leader master-1 disk IO saturated — etcd process in D state!\n"
     ),
+    "etcd_quota_near_full": (
+        "## etcd Pods\n"
+        "NAME     READY   STATUS    RESTARTS   AGE\n"
+        "etcd-master-1   1/1     Running   0          30d\n"
+        "etcd-master-2   1/1     Running   0          30d\n"
+        "etcd-master-3   1/1     Running   0          30d\n"
+        "\n## etcd Members\n"
+        "8e9e05c52164694d, started, master-1, https://172.16.0.1:2380, https://172.16.0.1:2379, true\n"
+        "91cc3fe84ba1c2f0, started, master-2, https://172.16.0.2:2380, https://172.16.0.2:2379, false\n"
+        "a6f4b2d18c0e9a35, started, master-3, https://172.16.0.3:2380, https://172.16.0.3:2379, false\n"
+        "\n## Endpoint Status\n"
+        "ENDPOINT           DB SIZE   RAFT TERM  RAFT INDEX\n"
+        "172.16.0.1:2379   7.15 GB   320        13985500 (leader, backend_commit p99=185ms WARNING!)\n"
+        "172.16.0.2:2379   7.15 GB   320        13985500 (follower)\n"
+        "172.16.0.3:2379   7.15 GB   320        13985500 (follower)\n"
+        "WARNING: DB size 7.15GB approaching 8GB quota — NOSPACE alarm on all members!\n"
+        "说明: 3 memebr均健康无重启，但DB大小已到89%配额，compaction无法释放足够空间\n"
+    ),
+    "etcd_quorum_loss": (
+        "## etcd Pods\n"
+        "NAME     READY   STATUS    RESTARTS   AGE\n"
+        "etcd-master-1   0/1     CrashLoopBackOff 12    30d (leader lost!)\n"
+        "etcd-master-2   0/1     CrashLoopBackOff 8     30d (follower down!)\n"
+        "etcd-master-3   1/1     Running   0          30d (single survivor!)\n"
+        "\n## etcd Members\n"
+        "8e9e05c52164694d, unreachable, master-1, https://172.16.0.1:2380, https://172.16.0.1:2379, lost\n"
+        "91cc3fe84ba1c2f0, unreachable, master-2, https://172.16.0.2:2380, https://172.16.0.2:2379, lost\n"
+        "a6f4b2d18c0e9a35, started, master-3, https://172.16.0.3:2380, https://172.16.0.3:2379, false\n"
+        "\n## Endpoint Status\n"
+        "https://172.16.0.1:2379: unhealthy — connection refused (etcd pod CrashLoopBackOff)\n"
+        "https://172.16.0.2:2379: unhealthy — connection refused (etcd pod CrashLoopBackOff)\n"
+        "https://172.16.0.3:2379: 仅1/3存活 — 无法形成法定人数! quorum lost!\n"
+        "说明: 2/3 etcd members down → quorum lost → API Server 降级只读模式\n"
+        "      根因: 某批io hang导致crash，磁盘io问题为主要原因\n"
+    ),
+    "dns_and_etcd": (
+        "## etcd Pods\n"
+        "NAME     READY   STATUS    RESTARTS   AGE\n"
+        "etcd-master-1   1/1     Running   8          30d (leader elections频繁!)\n"
+        "etcd-master-2   1/1     Running   3          30d\n"
+        "etcd-master-3   1/1     Running   0          30d\n"
+        "\n## etcd Members\n"
+        "8e9e05c52164694d, started, master-1, https://172.16.0.1:2380, https://172.16.0.1:2379, false (频繁leader切换!)\n"
+        "91cc3fe84ba1c2f0, started, master-2, https://172.16.0.2:2380, https://172.16.0.2:2379, true\n"
+        "a6f4b2d18c0e9a35, started, master-3, https://172.16.0.3:2380, https://172.16.0.3:2379, false\n"
+        "\n## Endpoint Status\n"
+        "ENDPOINT           RAFT TERM  RAFT INDEX\n"
+        "172.16.0.1:2379   328        16552300 (频繁leader election! 8次restart)\n"
+        "172.16.0.2:2379   328        16552300\n"
+        "172.16.0.3:2379   328        16552300\n"
+        "WARNING: etcd leader election频繁 — master-1磁盘不稳定导致leader切换\n"
+        "说明: etcd leader频繁切换+CoreDNS CrashLoopBackOff — 双重控制面故障\n"
+    ),
 }
 
 _ETCD_HEALTH: dict[str, str] = {
@@ -338,7 +654,7 @@ _ETCD_HEALTH: dict[str, str] = {
         "https://172.16.0.2:2379 is healthy: successfully committed proposal: took 3.1ms\n"
         "https://172.16.0.3:2379 is healthy: successfully committed proposal: took 2.8ms\n"
         "\n## Alarms\n"
-        "memberID:8e9e05c52164694d alarm:NOSPACE (WARNING — database size approaching quota)\n"
+        "（无告警）\n"
         "\n## Leader IDs\n"
         "\"leader\": 13740458283750686435 (master-3)\n"
     ),
@@ -351,6 +667,46 @@ _ETCD_HEALTH: dict[str, str] = {
         "memberID:8e9e05c52164694d alarm:NOSPACE\n"
         "\n## Leader IDs\n"
         "\"leader\": 13740458283750686435 (master-1 — leader with severe disk IO latency!)\n"
+    ),
+    "etcd_quota_near_full": (
+        "## Endpoint Health\n"
+        "https://172.16.0.1:2379 is healthy: successfully committed proposal: took 85.2ms (WARNING >50ms)\n"
+        "https://172.16.0.2:2379 is healthy: successfully committed proposal: took 78.5ms (WARNING >50ms)\n"
+        "https://172.16.0.3:2379 is healthy: successfully committed proposal: took 92.1ms (WARNING >50ms)\n"
+        "\n## Alarms\n"
+        "memberID:8e9e05c52164694d alarm:NOSPACE\n"
+        "memberID:91cc3fe84ba1c2f0 alarm:NOSPACE\n"
+        "memberID:a6f4b2d18c0e9a35 alarm:NOSPACE\n"
+        "\n## DB Size\n"
+        "8e9e05c52164694d: 7.15 GB / 8.0 GB (89.4% — 即将触发只读模式!)\n"
+        "91cc3fe84ba1c2f0: 7.15 GB / 8.0 GB (89.4%)\n"
+        "a6f4b2d18c0e9a35: 7.15 GB / 8.0 GB (89.4%)\n"
+        "quota-backend-bytes=8GB, 任一成员达到 100% 时 etcd 将进入只读模式\n"
+        "\n## Leader IDs\n"
+        "\"leader\": 13740458283750686435 (master-1)\n"
+    ),
+    "etcd_quorum_loss": (
+        "## Endpoint Health\n"
+        "https://172.16.0.1:2379 is unhealthy: failed to connect (CrashLoopBackOff, fsync latency 250ms p99!)\n"
+        "https://172.16.0.2:2379 is unhealthy: failed to connect (CrashLoopBackOff, disk IO hang!)\n"
+        "https://172.16.0.3:2379 is unhealthy: cluster lacks quorum (1/3 members alive)\n"
+        "\n## Alarms\n"
+        "MEMBER ERROR: cluster has no leader — quorum lost (2/3 members down)\n"
+        "MEMBER ERROR: raft proposal cannot be committed (majority unreachable)\n"
+        "\n## Leader IDs\n"
+        "\"leader\": 0 (NO LEADER — quorum lost!)\n"
+        "说明: 2/3 etcd节点因磁盘延迟CrashLoopBackOff → 法定人数丢失 → API Server只读模式\n"
+    ),
+    "dns_and_etcd": (
+        "## Endpoint Health\n"
+        "https://172.16.0.1:2379 is healthy: successfully committed proposal: took 350.0ms (WARNING! >100ms)\n"
+        "https://172.16.0.2:2379 is healthy: successfully committed proposal: took 3.5ms\n"
+        "https://172.16.0.3:2379 is healthy: successfully committed proposal: took 2.8ms\n"
+        "\n## Alarms\n"
+        "(无 NOSPACE/空间告警)\n"
+        "\n## Leader IDs\n"
+        "\"leader\": 25404582283750686435 (master-2 — 频繁切换: 8次在最近1h!)\n"
+        "说明: master-1 磁盘不稳定 → leader 频繁 election → API Server 间歇变慢\n"
     ),
 }
 
@@ -385,6 +741,42 @@ _ETCD_METRICS: dict[str, str] = {
         "etcd_server_has_leader 1\n"
         "etcd_server_proposals_failed_total 342 (raft proposals failing due to leader IO hang!)\n"
     ),
+    "etcd_quota_near_full": (
+        "etcd_disk_backend_commit_duration_seconds_bucket{le=\"0.01\"} 12000\n"
+        "etcd_disk_backend_commit_duration_seconds_bucket{le=\"0.1\"} 45000\n"
+        "etcd_disk_backend_commit_duration_seconds_bucket{le=\"0.5\"} 68000\n"
+        "WARNING: p99 backend_commit = 185ms (3x threshold! DB compaction slow)\n"
+        "etcd_disk_wal_fsync_duration_seconds_bucket{le=\"0.005\"} 38000\n"
+        "WARNING: p99 wal_fsync = 42ms (WAL write slowed by DB size)\n"
+        "etcd_server_leader_changes_seen_total 5\n"
+        "etcd_server_has_leader 1\n"
+        "etcd_server_proposals_failed_total 18 (raft proposals mildly failing)\n"
+        "etcd_mvcc_db_total_size_in_bytes 7680000000 (7.15 GB / 8 GB quota!)\n"
+        "etcd_server_health_failures 0 (no health failure yet, but NOSPACE alarm active)\n"
+        "说明: DB接近8GB配额，compaction/min-free调整已触发，写入延迟上升但不至于超时\n"
+    ),
+    "etcd_quorum_loss": (
+        "etcd_disk_backend_commit_duration_seconds_bucket{le=\"0.1\"} 800\n"
+        "CRITICAL: p99 backend_commit = 1250ms (2 members unreachable!)\n"
+        "etcd_disk_wal_fsync_duration_seconds_bucket{le=\"0.01\"} 200\n"
+        "CRITICAL: p99 wal_fsync = 480ms (disk IO saturated — causing etcd crash!)\n"
+        "etcd_server_leader_changes_seen_total 52 (extreme — leader lost repeatedly!)\n"
+        "etcd_server_has_leader 0 (NO LEADER — quorum lost!)\n"
+        "etcd_server_proposals_failed_total 1240 (all writes failing — quorum lost!)\n"
+        "etcd_server_health_failures 2 (master-1 and master-2 unhealthy!)\n"
+        "说明: 2/3节点CrashLoop→quorum丢失→所有写操作失败→API Server只读模式\n"
+    ),
+    "dns_and_etcd": (
+        "etcd_disk_backend_commit_duration_seconds_bucket{le=\"0.1\"} 28000\n"
+        "WARNING: p99 backend_commit = 380ms (disk unstable on master-1)\n"
+        "etcd_disk_wal_fsync_duration_seconds_bucket{le=\"0.01\"} 22000\n"
+        "WARNING: p99 wal_fsync = 95ms (moderate disk IO)\n"
+        "etcd_server_leader_changes_seen_total 18 (frequent! 8x in last hour)\n"
+        "etcd_server_has_leader 1\n"
+        "etcd_server_proposals_failed_total 55 (raft proposals occasionally failing)\n"
+        "etcd_server_health_failures 0\n"
+        "说明: leader election频繁因master-1磁盘不稳定→API Server间歇变慢+CoreDNS CrashLoop\n"
+    ),
 }
 
 _ETCD_LOGS: dict[str, str] = {
@@ -400,6 +792,17 @@ _ETCD_LOGS: dict[str, str] = {
         "2026-06-14T07:30:15.012Z WARN  leader failed to send out heartbeat — fsync took 1.2s\n"
         "2026-06-14T07:30:30.345Z ERROR raft proposal failed: request timed out\n"
         "2026-06-14T07:31:00.678Z WARN  disk backend commit blocked for 2.5s — check IO subsystem\n"
+    ),
+    "etcd_quota_near_full": (
+        "2026-06-14T18:00:00.123Z WARN  database space quota exceeded ([8e9e05c52164694d, 91cc3fe84ba1c2f0, a6f4b2d18c0e9a35]) NOSPACE alarm raised\n"
+        "2026-06-14T18:00:05.456Z INFO  saved snapshot at index 13985500 (compaction triggered but unable to free enough space)\n"
+        "2026-06-14T18:00:10.789Z WARN  apply entries took too long [0.58s for 128 entries] (compaction running concurrently)\n"
+        "2026-06-14T18:00:15.012Z WARN  mvcc: database space exceeded alarm — running compaction and defragmentation\n"
+        "2026-06-14T18:00:30.345Z WARN  backend commit latency p99=185ms (compaction I/O contention)\n"
+        "2026-06-14T18:01:00.678Z INFO  compaction took 45.2s — freed 120MB only (insufficient to clear NOSPACE)\n"
+        "2026-06-14T18:02:00.123Z WARN  database size: 7.15GB / 8GB (89.4%) — compaction/min-free=10% insufficient\n"
+    ),
+    "etcd_quorum_loss": (
     ),
 }
 
@@ -438,6 +841,51 @@ _COREDNS_LOGS: dict[str, str] = {
         "\n## coredns-6d4b-abc99 (worker-3 — UNREACHABLE)\n"
         "[Pod unreachable — worker-3 NotReady, kubelet killed by OOM Killer]\n"
     ),
+    "etcd_quota_near_full": (
+        "## CoreDNS Deployment\n"
+        "NAME      READY   UP-TO-DATE   AVAILABLE   AGE\n"
+        "coredns   2/2     2            2           30d (正常!)\n"
+        "\n## coredns-6d4b-xyz11\n"
+        "2026-06-14T18:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+        "2026-06-14T18:02:30.456Z [WARN] plugin/kubernetes: failed to list *v1.Endpoints for backend: context deadline exceeded\n"
+        "2026-06-14T18:02:31.789Z [WARN] plugin/kubernetes: failed to list *v1.Service for api-gateway: etcd request timeout\n"
+        "2026-06-14T18:03:00.012Z [ERROR] plugin/errors: 2 backend.default.svc.cluster.local. A: read udp ... i/o timeout\n"
+        "2026-06-14T18:05:00.345Z [WARN] plugin/kubernetes: List Endpoints latency p99=3.2s (normal<0.1s! etcd slow)\n"
+        "\n## coredns-6d4b-abc99\n"
+        "2026-06-14T18:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+        "2026-06-14T18:02:35.456Z [WARN] plugin/kubernetes: failed to list *v1.Endpoints: context deadline exceeded\n"
+        "2026-06-14T18:03:15.789Z [ERROR] plugin/errors: api-gateway.default A: read udp ... i/o timeout\n"
+        "说明: CoreDNS Pod全部健康(2/2)，但查询etcd时频繁超时 → etcd NOSPACE导致读延迟\n"
+        "      并非CoreDNS自身问题—症状表现为DNS超时但根因在etcd层\n"
+    ),
+    "coredns_cache_poison": (
+        "## CoreDNS Deployment\n"
+        "NAME      READY   UP-TO-DATE   AVAILABLE   AGE\n"
+        "coredns   2/2     2            2           30d (正常!)\n"
+        "\n## coredns-6d4b-xyz11\n"
+        "2026-06-14T10:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+        "2026-06-14T10:30:00.456Z [WARN] plugin/cache: serving stale record backend-svc.default → 10.0.1.88 (TTL not expired!)\n"
+        "2026-06-14T10:30:05.789Z [INFO] plugin/kubernetes: resolved backend-svc.default → 10.0.1.88 (stale endpoint!)\n"
+        "2026-06-14T10:31:00.012Z [WARN] plugin/kubernetes: Pod 10.0.1.88 already terminated — cache entry should have been invalidated\n"
+        "2026-06-14T10:35:00.345Z [WARN] plugin/cache: returning cached entry for backend-svc (age=300s, TTL still valid)\n"
+        "说明: CoreDNS缓存未正确失效已终止Pod的Endpoint→间歇返回错误IP\n"
+        "      根因可能: kubelet未及时更新EndpointSlice→CoreDNS使用过时缓存\n"
+    ),
+    "dns_and_etcd": (
+        "## CoreDNS Deployment\n"
+        "NAME      READY   UP-TO-DATE   AVAILABLE   AGE\n"
+        "coredns   1/2     2            1           30d (仅1副本可用!)\n"
+        "\n## coredns-6d4b-xyz11 (worker-1 — only healthy replica)\n"
+        "2026-06-14T09:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+        "2026-06-14T09:05:00.456Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+        "2026-06-14T09:05:05.789Z [WARN] plugin/forward: max retries exceeded for upstream\n"
+        "\n## coredns-6d4b-def88 (worker-2 — CrashLoopBackOff)\n"
+        "2026-06-14T08:50:00.123Z [FATAL] OOMKilled — memory limit 64Mi exceeded (need 128Mi!)\n"
+        "2026-06-14T08:55:00.456Z [INFO] Starting CoreDNS-1.11.1 (restart #8)\n"
+        "2026-06-14T08:58:00.789Z [FATAL] OOMKilled again — CrashLoopBackOff\n"
+        "说明: CoreDNS 副本1/2 → 1个CrashLoopBackOff(资源不足OOMKilled) + etcd leader频繁切换\n"
+        "      双根因叠加 → 剩余副本过载 + 查询etcd超时 → DNS间歇失败\n"
+    ),
 }
 
 _COREDNS_DESCRIBE: dict[str, str] = {
@@ -465,6 +913,51 @@ _COREDNS_DESCRIBE: dict[str, str] = {
         "\n## kube-dns Service\n"
         "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
         "\n## Corefile ConfigMap (same as normal)\n"
+    ),
+    "etcd_quota_near_full": (
+        "## CoreDNS Deployment\n"
+        "Name:                   coredns\n"
+        "Namespace:              kube-system\n"
+        "Replicas:               2 desired | 2 available (正常!)\n"
+        "Strategy:               RollingUpdate (max unavailable 1)\n"
+        "Conditions:             Available=True, Progressing=False\n"
+        "Events: (无异常事件)\n"
+        "\n## kube-dns Service\n"
+        "NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)\n"
+        "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
+        "\n## Corefile ConfigMap\n"
+        ".:53 {\n    errors\n    health\n    kubernetes cluster.local in-addr.arpa ip6.arpa\n    prometheus :9153\n    forward . /etc/resolv.conf\n    cache 30\n    loop\n    reload\n}\n"
+        "说明: CoreDNS Deployment完全正常(2/2 Ready, Corefile标准, kube-dns Service存在)\n"
+        "      不像 conntrack/multi_layer 场景，此场景 CoreDNS 本身无故障\n"
+    ),
+    "coredns_cache_poison": (
+        "## CoreDNS Deployment\n"
+        "Name:                   coredns\n"
+        "Namespace:              kube-system\n"
+        "Replicas:               2 desired | 2 available (正常!)\n"
+        "Strategy:               RollingUpdate (max unavailable 1)\n"
+        "Conditions:             Available=True, Progressing=False\n"
+        "Events: (无异常事件 — CoreDNS Deployment本身健康)\n"
+        "\n## kube-dns Service\n"
+        "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
+        "\n## Corefile ConfigMap\n"
+        ".:53 {\n    errors\n    health\n    kubernetes cluster.local in-addr.arpa ip6.arpa\n    prometheus :9153\n    forward . /etc/resolv.conf\n    cache 30\n    loop\n    reload\n}\n"
+        "说明: CoreDNS Deployment健康但cache未失效→返回stale endpoint IP→间歇路由错误\n"
+        "      注意: CoreDNS本身无Crash/Restart—问题在缓存数据一致性\n"
+    ),
+    "dns_and_etcd": (
+        "## CoreDNS Deployment\n"
+        "Name:                   coredns\n"
+        "Namespace:              kube-system\n"
+        "Replicas:               2 desired | 1 available (1 CrashLoopBackOff!)\n"
+        "Strategy:               RollingUpdate (max unavailable 1)\n"
+        "Conditions:             Available=False (MinimumReplicasUnavailable)\n"
+        "Events: Warning — CrashLoopBackOff on coredns-6d4b-def88 (OOMKilled: 64Mi limit too small!)\n"
+        "\n## kube-dns Service\n"
+        "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
+        "\n## Corefile ConfigMap (same as normal)\n"
+        "说明: CoreDNS 1/2 Running — 1个副本因内存不足OOMKilled CrashLoopBackOff\n"
+        "      剩余副本处理全部DNS查询→过载超时\n"
     ),
 }
 
@@ -623,7 +1116,7 @@ def get_cluster_overview(cluster_name: str) -> str:
     """Get high-level cluster overview: nodes, non-running pods, namespace count."""
     from diagnostics.tools.mock.data import kubernetes_nodes_data, kubernetes_pods_data
 
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     nodes = kubernetes_nodes_data(scenario)
     pods = kubernetes_pods_data(scenario)
     return (
@@ -643,7 +1136,7 @@ def get_pod_logs(cluster_name: str, namespace: str,
                  pod_name: str, tail_lines: int = 200) -> str:
     """Retrieve recent pod logs."""
     _ = cluster_name, namespace, pod_name, tail_lines
-    return _POD_LOGS.get(_active_scenario, _POD_LOGS["normal"])
+    return _POD_LOGS.get(get_active_scenario(), _POD_LOGS["normal"])
 
 
 @tool
@@ -651,7 +1144,7 @@ def get_pod_logs_since(cluster_name: str, namespace: str,
                        pod_name: str, minutes: int = 5) -> str:
     """Retrieve pod logs from the last N minutes."""
     _ = cluster_name, namespace, pod_name, minutes
-    logs = _POD_LOGS.get(_active_scenario, _POD_LOGS["normal"])
+    logs = _POD_LOGS.get(get_active_scenario(), _POD_LOGS["normal"])
     # Return last few lines as "recent"
     lines = logs.strip().split("\n")
     recent = lines[-min(4, len(lines)):]
@@ -663,7 +1156,7 @@ def get_pod_logs_lines(cluster_name: str, namespace: str,
                        pod_name: str, head_lines: int = 50) -> str:
     """Retrieve the last N lines of pod logs."""
     _ = cluster_name, namespace, pod_name, head_lines
-    logs = _POD_LOGS.get(_active_scenario, _POD_LOGS["normal"])
+    logs = _POD_LOGS.get(get_active_scenario(), _POD_LOGS["normal"])
     lines = logs.strip().split("\n")
     return "\n".join(lines[-min(head_lines, len(lines)):])
 
@@ -673,7 +1166,7 @@ def get_pod_previous_logs(cluster_name: str, namespace: str,
                           pod_name: str, tail_lines: int = 200) -> str:
     """Retrieve logs from the PREVIOUS (crashed) container instance."""
     _ = cluster_name, namespace, pod_name, tail_lines
-    logs = _POD_PREVIOUS_LOGS.get(_active_scenario)
+    logs = _POD_PREVIOUS_LOGS.get(get_active_scenario())
     if logs:
         return f"## Previous Container Logs\n{logs}"
     return "[No previous container — pod has not restarted or previous logs unavailable]"
@@ -683,14 +1176,14 @@ def get_pod_previous_logs(cluster_name: str, namespace: str,
 def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get full describe output for a pod."""
     _ = cluster_name, namespace, pod_name
-    return _POD_DESCRIBE.get(_active_scenario, _POD_DESCRIBE["normal"])
+    return _POD_DESCRIBE.get(get_active_scenario(), _POD_DESCRIBE["normal"])
 
 
 @tool
 def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get events related to a specific pod."""
     _ = cluster_name, namespace, pod_name
-    return _POD_EVENTS.get(_active_scenario, _POD_EVENTS["normal"])
+    return _POD_EVENTS.get(get_active_scenario(), _POD_EVENTS["normal"])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -701,12 +1194,12 @@ def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
 def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
     """Get recent cluster-wide or namespace-scoped events (last 30)."""
     _ = cluster_name, namespace
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     events_map: dict[str, str] = {
         "normal": (
-            "NAMESPACE     LAST SEEN   TYPE     REASON               MESSAGE\n"
-            "kube-system   10m         Warning  NOSPCACE             etcd cluster has limited space\n"
-            "default       1d          Normal   ScalingReplicaSet    Scaled up replica set nginx to 3\n"
+            "NAMESPACE   LAST SEEN   TYPE     REASON               MESSAGE\n"
+            "default     1d          Normal   ScalingReplicaSet    Scaled up replica set nginx to 3\n"
+            "default     3d          Normal   Scheduled            Successfully assigned pod to node\n"
         ),
         "container_crash": (
             "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
@@ -747,6 +1240,49 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
             "default       5m          Warning   DNSResolutionFailed  Intermittent DNS — CoreDNS only 1/3 replicas\n"
             "kube-system   5m          Warning   MinimumReplicasUnavailable  CoreDNS deployment 1/3 available\n"
         ),
+        "etcd_quota_near_full": (
+            "NAMESPACE     LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "kube-system   2m          Warning   NOSPACE              etcd cluster has limited space: 7.15GB/8GB (89%)\n"
+            "default       30s         Warning   ReadinessProbeFailed api-gateway readiness probe HTTP 8080/ready timeout\n"
+            "default       30s         Warning   BackOff              CrashLoopBackOff — restart triggered by etcd timeout\n"
+            "default       2m          Warning   LivenessProbeFailed  api-gateway liveness probe failed (etcd wait)\n"
+            "kube-system   3m          Warning   NOSPACE              etcd database size approaching quota (all 3 members)\n"
+        ),
+        "oom_score_misconfig": (
+            "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default     35m         Warning   NodeStatusUnknown    Node worker-2 stopped posting status (kubelet killed)\n"
+            "default     35m         Warning   OOMKillMisconfig     OOM Killer killed kubelet (oom_score_adj=-500) instead of java-app (750)\n"
+            "default     30m         Warning   Unreachable          Pods on worker-2 unreachable\n"
+        ),
+        "memory_leak_and_disk_full": (
+            "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default     15m         Warning   OOMKilled            java-backend OOMKilled (RSS=6.8GB — off-heap leak)\n"
+            "default     15m         Warning   DiskPressure         /dev/sda1 100% full — ext4 journal abort\n"
+            "default     10m         Warning   BackOff              CrashLoopBackOff #8 (disk full prevents log writes)\n"
+        ),
+        "coredns_cache_poison": (
+            "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default     30m         Warning   DNSResolutionError   Service resolved to stale IP 10.0.1.88 (terminated Pod)\n"
+            "default     30m         Warning   ConnectionRefused    Connection to 10.0.1.88 refused — stale endpoint\n"
+        ),
+        "etcd_quorum_loss": (
+            "NAMESPACE     LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "kube-system   5m          Warning   CrashLoopBackOff     etcd-master-1 CrashLoopBackOff (fsync latency 250ms!)\n"
+            "kube-system   5m          Warning   CrashLoopBackOff     etcd-master-2 CrashLoopBackOff (disk IO hang!)\n"
+            "kube-system   5m          Warning   QuorumLost           etcd cluster lost quorum (1/3 members alive)\n"
+            "default       3m          Warning   FailedCreate         API Server read-only — cannot create/update resources\n"
+        ),
+        "dns_and_etcd": (
+            "NAMESPACE     LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default       1m          Warning   DNSLookupTimeout     user-svc DNS lookup timeout (CoreDNS CrashLoopBackOff)\n"
+            "kube-system   2m          Warning   CrashLoopBackOff     CoreDNS pod coredns-6d4b-def88 OOMKilled (memory 64Mi limit)\n"
+            "kube-system   3m          Warning   EtcdLeaderChanged    etcd leader changed (master-1 unstable — 8x in 1h)\n"
+        ),
+        "image_pull_backoff": (
+            "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default     30m         Warning   Failed               Failed to pull image \"node:18-alpine\": 429 Too Many Requests\n"
+            "default     25m         Warning   BackOff              ImagePullBackOff — Docker Hub rate limit (100 pulls/6h)\n"
+        ),
     }
     return events_map.get(scenario, events_map["normal"])
 
@@ -759,7 +1295,7 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
 def get_node_info(cluster_name: str, node_name: str) -> str:
     """Get detailed node information."""
     _ = cluster_name, node_name
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     node_info_map: dict[str, str] = {
         "normal": (
             f"Name:               {node_name}\n"
@@ -799,14 +1335,14 @@ def get_node_conditions(cluster_name: str) -> str:
     """Get a quick overview of all node conditions."""
     _ = cluster_name
     from diagnostics.tools.mock.data import kubernetes_nodes_data
-    return kubernetes_nodes_data(_active_scenario)
+    return kubernetes_nodes_data(get_active_scenario())
 
 
 @tool
 def get_node_resource_usage(cluster_name: str) -> str:
     """Get node CPU/Memory usage (requires metrics-server)."""
     _ = cluster_name
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     usage_map: dict[str, str] = {
         "normal": (
             "NAME         CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%\n"
@@ -839,7 +1375,7 @@ def get_node_resource_usage(cluster_name: str) -> str:
 def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
     """Get pod CPU/Memory usage (requires metrics-server)."""
     _ = cluster_name, namespace
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     usage: dict[str, str] = {
         "normal": (
             "NAMESPACE     NAME                     CPU(cores)   MEMORY(bytes)\n"
@@ -856,6 +1392,12 @@ def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
             "default       api-gateway-abc12        55m          220Mi    (high connections)\n"
             "default       api-gateway-def34        48m          210Mi\n"
         ),
+        "etcd_quota_near_full": (
+            "NAMESPACE     NAME                     CPU(cores)   MEMORY(bytes)\n"
+            "default       api-gateway-ghi56        25m          420Mi    (82% of 512Mi limit — normal!)\n"
+            "default       backend-service-xyz12    15m          350Mi\n"
+            "default       nginx-7d8b-jkl78         5m           45Mi\n"
+        ),
     }
     return usage.get(scenario, usage["normal"])
 
@@ -864,7 +1406,7 @@ def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
 def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
     """Get pods with high restart counts (>=5 restarts)."""
     _ = cluster_name, namespace
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     restart_map: dict[str, str] = {
         "normal": (
             "NAMESPACE  NAME                 RESTARTS  STATUS    NODE\n"
@@ -893,6 +1435,37 @@ def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
             "default    api-gateway-abc12    18        CrashLoopBackOff   worker-1 (total: 18 — cgroup OOM!)\n"
             "(Showing pods with ≥5 restarts, last 20)\n"
         ),
+        "etcd_quota_near_full": (
+            "NAMESPACE  NAME                 RESTARTS  STATUS             NODE\n"
+            "default    api-gateway-abc12    8         CrashLoopBackOff   worker-1 (total: 8 — etcd timeout kills)\n"
+            "default    api-gateway-def34    6         CrashLoopBackOff   worker-2 (total: 6 — etcd timeout kills)\n"
+            "(Showing pods with ≥5 restarts, last 20)\n"
+        ),
+        "oom_score_misconfig": (
+            "NAMESPACE  NAME                 RESTARTS  STATUS    NODE\n"
+            "(No pods with ≥5 restarts — kubelet was killed, not pods)\n"
+        ),
+        "memory_leak_and_disk_full": (
+            "NAMESPACE  NAME                 RESTARTS  STATUS             NODE\n"
+            "default    java-backend-abc12   8         OOMKilled          worker-1 (total: 8 — off-heap leak + disk full)\n"
+            "(Showing pods with ≥5 restarts, last 20)\n"
+        ),
+        "etcd_quorum_loss": (
+            "NAMESPACE     NAME                 RESTARTS  STATUS             NODE\n"
+            "kube-system   etcd-master-1        12        CrashLoopBackOff   master-1 (total: 12 — disk IO crash!)\n"
+            "kube-system   etcd-master-2        8         CrashLoopBackOff   master-2 (total: 8 — disk IO hang!)\n"
+            "(Showing pods with ≥5 restarts, last 20)\n"
+        ),
+        "dns_and_etcd": (
+            "NAMESPACE     NAME                 RESTARTS  STATUS             NODE\n"
+            "kube-system   coredns-6d4b-def88   8         CrashLoopBackOff   worker-2 (total: 8 — OOMKilled 64Mi!)\n"
+            "default       user-svc-abc12       5         CrashLoopBackOff   worker-2 (total: 5)\n"
+            "(Showing pods with ≥5 restarts, last 20)\n"
+        ),
+        "image_pull_backoff": (
+            "NAMESPACE  NAME                 RESTARTS  STATUS    NODE\n"
+            "(No pods with ≥5 restarts — ImagePullBackOff, no crashes)\n"
+        ),
     }
     return restart_map.get(scenario, restart_map["normal"])
 
@@ -905,7 +1478,7 @@ def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
 def get_system_pods(cluster_name: str) -> str:
     """Get all system pods in kube-system namespace."""
     _ = cluster_name
-    scenario = _active_scenario
+    scenario = get_active_scenario()
     system_pods: dict[str, str] = {
         "normal": (
             "NAMESPACE     NAME                              READY   STATUS    RESTARTS   AGE\n"
@@ -927,6 +1500,18 @@ def get_system_pods(cluster_name: str) -> str:
             "kube-system   kube-controller-manager-master-1    1/1     Running     1          30d\n"
             "kube-system   kube-scheduler-master-1             1/1     Running     0          30d\n"
         ),
+        "etcd_quota_near_full": (
+            "NAMESPACE     NAME                              READY   STATUS    RESTARTS   AGE\n"
+            "kube-system   coredns-6d4b-xyz11                 1/1     Running   0          30d (正常)\n"
+            "kube-system   coredns-6d4b-abc99                 1/1     Running   0          30d (正常)\n"
+            "kube-system   etcd-master-1                      1/1     Running   0          30d (NOSPACE alarm!)\n"
+            "kube-system   etcd-master-2                      1/1     Running   0          30d (NOSPACE alarm!)\n"
+            "kube-system   etcd-master-3                      1/1     Running   0          30d (NOSPACE alarm!)\n"
+            "kube-system   kube-apiserver-master-1             1/1     Running   0          30d (写入延迟p99=850ms)\n"
+            "kube-system   kube-controller-manager-master-1    1/1     Running   0          30d\n"
+            "kube-system   kube-scheduler-master-1             1/1     Running   0          30d\n"
+            "kube-system   kube-proxy-lmn99                    1/1     Running   0          30d\n"
+        ),
     }
     return system_pods.get(scenario, system_pods["normal"])
 
@@ -940,14 +1525,14 @@ def get_coredns_logs(cluster_name: str, tail_lines: int = 200,
                      since_minutes: int = 0) -> str:
     """Get logs from all CoreDNS pods in kube-system."""
     _ = cluster_name, tail_lines, since_minutes
-    return _COREDNS_LOGS.get(_active_scenario, _COREDNS_LOGS["normal"])
+    return _COREDNS_LOGS.get(get_active_scenario(), _COREDNS_LOGS["normal"])
 
 
 @tool
 def describe_coredns(cluster_name: str) -> str:
     """Describe CoreDNS deployment and show Corefile ConfigMap in kube-system."""
     _ = cluster_name
-    return _COREDNS_DESCRIBE.get(_active_scenario, _COREDNS_DESCRIBE["normal"])
+    return _COREDNS_DESCRIBE.get(get_active_scenario(), _COREDNS_DESCRIBE["normal"])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -958,7 +1543,7 @@ def describe_coredns(cluster_name: str) -> str:
 def list_helm_releases(cluster_name: str, namespace: str = "") -> str:
     """List all Helm 3 releases by querying release secrets."""
     _ = cluster_name, namespace
-    return _HELM_RELEASES.get(_active_scenario, _HELM_RELEASES["normal"])
+    return _HELM_RELEASES.get(get_active_scenario(), _HELM_RELEASES["normal"])
 
 
 @tool
@@ -966,7 +1551,7 @@ def get_helm_release_history(cluster_name: str, release_name: str,
                               namespace: str = "default", max_revisions: int = 10) -> str:
     """Get revision history of a Helm release."""
     _ = cluster_name, release_name, namespace, max_revisions
-    return _HELM_HISTORY.get(_active_scenario, _HELM_HISTORY["normal"])
+    return _HELM_HISTORY.get(get_active_scenario(), _HELM_HISTORY["normal"])
 
 
 @tool
@@ -974,7 +1559,7 @@ def get_helm_release_values(cluster_name: str, release_name: str,
                              namespace: str = "default", revision: int = 0) -> str:
     """Extract values from a Helm release secret."""
     _ = cluster_name, release_name, namespace, revision
-    return _HELM_VALUES.get(_active_scenario, _HELM_VALUES["normal"])
+    return _HELM_VALUES.get(get_active_scenario(), _HELM_VALUES["normal"])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -985,7 +1570,7 @@ def get_helm_release_values(cluster_name: str, release_name: str,
 def get_etcd_status(cluster_name: str) -> str:
     """Get etcd cluster status: pod health, member list, leader info."""
     _ = cluster_name
-    return _ETCD_STATUS.get(_active_scenario, _ETCD_STATUS["normal"])
+    return _ETCD_STATUS.get(get_active_scenario(), _ETCD_STATUS["normal"])
 
 
 @tool
@@ -993,21 +1578,21 @@ def get_etcd_logs(cluster_name: str, tail_lines: int = 200,
                   since_minutes: int = 0) -> str:
     """Get recent logs from all etcd pods."""
     _ = cluster_name, tail_lines, since_minutes
-    return _ETCD_LOGS.get(_active_scenario, _ETCD_LOGS["normal"])
+    return _ETCD_LOGS.get(get_active_scenario(), _ETCD_LOGS["normal"])
 
 
 @tool
 def check_etcd_health(cluster_name: str) -> str:
     """Check etcd endpoint health, alarm list, and Raft leader changes."""
     _ = cluster_name
-    return _ETCD_HEALTH.get(_active_scenario, _ETCD_HEALTH["normal"])
+    return _ETCD_HEALTH.get(get_active_scenario(), _ETCD_HEALTH["normal"])
 
 
 @tool
 def get_etcd_metrics(cluster_name: str) -> str:
     """Get key etcd metrics: disk backend commit duration, Raft proposals, WAL fsync."""
     _ = cluster_name
-    return _ETCD_METRICS.get(_active_scenario, _ETCD_METRICS["normal"])
+    return _ETCD_METRICS.get(get_active_scenario(), _ETCD_METRICS["normal"])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1019,7 +1604,7 @@ def check_service_endpoints(cluster_name: str, service_name: str,
                             namespace: str = "default") -> str:
     """Check whether a Service has healthy endpoints."""
     _ = cluster_name, service_name, namespace
-    return _SERVICE_ENDPOINTS.get(_active_scenario, _SERVICE_ENDPOINTS["normal"])
+    return _SERVICE_ENDPOINTS.get(get_active_scenario(), _SERVICE_ENDPOINTS["normal"])
 
 
 @tool
@@ -1030,7 +1615,7 @@ def get_configmap(cluster_name: str, configmap_name: str,
     configmaps: dict[str, str] = {
         "normal": f"## ConfigMap: {configmap_name}\napiVersion: v1\nkind: ConfigMap\ndata:\n  config.yaml: |\n    server.port: 8080\n    log.level: info",
     }
-    return configmaps.get(_active_scenario, configmaps["normal"])
+    return configmaps.get(get_active_scenario(), configmaps["normal"])
 
 
 @tool
@@ -1038,7 +1623,7 @@ def list_namespace_resources(cluster_name: str, namespace: str = "default") -> s
     """List all resources in a namespace."""
     _ = cluster_name, namespace
     from diagnostics.tools.mock.data import kubernetes_pods_data
-    pods = kubernetes_pods_data(_active_scenario)
+    pods = kubernetes_pods_data(get_active_scenario())
     return (
         "NAME                                    READY   STATUS             RESTARTS   AGE\n"
         + pods
@@ -1079,14 +1664,14 @@ def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
 def get_network_policies(cluster_name: str, namespace: str = "") -> str:
     """List NetworkPolicies affecting pod-to-pod communication."""
     _ = cluster_name, namespace
-    return _NETWORK_POLICIES.get(_active_scenario, _NETWORK_POLICIES["normal"])
+    return _NETWORK_POLICIES.get(get_active_scenario(), _NETWORK_POLICIES["normal"])
 
 
 @tool
 def check_rbac_permissions(cluster_name: str, namespace: str = "") -> str:
     """List RBAC roles, rolebindings, and clusterroles."""
     _ = cluster_name, namespace
-    return _RBAC.get(_active_scenario, _RBAC["normal"])
+    return _RBAC.get(get_active_scenario(), _RBAC["normal"])
 
 
 @tool
@@ -1131,17 +1716,17 @@ def check_kubernetes_pods(namespace: str = "default") -> str:
     Args:
         namespace: Kubernetes namespace (default: "default")
     """
-    pods = kubernetes_pods_data(_active_scenario)
+    pods = kubernetes_pods_data(get_active_scenario())
     return f"Namespace: {namespace}\n{pods}"
 
 
 @tool
 def check_kubernetes_nodes() -> str:
     """Check Kubernetes node statuses, resource usage, and conditions (MemoryPressure, etc.)."""
-    return kubernetes_nodes_data(_active_scenario)
+    return kubernetes_nodes_data(get_active_scenario())
 
 
 @tool
 def check_kubernetes_control_plane() -> str:
     """Check Kubernetes control plane health: kube-apiserver, etcd, kube-scheduler, kube-controller-manager."""
-    return kubernetes_control_plane_data(_active_scenario)
+    return kubernetes_control_plane_data(get_active_scenario())

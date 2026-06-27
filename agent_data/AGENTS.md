@@ -5,6 +5,28 @@
 - **USE 方法**：针对每种资源按利用率→饱和度→错误顺序检查。
 - **分层诊断**：OS层 → 内核层 → 运行时层 → 集群层 → 应用层，下层问题向上传导。
 
+## Argus 监控协作模型
+
+Coordinator 持有 Argus 监控工具，通过 1min 粒度趋势建立故障画像：
+
+| Argus 工具 | 关注指标 | 异常信号 |
+|-----------|---------|---------|
+| `query_argus_cpu` | CPU%/Load/iowait | 1min 内 CPU 突变 >50% 或 iowait 突变 >30% |
+| `query_argus_memory` | Mem%/Swap/OOM | Swap 持续增长或 OOM 事件 |
+| `query_argus_disk` | Util%/await/IOPS | util >90% 或 await >50ms |
+| `query_argus_network` | 丢包/重传/ESTAB | 丢包和重传在同一分钟暴增 → 独立事件 |
+| `query_argus_kubernetes` | NotReady/PodRestarts/API Lat | 节点失联的精确时间和 Pod 重启数 |
+
+**关键判断**：两指标在同一分钟同时突变 → 可能**独立根因**（非因果），应形成 2 个假设。
+
+## 委派决策速查
+
+| 症状域 | 委派专家 | 典型指令 |
+|--------|---------|---------|
+| CPU/内存/磁盘/网络异常 | `host-expert` | "验证假设H1，使用xx技能检查xx" |
+| Pod/Node/etcd/DNS 异常 | `k8s-expert` | "验证假设H2，检查xx集群状态" |
+| GPU 异常 | `gpu-expert` | "验证假设H3，检查GPU健康/显存" |
+
 ## K8s 组件故障速查
 
 遇到以下 `kubectl` 症状时，优先排查对应组件：
@@ -34,16 +56,18 @@
 
 ## 常见故障模式
 
-### 系统层
-| 症状 | 可能根因 | 优先检查工具 | Skill |
-|------|---------|------------|-------|
-| load avg 高 + CPU util 低 + iowait 高 | 磁盘 IO 瓶颈 | check_cpu, check_disk, check_processes | `disk-io-diagnosis` |
-| 进程 RSS 持续增长 + swap 增加 | 内存泄漏 | check_memory, check_processes | `memory-diagnosis` |
-| 磁盘 util 99% + await 高 + 进程 D 状态 | 存储性能瓶颈 | check_disk, check_cpu | `disk-io-diagnosis` |
+> **注意**：Coordinator 通过 Argus 发现异常后**委派专家**使用以下工具和技能。Coordinator 自身不持有 `check_*` 工具。
+
+### 系统层（委派 host-expert）
+| 症状 | 可能根因 | 专家工具 | Skill |
+|------|---------|---------|-------|
+| load avg 高 + CPU util 低 + iowait 高 | 磁盘 IO 瓶颈 | check_cpu, check_disk | `disk-io-diagnosis` |
+| 进程 RSS 持续增长 + swap 增加 | 内存泄漏 | check_memory | `memory-diagnosis` |
+| 磁盘 util 99% + await 高 + 进程 D 状态 | 存储性能瓶颈 | check_disk | `disk-io-diagnosis` |
 | GPU 显存耗尽 + CUDA OOM | 显存不足或泄漏 | check_gpu_memory, check_gpu_utilization | `gpu-diagnosis` |
 | GPU 温度 >85°C + clock 降低 | 散热不足 | check_gpu_health | `gpu-diagnosis` |
 
-### 网络层
+### 网络层（委派 host-expert）
 | 症状 | 可能根因 | Skill |
 |------|---------|-------|
 | TCP 重传率高 + Send-Q 堆积 | 网络拥塞 | `network-diagnosis` |
@@ -54,16 +78,16 @@
 | `ss -lnt` Recv-Q = Send-Q，连接间歇超时 | TCP accept 队列溢出 | `tcp-listen-overflow` |
 | TCP 重传高但接口无丢包 | 内核参数配置不当 | `kernel-parameter-drops` |
 
-### 容器/K8s 跨层
-| 症状 | 可能根因 | Skill |
-|------|---------|-------|
-| Node NotReady + 资源正常 | gRPC 死连接 (kubelet) | `grpc-connection-leak` |
-| Node NotReady + 磁盘 IO 高 | kubelet lease 超时 | `cross-layer-diagnosis` |
-| Node NotReady + kubelet 被 kill | 系统 OOM | `cross-layer-diagnosis` |
-| Pod 健康但被重启 | CPU 节流→探针超时 | `cross-layer-diagnosis` |
-| Pod 间跨节点通信失败 | ARP 表满 / Conntrack 满 | `arp-cache-diagnosis` / `conntrack-diagnosis` |
+### 容器/K8s 跨层（委派 host-expert 或 k8s-expert）
+| 症状 | 可能根因 | Skill | 专家 |
+|------|---------|-------|------|
+| Node NotReady + 资源正常 | gRPC 死连接 (kubelet) | `grpc-connection-leak` | host-expert |
+| Node NotReady + 磁盘 IO 高 | kubelet lease 超时 | `cross-layer-diagnosis` | host-expert |
+| Node NotReady + kubelet 被 kill | 系统 OOM | `cross-layer-diagnosis` | host-expert |
+| Pod 健康但被重启 | CPU 节流→探针超时 | `cross-layer-diagnosis` | host-expert |
+| Pod 间跨节点通信失败 | ARP 表满 / Conntrack 满 | `arp-cache-diagnosis` / `conntrack-diagnosis` | host-expert |
 
-### K8s 控制面 & 组件
+### K8s 控制面 & 组件（委派 k8s-expert）
 | 症状 | 可能根因 | Skill |
 |------|---------|-------|
 | `kubectl` 超时，`/healthz` 504 | API server OOM 或 CPU 不足 | `control-plane-diagnosis` |

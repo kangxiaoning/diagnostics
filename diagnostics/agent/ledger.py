@@ -76,8 +76,10 @@ def new_ledger() -> DiagnosisLedger:
         current_phase="understand",
         current_round=0,
         rounds=[],
-        root_cause=None,
-        root_cause_hypothesis_id=None,
+        root_cause=None,               # backward-compat: first confirmed root cause
+        root_cause_hypothesis_id=None,  # backward-compat
+        root_causes=[],                # list[str] — all confirmed root causes
+        root_cause_hypothesis_ids=[],  # list[str] — matching hypothesis IDs
         report=None,
         exhausted=False,
         skill_mode=False,
@@ -339,6 +341,19 @@ def add_evidence_to_active(
 
 def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     """Derive the current diagnosis phase from ledger state."""
+    # Multi-root: if some roots are confirmed but others still pending,
+    # stay in evaluate to continue diagnosing remaining symptoms.
+    root_causes = ledger.get("root_causes", [])
+    root_ids = ledger.get("root_hypothesis_ids", [])
+    if root_causes and root_ids:
+        confirmed_ids = set(ledger.get("root_cause_hypothesis_ids", []))
+        hypotheses = ledger.get("hypotheses", {})
+        for hid in root_ids:
+            if hid in confirmed_ids:
+                continue
+            node = hypotheses.get(hid)
+            if node and node.get("status") not in ("refuted", "dead_end"):
+                return "evaluate"  # still has pending root hypotheses
     if ledger.get("root_cause") or ledger.get("report"):
         return "report"
     if ledger.get("exhausted"):
@@ -353,13 +368,17 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
 
 def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     if ledger.get("fault_profile") is None:
-        # Allow only 1 round in understand before forcing hypothesize.
-        # If the LLM has already had a full round to collect data but still
-        # hasn't called commit_hypotheses (fault_profile remains None), force
-        # the phase to hypothesize so it stops re-collecting the same data.
-        if ledger.get("current_round", 0) >= 2:
+        # If hypotheses have already been committed, UNDERSTAND is complete
+        # even if fault_profile wasn't explicitly populated.  Fall through
+        # to regular phase logic based on hypothesis status.
+        if ledger.get("hypotheses"):
+            pass  # fall through — hypotheses exist, derive phase from their status
+        elif ledger.get("current_round", 0) >= 2:
+            # LLM had at least one full round but still hasn't called
+            # commit_hypotheses — force advance to stop re-collecting data.
             return "hypothesize"
-        return "understand"
+        else:
+            return "understand"
 
     hypotheses: dict = ledger["hypotheses"]
     if not hypotheses:
@@ -486,6 +505,15 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
 
 # ── Context rendering (injected into system message each round) ──
 
+# Scaffolding tools that are NOT diagnostic — excluded from history rendering
+_SCAFFOLDING_TOOLS_BUILTIN = frozenset({
+    "write_file", "read_file", "edit_file",
+    "write_todos", "read_todos",
+    "ls", "glob", "grep",
+    "commit_hypotheses", "select_path", "record_finding", "backtrack",
+    "list_diagnostic_capabilities", "get_system_overview",
+})
+
 def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
     """Render a compact, structured summary of the ledger for LLM context."""
     if not ledger:
@@ -528,9 +556,43 @@ def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
             lines.append(f"- {h['id']} {h['statement']}: {reason}")
         lines.append("")
 
-    # Root cause
-    if ledger.get("root_cause"):
+    # Root causes (multi-root support)
+    root_causes: list[str] = ledger.get("root_causes", [])
+    if root_causes:
+        if len(root_causes) == 1:
+            lines.append(f"## 根因: {root_causes[0]}")
+        else:
+            lines.append("## 已确认根因")
+            for i, rc in enumerate(root_causes, 1):
+                lines.append(f"{i}. {rc}")
+        lines.append("")
+    elif ledger.get("root_cause"):
         lines.append(f"## 根因: {ledger['root_cause']}")
+        lines.append("")
+
+    # ── Diagnostic history: tools called per round with key findings ──
+    # Renders a concise timeline so the LLM knows what has been done
+    # and does not re-call tools whose results are already recorded.
+    rounds_data = ledger.get("rounds", [])
+    if rounds_data:
+        lines.append("## 诊断历史 (已调用工具)")
+        # Group by round number
+        round_map: dict[int, list[str]] = {}
+        for rd in rounds_data:
+            rn = rd.get("round", 0)
+            if rn not in round_map:
+                round_map[rn] = []
+            for tc in rd.get("tools_called", []):
+                if tc not in _SCAFFOLDING_TOOLS_BUILTIN and tc != "task":
+                    round_map[rn].append(tc)
+        for rn in sorted(round_map.keys()):
+            tools = round_map[rn]
+            if tools:
+                # Deduplicate within round
+                unique = list(dict.fromkeys(tools))
+                lines.append(f"- 第{rn}轮: {', '.join(unique)}")
+        if any("task" in rd.get("tools_called", []) for rd in rounds_data):
+            lines.append("- (含委派专家调用)")
         lines.append("")
 
     # Current step guidance
@@ -564,7 +626,7 @@ def _render_hypothesis_tree(
         # Evidence
         for ev in node["evidence"]:
             support_tag = "支持" if ev["supports"] else "反驳"
-            lines.append(f"{prefix}  证据: {ev['summary'][:150]} ({support_tag})")
+            lines.append(f"{prefix}  证据: {ev['summary']} ({support_tag})")
         # Verification tools
         if node["verification_tools"]:
             lines.append(f"{prefix}  已验证工具: {', '.join(node['verification_tools'])}")
@@ -582,8 +644,15 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
         return (
             "你当前处于 UNDERSTAND 阶段。\n"
             "- 从用户输入提取故障画像（实体、症状、时间线、变更、已尝试操作）\n"
-            "- 调用 get_system_overview() 建立基线，可补充1~2个最相关检查\n"
+            "- 根据症状选择 Argus 模块并行查询：\n"
+            "  CPU/负载 → query_argus_cpu()\n"
+            "  内存/OOM → query_argus_memory()\n"
+            "  磁盘IO → query_argus_disk()\n"
+            "  网络丢包/DNS → query_argus_network()\n"
+            "  K8s → query_argus_kubernetes()\n"
+            "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
             "- 可 read_file 读取实体 HISTORY.md 关联历史\n"
+            "- ⚠ 查看上方「诊断历史」，禁止重复调用已执行过的工具\n"
             "- 完成后必须调用 commit_hypotheses 提交初始假设"
         )
     if phase == "hypothesize":
@@ -607,12 +676,22 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
         stmt = active.get("statement", "?")
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {active_id}: {stmt}\n"
-            "- 调用验证该假设所需的最少工具（通常1~3个）\n"
-            "- 专家委派(task)时在指令中明确\"验证假设{active_id}\"并传入假设上下文\n"
+            "- 主机假设 → task(\"host-expert\", ...) 委派验证\n"
+            "- K8s 假设 → task(\"k8s-expert\", ...) 委派验证\n"
+            "- GPU 假设 → task(\"gpu-expert\", ...) 委派验证\n"
+            "- 委派时明确\"验证假设{active_id}\"并传入假设上下文\n"
             "- 收到结果后必须调用 record_finding 记录结论\n"
+            "- ⚠ 查看上方「诊断历史」和假设的「证据」字段，禁止重复调用已有结果的工具\n"
             "- 禁止调用与当前假设无关的工具"
         )
     if phase == "evaluate":
+        pending_hint = ""
+        root_cause_hyp_ids = ledger.get("root_cause_hypothesis_ids", [])
+        root_ids = ledger.get("root_hypothesis_ids", [])
+        pending = [h for h in root_ids if h not in root_cause_hyp_ids
+                   and ledger["hypotheses"].get(h, {}).get("status") not in ("refuted", "dead_end")]
+        if root_cause_hyp_ids and pending:
+            pending_hint = f"\n- ⚠ 仍有待验证的假设: {', '.join(pending)}，使用 select_path 切换验证"
         return (
             "你当前处于 EVALUATE 阶段。\n"
             "- 评估本层所有假设的验证结果\n"
@@ -620,6 +699,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "- 若根因已确认(p≥80%且足够具体) → 进入 REPORT\n"
             "- 若需深化 → 在 confirmed 假设下 HYPOTHESIZE\n"
             "- 若全部 refuted → 评估是否回溯"
+            + pending_hint
         )
     if phase == "skill_verify":
         skill_ids = ledger.get("skill_ids", [])
@@ -637,11 +717,17 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "- 调用 select_path 选择回溯目标"
         )
     if phase == "report":
+        n_causes = len(ledger.get("root_causes", []))
+        multi_hint = (
+            f"\n- 已确认 {n_causes} 个根因，报告中需分别列出每个根因的证据链和修复建议"
+            if n_causes > 1 else ""
+        )
         return (
             "你当前处于 REPORT 阶段。\n"
             "- 基于诊断台账生成报告（台账即证据链）\n"
-            "- 报告必须包含: 根因、证据链、排除的假设及排除原因\n"
-            f"- 使用 write_file 将报告写入 {{report_path}}\n"
+            "- 报告必须包含: 根因（如有多个，按条目分别列出）、证据链、排除的假设及排除原因"
+            + multi_hint +
+            f"\n- 使用 write_file 将报告写入 {{report_path}}\n"
             f"- 使用 write_file 将台账写入 {{ledger_path}}（JSON格式）"
         )
     return ""
@@ -689,30 +775,62 @@ def record_round(
 
 # ── Exit condition checking ──
 
-def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str]:
+def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | None]:
     """Check if diagnosis should exit to REPORT.
 
-    Returns (should_exit, reason). This is advisory — the LLM in EVALUATE
-    phase makes the final decision. Called after record_finding to hint
-    the LLM that a REPORT transition may be appropriate.
+    Returns (should_exit, reason, confirmed_hypothesis_id).
+    Multi-root-cause: exits only when ALL root hypotheses have reached a
+    terminal state AND at least one is confirmed.  If some are confirmed
+    but others are still pending/verifying, the LLM is encouraged to
+    continue diagnosing the remaining symptoms.
     """
     hypotheses: dict = ledger["hypotheses"]
     if not hypotheses:
-        return False, ""
+        return False, "", None
 
+    root_ids: list[str] = ledger.get("root_hypothesis_ids", [])
+
+    # ── Multi-root: assess each root hypothesis independently ──
+    if root_ids:
+        pending_ids: list[str] = []
+        confirmed_ids: list[str] = []
+        for hid in root_ids:
+            node = hypotheses.get(hid)
+            if not node:
+                continue
+            if node["status"] == "confirmed" and node["probability"] >= 80:
+                confirmed_ids.append(hid)
+            elif node["status"] in ("pending", "verifying"):
+                pending_ids.append(hid)
+
+        if confirmed_ids and pending_ids:
+            # Some roots confirmed, others still pending → continue
+            return False, (
+                f"部分根因已确认: {', '.join(confirmed_ids)}"
+                f"，仍需验证: {', '.join(pending_ids)}"
+            ), confirmed_ids[0]
+
+        if confirmed_ids and not pending_ids:
+            # All roots resolved, at least one confirmed → exit
+            best = hypotheses[confirmed_ids[0]]
+            return True, (
+                f"根因确认: {best['id']} {best['statement']}"
+                f" (p={best['probability']}%)"
+            ), confirmed_ids[0]
+
+    # ── Single-root / legacy: first confirmed hypothesis triggers exit ──
     # Condition 1: Root cause confirmed — a confirmed hypothesis with p>=80%
     # that either has no sub-hypotheses (leaf) or has confirmed sub-hypotheses.
     for node in hypotheses.values():
         if node["status"] != "confirmed" or node["probability"] < 80:
             continue
         if not node["sub_hypothesis_ids"]:
-            # Leaf confirmed node — suggest exit (LLM may still choose to deepen)
-            return True, f"根因确认: {node['id']} {node['statement']} (p={node['probability']}%)"
+            return True, f"根因确认: {node['id']} {node['statement']} (p={node['probability']}%)", node["id"]
         # Has sub-hypotheses — check if any sub is confirmed
         for sid in node["sub_hypothesis_ids"]:
             sub = hypotheses[sid]
             if sub["status"] == "confirmed" and not sub["sub_hypothesis_ids"]:
-                return True, f"根因确认: {sub['id']} {sub['statement']} (p={sub['probability']}%)"
+                return True, f"根因确认: {sub['id']} {sub['statement']} (p={sub['probability']}%)", sub["id"]
 
     # Condition 2: All hypotheses exhausted
     all_terminal = all(
@@ -722,10 +840,10 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str]:
     if all_terminal and not _can_backtrack(ledger):
         confirmed = [h for h in hypotheses.values() if h["status"] == "confirmed"]
         if not confirmed:
-            return True, "假设穷尽: 所有假设已验证但未确认根因"
+            return True, "假设穷尽: 所有假设已验证但未确认根因", None
 
     # Condition 3: Evidence saturated (3+ consecutive inconclusive)
     if ledger.get("_inconclusive_streak", 0) >= 3:
-        return True, "证据饱和: 连续3次验证结果不明确"
+        return True, "证据饱和: 连续3次验证结果不明确", None
 
-    return False, ""
+    return False, "", None

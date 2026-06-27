@@ -168,8 +168,7 @@ class TraceWriter:
         for idx in list(self._tool_result_slots):
             old = self._tool_result_slots[idx]
             if old[1].startswith("> ⏳"):
-                self._lines[idx + 1] = ""
-                self._lines[idx + 2] = "> (无输出)"
+                self._lines[idx + 1] = "> (无输出)"
                 self._tool_result_slots.pop(idx, None)
         duration = (datetime.now(timezone.utc) - self._started_at).total_seconds()
         self._lines.insert(1, f"**耗时**: {duration:.1f}s\n")

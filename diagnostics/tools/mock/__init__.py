@@ -9,6 +9,6 @@ Directory:
     registry.py    — Tool aggregation for agent injection
 """
 
-from diagnostics.tools.mock.registry import get_k8s_mock_tools, get_mock_tools
+from diagnostics.tools.mock.registry import get_coordinator_mock_tools, get_k8s_mock_tools, get_mock_tools
 
-__all__ = ["get_mock_tools", "get_k8s_mock_tools"]
+__all__ = ["get_coordinator_mock_tools", "get_mock_tools", "get_k8s_mock_tools"]

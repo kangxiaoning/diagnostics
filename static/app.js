@@ -981,6 +981,17 @@ function onStructuredResponse(payload) {
     const html = parts.join('\n\n');
     activeAnswerBody.innerHTML = renderMarkdown(html);
   }
+
+  // Update ledger root_cause from structured response (authoritative final conclusion).
+  // The ledger's root_cause was snapshotted when the first hypothesis was confirmed,
+  // but the LLM may reach a different conclusion after full REPORT-phase analysis.
+  if (payload.root_cause && currentLedger && currentLedger.root_cause !== payload.root_cause) {
+    console.log(`[DIAG] structured_response root_cause updated: "${(currentLedger.root_cause||'').substring(0,40)}..." -> "${payload.root_cause.substring(0,40)}..."`);
+    currentLedger.root_cause = payload.root_cause;
+    // Re-render hypothesis banner to show the corrected root cause.
+    // renderHypothesisTree does incremental DOM diff, so only the banner updates.
+    renderHypothesisTree(currentLedger);
+  }
 }
 
 // ═══════════════════ Tree Snapshot Handler ═══════════════════
@@ -1106,7 +1117,11 @@ function onTreeDelta(payload) {
       // full tree_snapshot.
       if (!alreadyExists) {
         for (const pid of parentIds) {
-          if (pid) GRAPH.edges.push({ from: pid, to: step.id });
+          if (pid) {
+            GRAPH.edges.push({ from: pid, to: step.id });
+            const pNode = GRAPH.nodes.get(pid);
+            console.log(`[DIAG] edge registered: ${pid}("${pNode?.title||'?'}" el=${pNode?.el?'set':'null'} h=${pNode?.el?pNode.el.getBoundingClientRect().height.toFixed(1):'N/A'}) -> ${step.id}("${step.title}")`);
+          }
         }
       }
       structureChanged = true;
@@ -1172,6 +1187,7 @@ function _scheduleEdgeSafetyNet() {
   clearTimeout(_edgeSafetyTimer);
   _edgeSafetyTimer = setTimeout(() => {
     if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
+      console.log(`[DIAG] 300ms safety-net fired, calling drawAllEdges`);
       drawAllEdges();
     }
   }, 300);
@@ -1181,38 +1197,52 @@ function _scheduleEdgeSafetyNet() {
 // Uses double-rAF to ensure the browser has fully laid out ALL new DOM
 // nodes (not just the sentinel) before computing edge coordinates.
 function _watchReflowThenDraw(sentinelEl) {
+  const sentinelId = sentinelEl?.dataset?.nodeId || 'null';
   // Disconnect any previous observer first.
   if (_edgeReflowObserver) {
+    console.log(`[DIAG] _watchReflowThenDraw disconnecting previous observer (new sentinel=${sentinelId})`);
     _edgeReflowObserver.disconnect();
     _edgeReflowObserver = null;
   }
-  if (!sentinelEl) return;
+  if (!sentinelEl) {
+    console.log(`[DIAG] _watchReflowThenDraw sentinelEl is null — only safety-net will draw`);
+    return;
+  }
 
+  const initialH = sentinelEl.getBoundingClientRect().height;
+  console.log(`[DIAG] _watchReflowThenDraw sentinel=${sentinelId} initialHeight=${initialH.toFixed(1)}`);
   // If already has height, wait two rAFs:
   //   rAF-1: browser computes layout for all nodes
   //   rAF-2: layout is stable, draw edges with correct coordinates
-  if (sentinelEl.getBoundingClientRect().height > 0) {
+  if (initialH > 0) {
+    console.log(`[DIAG] _watchReflowThenDraw sentinel already has height, scheduling double-rAF`);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         clearTimeout(_edgeSafetyTimer);
+        console.log(`[DIAG] double-rAF fired, calling drawAllEdges (sentinel=${sentinelId})`);
         drawAllEdges();
       });
     });
     return;
   }
 
+  console.log(`[DIAG] _watchReflowThenDraw sentinel height=0, setting up ResizeObserver`);
   _edgeReflowObserver = new ResizeObserver((entries, obs) => {
     for (const entry of entries) {
       const h = entry.contentRect ? entry.contentRect.height
                                   : entry.target.getBoundingClientRect().height;
       if (h > 0) {
+        console.log(`[DIAG] ResizeObserver fired h=${h.toFixed(1)} (sentinel=${sentinelId})`);
         obs.disconnect();
         _edgeReflowObserver = null;
         clearTimeout(_edgeSafetyTimer); // cancel safety-net — not needed
         // Double rAF: first frame lets sibling/ancestor layout settle,
         // second frame ensures all coordinates are stable.
         requestAnimationFrame(() => {
-          requestAnimationFrame(() => drawAllEdges());
+          requestAnimationFrame(() => {
+            console.log(`[DIAG] ResizeObserver double-rAF fired, calling drawAllEdges (sentinel=${sentinelId})`);
+            drawAllEdges();
+          });
         });
         return;
       }
@@ -1260,6 +1290,17 @@ function renderTree() {
 
   graphNodes.appendChild(container);
 
+  // ── Diagnostic: snapshot all node.el states right after DOM mount ──
+  if (GRAPH.edges.length > 0) {
+    const elStates = [];
+    for (const edge of GRAPH.edges) {
+      const fn = GRAPH.nodes.get(edge.from);
+      const tn = GRAPH.nodes.get(edge.to);
+      elStates.push(`${edge.from}("${fn?.title||'?'}" el=${fn?.el?'set':'null'} h=${fn?.el?fn.el.getBoundingClientRect().height.toFixed(1):'N/A'}) -> ${edge.to}("${tn?.title||'?'}" el=${tn?.el?'set':'null'} h=${tn?.el?tn.el.getBoundingClientRect().height.toFixed(1):'N/A'})`);
+    }
+    console.log(`[DIAG] renderTree DOM mounted, lastEl=${lastEl?.dataset?.nodeId||'null'} edges=${GRAPH.edges.length} document.hidden=${document.hidden}`, elStates);
+  }
+
   // Use ResizeObserver on the last node to detect reflow completion.
   // Safety-net (300ms) fires if ResizeObserver never reports height > 0.
   _scheduleEdgeSafetyNet();
@@ -1271,6 +1312,7 @@ function renderTree() {
   clearTimeout(_edgePostPaintTimer);
   _edgePostPaintTimer = setTimeout(() => {
     if (GRAPH.nodes.size > 0 && GRAPH.edges.length > 0) {
+      console.log(`[DIAG] 150ms post-paint timer fired, calling drawAllEdges`);
       drawAllEdges();
     }
   }, 150);
@@ -1285,7 +1327,10 @@ function renderTree() {
   // be cleared.  The async safety-nets above handle the visibility-change
   // redraw correctly.
   if (!document.hidden && GRAPH.edges.length > 0) {
+    console.log(`[DIAG] renderTree sync drawAllEdges (document.hidden=${document.hidden})`);
     drawAllEdges();
+  } else if (document.hidden) {
+    console.log(`[DIAG] renderTree skipping sync drawAllEdges — document is hidden`);
   }
 
   // Only auto-scroll if user hasn't scrolled up manually
@@ -1444,7 +1489,7 @@ function drawAllEdges() {
     const toNode = GRAPH.nodes.get(edge.to);
     if (!fromNode || !toNode) continue;
     if (!fromNode.el || !toNode.el) {
-      skippedNoEl.push(`${edge.from}->${edge.to}(fromEl=${!!fromNode?.el},toEl=${!!toNode?.el})`);
+      skippedNoEl.push(`${edge.from}("${fromNode?.title||'?'}")->${edge.to}("${toNode?.title||'?'}")(fromEl=${!!fromNode?.el},toEl=${!!toNode?.el})`);
       continue;
     }
 
@@ -1457,7 +1502,7 @@ function drawAllEdges() {
     // Re-watch the zero-height node so drawAllEdges retries immediately
     // once that node's reflow completes (instead of waiting 300ms).
     if (fromRect.height === 0 || toRect.height === 0) {
-      skippedZeroH.push(`${edge.from}(h=${fromRect.height.toFixed(1)})->${edge.to}(h=${toRect.height.toFixed(1)})`);
+      skippedZeroH.push(`${edge.from}("${fromNode.title}" h=${fromRect.height.toFixed(1)})->${edge.to}("${toNode.title}" h=${toRect.height.toFixed(1)})`);
       const zeroEl = fromRect.height === 0 ? fromNode.el : toNode.el;
       _watchReflowThenDraw(zeroEl);
       continue;
@@ -1947,7 +1992,13 @@ function renderHypothesisTree(ledger) {
   if (activePath.length > 0) {
     bannerHtml += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
   }
-  if (ledger.root_cause) {
+  const rootCauses = ledger.root_causes || [];
+  if (rootCauses.length > 1) {
+    bannerHtml += `<br>🎯 根因:`;
+    rootCauses.forEach((rc, i) => {
+      bannerHtml += `<br>&nbsp;&nbsp;${i+1}. <strong>${esc(rc)}</strong>`;
+    });
+  } else if (ledger.root_cause) {
     bannerHtml += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
   }
   bannerHtml += `</div>`;
@@ -2258,7 +2309,13 @@ function _renderHistoryHypothesis(ledger) {
   if (activePath.length > 0) {
     bannerHtml += ` · 活动路径: <strong>${esc(activePath.join(" → "))}</strong>`;
   }
-  if (ledger.root_cause) {
+  const rootCauses = ledger.root_causes || [];
+  if (rootCauses.length > 1) {
+    bannerHtml += `<br>🎯 根因:`;
+    rootCauses.forEach((rc, i) => {
+      bannerHtml += `<br>&nbsp;&nbsp;${i+1}. <strong>${esc(rc)}</strong>`;
+    });
+  } else if (ledger.root_cause) {
     bannerHtml += `<br>🎯 根因: <strong>${esc(ledger.root_cause)}</strong>`;
   }
   bannerHtml += `</div>`;

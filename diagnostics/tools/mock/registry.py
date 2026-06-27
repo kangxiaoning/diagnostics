@@ -3,14 +3,15 @@
 from collections.abc import Sequence
 from typing import Any
 
+from diagnostics.tools.mock.argus import (
+    query_argus_cpu,
+    query_argus_disk,
+    query_argus_kubernetes,
+    query_argus_memory,
+    query_argus_network,
+)
 from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
 from diagnostics.tools.mock.hosts import (
-    check_cpu,
-    check_disk,
-    check_memory,
-    check_network,
-    check_processes,
-    get_system_overview,
     list_diagnostic_capabilities,
 )
 from diagnostics.tools.mock.kubernetes import (
@@ -54,15 +55,8 @@ from diagnostics.tools.mock.kubernetes import (
 
 
 def get_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
-    """Return all mock diagnostic tools (scenario-driven)."""
+    """Return all mock diagnostic tools (scenario-driven — legacy, use get_coordinator_mock_tools)."""
     return [
-        # ── Host-level diagnostics ──
-        get_system_overview,
-        check_cpu,
-        check_memory,
-        check_disk,
-        check_network,
-        check_processes,
         # ── GPU diagnostics ──
         check_gpu_health,
         check_gpu_memory,
@@ -104,6 +98,31 @@ def get_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         list_namespace_resources,
         get_pv_pvc_status,
         get_ingress_status,
+        # ── Meta ──
+        list_diagnostic_capabilities,
+        *extra_tools,
+    ]
+
+
+def get_coordinator_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
+    """Return Coordinator-only tools — Argus monitoring + GPU + meta.
+
+    Coordinator uses Argus for situational awareness (1min trends across
+    CPU/memory/disk/network/K8s).  Deep diagnostic tools (check_cpu etc.)
+    are EXCLUSIVELY available to experts.  K8s tools are exclusively available
+    to k8s-expert.
+    """
+    return [
+        # ── Argus monitoring (PRIMARY — 1min trends) ──
+        query_argus_cpu,
+        query_argus_memory,
+        query_argus_disk,
+        query_argus_network,
+        query_argus_kubernetes,
+        # ── GPU diagnostics ──
+        check_gpu_health,
+        check_gpu_memory,
+        check_gpu_utilization,
         # ── Meta ──
         list_diagnostic_capabilities,
         *extra_tools,

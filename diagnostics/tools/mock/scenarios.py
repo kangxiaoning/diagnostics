@@ -85,6 +85,73 @@ AVAILABLE_SCENARIOS: dict[str, Scenario] = {
         "multi_layer_cascading", "多层叠加故障(etcd磁盘+节点OOM+应用OOM+DNS)",
         "etcd磁盘IO饱和→API Server变慢；worker节点OOM杀kubelet→NotReady；Pod limit不足OOMKilled；CoreDNS单副本DNS间歇超时",
     ),
+    # ═══ Multi-root-cause (independent simultaneous failures) ═══
+    "stress_cpu_and_tc_loss": Scenario(
+        "stress_cpu_and_tc_loss", "双根因：stress进程CPU高 + tc策略丢包",
+        "stress-ng占用全部CPU导致服务响应超时；同时tc qdisc netem丢包5%导致API调用间歇失败。两个故障独立但症状叠加",
+    ),
+    "conntrack_and_oom": Scenario(
+        "conntrack_and_oom", "双根因：conntrack表满 + Java内存泄漏OOM",
+        "nf_conntrack表满导致Pod网络丢包和DNS超时；同时Java应用bytedance堆外内存泄漏触发OOMKilled。网络症状和OOM症状同时出现",
+    ),
+    "disk_io_and_dns": Scenario(
+        "disk_io_and_dns", "双根因：磁盘IO饱和 + CoreDNS配置错误",
+        "日志rotate引起磁盘IO飙升导致服务写日志阻塞；同时CoreDNS forward配置指向已下线的上游DNS导致解析超时。延迟和DNS失败双重症状",
+    ),
+    # ═══ Additional scenarios: K8s ═══
+    "coredns_cache_poison": Scenario(
+        "coredns_cache_poison", "CoreDNS缓存污染→服务路由到错误IP",
+        "CoreDNS缓存被错误DNS响应污染，应用解析到错误IP地址，部分请求路由到旧端点失败",
+    ),
+    "etcd_quorum_loss": Scenario(
+        "etcd_quorum_loss", "etcd多数派丢失→API Server只读",
+        "etcd集群中2/3节点磁盘延迟导致leader选举失败，API Server降级为只读模式",
+    ),
+    "image_pull_backoff": Scenario(
+        "image_pull_backoff", "容器镜像拉取失败→Pod启动失败",
+        "Docker Hub速率限制触发ImagePullBackOff，新Pod无法启动，已有Pod正常运行",
+    ),
+    "disk_full_var_log": Scenario(
+        "disk_full_var_log", "磁盘空间耗尽→容器运行时崩溃",
+        "/var/log 分区被日志写满导致容器运行时无法创建新容器，现有容器逐步失联",
+    ),
+    "oom_score_misconfig": Scenario(
+        "oom_score_misconfig", "OOM Score配置错误→误杀kubelet",
+        "kubelet的oom_score_adj配置不当在内存压力下被OOM Killer终止，节点NotReady",
+    ),
+    "fs_inode_exhaustion": Scenario(
+        "fs_inode_exhaustion", "Inode耗尽→写操作失败",
+        "小文件过多导致inode耗尽，df显示磁盘有空间但touch创建文件失败，服务日志写入异常",
+    ),
+    # ═══ Additional scenarios: Host ═══
+    "systemd_limit_nofile": Scenario(
+        "systemd_limit_nofile", "systemd文件描述符限制→连接失败",
+        "systemd隐式地将LimitNOFILE从高值截断到65536，高并发服务连接池耗尽后新连接失败",
+    ),
+    "ebpf_probe_overhead": Scenario(
+        "ebpf_probe_overhead", "eBPF监控开销→CPU飙升",
+        "eBPF探针在特定内核路径触发过量事件导致CPU sys%飙升，应用响应延迟增加",
+    ),
+    "swap_thrashing": Scenario(
+        "swap_thrashing", "Swap抖动→系统全面降速",
+        "内存压力导致频繁swap换入换出，iowait高同时mem利用率高，所有进程响应严重延迟",
+    ),
+    # ═══ Additional scenarios: Dual root cause ═══
+    "memory_leak_and_disk_full": Scenario(
+        "memory_leak_and_disk_full", "双根因：内存泄漏 + 磁盘空间耗尽",
+        "Java进程内存泄漏导致频繁GC，同时日志未rotate写满磁盘，应用OOMKilled且无法写日志",
+    ),
+    "dns_and_etcd": Scenario(
+        "dns_and_etcd", "双根因：CoreDNS CrashLoop + etcd leader频繁切换",
+        "CoreDNS因资源配置不足CrashLoopBackOff导致DNS解析失败，etcd leader因磁盘抖动频繁切换导致API Server慢",
+    ),
+    # ═══ etcd quota near full — control plane bottleneck ═══
+    "etcd_quota_near_full": Scenario(
+        "etcd_quota_near_full", "etcd配额接近上限→API写延迟→应用故障",
+        "etcd数据库接近8GB配额上限，compaction无法释放足够空间，API Server写入延迟p99=850ms，"
+        "导致api-gateway探针超时CrashLoopBackOff，CoreDNS查询service时也因etcd超时而间歇DNS失败，"
+        "但所有节点和Pod资源正常，非OOM/CPU/网络问题",
+    ),
 }
 
 _active_scenario: str = "normal"
