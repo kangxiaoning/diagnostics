@@ -9,5 +9,7 @@ log/*
 agent_data/skills.db
 agent_data/reports/
 agent_data/traces/
-MILESTONES.md
-SYSTEM_DESIGN.md
+
+# Design docs & test cases — not version controlled
+private/
+test_cases/
