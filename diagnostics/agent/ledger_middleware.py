@@ -70,6 +70,7 @@ _MAX_ROUNDS = 20                    # Hard limit: force REPORT after this many L
 _STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding → stagnation
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
+_REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -389,18 +390,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             combined_block = f"{combined_block}\n\n{safety_block}" if combined_block else safety_block
 
         # ── Timeout protection: prevent single LLM call from hanging forever ──
+        # REPORT phase generates a long markdown report — use a longer timeout.
         _call_request = request.override(system_message=append_to_system_message(
             request.system_message, combined_block)) if combined_block else request
+        _effective_timeout = (
+            _REPORT_PHASE_TIMEOUT
+            if ledger.get("current_phase") == "report"
+            else _MODEL_CALL_TIMEOUT
+        )
         try:
             response = await asyncio.wait_for(
                 handler(_call_request),
-                timeout=_MODEL_CALL_TIMEOUT,
+                timeout=_effective_timeout,
             )
         except asyncio.TimeoutError:
             logger.error(
                 "Model call timed out after %ds (round %d, phase=%s). "
                 "Forcing REPORT phase.",
-                _MODEL_CALL_TIMEOUT,
+                _effective_timeout,
                 self._model_call_count,
                 ledger.get("current_phase", "?"),
             )
@@ -411,7 +418,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             from langchain_core.messages import AIMessage
             error_msg = AIMessage(
                 content=(
-                    f"[系统超时] 模型调用超过 {_MODEL_CALL_TIMEOUT} 秒限制。"
+                    f"[系统超时] 模型调用超过 {_effective_timeout} 秒限制。"
                     "已强制进入 REPORT 阶段。请基于已有证据立即生成诊断报告。"
                 ),
             )
@@ -580,21 +587,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     except Exception:
                         pass
 
-                # Auto-finalize any hypotheses still in "verifying" state
+                # Auto-finalize any hypotheses still in non-terminal state
                 # when the report is written.  The LLM may have skipped
                 # record_finding for indirectly refuted hypotheses (e.g.
                 # H2 verification data also disproves H3, but the LLM
                 # jumps directly to REPORT without calling record_finding
-                # on the indirectly refuted hypothesis).
+                # on the indirectly refuted hypothesis).  Similarly,
+                # low-probability hypotheses may remain "pending" if
+                # the LLM confirmed a high-confidence root cause and
+                # proceeded directly to report generation.
                 if ledger:
                     hypotheses = ledger.get("hypotheses", {})
                     finalized_any = False
                     for hid, node in hypotheses.items():
-                        if node.get("status") == "verifying":
+                        status = node.get("status")
+                        if status == "verifying":
                             record_finding(
                                 ledger, hid, "refuted",
                                 "诊断报告已生成，该假设在验证其他假设时被间接证据证伪，系统自动终结。",
                                 5,
+                            )
+                            finalized_any = True
+                        elif status == "pending":
+                            record_finding(
+                                ledger, hid, "refuted",
+                                "诊断报告已生成，核心假设已确认，该假设未被验证，系统自动关闭。",
+                                node.get("probability", 5),
                             )
                             finalized_any = True
                     if finalized_any:
