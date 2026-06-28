@@ -523,6 +523,7 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "ls", "glob", "grep",
     "commit_hypotheses", "select_path", "record_finding", "backtrack",
     "list_diagnostic_capabilities", "get_system_overview",
+    "FaultProfileSchema",  # structured output extraction, not a diagnostic tool
 })
 
 def render_ledger_context(ledger: DiagnosisLedger | None) -> str:

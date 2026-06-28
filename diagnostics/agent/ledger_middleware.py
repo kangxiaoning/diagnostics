@@ -58,6 +58,7 @@ _SCAFFOLDING_TOOLS = frozenset({
     "write_file", "read_file", "edit_file",
     "write_todos", "read_todos",
     "ls", "glob", "grep",
+    "FaultProfileSchema",  # structured output extraction, not a diagnostic tool
 })
 
 # Ledger management tools (handled by this middleware)
