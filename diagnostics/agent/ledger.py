@@ -363,8 +363,20 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
             if hid in confirmed_ids:
                 continue
             node = hypotheses.get(hid)
-            if node and node.get("status") not in ("refuted", "dead_end"):
-                return "evaluate"  # still has pending root hypotheses
+            if not node:
+                continue
+            status = node.get("status")
+            # deprioritized is a terminal state — the LLM chose to focus
+            # on a higher-priority path and should not be blocked by it.
+            if status in ("refuted", "dead_end", "deprioritized"):
+                continue
+            # Low-probability pending hypotheses (p ≤ 15%) should not
+            # block the transition to REPORT — they are unlikely to be
+            # the root cause and spending rounds verifying them yields
+            # diminishing returns.
+            if status == "pending" and node.get("probability", 0) <= 15:
+                continue
+            return "evaluate"  # still has actionable root hypotheses
     if ledger.get("root_cause") or ledger.get("report"):
         return "report"
     if ledger.get("exhausted"):
@@ -821,7 +833,11 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             if node["status"] == "confirmed" and node["probability"] >= 80:
                 confirmed_ids.append(hid)
             elif node["status"] in ("pending", "verifying"):
-                pending_ids.append(hid)
+                # Low-probability pending hypotheses (p ≤ 15%) do not
+                # block exit — they are unlikely root causes and the
+                # LLM should synthesize a report with confirmed causes.
+                if node.get("probability", 0) > 15:
+                    pending_ids.append(hid)
 
         if confirmed_ids and pending_ids:
             # Some roots confirmed, others still pending → continue

@@ -478,26 +478,32 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 state.done_tools.add(tc_id)
                 output = _extract_text(message)
                 info = state.active_tools.pop(tc_id, None)
-                if info:
+                # Skip orphaned tool_end events — the corresponding
+                # tool_start was filtered out (e.g. FaultProfileSchema
+                # pseudo-tool from abefore_agent structured output).
+                if info is None:
+                    logger.debug("[round=%d] Skipping orphaned ToolMessage (no tool_start): %s",
+                                 state.round_number, tc_id)
+                else:
                     logger.info("[round=%d] Tool done: %s", state.round_number, info["label"])
-                events.append(AgentEvent("tool_end", {
-                    "id": tc_id,
-                    "name": info["name"] if info else "unknown",
-                    "label": info["label"] if info else "工具调用",
-                    "path": info["path"] if info else path,
-                    "output": output[:2000],
-                    "output_full": output,
-                    "round": state.round_number,
-                }))
-                # Emit tool result summary to the current round's think section
-                label = info["label"] if info else "工具调用"
-                summary = _summarize_output(output)
-                events.append(AgentEvent("text_delta", {
-                    "text": f"\n📊 **{label}**: {summary}",
-                    "path": path,
-                    "round": state.round_number,
-                    "phase": "thinking",
-                }))
+                    events.append(AgentEvent("tool_end", {
+                        "id": tc_id,
+                        "name": info["name"],
+                        "label": info["label"],
+                        "path": info["path"],
+                        "output": output[:2000],
+                        "output_full": output,
+                        "round": state.round_number,
+                    }))
+                    # Emit tool result summary to the current round's think section
+                    label = info["label"]
+                    summary = _summarize_output(output)
+                    events.append(AgentEvent("text_delta", {
+                        "text": f"\n📊 **{label}**: {summary}",
+                        "path": path,
+                        "round": state.round_number,
+                        "phase": "thinking",
+                    }))
 
     elif mode == "updates":
         if isinstance(data, dict):
@@ -512,18 +518,22 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 state.done_tools.add(tc_id)
                                 output = _extract_text(last)
                                 info = state.active_tools.pop(tc_id, None)
-                                if info:
+                                # Skip orphaned tool_end (e.g. FaultProfileSchema)
+                                if info is None:
+                                    logger.debug("[round=%d] Skipping orphaned ToolMessage (updates): %s",
+                                                 state.round_number, tc_id)
+                                else:
                                     logger.info("[round=%d] Tool done (updates): %s",
                                                 state.round_number, info["label"])
-                                events.append(AgentEvent("tool_end", {
-                                    "id": tc_id,
-                                    "name": info["name"] if info else "unknown",
-                                    "label": info["label"] if info else "工具调用",
-                                    "path": info["path"] if info else path,
-                                    "output": output[:2000],
-                                    "output_full": output,
-                                    "round": state.round_number,
-                                }))
+                                    events.append(AgentEvent("tool_end", {
+                                        "id": tc_id,
+                                        "name": info["name"],
+                                        "label": info["label"],
+                                        "path": info["path"],
+                                        "output": output[:2000],
+                                        "output_full": output,
+                                        "round": state.round_number,
+                                    }))
                 # 🔑 Extract COMPLETE tool call args from model_request (updates mode).
                 #    LM Studio/Qwen streaming sends empty args in messages mode;
                 #    updates mode has the real, complete args from LangGraph state.

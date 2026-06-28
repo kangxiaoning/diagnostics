@@ -885,6 +885,21 @@ _CPU_DATA: dict[str, Callable[[], str]] = {
             [28, 1.2, 6, "etcd 10%"],
         ],
         summary="⚠ CPU 正常（20-30%），etcd compaction 轻度增加iowait（5-7%），无CPU瓶颈"),
+    "multi_layer_cascading": lambda: _fmt("CPU", "prod-us-east/master-1+worker-3", "15:00",
+        cols=["CPU%", "Load", "iowait%", "Top Process"],
+        rows=[
+            [15, 0.6, 3, "etcd 4%"],
+            [18, 0.8, 5, "etcd 6%"],
+            [25, 1.5, 18, "etcd 15% (D-state)"],
+            [35, 2.8, 32, "etcd 22% (D-state)"],
+            [40, 4.2, 45, "etcd 30% (D-state)"],
+            [38, 5.5, 48, "java 35% (worker-3 OOM reclaim)"],
+            [42, 6.0, 50, "etcd 28% + kswapd 12%"],
+            [40, 5.8, 48, "etcd 25% + kswapd 10%"],
+            [35, 4.5, 40, "etcd 20%"],
+            [30, 3.2, 30, "etcd 15%"],
+        ],
+        summary="🔴 master-1 iowait 3→50%(etcd D-state IO hang) + worker-3 sys%飙升(OOM页面回收)"),
 }
 
 _MEM_DATA: dict[str, Callable[[], str]] = {
@@ -915,6 +930,21 @@ _MEM_DATA: dict[str, Callable[[], str]] = {
         cols=["Mem%", "Swap%", "Available(GiB)", "OOM Events"],
         rows=[[50, 0, 3.0, "—"]] * 10,
         summary="✅ 内存正常 — 无 OOM 风险"),
+    "multi_layer_cascading": lambda: _fmt("Memory", "prod-us-east/worker-3", "15:00",
+        cols=["Mem%", "Swap%", "Available(GiB)", "OOM Events"],
+        rows=[
+            [72, 5, 1.8, "—"],
+            [75, 8, 1.5, "—"],
+            [80, 15, 1.1, "—"],
+            [85, 25, 0.8, "—"],
+            [90, 40, 0.5, "—"],
+            [95, 60, 0.2, "OOM Kill: kubelet(pid=1)"],
+            [92, 55, 0.4, "—"],
+            [88, 45, 0.6, "—"],
+            [85, 35, 0.9, "—"],
+            [82, 28, 1.2, "—"],
+        ],
+        summary="🔴 worker-3 内存枯竭 72→95% + Swap 5→60% → 15:05 OOM Kill kubelet(pid=1, RSS=6.2GB java)"),
 }
 
 _DISK_DATA: dict[str, Callable[[], str]] = {
@@ -956,6 +986,21 @@ _DISK_DATA: dict[str, Callable[[], str]] = {
             [38, 65, 120, 15.0],
         ],
         summary="⚠ 磁盘 IO util 30→45% — etcd compaction 导致IO中等升高但远未饱和"),
+    "multi_layer_cascading": lambda: _fmt("Disk", "prod-us-east/master-1/sda", "15:00",
+        cols=["Util%", "IOPS(r/s)", "IOPS(w/s)", "await(ms)"],
+        rows=[
+            [25, 40, 80, 5.0],
+            [30, 45, 90, 8.0],
+            [55, 60, 120, 35.0],
+            [78, 80, 150, 85.0],
+            [92, 90, 160, 145.0],
+            [99, 95, 165, 185.0],
+            [99.8, 92, 160, 185.0],
+            [99.5, 88, 155, 180.0],
+            [98, 85, 150, 170.0],
+            [95, 80, 140, 150.0],
+        ],
+        summary="🔴 master-1 sda %util 25→99.8% + await 5→185ms — etcd 数据盘 IO hang (D-state进程堆积)"),
 }
 
 _NET_DATA: dict[str, Callable[[], str]] = {
@@ -998,6 +1043,21 @@ _NET_DATA: dict[str, Callable[[], str]] = {
             [128, 84, 0, 0.5, 352],
         ],
         summary="✅ 网络接口层正常 — 丢包=0，重传正常（DNS超时不来自网络层）"),
+    "multi_layer_cascading": lambda: _fmt("Network", "prod-us-east/worker-3", "15:00",
+        cols=["RX(Mbps)", "TX(Mbps)", "丢包", "重传%", "ESTAB"],
+        rows=[
+            [150, 100, 0, 0.5, 420],
+            [155, 102, 0, 0.5, 425],
+            [148, 98, 0, 0.6, 418],
+            [152, 100, 0, 0.5, 422],
+            [150, 99, 0, 0.5, 420],
+            [155, 102, 0, 0.6, 428],
+            [150, 100, 0, 0.5, 422],
+            [148, 98, 0, 0.5, 418],
+            [152, 100, 0, 0.5, 420],
+            [150, 99, 0, 0.5, 422],
+        ],
+        summary="✅ 网络接口层正常 — 丢包=0，重传正常（DNS间歇超时不来自网络层，是CoreDNS受etcd延迟影响）"),
 }
 
 _K8S_DATA: dict[str, Callable[[], str]] = {

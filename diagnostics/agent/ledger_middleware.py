@@ -975,7 +975,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 node = ledger["hypotheses"].get(rid)
                 if node and node["status"] == "confirmed" and rid not in cids:
                     cids.append(rid)
-                    causes.append(node["statement"])
+                    stmt = node["statement"]
+                    # Deduplicate: different hypotheses may converge on
+                    # the same root cause statement after statement_update.
+                    if stmt not in causes:
+                        causes.append(stmt)
             # Keep backward-compat fields in sync with first entry
             if cids:
                 ledger["root_cause"] = causes[0]
@@ -1006,7 +1010,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 cids: list[str] = ledger["root_cause_hypothesis_ids"]
                 causes: list[str] = ledger.setdefault("root_causes", [])
                 cids.append(hypothesis_id)
-                causes.append(statement_update)
+                if statement_update not in causes:
+                    causes.append(statement_update)
                 if not ledger.get("root_cause"):
                     ledger["root_cause"] = statement_update
                     ledger["root_cause_hypothesis_id"] = hypothesis_id
