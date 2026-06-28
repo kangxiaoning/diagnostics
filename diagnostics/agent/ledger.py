@@ -706,8 +706,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
         return (
             "你当前处于 EVALUATE 阶段。\n"
             "- 评估本层所有假设的验证结果\n"
-            "- 调用 select_path 选择1条最接近根因的路径深入\n"
-            "- 若根因已确认(p≥80%且足够具体) → 进入 REPORT\n"
+            "- 调用 select_path 选择1条最可能的根因深入验证\n"
+            "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
+            "refuted 仅用于证据明确证伪的假设。多个假设可同时为 confirmed。\n"
+            "- 若本层存在 confirmed(p≥80%)，其他假设均达终态 → 进入 REPORT\n"
             "- 若需深化 → 在 confirmed 假设下 HYPOTHESIZE\n"
             "- 若全部 refuted → 评估是否回溯\n"
             "- ⚠ 概率判断原则：若核心因果关系已由证据确认"
@@ -740,6 +742,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
         )
         return (
             "你当前处于 REPORT 阶段。\n"
+            "- 在生成报告前，对所有已验证但未 record_finding 的假设调用 record_finding 记录结论\n"
             "- 基于诊断台账生成报告（台账即证据链）\n"
             "- 报告必须包含: 根因（如有多个，按条目分别列出）、证据链、排除的假设及排除原因"
             + multi_hint +

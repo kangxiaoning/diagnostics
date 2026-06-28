@@ -624,11 +624,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     for hid, node in hypotheses.items():
                         status = node.get("status")
                         if status == "verifying":
-                            record_finding(
-                                ledger, hid, "refuted",
-                                "诊断报告已生成，该假设在验证其他假设时被间接证据证伪，系统自动终结。",
-                                5,
+                            # Check if there is supporting evidence from an expert.
+                            # If the LLM verified this hypothesis and the expert
+                            # returned confirmed results but the LLM jumped to REPORT
+                            # without calling record_finding, auto-confirm it.
+                            has_supporting = any(
+                                e.get("supports") and e.get("source", "").startswith("expert:")
+                                for e in node.get("evidence", [])
                             )
+                            if has_supporting:
+                                record_finding(
+                                    ledger, hid, "confirmed",
+                                    "诊断报告已生成，系统根据已有专家证据自动确认为次要根因/加剧因素。",
+                                    node.get("probability", 75),
+                                )
+                            else:
+                                record_finding(
+                                    ledger, hid, "refuted",
+                                    "诊断报告已生成，该假设在验证其他假设时被间接证据证伪，系统自动终结。",
+                                    5,
+                                )
                             finalized_any = True
                         elif status == "pending":
                             record_finding(
@@ -639,7 +654,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             finalized_any = True
                     if finalized_any:
                         ledger["current_phase"] = derive_phase(ledger)
-                        self._persist_ledger(ledger)
+                    # Always persist after write_file so that report content
+                    # is saved to the ledger JSON regardless of whether
+                    # auto-finalize ran.  Without this, the report field is
+                    # lost when all hypotheses were already in terminal state.
+                    self._persist_ledger(ledger)
+                    if finalized_any:
                         # Emit final ledger snapshot so the frontend receives
                         # the correct hypothesis statuses.
                         try:
@@ -1012,8 +1032,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="record_finding",
             description=(
                 "记录假设验证结论（VERIFY阶段后必须调用）。"
-                "verdict: confirmed(已证实) | refuted(已排除) | inconclusive(证据不足)。"
-                "confirmed且概率≥80%且假设足够具体时自动进入REPORT阶段。"
+                "verdict: confirmed(已证实，可同时存在多个确认的根因/加剧因素)"
+                " | refuted(证据明确证伪，该假设不成立)"
+                " | inconclusive(证据不足)。"
+                "注意：多个假设可以同时为confirmed（多根因场景），refuted仅用于证据明确否定的假设。"
+                "所有root假设均到达终态且至少1个confirmed时自动进入REPORT阶段。"
             ),
             coroutine=_run,
             args_schema=RecordFindingInput,

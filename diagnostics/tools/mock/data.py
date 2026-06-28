@@ -1115,4 +1115,12 @@ kube-controller-manager Healthy leader elected (endpoint sync delayed)
 etcd-0                 Healthy   raft index: 13985500 (backend_commit p99=185ms, NOSPACE alarm!)
 说明: 控制面组件均报告Healthy，但kube-apiserver写入延迟p99=850ms
       etcd NOSPACE告警→backend_commit延迟→API Server写操作排队→全局影响"""
+    if scenario == "dns_and_etcd":
+        return """COMPONENT              STATUS    MESSAGE
+kube-apiserver         Healthy   serving at https://172.16.0.1:6443 (intermittent latency: etcd leader changes)
+kube-scheduler         Healthy   leader elected
+kube-controller-manager Healthy  leader elected
+etcd-0                 Healthy   raft index: 16552300 (WARNING: leader elections 8x/hour, wal_fsync p99=95ms)
+说明: etcd leader频繁切换→API Server间歇延迟→CoreDNS查询超时→DNS解析失败
+      控制面组件表面Healthy但etcd存在性能劣化"""
     return base
