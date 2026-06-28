@@ -421,6 +421,12 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     tc_id = _extract_tool_id(tc)
                     tc_name = _extract_tool_name(tc)
                     tc_args = _extract_tool_args(tc)
+                    # ── Skip FaultProfileSchema: it is a structured output
+                    # extraction pseudo-tool from abefore_agent, not a real
+                    # diagnostic tool.  Emitting it as a tool_start event
+                    # confuses the frontend tree and causes "运行中" hang.
+                    if tc_name == "FaultProfileSchema":
+                        continue
                     # Log file tools and task for args inspection
                     if tc_name in ("read_file", "write_file", "edit_file",
                                    "write_todos", "task", "glob", "grep", "ls"):
