@@ -69,7 +69,7 @@ _LEDGER_TOOLS = frozenset({
 _MAX_ROUNDS = 20                    # Hard limit: force REPORT after this many LLM rounds
 _STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding → stagnation
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
-_MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "180"))  # seconds per LLM call
+_MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -628,13 +628,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
     def _build_safety_warnings(self, ledger: DiagnosisLedger) -> str:
         """Build safety directive messages injected into the system prompt.
 
-        Three escalating safety mechanisms prevent infinite loops:
+        Safety mechanisms prevent infinite loops and premature termination:
 
         1. **Max rounds (P1)**: Hard limit on LLM rounds — forces REPORT phase.
-        2. **Stagnation detection (P2/P3)**: After ≥3 consecutive task() calls
+        2. **Understand stagnation (P2/P3)**: When round >= 2 but no hypotheses
+           committed, inject a strong directive to force commit_hypotheses.
+           Runs independently of the min-round-for-safety threshold.
+        3. **Stagnation detection (P2/P3)**: After ≥3 consecutive task() calls
            without record_finding, auto-records an inconclusive finding for
            the active hypothesis and warns the LLM.
-        3. **Loop warning (P2)**: Weaker early warning when ≥3 task() calls
+        4. **Loop warning (P2)**: Weaker early warning when ≥3 task() calls
            pile up before the stagnation threshold triggers auto-recording.
 
         Returns an empty string when no warnings apply.
@@ -654,6 +657,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
             logger.warning(
                 "Safety: max rounds (%d) reached — forcing REPORT phase",
+                round_num,
+            )
+
+        # ── P2/P3: Understand stagnation — force commit_hypotheses ──
+        # Runs independently of _MIN_ROUND_FOR_SAFETY: if the LLM has
+        # completed round 1 (data collection) but round 2 starts without
+        # any hypotheses, inject a hard directive to commit hypotheses NOW.
+        # Without this, the LLM may output analysis as plain text instead
+        # of calling commit_hypotheses, causing the agent loop to exit.
+        if (
+            round_num >= 2
+            and ledger.get("fault_profile") is None
+            and not ledger.get("hypotheses")
+        ):
+            warnings.append(
+                "⚠ [系统强制] 数据采集已完成（第1轮），当前是第"
+                f"{round_num}轮。你尚未提交任何假设。\n"
+                "禁止继续调用诊断工具或输出纯文本分析。\n"
+                "你必须在本轮调用 commit_hypotheses 提交至少1个假设，"
+                "否则诊断将提前终止。\n"
+                "基于上一轮已获取的 Argus 数据，提出假设并立即调用 "
+                "commit_hypotheses。"
+            )
+            logger.warning(
+                "Safety: understand stagnation detected (round %d, "
+                "no hypotheses, no fault_profile) — forcing commit",
                 round_num,
             )
 
