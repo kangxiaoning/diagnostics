@@ -261,6 +261,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Safety mechanism tracking
         self._consecutive_task_count: int = 0
         self._last_finding_round: int = 0
+        self._last_task_round: int = 0
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
@@ -560,6 +561,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         elif tool_name == "task":
             # Track consecutive task() calls without record_finding (loop detection)
             self._consecutive_task_count += 1
+            self._last_task_round = self._model_call_count
 
         # Capture report content when write_file writes to the pre-generated
         # report path — emit for frontend answer-body without text parsing.
@@ -684,6 +686,34 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "Safety: understand stagnation detected (round %d, "
                 "no hypotheses, no fault_profile) — forcing commit",
                 round_num,
+            )
+
+        # ── Delegation saturation — prevent redundant re-delegation ──
+        # Detects the pattern: task() → record_finding → task() again.
+        # Even though record_finding resets _consecutive_task_count,
+        # reaching count >= 2 means the Coordinator already obtained
+        # findings but is re-delegating instead of progressing.
+        # This is a generic behavior-pattern check — no assumptions
+        # about specific tools, hypotheses, or failure modes.
+        if (
+            ledger.get("hypotheses")
+            and self._consecutive_task_count >= 2
+            and round_num < _MAX_ROUNDS
+        ):
+            warnings.append(
+                f"⚠ [系统警告] 已连续{self._consecutive_task_count}次"
+                "委派专家验证，此前已获得验证结论。\n"
+                "专家的工具集有限，重复委派不会获得新数据。\n"
+                "- 若已确认核心事实，仅缺少次要细节（如启动者、触发源），"
+                "应基于已有证据给出最终判断并生成报告\n"
+                "- 若有其他未验证的假设，应切换到其他假设验证\n"
+                "- 禁止再次委派专家查询相同假设"
+            )
+            logger.warning(
+                "Safety: delegation saturation (count=%d, round=%d, "
+                "phase=%s) — warning injected",
+                self._consecutive_task_count, round_num,
+                ledger.get("current_phase", "?"),
             )
 
         # ── P2/P3: Stagnation & loop detection (only after min round) ──

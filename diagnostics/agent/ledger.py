@@ -709,7 +709,12 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "- 调用 select_path 选择1条最接近根因的路径深入\n"
             "- 若根因已确认(p≥80%且足够具体) → 进入 REPORT\n"
             "- 若需深化 → 在 confirmed 假设下 HYPOTHESIZE\n"
-            "- 若全部 refuted → 评估是否回溯"
+            "- 若全部 refuted → 评估是否回溯\n"
+            "- ⚠ 概率判断原则：若核心因果关系已由证据确认"
+            "（如「异常进程占满资源→服务响应超时」），"
+            "仅次要细节未知（如触发者、启动源），"
+            "应保持高概率(≥80%)。"
+            "不要因为次要信息缺失而过度降低根因概率。"
             + pending_hint
         )
     if phase == "skill_verify":
@@ -852,6 +857,14 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         confirmed = [h for h in hypotheses.values() if h["status"] == "confirmed"]
         if not confirmed:
             return True, "假设穷尽: 所有假设已验证但未确认根因", None
+        # All hypotheses reached terminal states and at least one is
+        # confirmed (even if p<80%).  Continuing to verify won't yield
+        # new data — exit to REPORT so the LLM can synthesize findings.
+        best = max(confirmed, key=lambda h: h["probability"])
+        return True, (
+            f"假设穷尽: 所有假设已验证完毕，最佳根因 "
+            f"{best['id']} {best['statement']} (p={best['probability']}%)"
+        ), best["id"]
 
     # Condition 3: Evidence saturated (3+ consecutive inconclusive)
     if ledger.get("_inconclusive_streak", 0) >= 3:
