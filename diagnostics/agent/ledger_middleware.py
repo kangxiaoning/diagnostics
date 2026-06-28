@@ -89,7 +89,7 @@ def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
         tools_called.update(rd.get("tools_called", []))
     diagnostic_tools = sorted(tools_called - _SCAFFOLDING_TOOLS - _LEDGER_TOOLS - {"task"})
     if diagnostic_tools:
-        lines.append(f"已调用工具: {', '.join(diagnostic_tools)}")
+        lines.append(f"Coordinator 已通过 Argus 收集基线数据: {', '.join(diagnostic_tools)}")
 
     # ── Evidence already collected per hypothesis ──
     for hid, h in ledger.get("hypotheses", {}).items():
@@ -470,7 +470,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if ctx:
                     desc = tool_args.get("description", "")
                     tool_args["description"] = (
-                        f"{desc}\n\n---\n[已收集的诊断数据 — 无需重复查询]\n{ctx}"
+                        f"{desc}\n\n---\n"
+                        f"[Coordinator 基线数据 — 供交叉验证]\n"
+                        f"⚠ 不得重复调用下面列出的工具。基线数据可作为时序趋势参考，"
+                        f"但你的分析必须有独立推理，不能仅重述 Coordinator 数据\n"
+                        f"{ctx}"
                     )
                     try:
                         request.tool_call["args"] = tool_args
@@ -938,23 +942,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Check exit conditions
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)
 
-            # ── Multi-root: accumulate confirmed root causes ──
-            # When a hypothesis is confirmed, record it in the root_causes list
-            # even if other root hypotheses are still pending.  Only transition
-            # to REPORT when all root hypotheses are resolved.
-            if confirmed_id and "根因確認" not in reason and "根因确认" in reason:
-                # Single-root confirmed → traditional exit path
-                pass
-            if confirmed_id and confirmed_id in ledger.get("hypotheses", {}):
-                node = ledger["hypotheses"][confirmed_id]
-                cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
-                causes: list[str] = ledger.setdefault("root_causes", [])
-                if confirmed_id not in cids:
-                    cids.append(confirmed_id)
+            # ── Multi-root: accumulate ALL confirmed root causes ──
+            # Iterate over every root hypothesis — not just the single
+            # confirmed_id returned by check_exit_conditions (which is
+            # always the first confirmed hypothesis).  This ensures that
+            # in multi-root scenarios (e.g. memory_leak_and_disk_full),
+            # each confirmed root cause is tracked independently.
+            cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
+            causes: list[str] = ledger.setdefault("root_causes", [])
+            for rid in ledger.get("root_hypothesis_ids", []):
+                node = ledger["hypotheses"].get(rid)
+                if node and node["status"] == "confirmed" and rid not in cids:
+                    cids.append(rid)
                     causes.append(node["statement"])
-                    # Keep backward-compat fields in sync with first entry
-                    ledger["root_cause"] = causes[0]
-                    ledger["root_cause_hypothesis_id"] = cids[0]
+            # Keep backward-compat fields in sync with first entry
+            if cids:
+                ledger["root_cause"] = causes[0]
+                ledger["root_cause_hypothesis_id"] = cids[0]
 
             # Sync root_causes text when statement was updated for an
             # already-confirmed hypothesis (e.g. "etcd compaction" → "etcd NOSPACE").
@@ -967,6 +971,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # Also update backward-compat field
                 if ledger.get("root_cause") == old_statement:
                     ledger["root_cause"] = statement_update
+
+            # ── Capture corrected statement as a root cause even when
+            # the hypothesis is refuted.  A single hypothesis may combine
+            # multiple causes (e.g. "disk IO caused CoreDNS timeout").
+            # When the LLM discovers that one part is correct and the
+            # other is wrong, it refutes the hypothesis but provides a
+            # statement_update that isolates the valid sub-finding.
+            # Recording that statement prevents the valid finding from
+            # being lost in the structured root_causes list.
+            if (statement_update
+                and hypothesis_id not in ledger.setdefault("root_cause_hypothesis_ids", [])):
+                cids: list[str] = ledger["root_cause_hypothesis_ids"]
+                causes: list[str] = ledger.setdefault("root_causes", [])
+                cids.append(hypothesis_id)
+                causes.append(statement_update)
+                if not ledger.get("root_cause"):
+                    ledger["root_cause"] = statement_update
+                    ledger["root_cause_hypothesis_id"] = hypothesis_id
 
             if should_exit:
                 ledger["current_phase"] = "report"

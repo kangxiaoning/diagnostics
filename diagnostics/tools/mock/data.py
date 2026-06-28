@@ -25,7 +25,7 @@ def _load_avg(scenario: str) -> str:
         "stress_cpu_and_tc_loss": "8.52, 7.85, 6.30",
         "conntrack_and_oom": "3.85, 3.20, 2.90",
         "disk_io_and_dns": "4.85, 4.25, 3.60",
-        # ── Additional scenarios ──
+        "memory_leak_and_disk_full": "3.10, 3.50, 4.20",
         "coredns_cache_poison": "1.50, 1.40, 1.35",
         "etcd_quorum_loss": "3.50, 3.20, 2.80",
         "image_pull_backoff": "1.20, 1.15, 1.10",
@@ -233,6 +233,13 @@ dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
 dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:6754304kB
 说明: Java进程RSS=6.4GB持续增长—堆外内存泄漏(bytedance)触发OOM Killer
       注意: 此场景除OOM外还有conntrack满导致网络丢包—两条独立根因同时存在"""
+    if scenario == "memory_leak_and_disk_full":
+        return """Mem: 7.6Gi total, 7.2Gi used, 120Mi free, 280Mi buff/cache, 180Mi available (严重不足!)
+Swap: 2.0Gi total, 1.5Gi used, 520Mi free
+/proc/meminfo: AnonPages=7130112kB (异常高 — Java堆外泄漏!), Committed_AS=13500224kB
+dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
+dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:7130112kB
+说明: Java进程RSS=6.8GB触发OOM Killer, 重启后堆外内存泄漏继续(15:09 Mem升至86%)"""
     # ── Multi-root: disk_io_and_dns ── 内存正常
     # ── Additional scenarios ──
     if scenario == "swap_thrashing":
@@ -299,6 +306,11 @@ df: /dev/sda1 50G 38G 10G 78% / (含/var/log目录)
 df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽!)
 df -i: /dev/sda1 6553600/6553600 100% (inode也耗尽!)
 说明: 磁盘空间和inode同时耗尽—/var/log分区写满"""
+    if scenario == "memory_leak_and_disk_full":
+        return """iostat: sda r/s=80 w/s=260 await=35.2ms svctm=12.5ms %util=96.0 (磁盘接近饱和!)
+df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽! 日志写满)
+df: /var/log 占用 42G — Java 重启循环产生大量 crash 日志
+说明: 磁盘 util 96%、100% space used — Java OOMKilled 重启循环产生日志风暴填满磁盘"""
     if scenario == "fs_inode_exhaustion":
         return """iostat: sda r/s=15 w/s=12 await=1.2ms svctm=0.6ms %util=3.5
 df: /dev/sda1 50G 15G 33G 32% / (空间充足!)
@@ -419,6 +431,15 @@ CoreDNS config: forward . 10.0.0.53 10.0.0.54 (上游DNS已下线! 10.0.0.53不�
 CoreDNS日志: [ERROR] plugin/forward: read udp 10.0.0.53:53: i/o timeout
 说明: 网络接口层正常无丢包—DNS超时是因为CoreDNS forward配置指向已下线DNS
       同时磁盘iowait=45%因日志rotate—两个独立根因"""
+    # ── Multi-root: memory_leak_and_disk_full ──
+    if scenario == "memory_leak_and_disk_full":
+        return """ss: ESTAB 320 connections. Send-Q backlog on some (kubelet heartbeats queued due to DiskPressure).
+eth0: RX 18.5GiB / TX 25.2GiB, dropped=0 (接口无丢包!)
+TCP retransmits: 2.5% (正常)
+conntrack -C: 8520 entries (正常 — nf_conntrack_max=131072, 使用率 6.5%)
+dmesg | grep conntrack: (无输出 — 无conntrack问题)
+说明: 网络接口层正常，无丢包无重传。磁盘满和内存泄漏不导致网络层面异常
+      此场景的网络症状全部来自应用层(DiskPressure→NotReady→调度失败)，非内核网络栈"""
     # ── Additional scenarios ──
     if scenario == "coredns_cache_poison":
         return """ss: ESTAB 420 connections, no Send-Q backlog.
@@ -580,6 +601,16 @@ dmesg: INFO: task kubelet:2345 blocked for more than 120 seconds (日志写入ha
 CoreDNS日志: [ERROR] plugin/forward: dial tcp 10.0.0.53:53: i/o timeout
 说明: logrotate→磁盘IO飙升→kubelet/应用D状态阻塞
       CoreDNS forward配置指向已下线DNS→解析超时—两个独立根因"""
+    # ── Multi-root: memory_leak_and_disk_full ──
+    if scenario == "memory_leak_and_disk_full":
+        return """PID 8765 java D 35.0% 75.5% java -Xmx6g -jar app.jar (RSS=6.8GB! 堆外泄漏→OOMKilled)
+PID 3210 root D 8.0% 5.0% kubelet (D状态! 磁盘满导致心跳写入失败)
+PID 1234 root D 6.0% 3.5% containerd (D状态! 无法创建新容器—no space left)
+dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
+dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:7130112kB
+dmesg: ext4 journal abort on /dev/sda1 (磁盘满→ext4日志写入失败)
+说明: 两个独立根因—(1)Java RSS 6.8GB堆外泄漏触发OOM Killer
+      (2)磁盘100%满导致kubelet/containerd D状态、无法创建新容器"""
     # ── Additional scenarios ──
     if scenario == "swap_thrashing":
         return """PID 5678 java S 5.0% 72.5% java (RSS=6.8GB—内存不足触发swap)

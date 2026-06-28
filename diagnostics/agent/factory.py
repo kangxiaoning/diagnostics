@@ -236,6 +236,7 @@ def build_agent(
         api_key=settings.api_key,
         temperature=settings.temperature,
         max_tokens=settings.max_tokens,
+        model_kwargs={"tool_choice": "auto"},
     )
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
