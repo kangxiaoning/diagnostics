@@ -114,6 +114,11 @@ AVAILABLE_SCENARIOS: dict[str, Scenario] = {
         entity_type="kubernetes",
         user_message="集群表现很乱：kubectl 慢十几秒，worker 节点 Pod 全部 Unknown，api-gateway 反复重启，DNS 间歇超时。像是多个独立问题叠加。",
         keywords=[
+            # Ops-engineer phrasing: describes symptoms, not root causes
+            ("crashloopbackoff", "notready", "dns"),
+            ("crashloopbackoff", "worker-3", "dns"),
+            ("worker-3", "notready", "crashloopbackoff"),
+            # Technical phrasing: mentions specific components
             ("etcd", "oom"),
             ("etcd", "worker-3"),
             ("master-1", "worker-3"),
