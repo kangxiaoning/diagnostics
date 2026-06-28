@@ -298,7 +298,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             return None
 
         try:
-            structured_model = self._model.with_structured_output(FaultProfileSchema)
+            # Use function_calling method because Qwen/LM Studio does not
+            # support the json_schema response_format.  The schema is wrapped
+            # as a tool and the model responds via a tool call.
+            structured_model = self._model.with_structured_output(
+                FaultProfileSchema, method="function_calling",
+            )
             profile: FaultProfileSchema = await structured_model.ainvoke(
                 [
                     {"role": "system", "content": (
@@ -311,7 +316,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
         except Exception as e:
             logger.warning("Failed to extract fault_profile via structured output: %s", e)
-            return None
+            # Graceful fallback: create ledger without fault_profile so
+            # diagnosis can proceed.  The LLM will still extract symptom
+            # information in its text reasoning.
+            ledger = new_ledger()
+            self._current_ledger = ledger
+            return {"_diagnosis_ledger": ledger}
 
         ledger = new_ledger()
         ledger["fault_profile"] = new_fault_profile(
@@ -486,7 +496,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if ledger is None:
             return result
 
-        # Auto-record evidence for diagnostic tools and expert delegations
+        # Extract output for all non-scaffolding tools (used by both
+        # evidence collection and round recording below).
         if tool_name not in _SCAFFOLDING_TOOLS:
             output = ""
             if isinstance(result, ToolMessage):
@@ -497,27 +508,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         output = msg.content if isinstance(msg.content, str) else str(msg.content)
                         break
 
-            source = f"expert:{tool_args.get('subagent_type', '?')}" if tool_name == "task" else f"tool:{tool_name}"
-            summary = output or ""
+            # ── Auto-record evidence (skip ledger tools — they self-manage) ──
+            # record_finding already writes coordinator evidence to the correct
+            # hypothesis; auto-collection would create a duplicate routed to
+            # active_path (always H1) regardless of which hypothesis is targeted.
+            if tool_name not in _LEDGER_TOOLS:
+                source = f"expert:{tool_args.get('subagent_type', '?')}" if tool_name == "task" else f"tool:{tool_name}"
+                summary = output or ""
 
-            if summary:
-                # ── Hypothesis-aware evidence routing ──
-                # For task() calls, parse the description to find which
-                # hypothesis is being verified (e.g. "验证假设 H2") and
-                # route evidence there.  Fall back to active_path when
-                # the description doesn't mention a specific hypothesis.
-                if tool_name == "task":
-                    target_hid = _parse_hypothesis_id_from_description(
-                        tool_args.get("description", ""),
-                        ledger.get("hypotheses", {}),
-                    )
-                    if target_hid and target_hid in ledger.get("hypotheses", {}):
-                        node = ledger["hypotheses"][target_hid]
-                        node["evidence"].append(new_evidence(
-                            source, summary, supports=True, tool_call_id=tool_call_id,
-                        ))
-                        if tool_name not in node["verification_tools"]:
-                            node["verification_tools"].append(tool_name)
+                if summary:
+                    # ── Hypothesis-aware evidence routing ──
+                    if tool_name == "task":
+                        target_hid = _parse_hypothesis_id_from_description(
+                            tool_args.get("description", ""),
+                            ledger.get("hypotheses", {}),
+                        )
+                        if target_hid and target_hid in ledger.get("hypotheses", {}):
+                            node = ledger["hypotheses"][target_hid]
+                            node["evidence"].append(new_evidence(
+                                source, summary, supports=True, tool_call_id=tool_call_id,
+                            ))
+                            if tool_name not in node["verification_tools"]:
+                                node["verification_tools"].append(tool_name)
+                        else:
+                            add_evidence_to_active(
+                                ledger, source, summary,
+                                supports=True,
+                                tool_call_id=tool_call_id,
+                                tool_name=tool_name,
+                            )
                     else:
                         add_evidence_to_active(
                             ledger, source, summary,
@@ -525,13 +544,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                         )
-                else:
-                    add_evidence_to_active(
-                        ledger, source, summary,
-                        supports=True,
-                        tool_call_id=tool_call_id,
-                        tool_name=tool_name,
-                    )
 
             # Build key_findings from tool output (first 200 chars)
             key_findings = ""
@@ -577,6 +589,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if file_path and _paths_match(file_path, self.report_path):
                 content = tool_args.get("content") or tool_args.get("text") or ""
                 if content:
+                    # Backfill report content into the ledger so that
+                    # result.json carries the full report text alongside
+                    # the structured hypothesis data.
+                    if ledger:
+                        ledger["report"] = content
+
                     try:
                         sw = getattr(request.runtime, "stream_writer", None)
                         if sw:

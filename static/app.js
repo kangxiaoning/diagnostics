@@ -95,6 +95,9 @@ loadHistoryList();
 historyBack.addEventListener("click", () => {
   historyViewer.classList.add("hidden");
   historyViewer.classList.remove("history-tab-active");
+  // Reset inline display styles when leaving history view
+  if (historyViewerBody) { historyViewerBody.style.display = ""; }
+  if (historyHypothesisCanvas) { historyHypothesisCanvas.style.display = ""; }
   historyBack.classList.add("hidden");
   historyViewerTitle.classList.add("hidden");
   document.querySelector(".app").classList.remove("history-open");
@@ -158,6 +161,9 @@ async function openHistory(item) {
   document.querySelector(".app").classList.add("history-open");
   historyViewer.classList.remove("hidden");
   historyViewer.classList.remove("history-tab-active");
+  // Reset inline display styles so CSS class rules take effect
+  if (historyViewerBody) { historyViewerBody.style.display = ""; }
+  if (historyHypothesisCanvas) { historyHypothesisCanvas.style.display = ""; }
   historyBack.classList.remove("hidden");
   historyViewerTitle.classList.remove("hidden");
   const durText = item.duration_secs ? ` · ${Math.round(item.duration_secs)}s` : "";
@@ -1611,23 +1617,16 @@ function finalizeGraph() {
 
 function renderMarkdown(text) {
   if (!text) return "";
-  // Sanitize raw text BEFORE markdown processing so that
-  // user-supplied <tags> never reach innerHTML.  Markdown
-  // sigils (# * ` etc.) are untouched by escNoBr.
+  // ── Phase 0: sanitize & protect code blocks ──
   let out = escNoBr(text);
-
-  // ── Phase 0: extract & protect code blocks ──
-  // Fenced and inline code are extracted BEFORE other transforms so that
-  // list detection, \n→<br>, etc. never penetrate code content.
   const codeStore = [];
+
   // Fenced code blocks ```...```
   out = out.replace(/```(\w*)\r?\n([\s\S]*?)```/g,
     (_, lang, code) => {
       const idx = codeStore.length;
-      // code was already escaped by the outer escNoBr; trimEnd preserves
-      // internal newlines which <pre> renders natively.
       codeStore.push(`<pre><code>${code.trimEnd()}</code></pre>`);
-      return `\n\x00CB${idx}\x00\n`;
+      return `\x00CB${idx}\x00`;
     });
   // Inline code `...`
   out = out.replace(/`([^`]+)`/g, (_, code) => {
@@ -1637,109 +1636,112 @@ function renderMarkdown(text) {
   });
 
   // ── Phase 1: block-level elements ──
-
+  // Horizontal rules (before headers to avoid #--- collision)
+  out = out.replace(/^[-*_]{3,}\s*$/gm, '<hr>');
   // Headers
   out = out.replace(/^### (.+)$/gm, '<h3>$1</h3>');
   out = out.replace(/^## (.+)$/gm, '<h2>$1</h2>');
   out = out.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-
-  // Bold **...** or __...__
+  // Bold / italic
   out = out.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   out = out.replace(/__(.+?)__/g, '<strong>$1</strong>');
-
-  // Italic *...* or _..._
   out = out.replace(/\*(.+?)\*/g, '<em>$1</em>');
   out = out.replace(/\b_(.+?)_\b/g, '<em>$1</em>');
-
   // Links
-  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-
-  // Blockquote > (processed before escNoBr)
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
+    '<a href="$2" target="_blank">$1</a>');
+  // Blockquote
   out = out.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
 
-  // ── Phase 2: tables — detect consecutive |...| lines ──
+  // ── Phase 2: tables ──
   {
     const lines = out.split('\n');
     let i = 0;
     const result = [];
     while (i < lines.length) {
-      // Skip code-block placeholders
-      if (/^\x00CB\d+\x00$/.test(lines[i].trim())) { result.push(lines[i]); i++; continue; }
-      // Try to match a table: at least 2 consecutive |...| lines
-      const tableStart = i;
-      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) i++;
-      const tableLines = lines.slice(tableStart, i);
-      if (tableLines.length === 0) {
-        // No pipe line here — pass through and advance
-        result.push(lines[i]);
-        i++;
-      } else if (tableLines.length >= 2 && tableLines[1].trim().match(/^\|[-: |]+\|$/)) {
-        // Valid table: [header, separator, ...rows]
-        const headerCells = tableLines[0].trim().split('|').filter(c => c.trim() !== '').map(c => `<th>${c.trim()}</th>`);
-        const headerRow = `<tr>${headerCells.join('')}</tr>`;
-        const dataRows = tableLines.slice(2).map(line => {
-          const cells = line.trim().split('|').filter(c => c !== '').map(c => `<td>${c.trim()}</td>`);
-          return `<tr>${cells.join('')}</tr>`;
-        });
-        result.push(`<table><thead>${headerRow}</thead><tbody>${dataRows.join('')}</tbody></table>`);
-      } else {
-        // Pipe line(s) but not a valid table — push back
-        for (const l of tableLines) result.push(l);
+      if (/^\x00CB\d+\x00$/.test(lines[i].trim())) {
+        result.push(lines[i]); i++; continue;
       }
+      const start = i;
+      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) i++;
+      const tb = lines.slice(start, i);
+      if (tb.length >= 2 && tb[1].trim().match(/^\|[-: |]+\|$/)) {
+        const hdr = tb[0].trim().split('|').filter(c => c.trim())
+          .map(c => `<th>${c.trim()}</th>`).join('');
+        const rows = tb.slice(2).map(r =>
+          `<tr>${r.trim().split('|').filter(c => c !== '').map(c => `<td>${c.trim()}</td>`).join('')}</tr>`
+        ).join('');
+        result.push(`<table><thead><tr>${hdr}</tr></thead><tbody>${rows}</tbody></table>`);
+      } else if (tb.length > 0) {
+        for (const l of tb) result.push(l);
+        i++; // advance past non-table pipe line
+      }
+      if (start === i) { result.push(lines[i]); i++; }
     }
     out = result.join('\n');
   }
 
-  // ── Phase 3: lists — process lines into <ul>/<ol> blocks ──
-  const lines = out.split('\n');
-  let inUl = false, inOl = false;
-  for (let i = 0; i < lines.length; i++) {
-    // Skip code-block placeholder lines
-    if (/^\x00CB\d+\x00$/.test(lines[i].trim())) {
-      if (inUl) { lines[i - 1] += '</ul>'; inUl = false; }
-      if (inOl) { lines[i - 1] += '</ol>'; inOl = false; }
-      continue;
+  // ── Phase 3: nested lists (up to 2 levels) ──
+  {
+    const lines = out.split('\n');
+    let inUl = 0, inOl = 0;  // depth counter
+    for (let i = 0; i < lines.length; i++) {
+      if (/^\x00CB\d+\x00$/.test(lines[i].trim())) {
+        while (inUl > 0) { lines[i] = '</ul>' + lines[i]; inUl--; }
+        while (inOl > 0) { lines[i] = '</ol>' + lines[i]; inOl--; }
+        continue;
+      }
+      let m;
+      // Nested unordered (indented - or *)
+      if ((m = lines[i].match(/^(\s*)[-*] (.+)$/))) {
+        const depth = Math.min(Math.floor(m[1].length / 2), 1);
+        while (inUl > depth) { lines[i] = '</ul>' + lines[i]; inUl--; }
+        while (inOl > 0) { lines[i] = '</ol>' + lines[i]; inOl--; }
+        if (inUl < depth || inUl === 0) {
+          lines[i] = '<ul>' + lines[i]; inUl = depth || 1;
+        }
+        lines[i] = lines[i].replace(/^\s*[-*] /, '');
+        lines[i] = `<li>${lines[i]}</li>`;
+        continue;
+      }
+      // Nested ordered (indented N.)
+      if ((m = lines[i].match(/^(\s*)(\d+)\. (.+)$/))) {
+        const depth = Math.min(Math.floor(m[1].length / 2), 1);
+        while (inOl > depth) { lines[i] = '</ol>' + lines[i]; inOl--; }
+        while (inUl > 0) { lines[i] = '</ul>' + lines[i]; inUl--; }
+        if (inOl < depth || inOl === 0) {
+          lines[i] = '<ol>' + lines[i]; inOl = depth || 1;
+        }
+        lines[i] = lines[i].replace(/^\s*\d+\. /, '');
+        lines[i] = `<li>${lines[i]}</li>`;
+        continue;
+      }
+      // Non-list line: close open lists
+      if (inUl > 0) { lines[i] = '</ul>'.repeat(inUl) + lines[i]; inUl = 0; }
+      if (inOl > 0) { lines[i] = '</ol>'.repeat(inOl) + lines[i]; inOl = 0; }
     }
-    let m;
-    if ((m = lines[i].match(/^[-*] (.+)$/))) {
-      if (!inUl) { lines[i] = '<ul><li>' + m[1] + '</li>'; inUl = true; }
-      else { lines[i] = '<li>' + m[1] + '</li>'; }
-    } else if ((m = lines[i].match(/^\d+\. (.+)$/))) {
-      if (!inOl) { lines[i] = '<ol><li>' + m[1] + '</li>'; inOl = true; }
-      else { lines[i] = '<li>' + m[1] + '</li>'; }
-    } else {
-      if (inUl) { lines[i - 1] += '</ul>'; inUl = false; }
-      if (inOl) { lines[i - 1] += '</ol>'; inOl = false; }
-    }
+    while (inUl-- > 0) lines[lines.length - 1] += '</ul>';
+    while (inOl-- > 0) lines[lines.length - 1] += '</ol>';
+    out = lines.join('\n');
   }
-  if (inUl) lines[lines.length - 1] += '</ul>';
-  if (inOl) lines[lines.length - 1] += '</ol>';
-  out = lines.join('\n');
 
-  // ── Phase 4: paragraphs and cleanup ──
-  // (raw text already sanitized at entry point)
-
-  // Double newline → paragraph break
+  // ── Phase 4: paragraphs & cleanup ──
   out = out.replace(/\n\n+/g, '</p><p>');
-  // Remaining single \n → line break (GFM-style)
   out = out.replace(/\n/g, '<br>');
   out = '<p>' + out + '</p>';
 
-  // Clean up empty paragraphs and artifacts
+  // Remove wrapping <p> from block elements
+  const blocks = ['<hr>', '<h1>', '<h2>', '<h3>', '<ul>', '<ol>',
+                  '<pre>', '<blockquote>', '<table>'];
+  const closes = ['</h1>', '</h2>', '</h3>', '</ul>', '</ol>',
+                  '</pre>', '</blockquote>', '</table>'];
+  blocks.forEach(b => { out = out.replace(new RegExp(`<p>(${b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'g'), '$1'); });
+  closes.forEach(c => { out = out.replace(new RegExp(`(${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})</p>`, 'g'), '$1'); });
+
   out = out.replace(/<p>\s*<\/p>/g, '');
   out = out.replace(/<p><\/p>/g, '');
-  out = out.replace(/<p>(<[uo]l>)/g, '$1');
-  out = out.replace(/(<\/[uo]l>)<\/p>/g, '$1');
-  out = out.replace(/<p>(<pre>)/g, '$1');
-  out = out.replace(/(<\/pre>)<\/p>/g, '$1');
-  out = out.replace(/<p>(<blockquote>)/g, '$1');
-  out = out.replace(/(<\/blockquote>)<\/p>/g, '$1');
-  out = out.replace(/<p>(<table>)/g, '$1');
-  out = out.replace(/(<\/table>)<\/p>/g, '$1');
-  out = out.replace(/<p>(<h[123]>)/g, '$1');
-  out = out.replace(/(<\/h[123]>)<\/p>/g, '$1');
 
-  // ── Phase 5: restore protected code blocks ──
+  // ── Phase 5: restore code blocks ──
   out = out.replace(/\x00CB(\d+)\x00/g, (_, idx) => codeStore[Number(idx)]);
 
   return out;
@@ -1912,6 +1914,8 @@ function switchTab(tab) {
     if (historyViewer && !historyViewer.classList.contains("hidden")) {
       // In history mode: show execution panel, hide hypothesis panel
       historyViewer.classList.remove("history-tab-active");
+      if (historyViewerBody) { historyViewerBody.style.display = ""; }
+      if (historyHypothesisCanvas) { historyHypothesisCanvas.style.display = ""; }
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
       document.querySelector('[data-panel="execution"]').classList.add("active");
       // Redraw history execution edges
@@ -1926,6 +1930,8 @@ function switchTab(tab) {
     if (historyViewer && !historyViewer.classList.contains("hidden")) {
       // In history mode: show history hypothesis panel, hide execution panel
       historyViewer.classList.add("history-tab-active");
+      if (historyViewerBody) { historyViewerBody.style.display = "none"; }
+      if (historyHypothesisCanvas) { historyHypothesisCanvas.style.display = "block"; }
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
       // Redraw history hypothesis edges after panel becomes visible
       if (_historyLedger) _scheduleHistoryHypEdgeRedraw();
@@ -2137,7 +2143,7 @@ function renderHypothesisNode(node, allHypotheses, depth) {
     for (const ev of node.evidence) {
       const evCls = ev.supports ? "support" : "refute";
       const src = ev.source || "";
-      html += `<div class="hyp-evidence-item ${evCls}">${esc(ev.summary || "")}`;
+      html += `<div class="hyp-evidence-item ${evCls}">${renderMarkdown(ev.summary || "")}`;
       if (src) html += ` <span style="opacity:0.6">(${esc(src)})</span>`;
       html += `</div>`;
     }
