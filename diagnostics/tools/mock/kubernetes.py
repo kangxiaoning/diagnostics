@@ -803,6 +803,13 @@ _ETCD_LOGS: dict[str, str] = {
         "2026-06-14T18:02:00.123Z WARN  database size: 7.15GB / 8GB (89.4%) — compaction/min-free=10% insufficient\n"
     ),
     "etcd_quorum_loss": (
+        "2026-06-14T07:50:00.123Z ERROR etcd-master-1: failed to send out heartbeat on time (exceeded the 100ms timeout)\n"
+        "2026-06-14T07:50:05.456Z ERROR etcd-master-1: wal: sync duration 250ms, expected less than 100ms\n"
+        "2026-06-14T07:50:10.789Z FATAL etcd-master-1: disk IO hang — process restarting (CrashLoopBackOff #12)\n"
+        "2026-06-14T07:51:00.012Z ERROR etcd-master-2: disk IO hang — fsync p99=480ms (CRITICAL!)\n"
+        "2026-06-14T07:51:05.345Z FATAL etcd-master-2: process crashed — disk IO timeout (CrashLoopBackOff #8)\n"
+        "2026-06-14T07:52:00.678Z WARN  etcd-master-3: lost quorum — only 1/3 members alive\n"
+        "说明: 2/3 etcd节点因磁盘IO hang崩溃→quorum lost→API Server只读模式\n"
     ),
 }
 
@@ -886,6 +893,23 @@ _COREDNS_LOGS: dict[str, str] = {
         "说明: CoreDNS 副本1/2 → 1个CrashLoopBackOff(资源不足OOMKilled) + etcd leader频繁切换\n"
         "      双根因叠加 → 剩余副本过载 + 查询etcd超时 → DNS间歇失败\n"
     ),
+    "disk_io_and_dns": (
+        "## CoreDNS Deployment\n"
+        "NAME      READY   UP-TO-DATE   AVAILABLE   AGE\n"
+        "coredns   2/2     2            2           30d\n"
+        "\n## coredns-6d4b-xyz11\n"
+        "2026-06-14T15:02:00.123Z [INFO] plugin/reload: Running configuration SHA512 = def456\n"
+        "2026-06-14T15:03:00.456Z [ERROR] plugin/forward: read udp 10.0.0.53:53: i/o timeout\n"
+        "2026-06-14T15:03:05.789Z [ERROR] plugin/forward: read udp 10.0.0.54:53: i/o timeout\n"
+        "2026-06-14T15:03:10.012Z [ERROR] plugin/errors: 2 upstream-db.external.com. A: read udp 10.0.0.53:53: i/o timeout\n"
+        "2026-06-14T15:03:15.345Z [WARN] plugin/forward: max retries exceeded for upstream 10.0.0.53:53\n"
+        "2026-06-14T15:04:00.678Z [INFO] 127.0.0.1:12345 - \"A IN backend.default.svc.cluster.local. udp 52 false 512\" NOERROR qr,aa,rd 112 0.0001s\n"
+        "2026-06-14T15:05:00.901Z [ERROR] plugin/forward: dial tcp 10.0.0.53:53: i/o timeout\n"
+        "2026-06-14T15:06:00.234Z [ERROR] plugin/errors: 2 api.external-service.com. A: read udp 10.0.0.54:53: i/o timeout\n"
+        "说明: CoreDNS Pod全部健康(2/2 Ready)，内部域名解析正常(cluster.local)\n"
+        "      但forward插件指向已下线DNS(10.0.0.53/54不可达)→外部域名解析全部超时\n"
+        "      这是独立根因，与磁盘IO饱和无关\n"
+    ),
 }
 
 _COREDNS_DESCRIBE: dict[str, str] = {
@@ -957,7 +981,24 @@ _COREDNS_DESCRIBE: dict[str, str] = {
         "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
         "\n## Corefile ConfigMap (same as normal)\n"
         "说明: CoreDNS 1/2 Running — 1个副本因内存不足OOMKilled CrashLoopBackOff\n"
-        "      剩余副本处理全部DNS查询→过载超时\n"
+        "      剩余副本处理全部DNS查询→过载超时。\n"
+    ),
+    "disk_io_and_dns": (
+        "## CoreDNS Deployment\n"
+        "Name:                   coredns\n"
+        "Namespace:              kube-system\n"
+        "Replicas:               2 desired | 2 available\n"
+        "Strategy:               RollingUpdate (max unavailable 1)\n"
+        "Conditions:             Available=True, Progressing=False\n"
+        "Events: (无异常事件 — CoreDNS Pod全部健康)\n"
+        "\n## kube-dns Service\n"
+        "NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)\n"
+        "kube-dns   ClusterIP   10.0.0.10    <none>        53/UDP,53/TCP\n"
+        "\n## Corefile ConfigMap\n"
+        ".:53 {\n    errors\n    health\n    kubernetes cluster.local in-addr.arpa ip6.arpa\n    prometheus :9153\n    forward . 10.0.0.53 10.0.0.54\n    cache 30\n    loop\n    reload\n}\n"
+        "说明: CoreDNS Deployment健康(2/2 Ready)，内部DNS解析正常(cluster.local)\n"
+        "      但forward插件指向已下线DNS服务器(10.0.0.53/54不可达!)→外部域名解析全部超时\n"
+        "      注意: 这是独立根因，与磁盘IO饱和无关—需分别修复\n"
     ),
 }
 
@@ -1272,6 +1313,13 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
             "kube-system   5m          Warning   QuorumLost           etcd cluster lost quorum (1/3 members alive)\n"
             "default       3m          Warning   FailedCreate         API Server read-only — cannot create/update resources\n"
         ),
+        "disk_io_and_dns": (
+            "NAMESPACE     LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default       40m         Warning   IOTimeout            Write I/O timeout 30s (disk saturated by logrotate)\n"
+            "default       35m         Warning   DNSResolutionFailed  UnknownHostException: upstream-db.external.com\n"
+            "kube-system   30m         Warning   DNSForwardTimeout    CoreDNS forward timeout: upstream 10.0.0.53:53 unreachable\n"
+            "kube-system   25m         Warning   DNSForwardTimeout    CoreDNS forward timeout: upstream 10.0.0.54:53 unreachable\n"
+        ),
         "dns_and_etcd": (
             "NAMESPACE     LAST SEEN   TYPE      REASON               MESSAGE\n"
             "default       1m          Warning   DNSLookupTimeout     user-svc DNS lookup timeout (CoreDNS CrashLoopBackOff)\n"
@@ -1282,6 +1330,13 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
             "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
             "default     30m         Warning   Failed               Failed to pull image \"node:18-alpine\": 429 Too Many Requests\n"
             "default     25m         Warning   BackOff              ImagePullBackOff — Docker Hub rate limit (100 pulls/6h)\n"
+        ),
+        "conntrack_and_oom": (
+            "NAMESPACE   LAST SEEN   TYPE      REASON               MESSAGE\n"
+            "default     15m         Warning   OOMKilled            api-gateway OOMKilled (java RSS=6.4GB, off-heap leak!)\n"
+            "default     10m         Warning   DNSLookupTimeout     Readiness probe: DNS timeout (conntrack UDP drop)\n"
+            "default     5m          Warning   BackOff              CrashLoopBackOff #8\n"
+            "default     2m          Warning   OOMKilled            Repeat kill — java process memory climbing\n"
         ),
     }
     return events_map.get(scenario, events_map["normal"])
@@ -1325,6 +1380,33 @@ def get_node_info(cluster_name: str, node_name: str) -> str:
             "Kubelet Last Heartbeat: 5m12s ago (extended outage!)\n"
             "Kubelet Status:     Process killed by OOM Killer (PID 3210)\n"
             "dmesg:              oom-killer killed process kubelet (total-vm:4194304kB)\n"
+        ),
+        "oom_score_misconfig": (
+            f"Name:               {node_name}\n"
+            "Roles:              worker\n"
+            "Status:             NotReady (Reason: NodeStatusUnknown)\n"
+            "Conditions:         Ready=Unknown, MemoryPressure=True\n"
+            "Kubelet Status:     Process killed by OOM Killer (PID 3210)\n"
+            "Kubelet oom_score_adj: -500 (should be protected but WAS killed!)\n"
+            "App Pod oom_score_adj: 750 (survived — misconfig confirmed!)\n"
+            "dmesg:              oom-killer killed kubelet instead of java-app (oom_score_adj inversion!)\n"
+        ),
+        "conntrack_and_oom": (
+            f"Name:               {node_name}\n"
+            "Roles:              worker\n"
+            "Status:             Ready (but under severe memory pressure)\n"
+            "Conditions:         Ready=True, MemoryPressure=True\n"
+            "Kernel:             conntrack table 262144/262144 (FULL!)\n"
+            "OOM Events:         8 OOM kills in 2 days (java off-heap leak)\n"
+            "dmesg:              conntrack table full, dropping packets + java OOM killed\n"
+        ),
+        "multi_layer_cascading": (
+            f"Name:               {node_name}\n"
+            "Roles:              worker\n"
+            "Status:             NotReady (worker-3 — OOM Killer killed kubelet)\n"
+            "Conditions:         Ready=Unknown, MemoryPressure=True, DiskPressure=False\n"
+            "Kubelet Status:     Process killed by OOM Killer\n"
+            "Pods on this node:  All Unknown (2 CoreDNS replicas lost!)\n"
         ),
     }
     return node_info_map.get(scenario, node_info_map["normal"])
@@ -1397,6 +1479,12 @@ def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
             "default       api-gateway-ghi56        25m          420Mi    (82% of 512Mi limit — normal!)\n"
             "default       backend-service-xyz12    15m          350Mi\n"
             "default       nginx-7d8b-jkl78         5m           45Mi\n"
+        ),
+        "conntrack_and_oom": (
+            "NAMESPACE     NAME                     CPU(cores)   MEMORY(bytes)\n"
+            "default       api-gateway-abc12        85m          5.9Gi    (98% of 6Gi limit! off-heap leak!)\n"
+            "default       api-gateway-def34        72m          5.6Gi    (93% of 6Gi limit — climbing!)\n"
+            "default       backend-svc-xyz12        15m          350Mi\n"
         ),
     }
     return usage.get(scenario, usage["normal"])
@@ -1511,6 +1599,55 @@ def get_system_pods(cluster_name: str) -> str:
             "kube-system   kube-controller-manager-master-1    1/1     Running   0          30d\n"
             "kube-system   kube-scheduler-master-1             1/1     Running   0          30d\n"
             "kube-system   kube-proxy-lmn99                    1/1     Running   0          30d\n"
+        ),
+        "etcd_quorum_loss": (
+            "NAMESPACE     NAME                              READY   STATUS             RESTARTS   AGE\n"
+            "kube-system   etcd-master-1                      0/1     CrashLoopBackOff   12         30d (disk IO hang!)\n"
+            "kube-system   etcd-master-2                      0/1     CrashLoopBackOff   8          30d (disk IO hang!)\n"
+            "kube-system   etcd-master-3                      1/1     Running            0          30d (only survivor)\n"
+            "kube-system   coredns-6d4b-xyz11                 1/1     Running            0          30d\n"
+            "kube-system   coredns-6d4b-abc99                 1/1     Running            0          30d\n"
+            "kube-system   kube-apiserver-master-1             1/1     Running            0          30d (read-only mode!)\n"
+            "kube-system   kube-controller-manager-master-1    1/1     Running            0          30d\n"
+            "kube-system   kube-scheduler-master-1             1/1     Running            0          30d\n"
+            "kube-system   kube-proxy-lmn99                    1/1     Running            0          30d\n"
+        ),
+        "dns_and_etcd": (
+            "NAMESPACE     NAME                              READY   STATUS             RESTARTS   AGE\n"
+            "kube-system   coredns-6d4b-xyz11                 1/1     Running            0          30d (worker-1, healthy)\n"
+            "kube-system   coredns-6d4b-def88                 0/1     CrashLoopBackOff   8          30d (OOMKilled 64Mi!)\n"
+            "kube-system   etcd-master-1                      1/1     Running            8          30d (leader election频繁!)\n"
+            "kube-system   etcd-master-2                      1/1     Running            3          30d\n"
+            "kube-system   etcd-master-3                      1/1     Running            0          30d\n"
+            "kube-system   kube-apiserver-master-1             1/1     Running            1          30d (etcd慢导致间歇延迟)\n"
+            "kube-system   kube-controller-manager-master-1    1/1     Running            0          30d\n"
+            "kube-system   kube-scheduler-master-1             1/1     Running            0          30d\n"
+            "kube-system   kube-proxy-lmn99                    1/1     Running            0          30d\n"
+        ),
+        "coredns_cache_poison": (
+            "NAMESPACE     NAME                              READY   STATUS    RESTARTS   AGE\n"
+            "kube-system   coredns-6d4b-xyz11                 1/1     Running   0          30d (正常 — 缓存问题非Pod故障)\n"
+            "kube-system   coredns-6d4b-abc99                 1/1     Running   0          30d (正常)\n"
+            "kube-system   etcd-master-1                      1/1     Running   0          30d\n"
+            "kube-system   etcd-master-2                      1/1     Running   0          30d\n"
+            "kube-system   etcd-master-3                      1/1     Running   0          30d\n"
+            "kube-system   kube-apiserver-master-1             1/1     Running   0          30d\n"
+            "kube-system   kube-controller-manager-master-1    1/1     Running   0          30d\n"
+            "kube-system   kube-scheduler-master-1             1/1     Running   0          30d\n"
+            "kube-system   kube-proxy-lmn99                    1/1     Running   0          30d\n"
+        ),
+        "image_pull_backoff": (
+            "NAMESPACE     NAME                              READY   STATUS    RESTARTS   AGE\n"
+            "kube-system   coredns-6d4b-xyz11                 1/1     Running   0          30d\n"
+            "kube-system   coredns-6d4b-abc99                 1/1     Running   0          30d\n"
+            "kube-system   etcd-master-1                      1/1     Running   0          30d\n"
+            "kube-system   etcd-master-2                      1/1     Running   0          30d\n"
+            "kube-system   etcd-master-3                      1/1     Running   0          30d\n"
+            "kube-system   kube-apiserver-master-1             1/1     Running   0          30d\n"
+            "kube-system   kube-controller-manager-master-1    1/1     Running   0          30d\n"
+            "kube-system   kube-scheduler-master-1             1/1     Running   0          30d\n"
+            "kube-system   kube-proxy-lmn99                    1/1     Running   0          30d\n"
+            "说明: 所有系统Pod正常 — ImagePullBackOff仅影响用户namespace的新Pod部署\n"
         ),
     }
     return system_pods.get(scenario, system_pods["normal"])

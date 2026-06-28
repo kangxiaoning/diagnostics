@@ -282,14 +282,25 @@ def record_finding(
     evidence_summary: str,
     probability_update: int,
     new_insights: str = "",
+    statement_update: str = "",
 ) -> None:
-    """Record a verification finding for a hypothesis."""
+    """Record a verification finding for a hypothesis.
+
+    Args:
+        statement_update: If provided, replaces the hypothesis statement
+            with a more accurate version discovered during verification
+            (e.g. "etcd compaction" → "etcd NOSPACE alarm").
+    """
     hypotheses = ledger["hypotheses"]
     if hypothesis_id not in hypotheses:
         raise ValueError(f"假设 {hypothesis_id} 不存在")
 
     node = hypotheses[hypothesis_id]
     node["probability"] = max(0, min(100, probability_update))
+
+    # Update statement if a more accurate version was found during verification
+    if statement_update:
+        node["statement"] = statement_update
 
     supports = verdict == "confirmed"
     if evidence_summary:
@@ -728,7 +739,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "- 报告必须包含: 根因（如有多个，按条目分别列出）、证据链、排除的假设及排除原因"
             + multi_hint +
             f"\n- 使用 write_file 将报告写入 {{report_path}}\n"
-            f"- 使用 write_file 将台账写入 {{ledger_path}}（JSON格式）"
+            "- ⚠ 诊断台账（ledger JSON）已由系统自动持久化，无需手动写入"
         )
     return ""
 

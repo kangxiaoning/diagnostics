@@ -172,6 +172,14 @@ oom-killer invoked: killed process java (PID 8765) total-vm:12849152kB anon-rss:
 (无文件系统错误)
 ✅ dmesg 完全正常 — 内核层面无异常
 """
+    elif s == "memory_leak_and_disk_full":
+        return """## dmesg 关键信息
+java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
+Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:7130112kB (RSS=6.8GB)
+EXT4-fs error (device sda1): ext4_journal_check_start: Detected aborted journal
+ext4 journal abort on /dev/sda1 (磁盘满导致ext4日志写入失败)
+⚠ 双故障: Java内存泄漏OOM Killer + 磁盘满导致ext4日志异常
+"""
     else:
         return """## dmesg 关键信息
 (无异常 — 无 OOM/conntrack/IO hang/文件系统错误)

@@ -18,6 +18,7 @@ class Settings:
     api_key: str = "lm-studio"
     api_key_configured: bool = False
     temperature: float = 0.2
+    max_tokens: int = 4096
     max_history_messages: int = 16
     app_title: str = "Linux Diagnostics Agent"
 
@@ -34,6 +35,7 @@ class Settings:
             api_key=configured_api_key or cls.api_key,
             api_key_configured=configured_api_key is not None,
             temperature=float(os.getenv("DIAGNOSTICS_TEMPERATURE", str(cls.temperature))),
+            max_tokens=int(os.getenv("DIAGNOSTICS_MAX_TOKENS", str(cls.max_tokens))),
             max_history_messages=int(
                 os.getenv("DIAGNOSTICS_MAX_HISTORY_MESSAGES", str(cls.max_history_messages))
             ),

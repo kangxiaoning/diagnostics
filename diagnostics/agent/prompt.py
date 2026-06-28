@@ -85,6 +85,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
   - **委派描述里只描述症状、假设内容和期望结论，禁止引用 `/proc/**`、`/sys/**`、`/var/log/**` 等主机路径——subagent 无法访问这些路径，引用只会诱导 subagent 误用本地文件工具**
 - 可按需 `read_file` 加载 SKILL.md 指导委派方向
 - 收到结果后 → 调用 `record_finding` 记录结论
+  - 若验证发现原始假设表述不准确，使用 `statement_update` 参数修正表述（如 "etcd compaction" → "etcd NOSPACE alarm"）
+  - `statement_update` 会同步更新台账中的假设文本和根因记录
 - **禁止调用与当前假设无关的工具**
 
 #### 阶段 4: EVALUATE（评估与路径选择）
@@ -112,11 +114,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 {report_path}
 ```
 
-- 使用 `write_file` 将诊断台账写入以下路径（JSON 格式）：
-
-```
-{ledger_path}
-```
+**注意**：诊断台账（ledger JSON）已由系统自动持久化到 `{ledger_path}`，**无需手动写入**。只需写入报告文件即可。
 
 不要自行生成新路径——使用此精确路径。
 
@@ -192,7 +190,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 - `commit_hypotheses` — HYPOTHESIZE 阶段提交假设（每层 ≤3 个）
 - `select_path` — EVALUATE 阶段选择深入路径
-- `record_finding` — VERIFY 后记录验证结论
+- `record_finding` — VERIFY 后记录验证结论（支持 `statement_update` 修正假设表述）
 
 ### 禁用工具
 
@@ -271,7 +269,7 @@ VERIFY (聚焦 H1.1: JVM堆配置超过limit, 委派专家):
 
 EVALUATE → 退出条件1(根因确认): H1.1 confirmed p=90%, 无合理子假设 → REPORT
   → write_file("{report_path}", 诊断报告)
-  → write_file("{ledger_path}", 台账JSON)
+  （台账已由系统自动持久化，无需手动写入）
 </example>
 
 <example>
@@ -296,7 +294,7 @@ EVALUATE:
 REPORT → 退出条件1(根因确认): H1 confirmed p=92%
   报告开头: "诊断模式：技能驱动（conntrack-diagnosis）"
   → write_file("{report_path}", 诊断报告)
-  → write_file("{ledger_path}", 台账JSON)
+  （台账已由系统自动持久化，无需手动写入）
 </example>
 </examples>
 """

@@ -235,6 +235,7 @@ def build_agent(
         base_url=settings.base_url,
         api_key=settings.api_key,
         temperature=settings.temperature,
+        max_tokens=settings.max_tokens,
         model_kwargs={"tool_choice": "auto"},
     )
 
@@ -251,6 +252,7 @@ def build_agent(
     ledger_middleware = DiagnosisLedgerMiddleware(
         ledger_path=ledger_path,
         report_path=report_path,
+        model=model,
     )
 
     return create_deep_agent(

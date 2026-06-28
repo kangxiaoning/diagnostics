@@ -115,12 +115,17 @@ def _auto_set_scenario(message: str) -> None:
     Called before agent starts in mock mode.  Supports all 18+ scenarios.
     """
     msg = message.lower()
+    # ══════════════════════════════════════════════════════════════════
+    # Priority: dual/multi-root cause first (more specific multi-keyword
+    # patterns), then single-root cause (some with broad keywords).
+    # Within each tier, specific patterns precede general ones.
+    # ══════════════════════════════════════════════════════════════════
+
     # ── Dual root cause ──
     if _kw(msg, "504", "cpu") or _kw(msg, "prod-web-01", "504"):
         _set("stress_cpu_and_tc_loss"); return
     if _kw(msg, "api-gateway", "oom") or _kw(msg, "api-gateway", "dns", "内存"):
         _set("conntrack_and_oom"); return
-    # ── etcd quota near full (matches api-gateway 5xx + restart + DNS + 半年没发布) ──
     if _kw(msg, "api-gateway", "5xx", "重启", "dns") or \
        _kw(msg, "api-gateway", "5xx", "重启", "半年") or \
        _kw(msg, "etcd quota") or _kw(msg, "etcd", "接近上限"):
@@ -128,19 +133,33 @@ def _auto_set_scenario(message: str) -> None:
     if _kw(msg, "backend-svc", "dns") or _kw(msg, "backend-svc", "延迟", "磁盘") or \
        _kw(msg, "外部域名", "解析"):
         _set("disk_io_and_dns"); return
+    if _kw(msg, "内存泄漏", "磁盘") or _kw(msg, "gc", "频繁", "磁盘", "满") or \
+       _kw(msg, "oom", "日志", "写满"):
+        _set("memory_leak_and_disk_full"); return
+    # dns_and_etcd before container_crash (both match "crashloopbackoff")
+    if _kw(msg, "coredns", "crashloop", "etcd") or \
+       _kw(msg, "dns 失败", "api server 慢") or \
+       _kw(msg, "coredns", "etcd", "切换"):
+        _set("dns_and_etcd"); return
     # ── Cascading ──
     if _kw(msg, "etcd", "oom") or _kw(msg, "etcd", "worker-3") or \
        _kw(msg, "master-1", "worker-3") or _kw(msg, "表现很乱", "独立问题"):
         _set("multi_layer_cascading"); return
-    # ── K8s single root cause ──
-    if _kw(msg, "conntrack", "notready") or _kw(msg, "worker-5", "worker-8") or \
-       _kw(msg, "notready", "pod 被驱逐") or _kw(msg, "节点", "notready", "coredns"):
-        _set("conntrack_table_full"); return
+
+    # ── K8s single root cause (specific before general) ──
+    # kubelet_disk_io_starvation before conntrack_table_full (both match "notready"+"pod 被驱逐")
     if _kw(msg, "kubelet", "disk io") or _kw(msg, "node notready", "磁盘") or \
        _kw(msg, "pod 被驱逐", "磁盘"):
         _set("kubelet_disk_io_starvation"); return
+    if _kw(msg, "conntrack", "notready") or _kw(msg, "worker-5", "worker-8") or \
+       _kw(msg, "notready", "pod 被驱逐") or _kw(msg, "节点", "notready", "coredns"):
+        _set("conntrack_table_full"); return
+    # oom_score_misconfig before node_oom_kubelet_killed (both match "kubelet"+"oom")
+    if _kw(msg, "oom_score") or _kw(msg, "oom score") or \
+       _kw(msg, "误杀", "kubelet"):
+        _set("oom_score_misconfig"); return
     if _kw(msg, "kubelet", "oom") or _kw(msg, "oom kill", "kubelet") or \
-       _kw(msg, "节点 unknown", "内存"):
+       _kw(msg, "节点", "unknown", "内存") or _kw(msg, "节点", "unknown", "pod 不可达"):
         _set("node_oom_kubelet_killed"); return
     if _kw(msg, "cpu throttl", "探针") or _kw(msg, "健康 pod", "重启") or \
        _kw(msg, "探针超时", "cpu"):
@@ -151,16 +170,15 @@ def _auto_set_scenario(message: str) -> None:
     if _kw(msg, "mtu", "不匹配") or _kw(msg, "大包", "丢包") or \
        _kw(msg, "ping 小包通", "大包不通"):
         _set("mtu_mismatch"); return
-    if _kw(msg, "软中断", "cpu") or _kw(msg, "ksoftirqd", "高") or \
-       _kw(msg, "ring buffer", "溢出"):
-        _set("softirq_starvation"); return
-    if _kw(msg, "accept 队列", "满") or _kw(msg, "tcp", "间歇超时") or \
-       _kw(msg, "somaxconn"):
-        _set("tcp_accept_overflow"); return
     if _kw(msg, "容器", "频繁重启") or _kw(msg, "oomkilled", "limit") or \
        _kw(msg, "crashloopbackoff"):
         _set("container_crash"); return
-    # ── Host single root cause ──
+
+    # ── Host single root cause (specific before general) ──
+    # swap_thrashing before high_cpu_iowait (both match "iowait"+"高")
+    if _kw(msg, "swap", "抖动") or _kw(msg, "swap", "频繁") or \
+       _kw(msg, "换入换出"):
+        _set("swap_thrashing"); return
     if _kw(msg, "iowait", "高") or _kw(msg, "load avg", "cpu util 低") or \
        _kw(msg, "负载高", "cpu 低"):
         _set("high_cpu_iowait"); return
@@ -176,10 +194,17 @@ def _auto_set_scenario(message: str) -> None:
         _set("network_congestion"); return
     if _kw(msg, "io", "内存") or _kw(msg, "混合瓶颈"):
         _set("mixed_io_memory"); return
+    if _kw(msg, "软中断", "cpu") or _kw(msg, "ksoftirqd", "高") or \
+       _kw(msg, "ring buffer", "溢出"):
+        _set("softirq_starvation"); return
+    if _kw(msg, "accept 队列", "满") or _kw(msg, "tcp", "间歇超时") or \
+       _kw(msg, "somaxconn"):
+        _set("tcp_accept_overflow"); return
     # ── GPU ──
     if _kw(msg, "gpu", "oom") or _kw(msg, "cuda", "out of memory") or \
        _kw(msg, "显存", "耗尽"):
         _set("gpu_oom"); return
+
     # ── Additional K8s scenarios ──
     if _kw(msg, "coredns", "缓存") or _kw(msg, "dns", "错误 ip") or \
        _kw(msg, "解析到错误"):
@@ -193,12 +218,10 @@ def _auto_set_scenario(message: str) -> None:
     if _kw(msg, "磁盘", "写满") or _kw(msg, "var/log", "满") or \
        _kw(msg, "容器运行时", "崩溃"):
         _set("disk_full_var_log"); return
-    if _kw(msg, "oom_score") or _kw(msg, "误杀", "kubelet") or \
-       _kw(msg, "oom score", "不当"):
-        _set("oom_score_misconfig"); return
     if _kw(msg, "inode", "耗尽") or _kw(msg, "磁盘有空间", "创建文件失败") or \
        _kw(msg, "小文件过多"):
         _set("fs_inode_exhaustion"); return
+
     # ── Additional Host scenarios ──
     if _kw(msg, "systemd", "nofile") or _kw(msg, "limitnofile") or \
        _kw(msg, "文件描述符", "截断"):
@@ -206,17 +229,6 @@ def _auto_set_scenario(message: str) -> None:
     if _kw(msg, "ebpf", "高") or _kw(msg, "ebpf", "开销") or \
        _kw(msg, "探针", "过量"):
         _set("ebpf_probe_overhead"); return
-    if _kw(msg, "swap", "抖动") or _kw(msg, "swap", "频繁") or \
-       _kw(msg, "换入换出"):
-        _set("swap_thrashing"); return
-    # ── Additional dual root cause ──
-    if _kw(msg, "内存泄漏", "磁盘") or _kw(msg, "gc", "频繁", "磁盘", "满") or \
-       _kw(msg, "oom", "日志", "写满"):
-        _set("memory_leak_and_disk_full"); return
-    if _kw(msg, "coredns", "crashloop", "etcd") or \
-       _kw(msg, "dns 失败", "api server 慢") or \
-       _kw(msg, "coredns", "etcd", "切换"):
-        _set("dns_and_etcd"); return
 
 
 def _set(scenario_id: str) -> None:

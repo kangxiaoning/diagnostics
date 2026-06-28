@@ -11,7 +11,9 @@ See: private/HYPOTHESIS_LEDGER_DESIGN.md
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import pathlib
 import re
 from collections.abc import Awaitable, Callable
@@ -22,7 +24,8 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import ToolMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
@@ -38,6 +41,7 @@ from diagnostics.agent.ledger import (
     derive_phase,
     ledger_to_json,
     new_evidence,
+    new_fault_profile,
     new_ledger,
     record_finding,
     record_round,
@@ -60,6 +64,12 @@ _SCAFFOLDING_TOOLS = frozenset({
 _LEDGER_TOOLS = frozenset({
     "commit_hypotheses", "select_path", "record_finding", "backtrack",
 })
+
+# ── Safety mechanism thresholds ──
+_MAX_ROUNDS = 20                    # Hard limit: force REPORT after this many LLM rounds
+_STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding → stagnation
+_MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
+_MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "180"))  # seconds per LLM call
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -160,6 +170,29 @@ class DeprioritizedSpec(BaseModel):
     reason: str = Field(description="降级原因")
 
 
+class FaultProfileSchema(BaseModel):
+    """Structured output schema for extracting fault profile from user input."""
+
+    entities: list[str] = Field(
+        description="故障实体列表（如集群名、节点名、服务名、主机名）",
+    )
+    symptoms: list[str] = Field(
+        description="观察到的故障症状列表（如 P99延迟飙升、OOMKilled、磁盘满）",
+    )
+    timeline: str = Field(
+        default="",
+        description="故障时间线描述（如 '15:03 开始'、'最近1小时'）",
+    )
+    recent_changes: str = Field(
+        default="",
+        description="故障前的最近变更（如部署、配置变更），无则为空字符串",
+    )
+    prior_actions: str = Field(
+        default="",
+        description="用户已尝试的修复操作，无则为空字符串",
+    )
+
+
 class CommitHypothesesInput(BaseModel):
     hypotheses: list[HypothesisSpec] = Field(
         description="假设列表（最多3个，按概率降序）",
@@ -197,6 +230,14 @@ class RecordFindingInput(BaseModel):
         default="",
         description="新发现，可能催生新假设",
     )
+    statement_update: str = Field(
+        default="",
+        description=(
+            "修正后的假设表述（可选）。当验证发现原始表述不准确时使用，"
+            "例如将 'etcd compaction 导致...' 修正为 'etcd NOSPACE alarm 导致...'。"
+            "留空表示不修改原表述。"
+        ),
+    )
 
 
 # ── Middleware ──
@@ -206,17 +247,87 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     state_schema = DiagnosisLedgerState
 
-    def __init__(self, ledger_path: str = "", report_path: str = "") -> None:
+    def __init__(
+        self,
+        ledger_path: str = "",
+        report_path: str = "",
+        model: BaseChatModel | None = None,
+    ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
+        self._model = model
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
+        # Safety mechanism tracking
+        self._consecutive_task_count: int = 0
+        self._last_finding_round: int = 0
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
             self._make_record_finding_tool(),
             self._make_backtrack_tool(),
         ]
+
+    # ── Fault profile extraction via structured output ──
+
+    async def abefore_agent(self, state, runtime) -> dict | None:
+        """Extract fault_profile from user input using structured output.
+
+        Runs once before the agent loop starts.  Uses the chat model's
+        ``with_structured_output`` to reliably parse entities, symptoms,
+        timeline, etc. from the first HumanMessage — eliminating the
+        dependency on the LLM voluntarily calling a tool.
+        """
+        if self._model is None:
+            return None
+
+        # Only extract once — skip if ledger already has a fault_profile
+        # or if this is not the first invocation (ledger already exists).
+        if self._current_ledger is not None:
+            return None
+
+        messages = state.get("messages", [])
+        user_text = ""
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                user_text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+        if not user_text:
+            return None
+
+        try:
+            structured_model = self._model.with_structured_output(FaultProfileSchema)
+            profile: FaultProfileSchema = await structured_model.ainvoke(
+                [
+                    {"role": "system", "content": (
+                        "从用户故障描述中提取结构化故障画像。"
+                        "提取实体（集群、节点、服务名）、症状、时间线、最近变更和已尝试操作。"
+                        "如果某项信息未提及，使用空字符串或空列表。"
+                    )},
+                    {"role": "user", "content": user_text},
+                ],
+            )
+        except Exception as e:
+            logger.warning("Failed to extract fault_profile via structured output: %s", e)
+            return None
+
+        ledger = new_ledger()
+        ledger["fault_profile"] = new_fault_profile(
+            entities=profile.entities,
+            symptoms=profile.symptoms,
+            user_raw=user_text,
+            timeline=profile.timeline,
+            recent_changes=profile.recent_changes,
+            prior_actions=profile.prior_actions,
+        )
+        self._current_ledger = ledger
+
+        logger.info(
+            "Fault profile extracted: entities=%s, symptoms=%s",
+            profile.entities, profile.symptoms,
+        )
+
+        return {"_diagnosis_ledger": ledger}
 
     # ── Round detection via before_model hook ──
 
@@ -270,12 +381,44 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             self._current_ledger["current_round"] = self._model_call_count
 
         context_block = render_ledger_context(ledger)
-        if context_block:
-            new_sys = append_to_system_message(request.system_message, context_block)
-            new_request = request.override(system_message=new_sys)
-            response = await handler(new_request)
-        else:
-            response = await handler(request)
+        safety_block = self._build_safety_warnings(ledger)
+
+        combined_block = context_block
+        if safety_block:
+            combined_block = f"{combined_block}\n\n{safety_block}" if combined_block else safety_block
+
+        # ── Timeout protection: prevent single LLM call from hanging forever ──
+        _call_request = request.override(system_message=append_to_system_message(
+            request.system_message, combined_block)) if combined_block else request
+        try:
+            response = await asyncio.wait_for(
+                handler(_call_request),
+                timeout=_MODEL_CALL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Model call timed out after %ds (round %d, phase=%s). "
+                "Forcing REPORT phase.",
+                _MODEL_CALL_TIMEOUT,
+                self._model_call_count,
+                ledger.get("current_phase", "?"),
+            )
+            ledger["current_phase"] = "report"
+            self._persist_ledger(ledger)
+            # Return a synthetic error response so the agent loop can
+            # continue and generate a report with existing evidence.
+            from langchain_core.messages import AIMessage
+            error_msg = AIMessage(
+                content=(
+                    f"[系统超时] 模型调用超过 {_MODEL_CALL_TIMEOUT} 秒限制。"
+                    "已强制进入 REPORT 阶段。请基于已有证据立即生成诊断报告。"
+                ),
+            )
+            # Build a minimal ModelResponse with the error message.
+            # The agent loop will see this as the model's response and
+            # proceed to the next iteration where the REPORT phase directive
+            # will be injected via the safety mechanism.
+            response = ModelResponse(result=[error_msg])
 
         # Sync ledger back to state via ExtendedModelResponse so it persists
         # across rounds and survives SummarizationMiddleware compression.
@@ -382,14 +525,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         tool_name=tool_name,
                     )
 
+            # Build key_findings from tool output (first 200 chars)
+            key_findings = ""
+            if output:
+                key_findings = output[:200].replace("\n", " ").strip()
+
             record_round(
                 ledger, derive_phase(ledger),
                 tools_called=[tool_name],
                 action_summary=tool_args.get("description", "") if tool_name == "task" else tool_name,
+                key_findings=key_findings,
             )
 
         # After ledger management tools, persist and emit snapshot
         if tool_name in _LEDGER_TOOLS:
+            # Track record_finding calls for stagnation detection
+            if tool_name == "record_finding":
+                self._consecutive_task_count = 0
+                self._last_finding_round = self._model_call_count
             self._persist_ledger(ledger)
             # Emit ledger snapshot via stream_writer for frontend
             try:
@@ -404,6 +557,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     })
             except Exception:
                 pass  # stream_writer not available in all contexts
+        elif tool_name == "task":
+            # Track consecutive task() calls without record_finding (loop detection)
+            self._consecutive_task_count += 1
 
         # Capture report content when write_file writes to the pre-generated
         # report path — emit for frontend answer-body without text parsing.
@@ -466,6 +622,102 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 pass
 
         return result
+
+    # ── Safety mechanisms: max-round, loop detection, stagnation fallback ──
+
+    def _build_safety_warnings(self, ledger: DiagnosisLedger) -> str:
+        """Build safety directive messages injected into the system prompt.
+
+        Three escalating safety mechanisms prevent infinite loops:
+
+        1. **Max rounds (P1)**: Hard limit on LLM rounds — forces REPORT phase.
+        2. **Stagnation detection (P2/P3)**: After ≥3 consecutive task() calls
+           without record_finding, auto-records an inconclusive finding for
+           the active hypothesis and warns the LLM.
+        3. **Loop warning (P2)**: Weaker early warning when ≥3 task() calls
+           pile up before the stagnation threshold triggers auto-recording.
+
+        Returns an empty string when no warnings apply.
+        """
+        round_num = self._model_call_count
+        warnings: list[str] = []
+
+        # ── P1: Hard maximum round limit ──
+        if round_num >= _MAX_ROUNDS:
+            ledger["current_phase"] = "report"
+            warnings.append(
+                "⛔ [系统强制] 已达到最大诊断轮次限制"
+                f"（{_MAX_ROUNDS}轮）。\n"
+                "禁止再调用任何诊断工具或委派专家。\n"
+                "必须立即基于已有证据生成诊断报告。\n"
+                "即使证据不完整，也必须给出最佳判断和建议。"
+            )
+            logger.warning(
+                "Safety: max rounds (%d) reached — forcing REPORT phase",
+                round_num,
+            )
+
+        # ── P2/P3: Stagnation & loop detection (only after min round) ──
+        elif round_num >= _MIN_ROUND_FOR_SAFETY:
+            current_phase = ledger.get("current_phase", "")
+            has_hypotheses = bool(ledger.get("hypotheses"))
+
+            if self._consecutive_task_count >= _STAGNATION_THRESHOLD:
+                if current_phase == "verify" and has_hypotheses:
+                    # ── P3: Auto-record inconclusive for active hypothesis ──
+                    active_path = ledger.get("active_path", [])
+                    active_id = active_path[-1] if active_path else None
+                    if active_id and active_id in ledger.get("hypotheses", {}):
+                        record_finding(
+                            ledger, active_id, "inconclusive",
+                            f"连续{self._consecutive_task_count}次委派专家"
+                            f"均未获得可判定结论（第{round_num}轮），"
+                            "系统自动标记为不确定。",
+                            ledger["hypotheses"][active_id]["probability"],
+                        )
+                        should_exit, exit_reason, _ = check_exit_conditions(ledger)
+                        if should_exit:
+                            ledger["current_phase"] = "report"
+                            warnings.append(
+                                f"⚠ [系统安全阀] {exit_reason}\n"
+                                "系统已自动将活跃假设标记为不确定。\n"
+                                "必须立即进入REPORT阶段，基于已有证据生成诊断报告。"
+                            )
+                        else:
+                            phase = derive_phase(ledger)
+                            ledger["current_phase"] = phase
+                            warnings.append(
+                                f"⚠ [系统自动记录] 验证阶段超时"
+                                f"（连续{self._consecutive_task_count}次委派"
+                                "无明确结论），已自动标记为不确定。\n"
+                                f"当前阶段: {phase}。"
+                                "请根据新阶段指示继续诊断或生成报告。"
+                            )
+                        self._persist_ledger(ledger)
+                        self._consecutive_task_count = 0
+                        self._last_finding_round = round_num
+                        logger.warning(
+                            "Safety: auto-inconclusive for %s (round %d, "
+                            "consecutive_task=%d)",
+                            active_id, round_num,
+                            self._consecutive_task_count,
+                        )
+                else:
+                    # ── P2: Loop warning without auto-recording ──
+                    warnings.append(
+                        f"⚠ [系统警告] 已连续{self._consecutive_task_count}次"
+                        "委派专家但未记录验证结论。\n"
+                        "工具已返回足够数据，请分析已有证据并调用"
+                        " record_finding 记录结论，或直接生成报告。\n"
+                        "避免重复委派专家查询相同数据。"
+                    )
+                    logger.warning(
+                        "Safety: %d consecutive task() calls without "
+                        "record_finding (round %d, phase=%s)",
+                        self._consecutive_task_count, round_num, current_phase,
+                    )
+
+        return "\n\n".join(warnings) if warnings else ""
 
     # ── Tool: commit_hypotheses ──
 
@@ -568,15 +820,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             evidence_summary: str,
             probability_update: int,
             new_insights: str = "",
+            statement_update: str = "",
         ) -> str:
             ledger = mw._current_ledger
             if ledger is None:
                 return "错误: 诊断台账不存在"
 
+            # Capture old statement for root_causes sync
+            old_statement = ""
+            if statement_update and hypothesis_id in ledger.get("hypotheses", {}):
+                old_statement = ledger["hypotheses"][hypothesis_id].get("statement", "")
+
             try:
                 record_finding(
                     ledger, hypothesis_id, verdict,
                     evidence_summary, probability_update, new_insights,
+                    statement_update,
                 )
             except ValueError as e:
                 return f"记录失败: {e}"
@@ -602,6 +861,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     ledger["root_cause"] = causes[0]
                     ledger["root_cause_hypothesis_id"] = cids[0]
 
+            # Sync root_causes text when statement was updated for an
+            # already-confirmed hypothesis (e.g. "etcd compaction" → "etcd NOSPACE").
+            if old_statement and statement_update:
+                causes_list = ledger.get("root_causes", [])
+                for i, rc in enumerate(causes_list):
+                    if rc == old_statement:
+                        causes_list[i] = statement_update
+                        break
+                # Also update backward-compat field
+                if ledger.get("root_cause") == old_statement:
+                    ledger["root_cause"] = statement_update
+
             if should_exit:
                 ledger["current_phase"] = "report"
             elif "部分根因" in reason:
@@ -614,9 +885,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             mw._current_ledger = ledger
 
             exit_hint = f"\n⚠ {reason} — 进入REPORT阶段生成报告" if should_exit else ""
+            stmt_hint = f"\nℹ 假设表述已修正为: {statement_update}" if statement_update else ""
             return (
                 f"已记录验证结果: {hypothesis_id} → {verdict} (p={probability_update}%)\n"
-                f"{evidence_summary}{exit_hint}"
+                f"{evidence_summary}{stmt_hint}{exit_hint}"
             )
 
         return StructuredTool.from_function(
