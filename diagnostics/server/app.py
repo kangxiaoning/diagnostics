@@ -387,6 +387,7 @@ async def _chat_event_stream(
                     event.payload["name"],
                     format_tool_args(event.payload.get("args", {}), event.payload["name"]),
                     description,
+                    tool_call_id=event.payload.get("id", ""),
                 )
 
                 yield sse("tool_start", event.payload)
@@ -404,6 +405,7 @@ async def _chat_event_stream(
                     event.payload.get("round", 0),
                     event.payload.get("name", ""),
                     event.payload.get("output_full", ""),
+                    tool_call_id=event.payload.get("id", ""),
                 )
 
                 yield sse("tool_end", event.payload)

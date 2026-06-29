@@ -6,38 +6,66 @@ Each scenario provides a 10-min window per subsystem so the Coordinator can:
 3. Cross-reference concurrent metric changes to infer causality
 
 All data functions accept a scenario ID and return formatted text.
+Query parameters (name_chunk, start_time, end_time) are applied as
+display-level overrides on the formatted output.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 
 # ═══════════════════ Public per-metric query API ═══════════════════
 
-def query_argus_cpu_metrics(scenario: str) -> str:
+def query_argus_cpu_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
     handler = _CPU_DATA.get(scenario, _default)
-    return handler()
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
-def query_argus_memory_metrics(scenario: str) -> str:
+def query_argus_memory_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
     handler = _MEM_DATA.get(scenario, _default)
-    return handler()
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
-def query_argus_disk_metrics(scenario: str) -> str:
+def query_argus_disk_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
     handler = _DISK_DATA.get(scenario, _default)
-    return handler()
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
-def query_argus_network_metrics(scenario: str) -> str:
+def query_argus_network_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
     handler = _NET_DATA.get(scenario, _default)
-    return handler()
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
-def query_argus_k8s_metrics(scenario: str) -> str:
+def query_argus_k8s_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
     handler = _K8S_DATA.get(scenario, _default)
-    return handler()
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
 # ═══════════════════ Default (normal system) ═══════════════════
@@ -205,36 +233,36 @@ def _cpu_conntrack_oom() -> str:
     return _fmt("CPU", "prod-us-east/worker-3", "15:00",
         cols=["CPU%", "Load", "iowait%", "Top Process"],
         rows=[
-            [42, 1.8, 2, "java 42% (RSS 4.2G)"],
-            [45, 2.0, 2, "java 45% (RSS 4.5G)"],
-            [48, 2.5, 3, "java 48% (RSS 4.8G)"],
-            [50, 3.0, 5, "java 50% (RSS 5.2G)"],
-            [55, 3.5, 8, "java 55% (RSS 5.8G)"],
-            [58, 3.8, 10, "java 58% (RSS 6.4G) ⚠ OOMKilled!"],
+            [42, 1.8, 2, "java 42% (RSS 4.8G)"],
+            [44, 2.0, 2, "java 44% (RSS 5.1G)"],
+            [46, 2.5, 3, "java 46% (RSS 5.4G)"],
+            [48, 3.0, 5, "java 48% (RSS 5.7G)"],
+            [52, 3.5, 8, "java 52% (RSS 6.0G)"],
+            [56, 3.8, 10, "java 56% (RSS 6.6G) OOMKilled!"],
             [42, 2.0, 3, "java 30% (Pod重启后)"],
-            [45, 2.5, 3, "java 35%"],
-            [48, 2.8, 3, "java 38%"],
-            [50, 3.0, 4, "java 42%"],
+            [44, 2.5, 3, "java 35%"],
+            [46, 2.8, 3, "java 38%"],
+            [48, 3.0, 4, "java 42%"],
         ],
-        summary="🔴 15:05 Java OOMKilled (RSS 6.4GB)，sys%高因 softirq+内存回收")
+        summary="🔴 15:05 Java OOMKilled (RSS 6.6G)，Java RSS 从 15:00 起持续增长")
 
 
 def _mem_conntrack_oom() -> str:
     return _fmt("Memory", "prod-us-east/worker-3", "15:00",
         cols=["Mem%", "Swap%", "Available(MiB)", "OOM Events"],
         rows=[
-            [65, 0, 2240, "—"],
-            [68, 5, 1980, "—"],
-            [72, 15, 1720, "—"],
-            [78, 28, 1350, "—"],
-            [82, 42, 1100, "—"],
-            [88, 65, 720, "⚠ 接近OOM"],
-            [92, 85, 480, "🔴 Java OOMKilled!"],
+            [70, 0, 1800, "—"],
+            [73, 5, 1600, "—"],
+            [76, 15, 1400, "—"],
+            [79, 28, 1150, "—"],
+            [83, 42, 900, "—"],
+            [88, 65, 620, "⚠ 接近OOM"],
+            [93, 85, 380, "🔴 Java OOMKilled!"],
             [72, 45, 1720, "Pod重启后回落"],
             [75, 50, 1550, "—"],
             [78, 55, 1350, "—"],
         ],
-        summary="🔴 15:05 OOM — Java RSS 6.4GB 触发 OOM Killer，Swap 0→85%")
+        summary="🔴 15:05 Java OOMKilled (Mem 93%, Swap 85%)，内存从 15:00 起持续增长")
 
 
 def _disk_conntrack_oom() -> str:
@@ -259,7 +287,7 @@ def _net_conntrack_oom() -> str:
             [380, 300, 2000, 5.0, 10500],
             [400, 320, 500, 5.0, 12000],
         ],
-        summary="🔴 15:04 conntrack 131072/131072 满 → 丢包暴增 → 15:05 OOM 后回落")
+        summary="🔴 15:04 ESTAB=131072/131072, 丢包/重传飙升; 15:05 Java OOMKilled — 两个异常同时发生")
 
 
 # ═══════════════════ Scenario: disk_io_and_dns ═══════════════════
@@ -900,6 +928,7 @@ _CPU_DATA: dict[str, Callable[[], str]] = {
             [30, 3.2, 30, "etcd 15%"],
         ],
         summary="🔴 master-1 iowait 3→50%(etcd D-state IO hang) + worker-3 sys%飙升(OOM页面回收)"),
+    "dns_and_etcd": _cpu_normal,
 }
 
 _MEM_DATA: dict[str, Callable[[], str]] = {
@@ -945,6 +974,7 @@ _MEM_DATA: dict[str, Callable[[], str]] = {
             [82, 28, 1.2, "—"],
         ],
         summary="🔴 worker-3 内存枯竭 72→95% + Swap 5→60% → 15:05 OOM Kill kubelet(pid=1, RSS=6.2GB java)"),
+    "dns_and_etcd": _mem_normal,
 }
 
 _DISK_DATA: dict[str, Callable[[], str]] = {
@@ -986,6 +1016,21 @@ _DISK_DATA: dict[str, Callable[[], str]] = {
             [38, 65, 120, 15.0],
         ],
         summary="⚠ 磁盘 IO util 30→45% — etcd compaction 导致IO中等升高但远未饱和"),
+    "dns_and_etcd": lambda: _fmt("Disk", "prod-us-east/master-1", "15:00",
+        cols=["Util%", "IOPS(r/s)", "IOPS(w/s)", "await(ms)"],
+        rows=[
+            [20, 40, 80, 5.0],
+            [22, 42, 85, 6.0],
+            [35, 55, 110, 28.0],   # ← 磁盘间歇不稳定
+            [50, 70, 140, 65.0],   # ← await 飙升→ etcd backend_commit 380ms
+            [25, 45, 90, 8.0],     # ← 回落
+            [48, 68, 135, 55.0],   # ← 再次飙升
+            [30, 50, 100, 12.0],   # ← 回落
+            [55, 75, 145, 80.0],   # ← 第三次飙升→ leader election
+            [32, 52, 105, 15.0],
+            [45, 65, 130, 45.0],   # ← 尾部仍不稳定
+        ],
+        summary="⚠ master-1 磁盘间歇不稳定 — await 5→80ms 反复波动 → etcd leader频繁切换(p99 backend_commit=380ms)"),
     "multi_layer_cascading": lambda: _fmt("Disk", "prod-us-east/master-1/sda", "15:00",
         cols=["Util%", "IOPS(r/s)", "IOPS(w/s)", "await(ms)"],
         rows=[
@@ -1058,6 +1103,7 @@ _NET_DATA: dict[str, Callable[[], str]] = {
             [150, 99, 0, 0.5, 422],
         ],
         summary="✅ 网络接口层正常 — 丢包=0，重传正常（DNS间歇超时不来自网络层，是CoreDNS受etcd延迟影响）"),
+    "dns_and_etcd": _net_normal,
 }
 
 _K8S_DATA: dict[str, Callable[[], str]] = {
@@ -1123,14 +1169,14 @@ _K8S_DATA: dict[str, Callable[[], str]] = {
             [0, 0, 5, 2], [0, 0, 5, 2],
             [0, 0, 6, 3],
             [0, 0, 5, 5],
-            [0, 0, 5, 25],  # ← DNS 延迟开始升高（conntrack 满导致 UDP 丢包）
-            [0, 8, 8, 120], # ← Pod 重启 + DNS 超时
+            [0, 0, 5, 25],
+            [0, 8, 8, 120],
             [0, 12, 10, 250],
             [0, 8, 5, 80],
             [0, 5, 5, 30],
             [0, 3, 5, 10],
         ],
-        summary="🔴 15:05 Pod 重启 8 次（OOMKilled）+ DNS 延迟暴增（conntrack UDP 丢包）→ 15:06 OOM 后重启回落"),
+        summary="🔴 15:05 Pod 重启 8 次 (OOMKilled) + DNS 延迟 2ms→250ms"),
     "conntrack_table_full": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
         cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
         rows=[
@@ -1164,6 +1210,61 @@ _K8S_DATA: dict[str, Callable[[], str]] = {
 
 
 # ═══════════════════ Formatting ═══════════════════
+
+_HHMM_RE = re.compile(r'(\d{1,2}:\d{2})')
+_ISO_HHMM_RE = re.compile(r'T(\d{1,2}:\d{2})')
+
+
+def _extract_hhmm(time_str: str) -> str:
+    """Extract HH:MM from various time formats (ISO, plain HH:MM, etc.)."""
+    if not time_str:
+        return ""
+    m = _ISO_HHMM_RE.search(time_str)
+    if m:
+        return m.group(1)
+    m = _HHMM_RE.search(time_str)
+    return m.group(1) if m else time_str
+
+
+def _apply_query_overrides(
+    text: str,
+    name_chunk: str,
+    start_time: str,
+    end_time: str,
+) -> str:
+    """Apply query parameter overrides to formatted _fmt output.
+
+    - name_chunk: replaces the endpoint display in the header
+    - start_time / end_time: replaces the time range display
+    """
+    if not name_chunk and not start_time and not end_time:
+        return text
+
+    lines = text.split('\n', 2)
+    if len(lines) < 3:
+        return text
+
+    # Override endpoint display in header: "## Argus CPU — prod-web-01"
+    if name_chunk:
+        lines[0] = re.sub(r' — .+$', f' — {name_chunk}', lines[0])
+
+    # Override time range display
+    start_hhmm = _extract_hhmm(start_time)
+    end_hhmm = _extract_hhmm(end_time)
+    if start_hhmm or end_hhmm:
+        if start_hhmm and end_hhmm:
+            new_range = f"**时间范围**: {start_hhmm} ~ {end_hhmm}  **粒度**: 1min"
+        elif start_hhmm:
+            new_range = f"**时间范围**: {start_hhmm} ~  默认窗口  **粒度**: 1min"
+        else:
+            new_range = f"**时间范围**: 默认 ~ {end_hhmm}  **粒度**: 1min"
+        lines[1] = re.sub(
+            r'\*\*时间范围\*\*:.*?\*\*粒度\*\*:\s*1min',
+            new_range,
+            lines[1],
+        )
+
+    return '\n'.join(lines)
 
 def _fmt(
     subsystem: str,

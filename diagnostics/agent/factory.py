@@ -15,7 +15,12 @@ from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
-from diagnostics.tools.mock import get_coordinator_mock_tools, get_k8s_mock_tools
+from diagnostics.tools.mock import (
+    get_coordinator_mock_tools,
+    get_host_argus_tools,
+    get_k8s_argus_tools,
+    get_k8s_mock_tools,
+)
 from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
 from diagnostics.tools.mock.hosts import (
     check_conntrack,
@@ -61,6 +66,23 @@ _EXPERT_RETURN_SUFFIX = (
     "- 置信度: {高|中|低} + 百分比"
 )
 
+# Return format suffix for Argus time-series analysis experts.
+# Argus experts do NOT perform deep diagnosis — they collect and analyse
+# 1min-granularity monitoring metrics, returning structured time-series
+# correlation findings so Coordinator can form well-grounded hypotheses.
+_ARGUS_EXPERT_RETURN_SUFFIX = (
+    "\n\n**工具使用边界（严格遵守）**:\n"
+    "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
+    "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "\n**返回格式（严格遵循，不超过 600 字）**:\n"
+    "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
+    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 / ✅正常，每条标注具体数值\n"
+    "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
+    "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
+    "- 初步判断: 基于指标关联的根因推断（一句话）\n"
+    "- 置信度: {高|中|低} + 百分比"
+)
+
 
 def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
     """Define specialized diagnostic subagents with domain-specific skills.
@@ -72,7 +94,63 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
     - Output format with word limit to keep context clean
     """
     k8s_tools = get_k8s_mock_tools() if mode == "mock" else get_k8s_live_tools()
+    argus_host_tools = get_host_argus_tools() if mode == "mock" else []
+    argus_k8s_tools = get_k8s_argus_tools() if mode == "mock" else []
     return [
+        # ── Host Argus expert (host-level time-series analysis) ──
+        #
+        # Dedicated Argus metrics analyst for host-level indicators.
+        # Coordinator delegates in UNDERSTAND phase to get focused time-series
+        # correlation analysis without flooding its own context with raw metrics.
+        {
+            "name": "host-argus-expert",
+            "description": (
+                "查询并分析主机级 Argus 监控指标时序（CPU/内存/磁盘/网络 1min 粒度）。"
+                "适用场景：需要获取主机指标时间线以识别突变点、异常严重程度排序和"
+                "跨子系统时序关联时委派。"
+            ),
+            "system_prompt": (
+                "你是 Linux 主机指标时序分析专家。\n"
+                "你的职责是查询和分析 Argus 1min 粒度的分项指标时间线，"
+                "识别异常突变点、跨子系统时序关联、异常严重程度排序。\n\n"
+                "诊断原则：\n"
+                "- 并行查询所有相关 Argus 指标（CPU/内存/磁盘/网络）\n"
+                "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
+                "- 分析跨子系统时序关联——同一分钟的异常可能共享根因\n"
+                "- 推断因果方向（如：磁盘IO突变先于iowait升高→磁盘是根因方向）\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                + _ARGUS_EXPERT_RETURN_SUFFIX
+            ),
+            "tools": argus_host_tools,
+        },
+        # ── K8s Argus expert (cluster-level time-series analysis) ──
+        #
+        # Dedicated Argus metrics analyst for Kubernetes cluster indicators.
+        # Only has query_argus_kubernetes — host-level metrics (CPU/memory/disk/
+        # network) are exclusively owned by host-argus-expert to avoid duplicate
+        # queries when Coordinator delegates to both experts in parallel.
+        {
+            "name": "k8s-argus-expert",
+            "description": (
+                "查询并分析 Kubernetes 集群级 Argus 监控指标时序"
+                "（节点状态/Pod重启/API延迟/DNS延迟）。"
+                "适用场景：需要获取K8s集群指标时间线以识别集群异常时序、"
+                "控制面稳定性与工作负载状态时委派。"
+            ),
+            "system_prompt": (
+                "你是 Kubernetes 集群指标时序分析专家。\n"
+                "你的职责是查询和分析 Argus 1min 粒度的集群指标时间线，"
+                "识别集群异常时序与控制面稳定性问题。\n\n"
+                "诊断原则：\n"
+                "- 查询集群指标（NotReady/Pod重启/API延迟/DNS延迟），识别异常时间点\n"
+                "- 分析集群事件的时序关联与恶化趋势\n"
+                "- 区分控制面问题 vs 节点资源问题 vs 工作负载问题\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                "- 如需节点级CPU/内存/磁盘/网络时序，告知Coordinator另行委派host-argus-expert\n"
+                + _ARGUS_EXPERT_RETURN_SUFFIX
+            ),
+            "tools": argus_k8s_tools,
+        },
         # ── Host expert (unified: CPU + memory + disk + network) ──
         #
         # Merged from 4 separate experts because production incidents rarely

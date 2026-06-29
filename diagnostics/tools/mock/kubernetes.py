@@ -164,6 +164,15 @@ _POD_PREVIOUS_LOGS: dict[str, str] = {
         "2026-06-14T07:56:30.456Z WARN  Liveness probe failed — app was healthy but kubelet probe timed out\n"
         "Previous exit code: 137 (SIGKILL — liveness probe timeout due to CPU throttling)\n"
     ),
+    "dns_and_etcd": (
+        "## coredns-6d4b-def88 (previous container — restart #7)\n"
+        "2026-06-14T08:45:00.123Z [INFO] CoreDNS-1.11.1 starting\n"
+        "2026-06-14T08:46:00.456Z [INFO] plugin/reload: Running configuration SHA512 = abc123\n"
+        "2026-06-14T08:47:30.789Z [WARN] Memory usage climbing: 52Mi / 64Mi limit\n"
+        "2026-06-14T08:48:00.012Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+        "2026-06-14T08:49:00.345Z [FATAL] OOMKilled — memory limit 64Mi exceeded (need 128Mi!)\n"
+        "Previous exit code: 137 (SIGKILL — OOMKilled by cgroup, memory limit 64Mi too small for cluster size)\n"
+    ),
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -387,6 +396,39 @@ _POD_DESCRIBE: dict[str, str] = {
         "        Warning — CrashLoopBackOff #5 in 2d — DNS failure preventing startup\n"
         "        Warning — etcd leader changed during API Server request\n"
         "说明: 双根因—CoreDNS CrashLoopBackOff导致DNS解析超时+etcd leader频繁切换\n"
+    ),
+    "dns_and_etcd:coredns-crash": (
+        "Name:             coredns-6d4b-def88\n"
+        "Namespace:        kube-system\n"
+        "Status:           CrashLoopBackOff\n"
+        "Containers:\n"
+        "  coredns:\n"
+        "    Image: coredns/coredns:1.11.1\n"
+        "    State: Waiting (CrashLoopBackOff)\n"
+        "    Last State: Terminated (OOMKilled, ExitCode: 137)\n"
+        "    Restart Count: 8\n"
+        "    Limits: memory=64Mi\n"
+        "    Requests: memory=32Mi\n"
+        "    Last Termination Reason: OOMKilled\n"
+        "    Last Termination Message: memory limit 64Mi exceeded (need 128Mi!)\n"
+        "Conditions: Initialized=True, Ready=False, ContainersReady=False\n"
+        "Events: Warning — BackOff 8x — restarting failed container (OOMKilled)\n"
+        "        Warning — Memory usage climbing: 52Mi / 64Mi limit\n"
+    ),
+    "dns_and_etcd:coredns-healthy": (
+        "Name:             coredns-6d4b-xyz11\n"
+        "Namespace:        kube-system\n"
+        "Status:           Running\n"
+        "Containers:\n"
+        "  coredns:\n"
+        "    Image: coredns/coredns:1.11.1\n"
+        "    State: Running (Started: 7 days ago)\n"
+        "    Ready: True\n"
+        "    Restart Count: 0\n"
+        "    Limits: memory=64Mi\n"
+        "    Requests: memory=32Mi\n"
+        "Conditions: Initialized=True, Ready=True, ContainersReady=True\n"
+        "Events: Warning — plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
     ),
     "image_pull_backoff": (
         "Name:             new-deploy-abc12\n"
@@ -1196,8 +1238,25 @@ def get_pod_logs_since(cluster_name: str, namespace: str,
 def get_pod_logs_lines(cluster_name: str, namespace: str,
                        pod_name: str, head_lines: int = 50) -> str:
     """Retrieve the last N lines of pod logs."""
-    _ = cluster_name, namespace, pod_name, head_lines
-    logs = _POD_LOGS.get(get_active_scenario(), _POD_LOGS["normal"])
+    _ = cluster_name, namespace, head_lines
+    scenario = get_active_scenario()
+    # dns_and_etcd: differentiate by pod_name
+    if scenario == "dns_and_etcd":
+        if "coredns-6d4b-def88" in (pod_name or ""):
+            return (
+                "2026-06-14T08:50:00.123Z [INFO] CoreDNS-1.11.1 starting\n"
+                "2026-06-14T08:51:00.456Z [INFO] plugin/reload: Running configuration SHA512 = abc123\n"
+                "2026-06-14T08:55:00.789Z [WARN] Memory usage climbing: 52Mi / 64Mi limit\n"
+                "2026-06-14T08:58:00.012Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+                "2026-06-14T08:59:00.345Z [FATAL] OOMKilled — memory limit 64Mi exceeded (need 128Mi!)\n"
+            )
+        elif "coredns" in (pod_name or ""):
+            return (
+                "2026-06-14T09:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+                "2026-06-14T09:05:00.456Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+                "2026-06-14T09:05:05.789Z [WARN] plugin/forward: max retries exceeded for upstream\n"
+            )
+    logs = _POD_LOGS.get(scenario, _POD_LOGS["normal"])
     lines = logs.strip().split("\n")
     return "\n".join(lines[-min(head_lines, len(lines)):])
 
@@ -1216,8 +1275,15 @@ def get_pod_previous_logs(cluster_name: str, namespace: str,
 @tool
 def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get full describe output for a pod."""
-    _ = cluster_name, namespace, pod_name
-    return _POD_DESCRIBE.get(get_active_scenario(), _POD_DESCRIBE["normal"])
+    _ = cluster_name, namespace
+    scenario = get_active_scenario()
+    # dns_and_etcd: differentiate by pod_name
+    if scenario == "dns_and_etcd" and pod_name:
+        if "coredns-6d4b-def88" in pod_name:
+            return _POD_DESCRIBE.get("dns_and_etcd:coredns-crash", _POD_DESCRIBE["dns_and_etcd"])
+        elif "coredns" in pod_name:
+            return _POD_DESCRIBE.get("dns_and_etcd:coredns-healthy", _POD_DESCRIBE["dns_and_etcd"])
+    return _POD_DESCRIBE.get(scenario, _POD_DESCRIBE["normal"])
 
 
 @tool
@@ -1750,7 +1816,53 @@ def get_configmap(cluster_name: str, configmap_name: str,
     """Get ConfigMap content."""
     _ = cluster_name, namespace
     configmaps: dict[str, str] = {
-        "normal": f"## ConfigMap: {configmap_name}\napiVersion: v1\nkind: ConfigMap\ndata:\n  config.yaml: |\n    server.port: 8080\n    log.level: info",
+        "normal": (
+            f"## ConfigMap: {configmap_name}\n"
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: coredns\n"
+            "  namespace: kube-system\n"
+            "data:\n"
+            "  Corefile: |\n"
+            "    .:53 {\n"
+            "        errors\n"
+            "        health\n"
+            "        kubernetes cluster.local in-addr.arpa ip6.arpa {\n"
+            "          pods insecure\n"
+            "          fallthrough in-addr.arpa ip6.arpa\n"
+            "        }\n"
+            "        prometheus :9153\n"
+            "        forward . /etc/resolv.conf\n"
+            "        cache 30\n"
+            "        loop\n"
+            "        reload\n"
+            "    }\n"
+        ),
+        "dns_and_etcd": (
+            f"## ConfigMap: {configmap_name}\n"
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: coredns\n"
+            "  namespace: kube-system\n"
+            "data:\n"
+            "  Corefile: |\n"
+            "    .:53 {\n"
+            "        errors\n"
+            "        health\n"
+            "        kubernetes cluster.local in-addr.arpa ip6.arpa {\n"
+            "          pods insecure\n"
+            "          fallthrough in-addr.arpa ip6.arpa\n"
+            "        }\n"
+            "        prometheus :9153\n"
+            "        forward . /etc/resolv.conf\n"
+            "        cache 30\n"
+            "        loop\n"
+            "        reload\n"
+            "    }\n"
+            "说明: Corefile 配置正常 — CoreDNS CrashLoop 不是配置问题，是 memory limit 64Mi 过小\n"
+        ),
     }
     return configmaps.get(get_active_scenario(), configmaps["normal"])
 

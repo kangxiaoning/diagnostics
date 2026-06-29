@@ -63,6 +63,7 @@ class TraceWriter:
         self._llm_buffer: list[str] = []          # accumulate streaming chunks
         self._llm_header_inserted: bool = False   # "### LLM 输出" header flag
         self._tool_result_slots: dict[int, list[str]] = {}
+        self._tool_call_id_to_slot: dict[str, int] = {}  # tool_call_id → slot index
         self._ledger_sections: list[str] = []     # hypothesis tree snapshots
 
     # ── Public API ──
@@ -97,6 +98,7 @@ class TraceWriter:
         tool_name: str,
         tool_args: str,
         description: str = "",
+        tool_call_id: str = "",
     ) -> None:
         self._ensure_round(round_num)
         self._flush_llm_buffer()
@@ -110,12 +112,15 @@ class TraceWriter:
         idx = len(self._lines) - 1
         self._lines.append("> ⏳ 执行中…\n")
         self._tool_result_slots[idx] = ["", "> ⏳ 执行中…", ""]
+        if tool_call_id:
+            self._tool_call_id_to_slot[tool_call_id] = idx
 
     def tool_end(
         self,
         round_num: int,
         tool_name: str,
         output_full: str,
+        tool_call_id: str = "",
     ) -> None:
         _ = round_num, tool_name
         if not output_full:
@@ -127,15 +132,33 @@ class TraceWriter:
         )
         indented = "> " + summary.replace("\n", "\n> ") + suffix
         result_lines = ["", indented, ""]
-        for idx in sorted(self._tool_result_slots):
-            old = self._tool_result_slots[idx]
-            if old[1].startswith("> ⏳"):
-                self._lines[idx + 1] = result_lines[0]
-                self._lines.insert(idx + 2, result_lines[1])
-                self._lines.insert(idx + 3, result_lines[2])
-                self._tool_result_slots.pop(idx, None)
-                _fix_slots_after_insert(self._tool_result_slots, idx, 2)
-                return
+
+        # ── Match by tool_call_id when available (parallel calls) ──
+        # Batch tool calls (e.g. 5× record_finding) execute in parallel via
+        # asyncio.  tool_end events may arrive in a different order than
+        # tool_start.  Matching by tool_call_id ensures correct pairing.
+        target_idx: int | None = None
+        if tool_call_id and tool_call_id in self._tool_call_id_to_slot:
+            idx = self._tool_call_id_to_slot.pop(tool_call_id)
+            if idx in self._tool_result_slots:
+                target_idx = idx
+
+        # Fallback: FIFO (no tool_call_id provided or not found)
+        if target_idx is None:
+            for idx in sorted(self._tool_result_slots):
+                old = self._tool_result_slots[idx]
+                if old[1].startswith("> ⏳"):
+                    target_idx = idx
+                    break
+
+        if target_idx is not None:
+            self._lines[target_idx + 1] = result_lines[0]
+            self._lines.insert(target_idx + 2, result_lines[1])
+            self._lines.insert(target_idx + 3, result_lines[2])
+            self._tool_result_slots.pop(target_idx, None)
+            _fix_slots_after_insert(self._tool_result_slots, target_idx, 2)
+            # Rebuild id→slot mapping after index shift
+            self._rebuild_id_slot_map(target_idx, 2)
 
     def ledger_update(self, ledger: dict) -> None:
         """Record a diagnosis ledger snapshot (hypothesis tree evolution).
@@ -195,6 +218,12 @@ class TraceWriter:
             self._current_round = round_num
             self._llm_header_inserted = False
             self._lines.append(f"\n## 第{round_num}轮\n")
+
+    def _rebuild_id_slot_map(self, base: int, offset: int) -> None:
+        """Re-sync _tool_call_id_to_slot after line insertions shifted indices."""
+        for tid, idx in list(self._tool_call_id_to_slot.items()):
+            if idx > base:
+                self._tool_call_id_to_slot[tid] = idx + offset
 
     def _flush_llm_buffer(self) -> None:
         if not self._llm_buffer:

@@ -105,20 +105,15 @@ def get_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
 
 
 def get_coordinator_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
-    """Return Coordinator-only tools — Argus monitoring + GPU + meta.
+    """Return Coordinator-only tools — GPU + meta (no Argus, no deep diagnostics).
 
-    Coordinator uses Argus for situational awareness (1min trends across
-    CPU/memory/disk/network/K8s).  Deep diagnostic tools (check_cpu etc.)
-    are EXCLUSIVELY available to experts.  K8s tools are exclusively available
-    to k8s-expert.
+    Argus monitoring tools are now EXCLUSIVELY available to Argus experts
+    (host-argus-expert / k8s-argus-expert). Coordinator delegates to them
+    in the UNDERSTAND phase instead of querying Argus directly. This keeps
+    Coordinator's context lean and lets Argus experts perform focused
+    time-series correlation analysis.
     """
     return [
-        # ── Argus monitoring (PRIMARY — 1min trends) ──
-        query_argus_cpu,
-        query_argus_memory,
-        query_argus_disk,
-        query_argus_network,
-        query_argus_kubernetes,
         # ── GPU diagnostics ──
         check_gpu_health,
         check_gpu_memory,
@@ -126,6 +121,32 @@ def get_coordinator_mock_tools(extra_tools: Sequence[Any] = ()) -> list[Any]:
         # ── Meta ──
         list_diagnostic_capabilities,
         *extra_tools,
+    ]
+
+
+def get_host_argus_tools() -> list[Any]:
+    """Return host-level Argus monitoring tools (for host-argus-expert).
+
+    Covers CPU / memory / disk / network 1min-granularity metrics so the
+    expert can perform cross-subsystem time-series correlation analysis.
+    """
+    return [
+        query_argus_cpu,
+        query_argus_memory,
+        query_argus_disk,
+        query_argus_network,
+    ]
+
+
+def get_k8s_argus_tools() -> list[Any]:
+    """Return K8s-level Argus monitoring tools (for k8s-argus-expert).
+
+    Only the K8s cluster metrics tool — host-level metrics (CPU/memory/disk/
+    network) are exclusively owned by host-argus-expert to avoid duplicate
+    queries when Coordinator delegates to both experts in parallel.
+    """
+    return [
+        query_argus_kubernetes,
     ]
 
 

@@ -130,9 +130,9 @@ per-CPU: CPU0 96% | CPU1 97% | CPU2 94% | CPU3 98% | CPU4 95% | CPU5 96% | CPU6 
         return base + """
 top: PID 8765 java S 85.0% 72.5% java -Xmx6g -jar app.jar / PID 3210 root S 12.0% 5.0% kubelet
 vmstat 1 3: r=3 b=4 wa=8 us=42 sy=38 id=8
-CPU util: ~42% user, ~38% sys (高sys%—softirq处理conntrack+内存回收), load average: 3.9/3.2/2.9
-per-CPU softirq: CPU0 NET_RX=22105000 CPU1 NET_RX=18920000 (conntrack处理开销)
-说明: sys%高因conntrack查询/淘汰+OOM页面回收双开销叠加"""
+CPU util: ~42% user, ~38% sys, load average: 3.9/3.2/2.9
+per-CPU softirq: CPU0 NET_RX=22105000 CPU1 NET_RX=18920000
+说明: sys%=38%, softirq处理网络中断+OOM页面回收双开销叠加"""
     # ── Multi-root: disk_io_and_dns ──
     if scenario == "disk_io_and_dns":
         return base + """
@@ -226,13 +226,13 @@ dmesg (worker-3): Out of memory: Killed process 3210 (kubelet)
     # ── Multi-root: stress_cpu_and_tc_loss ── 内存正常
     # ── Multi-root: conntrack_and_oom ──
     if scenario == "conntrack_and_oom":
-        return """Mem: 7.6Gi total, 7.1Gi used, 120Mi free, 350Mi buff/cache, 200Mi available (严重不足!)
+        return """Mem: 7.6Gi total, 7.2Gi used, 80Mi free, 300Mi buff/cache, 150Mi available (严重不足!)
 Swap: 2.0Gi total, 1.8Gi used, 200Mi free (swap近乎耗尽)
-/proc/meminfo: AnonPages=6784512kB (异常高—Java堆外内存泄漏!), Committed_AS=14200224kB
+/proc/meminfo: AnonPages=6920192kB, Committed_AS=14200224kB
 dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
-dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:6754304kB
-说明: Java进程RSS=6.4GB持续增长—堆外内存泄漏(bytedance)触发OOM Killer
-      注意: 此场景除OOM外还有conntrack满导致网络丢包—两条独立根因同时存在"""
+dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:6920192kB
+说明: Java进程RSS=6.6GB, /proc/meminfo AnonPages持续增长
+      conntrack表131072/131072满导致网络丢包, 与OOM同时发生"""
     if scenario == "memory_leak_and_disk_full":
         return """Mem: 7.6Gi total, 7.2Gi used, 120Mi free, 280Mi buff/cache, 180Mi available (严重不足!)
 Swap: 2.0Gi total, 1.5Gi used, 520Mi free
@@ -325,6 +325,13 @@ vmstat: si=8500 so=9200 (swap换入换出极高)
         return """iostat: sda r/s=50 w/s=180 await=25.5ms svctm=8.2ms %util=62.0
 df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽! 日志写满)
 说明: 磁盘空间耗尽+内存泄漏同时存在—两个独立根因"""
+    # ── Multi-root: dns_and_etcd ── 间歇性磁盘抖动（与Argus时序对齐）
+    if scenario == "dns_and_etcd":
+        return """iostat (master-1 etcd节点): sda r/s=85 w/s=165 await=35.5ms svctm=3.2ms %util=48.0
+df: /dev/sda1 50G 22G 26G 44% /  /dev/sdb1 100G 55G 45G 55% /var/lib/etcd
+说明: master-1磁盘间歇不稳定 — 当前await=35.5ms偏高但非持续饱和
+      Argus时序显示await 5→80ms反复波动 → 可能影响etcd WAL fsync
+      磁盘IO抖动可能是etcd leader频繁切换的诱因之一"""
     # ── Scenario: etcd_quota_near_full ── 磁盘正常，etcd数据盘空间接近满
     if scenario == "etcd_quota_near_full":
         return """iostat (worker节点): sda r/s=25 w/s=45 await=1.5ms svctm=0.8ms %util=5.6
@@ -418,8 +425,8 @@ dmesg: nf_conntrack: table full, dropping packet (重复出现!)
 /proc/sys/net/netfilter/nf_conntrack_count: 131072 (已达上限!)
 conntrack -L (ESTAB): envoy sidecar=8500, java app=3200, kubelet=12 (envoy连接占65%)
 DNS测试: nslookup backend-svc.default.svc.cluster.local → timeout 5s (UDP包被conntrack丢弃!)
-说明: conntrack表100%满→内核丢弃新包→网络丢包和DNS超时
-      同时dmesg有OOM日志→两个独立根因: conntrack满 + Java OOM"""
+说明: conntrack表131072/131072满, 内核丢弃新连接包, 网络丢包85000, DNS测试超时
+      dmesg同时报nf_conntrack table full和java OOM"""
     # ── Multi-root: disk_io_and_dns ──
     if scenario == "disk_io_and_dns":
         return """ss: ESTAB 480 connections, no Send-Q backlog.
@@ -584,13 +591,12 @@ PID 9999 app S 3.0% 4.0% java backend-svc (响应超时—tc 5%丢包导致重�
       tc netem丢包5%→TCP重传率18.5%→API调用间歇失败—两个独立根因"""
     # ── Multi-root: conntrack_and_oom ──
     if scenario == "conntrack_and_oom":
-        return """PID 8765 java S 45.0% 72.5% java -Xmx6g -jar app.jar (RSS=6.4GB! 堆外泄漏bytedance)
+        return """PID 8765 java S 45.0% 72.5% java -Xmx6g -jar app.jar (RSS=6.6G)
 PID 3210 root S 12.0% 5.0% kubelet (CPU正常)
 PID 1234 envoy S 8.0% 3.5% envoy sidecar (ESTAB 8500+ —高连接数)
 dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL)
-dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:6754304kB
-说明: Java堆外内存泄漏RSS 6.4GB→触发OOM Killer→Pod被Kill
-      envoy sidecar 8500个ESTAB连接→conntrack表占满→网络丢包—两个独立根因"""
+dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:6920192kB
+说明: Java进程RSS=6.6G, dmesg报OOM Killer; envoy sidecar ESTAB 8500+, conntrack表131072/131072满"""
     # ── Multi-root: disk_io_and_dns ──
     if scenario == "disk_io_and_dns":
         return """PID 2345 root D 3.5% 2.0% kubelet (D状态! 写日志被磁盘IO阻塞)

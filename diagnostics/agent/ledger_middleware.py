@@ -261,7 +261,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
         # Safety mechanism tracking
-        self._consecutive_task_count: int = 0
+        self._consecutive_task_count: int = 0  # global: stagnation detection
+        self._same_delegate_count: int = 0     # per-key: delegation saturation
+        self._last_delegate_key: str = ""      # "expert:H1" etc.
         self._last_finding_round: int = 0
         self._last_task_round: int = 0
         self.tools: list = [
@@ -567,7 +569,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Track record_finding calls for stagnation detection
             if tool_name == "record_finding":
                 self._consecutive_task_count = 0
+                self._same_delegate_count = 0
+                self._last_delegate_key = ""
                 self._last_finding_round = self._model_call_count
+            # commit_hypotheses marks the UNDERSTAND→VERIFY boundary;
+            # reset stagnation counters so that UNDERSTAND-phase Argus task()
+            # calls do not accumulate into the VERIFY-phase threshold.
+            elif tool_name == "commit_hypotheses":
+                self._consecutive_task_count = 0
             self._persist_ledger(ledger)
             # Emit ledger snapshot via stream_writer for frontend
             try:
@@ -583,9 +592,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             except Exception:
                 pass  # stream_writer not available in all contexts
         elif tool_name == "task":
-            # Track consecutive task() calls without record_finding (loop detection)
+            # Track consecutive task() calls without record_finding (stagnation)
             self._consecutive_task_count += 1
             self._last_task_round = self._model_call_count
+
+            # Track per-(expert, hypothesis) delegation count (saturation)
+            expert = tool_args.get("subagent_type", "?")
+            hid = _parse_hypothesis_id_from_description(
+                tool_args.get("description", ""),
+                ledger.get("hypotheses", {}),
+            ) or "?"
+            delegate_key = f"{expert}:{hid}"
+            if delegate_key == self._last_delegate_key:
+                self._same_delegate_count += 1
+            else:
+                self._same_delegate_count = 1
+                self._last_delegate_key = delegate_key
 
         # Capture report content when write_file writes to the pre-generated
         # report path — emit for frontend answer-body without text parsing.
@@ -729,9 +751,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # any hypotheses, inject a hard directive to commit hypotheses NOW.
         # Without this, the LLM may output analysis as plain text instead
         # of calling commit_hypotheses, causing the agent loop to exit.
+        # NOTE: condition is `not hypotheses` only (no fault_profile check)
+        # because abefore_agent extracts fault_profile via structured output
+        # before the agent loop — the check must fire regardless of whether
+        # structured output succeeded or fell back gracefully.
         if (
             round_num >= 2
-            and ledger.get("fault_profile") is None
             and not ledger.get("hypotheses")
         ):
             warnings.append(
@@ -745,36 +770,40 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
             logger.warning(
                 "Safety: understand stagnation detected (round %d, "
-                "no hypotheses, no fault_profile) — forcing commit",
+                "no hypotheses) — forcing commit",
                 round_num,
             )
 
         # ── Delegation saturation — prevent redundant re-delegation ──
-        # Detects the pattern: task() → record_finding → task() again.
-        # Even though record_finding resets _consecutive_task_count,
-        # reaching count >= 2 means the Coordinator already obtained
-        # findings but is re-delegating instead of progressing.
-        # This is a generic behavior-pattern check — no assumptions
-        # about specific tools, hypotheses, or failure modes.
+        # Detects the pattern: task(expert, Hn) → record_finding →
+        # task(same expert, same Hn) repeated.  Uses per-key tracking
+        # (_same_delegate_count) so that delegating to different experts
+        # or for different hypotheses does not trigger false positives.
+        # IMPORTANT: Only fire after at least one record_finding call
+        # (_last_finding_round > 0), so UNDERSTAND-phase Argus expert
+        # tasks do not trigger premature saturation warnings that would
+        # cause the Coordinator to skip VERIFY expert delegation.
         if (
             ledger.get("hypotheses")
-            and self._consecutive_task_count >= 2
+            and self._same_delegate_count >= 2
             and round_num < _MAX_ROUNDS
+            and self._last_finding_round > 0
         ):
             warnings.append(
-                f"⚠ [系统警告] 已连续{self._consecutive_task_count}次"
-                "委派专家验证，此前已获得验证结论。\n"
+                f"⚠ [系统警告] 已连续{self._same_delegate_count}次"
+                f"委派相同专家验证相同假设（{self._last_delegate_key}），"
+                "此前已获得验证结论。\n"
                 "专家的工具集有限，重复委派不会获得新数据。\n"
                 "- 若已确认核心事实，仅缺少次要细节（如启动者、触发源），"
                 "应基于已有证据给出最终判断并生成报告\n"
                 "- 若有其他未验证的假设，应切换到其他假设验证\n"
-                "- 禁止再次委派专家查询相同假设"
+                "- 禁止再次委派相同专家查询相同假设"
             )
             logger.warning(
-                "Safety: delegation saturation (count=%d, round=%d, "
-                "phase=%s) — warning injected",
-                self._consecutive_task_count, round_num,
-                ledger.get("current_phase", "?"),
+                "Safety: delegation saturation (same_key=%s, count=%d, "
+                "round=%d, phase=%s) — warning injected",
+                self._last_delegate_key, self._same_delegate_count,
+                round_num, ledger.get("current_phase", "?"),
             )
 
         # ── P2/P3: Stagnation & loop detection (only after min round) ──
@@ -815,6 +844,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                         self._persist_ledger(ledger)
                         self._consecutive_task_count = 0
+                        self._same_delegate_count = 0
+                        self._last_delegate_key = ""
                         self._last_finding_round = round_num
                         logger.warning(
                             "Safety: auto-inconclusive for %s (round %d, "
