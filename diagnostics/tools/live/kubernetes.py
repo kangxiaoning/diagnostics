@@ -694,7 +694,7 @@ def get_etcd_status(cluster_name: str) -> str:
 
 
 @tool
-def get_etcd_logs(cluster_name: str, tail_lines: int = 200,
+def get_etcd_logs(cluster_name: str = "default", tail_lines: int = 200,
                   since_minutes: int = 0) -> str:
     """Get recent logs from all etcd pods.
 

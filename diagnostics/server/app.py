@@ -248,8 +248,6 @@ def _list_history() -> list[dict[str, Any]]:
 
     # Also include report .md files without result.json (fallback — no graph)
     for mf in sorted(reports_root.rglob("*.md"), reverse=True):
-        if mf.name == "HISTORY.md":
-            continue
         stem = mf.name.replace(".md", "")
         if stem in seen_stems:
             continue
@@ -306,6 +304,7 @@ async def _chat_event_stream(
         system_prompt=make_system_prompt(report_path, ledger_path),
         report_path=report_path,
         ledger_path=ledger_path,
+        entity_type=request.entity_type,
     )
 
     state.messages.append(HumanMessage(content=request.message))

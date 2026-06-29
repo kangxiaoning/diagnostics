@@ -661,7 +661,6 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             "  K8s 相关（节点/Pod/集群症状）→ task(\"k8s-argus-expert\", ...)\n"
             "  复合场景 → 同时委派两个专家（并行 task），分别负责主机级和集群级指标\n"
             "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
-            "- 可 read_file 读取实体 HISTORY.md 关联历史\n"
             "- ⚠ 查看上方「诊断历史」，禁止重复调用已执行过的工具\n"
             "- 完成后必须调用 commit_hypotheses 提交初始假设"
         )

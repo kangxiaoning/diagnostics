@@ -13,3 +13,6 @@ agent_data/traces/
 # Design docs & test cases — not version controlled
 private/
 test_cases/
+
+# Mock tools — local-only, not pushed to GitHub
+diagnostics/tools/mock/

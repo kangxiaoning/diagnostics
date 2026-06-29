@@ -15,24 +15,47 @@ from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
-from diagnostics.tools.mock import (
-    get_coordinator_mock_tools,
-    get_host_argus_tools,
-    get_k8s_argus_tools,
-    get_k8s_mock_tools,
-)
-from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
-from diagnostics.tools.mock.hosts import (
-    check_conntrack,
-    check_cpu,
-    check_disk,
-    check_dmesg,
-    check_memory,
-    check_network,
-    check_processes,
-    get_system_overview,
-)
-from diagnostics.tools.mock.kubernetes import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
+
+# Mock tools are optional — only available in local dev environments.
+# GitHub clones should set DIAGNOSTICS_MODE=production.
+try:
+    from diagnostics.tools.mock import (
+        get_coordinator_mock_tools,
+        get_host_argus_tools,
+        get_k8s_argus_tools,
+        get_k8s_mock_tools,
+    )
+    from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
+    from diagnostics.tools.mock.hosts import (
+        check_conntrack,
+        check_cpu,
+        check_disk,
+        check_dmesg,
+        check_memory,
+        check_network,
+        check_processes,
+        get_system_overview,
+    )
+    from diagnostics.tools.mock.kubernetes import (
+        check_kubernetes_control_plane,
+        check_kubernetes_nodes,
+        check_kubernetes_pods,
+    )
+    _MOCK_AVAILABLE = True
+except ImportError:
+    _MOCK_AVAILABLE = False
+    # Provide no-op stubs so the module loads cleanly.
+    # _build_subagents() will raise a clear error if mock mode is
+    # requested but mock tools are not installed.
+    def get_coordinator_mock_tools(): return []
+    def get_host_argus_tools(): return []
+    def get_k8s_argus_tools(): return []
+    def get_k8s_mock_tools(): return []
+    check_gpu_health = check_gpu_memory = check_gpu_utilization = None
+    check_conntrack = check_cpu = check_disk = check_dmesg = None
+    check_memory = check_network = check_processes = None
+    get_system_overview = None
+    check_kubernetes_control_plane = check_kubernetes_nodes = check_kubernetes_pods = None
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 AGENT_DATA_ROOT = PROJECT_ROOT / "agent_data"
@@ -86,7 +109,7 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
 )
 
 
-def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
+def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str, Any]]:
     """Define specialized diagnostic subagents with domain-specific skills.
 
     Each subagent has:
@@ -94,11 +117,21 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
     - Focused tool set (never inherit all tools)
     - Domain skills loaded lazily (skills-first diagnosis)
     - Output format with word limit to keep context clean
+
+    When *entity_type* is ``"host"``, Kubernetes-specific experts
+    (k8s-argus-expert, k8s-expert) are excluded — the target has no
+    K8s cluster, so delegating those experts would waste a round.
     """
+    if mode == "mock" and not _MOCK_AVAILABLE:
+        raise RuntimeError(
+            "Mock mode requested but mock tools are not installed. "
+            "Set DIAGNOSTICS_MODE=production or install the mock package."
+        )
+
     k8s_tools = get_k8s_mock_tools() if mode == "mock" else get_k8s_live_tools()
     argus_host_tools = get_host_argus_tools() if mode == "mock" else []
     argus_k8s_tools = get_k8s_argus_tools() if mode == "mock" else []
-    return [
+    subagents: list[dict[str, Any]] = [
         # ── Host Argus expert (host-level time-series analysis) ──
         #
         # Dedicated Argus metrics analyst for host-level indicators.
@@ -203,7 +236,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "- 给出具体修复方案（命令+参数值）\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg],
+            "tools": [t for t in [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg] if t is not None],
             "skills": [
                 "/agent_data/skills/system-health-check/",
                 "/agent_data/skills/cpu-diagnosis/",
@@ -235,9 +268,11 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
-                check_gpu_health,
-                check_gpu_memory,
-                check_gpu_utilization,
+                t for t in [
+                    check_gpu_health,
+                    check_gpu_memory,
+                    check_gpu_utilization,
+                ] if t is not None
             ],
             "skills": ["/agent_data/skills/gpu-diagnosis/"],
         },
@@ -290,8 +325,10 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [
-                check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods,
-                *k8s_tools,
+                t for t in [
+                    check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods,
+                    *k8s_tools,
+                ] if t is not None
             ],
             "skills": [
                 "/agent_data/skills/control-plane-diagnosis/",
@@ -305,6 +342,13 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         },
     ]
 
+    # Filter out K8s-specific experts when entity_type is "host"
+    if entity_type == "host":
+        _K8S_EXPERTS = {"k8s-argus-expert", "k8s-expert"}
+        subagents = [s for s in subagents if s["name"] not in _K8S_EXPERTS]
+
+    return subagents
+
 
 def build_agent(
     settings: Settings | None = None,
@@ -312,6 +356,7 @@ def build_agent(
     system_prompt: str | None = None,
     report_path: str = "",
     ledger_path: str = "",
+    entity_type: str = "",
 ):
     settings = settings or Settings.from_env()
 
@@ -356,7 +401,7 @@ def build_agent(
         ),
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
-        subagents=_build_subagents(mode),
+        subagents=_build_subagents(mode, entity_type=entity_type),
         middleware=[ledger_middleware],
         state_schema=DiagnosisLedgerState,
     )

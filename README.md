@@ -145,14 +145,13 @@ python main.py
 # 访问 http://127.0.0.1:8000
 ```
 
-## 持久化报告与历史关联
+## 持久化报告与历史
 
 ### 设计动机
 
-运维诊断不是一次性事件——同一个主机或 K8s 集群可能反复出现相同或关联的故障。本系统将每次诊断报告**按运维实体层级化持久存储**，并在诊断前自动读取该实体的历史故障记录，使 Coordinator 能够：
-- 识别是否属于历史故障复发
-- 对比当前异常指标与历史特征信号
-- 优先排查已被证实的历史根因
+运维诊断不是一次性事件——同一个主机或 K8s 集群可能反复出现相同或关联的故障。本系统将每次诊断报告**按运维实体层级化持久存储**，使 Coordinator 能够：
+- 事后回放诊断过程，复盘根因定位路径
+- 对比不同时间的诊断策略和结论
 - 在全局经验库（LEARNINGS.md）中积累跨实体的通用诊断模式
 
 ### 文件系统层级组织
@@ -163,21 +162,17 @@ python main.py
 agent_data/reports/
 ├── hosts/                                   ← 传统物理/虚拟机
 │   ├── server01/
-│   │   ├── HISTORY.md                       ← 该主机故障历史摘要
 │   │   ├── 2026-06-08_server01_oom-killed.md
 │   │   └── 2026-06-09_server01_cpu-load-high.md
 │   └── db-node-03/
-│       ├── HISTORY.md
 │       └── 2026-06-09_db-node-03_disk-io-saturation.md
 │
 └── kubernetes/                              ← 所有 K8s 集群（含 GPU）
     ├── prod-cluster/
-    │   ├── HISTORY.md                       ← 该集群故障历史摘要
     │   ├── 2026-06-09_prod-cluster_pod-java-backend-crashloop.md
     │   ├── 2026-06-09_prod-cluster_node-worker3-notready.md
     │   └── 2026-06-09_prod-cluster_gpu-gpu01-memory-oom.md
     └── staging-cluster/
-        ├── HISTORY.md
         └── ...
 ```
 
@@ -198,27 +193,20 @@ agent_data/reports/
 - 按实体列出所有报告：`ls reports/kubernetes/prod-cluster/`
 - 跨实体搜索根因：`grep -r "OOMKilled" reports/`
 
-### 历史关联流程
+### 诊断流程
 
-以下一次完整的"带历史追溯"诊断请求为例，展示 Coordinator 如何关联历史故障：
+以下一次完整的诊断请求为例，展示 Coordinator 的工作流程：
 
 ```mermaid
 flowchart TD
     Input["用户输入: 'prod-cluster 集群 Pod java-backend 频繁重启'"]
     Input --> Step1["Step 1: 实体识别<br/>category=kubernetes<br/>entity=prod-cluster"]
-    Step1 --> Step2["Step 2: 读取历史<br/>read_file reports/kubernetes/prod-cluster/HISTORY.md"]
-    Step2 --> Step3{"历史命中?"}
-    Step3 -->|"是: 3天前 worker2 有过 MemoryPressure"| Step4["Step 3: 将历史模式注入诊断上下文<br/>委派专家时提示关联历史案例"]
-    Step3 -->|"否: 无历史记录"| Step5["Step 3: 首次诊断该实体<br/>执行完整5轮诊断流程"]
-    Step4 --> Step5
-    Step5 --> Step6["Step 4: 第5轮收束<br/>write_file 层级归档路径"]
-    Step6 --> Step7["Step 5: 更新 HISTORY.md<br/>追加本次诊断摘要"]
-    Step7 --> Step8["Step 6: 全局自我进化<br/>更新 LEARNINGS.md"]
+    Step1 --> Step2["Step 2: 委派 Argus 专家采集监控指标<br/>形成假设并验证"]
+    Step2 --> Step3["Step 3: 收束诊断<br/>write_file 层级归档路径"]
+    Step3 --> Step4["Step 4: 全局自我进化<br/>更新 LEARNINGS.md"]
 ```
 
-**设计了两个层次的记忆**：
-- **实体级记忆（HISTORY.md）**：同一运维对象的故障时间线，精确到主机/集群
-- **全局级记忆（LEARNINGS.md）**：跨实体的通用诊断模式和方法论积累
+**全局级记忆（LEARNINGS.md）**：跨实体的通用诊断模式和方法论积累。
 
 ### 关键实现
 
@@ -228,10 +216,9 @@ flowchart TD
 
 **2. Prompt 驱动，零代码新增**
 
-实体识别、路径规划、历史读取、HISTORY.md 更新等全部逻辑通过 `prompt.py` 中的任务指令驱动，无需新增 Python 模块。Coordinator 在诊断开始时被指令：
+实体识别、路径规划等全部逻辑通过 `prompt.py` 中的任务指令驱动，无需新增 Python 模块。Coordinator 在诊断开始时被指令：
 - 提取运维对象 → 确定归档路径
-- 读取 HISTORY.md → 注入诊断上下文
-- 报告写入选定路径 → 更新 HISTORY.md → 更新 LEARNINGS.md
+- 报告写入选定路径 → 更新 LEARNINGS.md
 
 **3. 目录自动初始化**
 

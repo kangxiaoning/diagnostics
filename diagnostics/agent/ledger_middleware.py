@@ -422,13 +422,29 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         e.get("source", "").startswith("expert:")
                         for e in node.get("evidence", [])
                     )
+                    has_coordinator_support = any(
+                        e.get("supports") and e.get("source") == "coordinator"
+                        for e in node.get("evidence", [])
+                    )
                     if has_expert and node.get("status") == "verifying":
-                        record_finding(
-                            ledger, active_id, "confirmed",
-                            "[系统自动] LLM 在 verify 阶段未调用工具，"
-                            "系统基于已有专家证据自动确认。",
-                            node["probability"],
-                        )
+                        # Only auto-confirm when coordinator evidence with
+                        # supports=True exists.  Expert evidence alone is
+                        # insufficient — it always has supports=True
+                        # regardless of actual verdict.
+                        if has_coordinator_support:
+                            record_finding(
+                                ledger, active_id, "confirmed",
+                                "[\u7cfb\u7edf\u81ea\u52a8] LLM \u5728 verify \u9636\u6bb5\u672a\u8c03\u7528\u5de5\u5177\uff0c"
+                                "\u7cfb\u7edf\u57fa\u4e8e\u5df2\u6709\u534f\u8c03\u5458\u786e\u8ba4\u8bc1\u636e\u81ea\u52a8\u786e\u8ba4\u3002",
+                                node["probability"],
+                            )
+                        else:
+                            record_finding(
+                                ledger, active_id, "inconclusive",
+                                "[\u7cfb\u7edf\u81ea\u52a8] LLM \u5728 verify \u9636\u6bb5\u672a\u8c03\u7528\u5de5\u5177\uff0c"
+                                "\u8bc1\u636e\u4e0d\u8db3\u4ee5\u786e\u8ba4\uff0c\u7cfb\u7edf\u6807\u8bb0\u4e3a\u672a\u5b8c\u6210\u3002",
+                                node["probability"],
+                            )
                         ledger["current_phase"] = "report"
                         self._report_phase_start_round = self._model_call_count
                         self._persist_ledger(ledger)
@@ -443,11 +459,58 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         for m in ai_msgs:
                             if hasattr(m, "content") and isinstance(m.content, str):
                                 m.content += (
-                                    "\n\n[系统安全阀] verify 阶段已结束，"
-                                    f"假设 {active_id} 已自动确认。"
-                                    "请立即调用 write_file 生成诊断报告。"
+                                    "\n\n[\u7cfb\u7edf\u5b89\u5168\u9600] verify \u9636\u6bb5\u5df2\u7ed3\u675f\uff0c"
+                                    f"\u5047\u8bbe {active_id} \u5df2\u81ea\u52a8\u5904\u7406\u3002"
+                                    "\u8bf7\u7acb\u5373\u8c03\u7528 write_file \u751f\u6210\u8bca\u65ad\u62a5\u544a\u3002"
                                 )
                                 break
+
+        # ── Post-response: detect REPORT-phase stall ──
+        # If the model returned no tool calls while in REPORT phase
+        # (without having called write_file), auto-generate the report
+        # from ledger evidence.  Without this safety net, the agent
+        # loop exits with report=null and no .md file is created.
+        # This is the REPORT-phase equivalent of the verify-phase
+        # stall detection above (L410-451).
+        ledger = self._current_ledger
+        if ledger and ledger.get("current_phase") == "report":
+            ai_msgs = [
+                m for m in (response.result if isinstance(response.result, list) else [response.result])
+                if hasattr(m, "tool_calls")
+            ]
+            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
+            if not has_tool_calls and not ledger.get("report"):
+                # LLM exited REPORT without write_file — auto-generate
+                report_md = self._generate_report_from_ledger(ledger)
+                ledger["report"] = report_md
+
+                # Write .md to filesystem at canonical report_path
+                if self.report_path:
+                    try:
+                        import pathlib as _pathlib
+                        vpath = self.report_path
+                        real_path = vpath.replace(
+                            "/agent_data/",
+                            str(self._AGENT_DATA_REAL) + "/",
+                        )
+                        path = _pathlib.Path(real_path)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(report_md, encoding="utf-8")
+                        logger.info(
+                            "Auto-generated report written to %s (%d chars)",
+                            path, len(report_md),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to write auto-generated report: %s", e,
+                        )
+
+                self._persist_ledger(ledger)
+                logger.warning(
+                    "Safety: REPORT-phase stall (no write_file, "
+                    "round %d) — auto-generated report (%d chars)",
+                    self._model_call_count, len(report_md),
+                )
 
         # Sync ledger back to state via ExtendedModelResponse so it persists
         # across rounds and survives SummarizationMiddleware compression.
@@ -682,25 +745,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     for hid, node in hypotheses.items():
                         status = node.get("status")
                         if status == "verifying":
-                            # Check if there is supporting evidence from an expert.
-                            # If the LLM verified this hypothesis and the expert
-                            # returned confirmed results but the LLM jumped to REPORT
-                            # without calling record_finding, auto-confirm it.
-                            has_supporting = any(
-                                e.get("supports") and e.get("source", "").startswith("expert:")
+                            # Only auto-confirm when coordinator (record_finding)
+                            # evidence with supports=True exists — this indicates
+                            # the LLM explicitly confirmed the hypothesis but
+                            # write_file was called before the finding was saved.
+                            # Auto-collected expert evidence always has
+                            # supports=True regardless of actual verdict, so
+                            # it is NOT a reliable confirmation signal.
+                            has_coordinator_support = any(
+                                e.get("supports")
+                                and e.get("source") == "coordinator"
                                 for e in node.get("evidence", [])
                             )
-                            if has_supporting:
+                            if has_coordinator_support:
                                 record_finding(
                                     ledger, hid, "confirmed",
-                                    "诊断报告已生成，系统根据已有专家证据自动确认为次要根因/加剧因素。",
+                                    "诊断报告已生成，系统根据已有协调员确认证据自动确认。",
                                     node.get("probability", 75),
                                 )
                             else:
+                                # No explicit coordinator confirmation —
+                                # mark as dead_end (inconclusive) to preserve
+                                # the actual verification state.
                                 record_finding(
-                                    ledger, hid, "refuted",
-                                    "诊断报告已生成，该假设在验证其他假设时被间接证据证伪，系统自动终结。",
-                                    5,
+                                    ledger, hid, "inconclusive",
+                                    "诊断报告已生成，该假设验证未得出明确结论，系统标记为未完成。",
+                                    node.get("probability", 50),
                                 )
                             finalized_any = True
                         elif status == "pending":
@@ -962,20 +1032,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     e.get("source", "").startswith("expert:")
                     for e in node.get("evidence", [])
                 )
+                has_coordinator_support = any(
+                    e.get("supports") and e.get("source") == "coordinator"
+                    for e in node.get("evidence", [])
+                )
                 if has_expert and node.get("status") == "verifying":
-                    record_finding(
-                        ledger, active_id, "confirmed",
-                        f"[系统自动] 已获得专家验证证据但未记录结论"
-                        f"（第{round_num}轮），系统自动确认。",
-                        node["probability"],
-                    )
+                    if has_coordinator_support:
+                        record_finding(
+                            ledger, active_id, "confirmed",
+                            f"[\u7cfb\u7edf\u81ea\u52a8] \u5df2\u83b7\u5f97\u4e13\u5bb6\u9a8c\u8bc1\u8bc1\u636e\u4e14\u534f\u8c03\u5458\u5df2\u786e\u8ba4"
+                            f"\uff08\u7b2c{round_num}\u8f6e\uff09\uff0c\u7cfb\u7edf\u81ea\u52a8\u786e\u8ba4\u3002",
+                            node["probability"],
+                        )
+                    else:
+                        record_finding(
+                            ledger, active_id, "inconclusive",
+                            f"[\u7cfb\u7edf\u81ea\u52a8] \u5df2\u83b7\u5f97\u4e13\u5bb6\u9a8c\u8bc1\u8bc1\u636e\u4f46\u672a\u5f97\u5230\u534f\u8c03\u5458\u786e\u8ba4"
+                            f"\uff08\u7b2c{round_num}\u8f6e\uff09\uff0c\u7cfb\u7edf\u6807\u8bb0\u4e3a\u672a\u5b8c\u6210\u3002",
+                            node["probability"],
+                        )
                     ledger["current_phase"] = "report"
                     self._report_phase_start_round = round_num
                     warnings.append(
-                        "⛔ [系统安全阀] verify 阶段停滞过久"
-                        f"（第{round_num}轮），活跃假设 {active_id} 已"
-                        "获得专家证据但未记录结论。系统已自动确认。\n"
-                        "必须立即调用 write_file 生成诊断报告。"
+                        "\u26d4 [\u7cfb\u7edf\u5b89\u5168\u9600] verify \u9636\u6bb5\u505c\u6ede\u8fc7\u4e45"
+                        f"\uff08\u7b2c{round_num}\u8f6e\uff09\uff0c\u6d3b\u8dc3\u5047\u8bbe {active_id} \u5df2"
+                        "\u83b7\u5f97\u4e13\u5bb6\u8bc1\u636e\u4f46\u672a\u8bb0\u5f55\u7ed3\u8bba\u3002\u7cfb\u7edf\u5df2\u81ea\u52a8\u5904\u7406\u3002\n"
+                        "\u5fc5\u987b\u7acb\u5373\u8c03\u7528 write_file \u751f\u6210\u8bca\u65ad\u62a5\u544a\u3002"
                     )
                     self._persist_ledger(ledger)
                     self._consecutive_task_count = 0
@@ -994,7 +1076,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # safety valves or phase-derivation edge cases) when the LLM
         # should be evaluating remaining hypotheses first.
         current_phase = ledger.get("current_phase", "")
-        _pending_roots: list[str] = []
+        _pending_roots: list[str] = []  # only populated in evaluate phase
         if current_phase == "evaluate":
             root_ids = ledger.get("root_hypothesis_ids", [])
             _all_hypotheses = ledger.get("hypotheses", {})
@@ -1004,6 +1086,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and node.get("status") in ("pending", "verifying")
                 and node.get("probability", 0) > 15
             ]
+        # _pending_roots is empty for non-evaluate phases (initialized above)
 
         # ── REPORT phase write_file safety valve ──
         # If the LLM entered REPORT phase but didn't call write_file,
@@ -1146,7 +1229,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Capture old statement for root_causes sync
             old_statement = ""
             if statement_update and hypothesis_id in ledger.get("hypotheses", {}):
-                old_statement = ledger["hypotheses"][hypothesis_id].get("statement", "")
+                hnode = ledger["hypotheses"][hypothesis_id]
+                # Defect C: refuted hypotheses must not have their statement
+                # modified — the original hypothesis statement should be
+                # preserved for historical accuracy.
+                if hnode.get("status") == "refuted":
+                    return (
+                        f"⚠️ 假设 {hypothesis_id} 已被证伪(status=refuted)，"
+                        "禁止修改假设表述(statement_update)。"
+                        "请使用新的证据描述发现，不要修改已排除假设的原始表述。"
+                    )
+                old_statement = hnode.get("statement", "")
+
+            # Defect D: Terminal-state guard — hypotheses already in
+            # confirmed/refuted must not be re-recorded.  This prevents
+            # the LLM from accidentally overwriting a correct verdict
+            # (e.g. calling record_finding(H1, refuted) after already
+            # calling record_finding(H1, confirmed)).
+            if hypothesis_id in ledger.get("hypotheses", {}):
+                _hnode = ledger["hypotheses"][hypothesis_id]
+                _terminal = _hnode.get("status")
+                if _terminal in ("confirmed", "refuted"):
+                    return (
+                        f"⚠️ 假设 {hypothesis_id} 已处于终态"
+                        f"(status={_terminal}, "
+                        f"p={_hnode.get('probability')}%)，"
+                        "不允许重复记录验证结论。"
+                        "如需修正，请使用新假设(commit_hypotheses)"
+                        "或回溯(backtrack)。"
+                    )
 
             try:
                 record_finding(
@@ -1194,24 +1305,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if ledger.get("root_cause") == old_statement:
                     ledger["root_cause"] = statement_update
 
-            # ── Capture corrected statement as a root cause even when
-            # the hypothesis is refuted.  A single hypothesis may combine
-            # multiple causes (e.g. "disk IO caused CoreDNS timeout").
-            # When the LLM discovers that one part is correct and the
-            # other is wrong, it refutes the hypothesis but provides a
-            # statement_update that isolates the valid sub-finding.
-            # Recording that statement prevents the valid finding from
-            # being lost in the structured root_causes list.
-            if (statement_update
-                and hypothesis_id not in ledger.setdefault("root_cause_hypothesis_ids", [])):
-                cids: list[str] = ledger["root_cause_hypothesis_ids"]
-                causes: list[str] = ledger.setdefault("root_causes", [])
-                cids.append(hypothesis_id)
-                if statement_update not in causes:
-                    causes.append(statement_update)
-                if not ledger.get("root_cause"):
-                    ledger["root_cause"] = statement_update
-                    ledger["root_cause_hypothesis_id"] = hypothesis_id
+            # ── Cleanup: remove non-confirmed hypotheses from
+            # root_cause_hypothesis_ids.  Ensures that refuted or
+            # deprioritized hypotheses do not appear as root causes.
+            hypotheses_dict = ledger.get("hypotheses", {})
+            cids[:] = [
+                cid for cid in cids
+                if hypotheses_dict.get(cid, {}).get("status") == "confirmed"
+            ]
+            # Rebuild root_causes to match cleaned cids
+            causes[:] = [
+                hypotheses_dict[cid]["statement"]
+                for cid in cids
+                if cid in hypotheses_dict
+            ]
+            # Re-sync backward-compat fields after cleanup
+            if cids:
+                ledger["root_cause"] = causes[0] if causes else ""
+                ledger["root_cause_hypothesis_id"] = cids[0]
+            else:
+                ledger.pop("root_cause", None)
+                ledger.pop("root_cause_hypothesis_id", None)
+
+            # ── Defect E: Sort root_cause_hypothesis_ids by probability
+            # descending so the highest-confidence root cause is always
+            # primary, regardless of record_finding call order. ──
+            if len(cids) > 1:
+                cids.sort(
+                    key=lambda _c: hypotheses_dict.get(_c, {}).get("probability", 0),
+                    reverse=True,
+                )
+                causes[:] = [
+                    hypotheses_dict[_c]["statement"]
+                    for _c in cids
+                    if _c in hypotheses_dict
+                ]
+                ledger["root_cause"] = causes[0] if causes else ""
+                ledger["root_cause_hypothesis_id"] = cids[0]
 
             if should_exit:
                 ledger["current_phase"] = "report"
@@ -1303,6 +1433,92 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             ),
             coroutine=_run,
         )
+
+    # ── Auto-report generation (P11 safety net) ──
+
+    def _generate_report_from_ledger(self, ledger: DiagnosisLedger) -> str:
+        """Generate a diagnostic report from ledger evidence.
+
+        Used as a last-resort safety net when the LLM exits the REPORT
+        phase without calling write_file (P11).
+        """
+        import datetime as _dt
+
+        lines: list[str] = []
+        lines.append("# 故障诊断报告\n")
+        lines.append(
+            f"**诊断日期**：{_dt.datetime.now().strftime('%Y-%m-%d')}"
+        )
+
+        # Fault overview from root causes
+        root_causes = ledger.get("root_causes", [])
+        if root_causes:
+            lines.append(
+                f"**故障概述**：{root_causes[0]}"
+            )
+
+        # Confidence from confirmed hypotheses
+        hypotheses = ledger.get("hypotheses", {})
+        confirmed = [
+            h for h in hypotheses.values() if h.get("status") == "confirmed"
+        ]
+        if confirmed:
+            max_p = max(h.get("probability", 0) for h in confirmed)
+            level = (
+                "高" if max_p >= 80
+                else "中" if max_p >= 50
+                else "低"
+            )
+            lines.append(f"**根因置信度**：{level}（{max_p}%）")
+        lines.append("")
+
+        # Root cause analysis
+        if root_causes:
+            lines.append("## 根因分析\n")
+            for i, rc in enumerate(root_causes, 1):
+                lines.append(f"{i}. {rc}")
+            lines.append("")
+
+        # Evidence chain
+        lines.append("## 证据链与时间线\n")
+        for hid, h in hypotheses.items():
+            status = h.get("status", "unknown")
+            p = h.get("probability", 0)
+            stmt = h.get("statement", "")
+            status_cn = {
+                "confirmed": "✅已确认",
+                "refuted": "❌已排除",
+                "deprioritized": "⬇已降级",
+                "verifying": "🔄验证中",
+                "pending": "⏳待验证",
+            }.get(status, status)
+            lines.append(f"- **{hid}** [{status_cn} p={p}%] {stmt}")
+            for e in h.get("evidence", []):
+                src = e.get("source", "")
+                summ = e.get("summary", "")[:200]
+                if summ:
+                    lines.append(f"  - [{src}] {summ}")
+        lines.append("")
+
+        # Excluded hypotheses
+        refuted = [
+            h for h in hypotheses.values()
+            if h.get("status") in ("refuted", "deprioritized")
+        ]
+        if refuted:
+            lines.append("## 排除的假设\n")
+            for h in refuted:
+                lines.append(
+                    f"- {h.get('statement', '')}"
+                    f"（{h.get('status')}，概率{h.get('probability', 0)}%）"
+                )
+            lines.append("")
+
+        # Repair suggestions (placeholder)
+        lines.append("## 修复建议\n")
+        lines.append("（请根据根因分析结果制定具体修复方案）")
+
+        return "\n".join(lines)
 
     # ── Persistence ──
 
