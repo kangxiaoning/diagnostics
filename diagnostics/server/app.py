@@ -184,10 +184,23 @@ def _save_result(
     logger.info("Result saved to %s", result_path)
 
     # Save .md (report content)
-    if content:
+    # Primary source: text_delta answering-phase stream (``content``).
+    # Fallback: ledger["report"] captured by middleware write_file handler.
+    # This ensures the .md is always written at the canonical report_path
+    # even when the LLM uses write_file (producing no answering text_delta)
+    # or alters the filename (e.g. strips HHMMSS).
+    md_content = content
+    if not md_content and ledger:
+        try:
+            md_content = ledger.get("report") or ""
+        except Exception:
+            pass
+    if md_content:
         md_path = Path(ROOT_DIR / stem.lstrip("/")).with_suffix(".md")
-        md_path.write_text(content, encoding="utf-8")
-        logger.info("Report saved to %s", md_path)
+        md_path.write_text(md_content, encoding="utf-8")
+        logger.info("Report saved to %s (%d chars, source=%s)",
+                     md_path, len(md_content),
+                     "text_delta" if content else "ledger.report")
 
 
 def _serialize_tree(tree: TreeBuilder) -> list[dict[str, Any]]:

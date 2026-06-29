@@ -58,13 +58,23 @@ def query_argus_network_metrics(
     return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
-def query_argus_k8s_metrics(
+def query_argus_nodes_metrics(
     scenario: str,
     name_chunk: str = "",
     start_time: str = "",
     end_time: str = "",
 ) -> str:
-    handler = _K8S_DATA.get(scenario, _default)
+    handler = _NODES_DATA.get(scenario, _nodes_default)
+    return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
+
+
+def query_argus_services_metrics(
+    scenario: str,
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
+    handler = _SERVICES_DATA.get(scenario, _services_default)
     return _apply_query_overrides(handler(), name_chunk, start_time, end_time)
 
 
@@ -162,6 +172,20 @@ def _k8s_normal() -> str:
             [0, 0, 6, 2],
         ],
         summary="✅ K8s 正常 — 无异常波动")
+
+
+def _nodes_default() -> str:
+    return _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[[0, 0, 0, 0]] * 10,
+        summary="✅ 节点与 Pod 正常 — 无异常波动")
+
+
+def _services_default() -> str:
+    return _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[[5, 1, 1200, 2, 0]] * 10,
+        summary="✅ 控制面与 DNS 正常 — 无异常波动")
 
 
 # ═══════════════════ Scenario: stress_cpu_and_tc_loss ═══════════════════
@@ -300,14 +324,14 @@ def _cpu_disk_dns() -> str:
             [18, 1.8, 3, "java 15%"],
             [22, 2.5, 5, "java 18%"],
             [25, 4.9, 45, "kubelet D!"],  # ← iowait 暴增
-            [25, 4.8, 45, "java D!"],
+            [25, 4.8, 45, "kubelet D!"],
             [25, 4.9, 45, "logrotate R"],
             [25, 4.8, 45, "kubelet D!"],
-            [25, 4.9, 45, "java D!"],
+            [25, 4.9, 45, "java S (await IO)"],
             [25, 4.5, 42, "kubelet D!"],
-            [25, 4.3, 40, "java D!"],
+            [25, 4.3, 40, "java S (await IO)"],
         ],
-        summary="🔴 15:03 iowait 2→45% — logrotate 触发磁盘 IO 飙升，kubelet/java D 状态")
+        summary="🔴 15:03 iowait 2→45% — logrotate 触发磁盘 IO 飙升，kubelet D 状态，java 等待 IO")
 
 
 def _mem_disk_dns() -> str:
@@ -723,6 +747,17 @@ _mem_node_oom = lambda: _fmt("Memory", "prod-us-east/worker-2", "15:00",
     ],
     summary="🔴 15:07 OOM Killer杀kubelet(PID 3210) — Java RSS 5.5G耗尽节点内存")
 
+_mem_oom_score = lambda: _fmt("Memory", "prod-us-east/worker-2", "15:00",
+    cols=["Mem%", "Swap%", "Available(MiB)", "OOM Events"],
+    rows=[
+        [68, 0, 2000, "—"], [72, 5, 1750, "—"], [76, 10, 1500, "—"],
+        [80, 22, 1200, "—"], [84, 38, 850, "⚠ 内存压力"],
+        [88, 55, 520, "⚠ Java RSS 5.2G"], [92, 75, 280, "🔴 接近OOM"],
+        [95, 88, 140, "🔴 OOM Kill kubelet PID 3210! (oom_score_adj=-500被误杀!)"],
+        [70, 48, 1720, "kubelet被误杀后内存回落"], [73, 52, 1580, "—"],
+    ],
+    summary="🔴 15:07 OOM Killer误杀kubelet(PID 3210, oom_score_adj=-500) — 应用Pod oom_score_adj=750反而存活")
+
 _cpu_node_oom = lambda: _fmt("CPU", "prod-us-east/worker-2", "15:00",
     cols=["CPU%", "Load", "iowait%", "Top Process"],
     rows=[
@@ -734,6 +769,18 @@ _cpu_node_oom = lambda: _fmt("CPU", "prod-us-east/worker-2", "15:00",
         [22, 1.8, 3, "java 20%"],
     ],
     summary="🔴 15:06 CPU突降 — kubelet被OOM Killer终止后节点指标不可达")
+
+_cpu_oom_score = lambda: _fmt("CPU", "prod-us-east/worker-2", "15:00",
+    cols=["CPU%", "Load", "iowait%", "Top Process"],
+    rows=[
+        [38, 1.8, 3, "java 35%"], [42, 2.2, 5, "java 40%"],
+        [48, 2.8, 8, "java 45%"], [52, 3.2, 10, "java 50%"],
+        [58, 3.8, 12, "java 52% (RSS 5.2G)"], [55, 3.5, 15, "kswapd 18%"],
+        [12, 0.8, 5, "java 10% (kubelet OOM误杀!)"],
+        [15, 1.0, 3, "java 12%"], [18, 1.2, 3, "java 15%"],
+        [20, 1.5, 3, "java 18%"],
+    ],
+    summary="🔴 15:06 CPU突降 — kubelet被OOM Killer误杀(oom_score_adj=-500配置不当)，应用Pod反而存活")
 
 
 # ═══════════════════ Scenario: cpu_throttle_probe_failure (cross) ═══════════════════
@@ -886,7 +933,7 @@ _CPU_DATA: dict[str, Callable[[], str]] = {
     "swap_thrashing": _cpu_swap,
     "kubelet_disk_io_starvation": _cpu_kubelet_io,
     "node_oom_kubelet_killed": _cpu_node_oom,
-    "oom_score_misconfig": _cpu_node_oom,
+    "oom_score_misconfig": _cpu_oom_score,
     "cpu_throttle_probe_failure": _cpu_throttle,
     "memory_leak": _cpu_normal,
     "disk_bottleneck": _cpu_normal,
@@ -929,6 +976,26 @@ _CPU_DATA: dict[str, Callable[[], str]] = {
         ],
         summary="🔴 master-1 iowait 3→50%(etcd D-state IO hang) + worker-3 sys%飙升(OOM页面回收)"),
     "dns_and_etcd": _cpu_normal,
+    # ── K8s scenarios: host resources normal (root cause is cluster-level) ──
+    "container_crash": _cpu_normal,
+    "coredns_cache_poison": _cpu_normal,
+    "image_pull_backoff": _cpu_normal,
+    # ── etcd_quorum_loss: disk delay causes iowait on etcd nodes ──
+    "etcd_quorum_loss": lambda: _fmt("CPU", "prod-us-east/etcd-node", "15:00",
+        cols=["CPU%", "Load", "iowait%", "Top Process"],
+        rows=[
+            [15, 0.8, 3, "etcd 5%"],
+            [18, 1.0, 5, "etcd 8%"],
+            [25, 1.8, 22, "etcd 18% (D-state)"],
+            [32, 2.5, 35, "etcd 25% (D-state)"],
+            [28, 2.2, 30, "etcd 20% (D-state)"],
+            [22, 1.8, 22, "etcd 15%"],
+            [18, 1.2, 10, "etcd 10%"],
+            [15, 0.8, 5, "etcd 6%"],
+            [15, 0.8, 3, "etcd 5%"],
+            [15, 0.8, 3, "etcd 5%"],
+        ],
+        summary="⚠ etcd节点 iowait 3→35% — 磁盘延迟致etcd D-state阻塞，leader选举失败"),
 }
 
 _MEM_DATA: dict[str, Callable[[], str]] = {
@@ -947,7 +1014,7 @@ _MEM_DATA: dict[str, Callable[[], str]] = {
     "swap_thrashing": _mem_swap,
     "kubelet_disk_io_starvation": _mem_normal,
     "node_oom_kubelet_killed": _mem_node_oom,
-    "oom_score_misconfig": _mem_node_oom,
+    "oom_score_misconfig": _mem_oom_score,
     "cpu_throttle_probe_failure": _mem_normal,
     "gpu_oom": _mem_gpu,
     "arp_cache_full": _mem_normal,
@@ -967,14 +1034,20 @@ _MEM_DATA: dict[str, Callable[[], str]] = {
             [80, 15, 1.1, "—"],
             [85, 25, 0.8, "—"],
             [90, 40, 0.5, "—"],
-            [95, 60, 0.2, "OOM Kill: kubelet(pid=1)"],
+            [95, 60, 0.2, "OOM Kill: kubelet(pid=3210)"],
             [92, 55, 0.4, "—"],
             [88, 45, 0.6, "—"],
             [85, 35, 0.9, "—"],
             [82, 28, 1.2, "—"],
         ],
-        summary="🔴 worker-3 内存枯竭 72→95% + Swap 5→60% → 15:05 OOM Kill kubelet(pid=1, RSS=6.2GB java)"),
+        summary="🔴 worker-3 内存枯竭 72→95% + Swap 5→60% → 15:05 OOM Kill kubelet(pid=3210, RSS=6.2GB java)"),
     "dns_and_etcd": _mem_normal,
+    # ── K8s scenarios: host memory normal ──
+    "container_crash": _mem_normal,
+    "coredns_cache_poison": _mem_normal,
+    "etcd_quorum_loss": _mem_normal,
+    "image_pull_backoff": _mem_normal,
+    "conntrack_table_full": _mem_normal,
 }
 
 _DISK_DATA: dict[str, Callable[[], str]] = {
@@ -1046,6 +1119,27 @@ _DISK_DATA: dict[str, Callable[[], str]] = {
             [95, 80, 140, 150.0],
         ],
         summary="🔴 master-1 sda %util 25→99.8% + await 5→185ms — etcd 数据盘 IO hang (D-state进程堆积)"),
+    # ── K8s scenarios: host disk normal ──
+    "container_crash": _disk_normal,
+    "coredns_cache_poison": _disk_normal,
+    "image_pull_backoff": _disk_normal,
+    "conntrack_table_full": _disk_normal,
+    # ── etcd_quorum_loss: disk delay on etcd data disk ──
+    "etcd_quorum_loss": lambda: _fmt("Disk", "prod-us-east/etcd-node", "15:00",
+        cols=["Util%", "IOPS(r/s)", "IOPS(w/s)", "await(ms)"],
+        rows=[
+            [25, 40, 80, 5.0],
+            [30, 45, 90, 8.0],
+            [55, 60, 120, 38.0],
+            [82, 80, 150, 95.0],
+            [75, 70, 140, 85.0],
+            [48, 55, 100, 25.0],
+            [32, 45, 85, 10.0],
+            [28, 42, 82, 8.0],
+            [25, 40, 80, 5.0],
+            [25, 40, 80, 5.0],
+        ],
+        summary="🔴 etcd数据盘 await 5→95ms + util 25→82% — 磁盘延迟致etcd多数派丢失"),
 }
 
 _NET_DATA: dict[str, Callable[[], str]] = {
@@ -1054,6 +1148,11 @@ _NET_DATA: dict[str, Callable[[], str]] = {
     "memory_leak": _net_normal,
     "disk_bottleneck": _net_normal,
     "softirq_starvation": _net_softirq,
+    # ── K8s scenarios: host network normal ──
+    "container_crash": _net_normal,
+    "coredns_cache_poison": _net_normal,
+    "etcd_quorum_loss": _net_normal,
+    "image_pull_backoff": _net_normal,
     "tcp_accept_overflow": _net_tcp_overflow,
     "high_cpu_iowait": _net_normal,
     "mixed_io_memory": _net_normal,
@@ -1106,106 +1205,260 @@ _NET_DATA: dict[str, Callable[[], str]] = {
     "dns_and_etcd": _net_normal,
 }
 
-_K8S_DATA: dict[str, Callable[[], str]] = {
-    "memory_leak_and_disk_full": _k8s_mem_leak_disk,
-    "container_crash": _k8s_container_crash,
-    "coredns_cache_poison": _k8s_coredns_poison,
-    "etcd_quorum_loss": _k8s_etcd_quorum,
-    "image_pull_backoff": _k8s_image_pull,
-    "dns_and_etcd": _k8s_dns_etcd,
-    "multi_layer_cascading": _k8s_multi_layer,
-    "arp_cache_full": _k8s_arp,
-    "mtu_mismatch": _k8s_mtu,
-    "kubelet_disk_io_starvation": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+
+# ═══════════════════ NODES DATA (NotReady / PodRestarts / Evictions / Pending) ═══════════════════
+
+_NODES_DATA: dict[str, Callable[[], str]] = {
+    "memory_leak_and_disk_full": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2], [0, 0, 5, 2],
-            [1, 0, 8, 3], [1, 0, 12, 5], [1, 5, 15, 8],
-            [1, 10, 12, 5], [1, 8, 10, 4], [1, 5, 8, 3], [1, 3, 6, 2],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 3, 0, 0],  # ← OOMKilled Pod 重启
+            [0, 5, 0, 0], [0, 2, 0, 0],
+            [1, 4, 2, 0],  # ← DiskPressure → NotReady + Evictions
+            [1, 6, 3, 0],
         ],
-        summary="🔴 15:03 worker-2 NotReady — kubelet lease超时, Pod被驱逐"),
-    "node_oom_kubelet_killed": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 15:05 Pod OOMKilled 重启 3次 → 15:08 DiskPressure 导致 worker-4 NotReady + 2次驱逐"),
+    "container_crash": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2], [0, 0, 5, 2],
-            [0, 0, 6, 2], [0, 0, 6, 3], [0, 0, 8, 3],
-            [1, 0, 15, 8], [1, 0, 12, 5], [1, 0, 10, 4], [1, 0, 8, 3],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 3, 0, 0], [0, 5, 0, 0], [0, 8, 0, 0],
+            [0, 12, 0, 0], [0, 10, 0, 0], [0, 8, 0, 0], [0, 5, 0, 0],
         ],
-        summary="🔴 15:06 worker-2 NotReady(Unknown) — kubelet被OOM Killer终止, 所有Pod不可达"),
-    "oom_score_misconfig": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 15:03 Pod重启暴增 — java-backend OOMKilled(CrashLoopBackOff), 12次重启/30min, 无节点异常"),
+    "coredns_cache_poison": _nodes_default,
+    "etcd_quorum_loss": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2], [0, 0, 5, 2],
-            [0, 0, 6, 2], [0, 0, 6, 3], [0, 0, 8, 3],
-            [1, 0, 15, 8], [1, 0, 12, 5], [1, 0, 10, 4], [1, 0, 8, 3],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 2, 0, 1], [0, 5, 0, 3], [0, 8, 2, 5],
+            [0, 10, 3, 8], [0, 8, 2, 5], [0, 5, 1, 3], [0, 3, 0, 1],
         ],
-        summary="🔴 15:06 worker-2 NotReady — kubelet被OOM Killer误杀(oom_score_adj配置错误), 应用Pod反而存活"),
-    "cpu_throttle_probe_failure": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 15:03 Pod重启暴增(API Server只读模式无法调度) + Pending Pod堆积(Deployment无法创建)"),
+    "image_pull_backoff": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[[0, 0, 0, 2]] * 10,
+        summary="⚠ 2个 Pod Pending(ImagePullBackOff) — 仅影响新 Pod, 无重启/NotReady"),
+    "dns_and_etcd": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2], [0, 0, 5, 2],
-            [0, 2, 8, 3], [0, 5, 10, 4], [0, 8, 12, 5],
-            [0, 10, 10, 4], [0, 8, 8, 3], [0, 5, 6, 3], [0, 3, 5, 2],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 2, 0, 0],
+            [0, 5, 0, 0], [0, 8, 0, 0], [0, 10, 0, 0],
+            [0, 8, 0, 0], [0, 6, 0, 0], [0, 4, 0, 0], [0, 3, 0, 0],
         ],
-        summary="🔴 15:03 Pod重启暴增(CPU节流→探针超时) — 非OOM/Crash, 是kubelet探针误判"),
-    "disk_io_and_dns": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 Pod重启10次 — CoreDNS CrashLoopBackOff, 无节点NotReady"),
+    "multi_layer_cascading": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2],
-            [0, 0, 5, 2],
-            [0, 0, 5, 3],
-            [0, 0, 8, 5000],  # ← DNS延迟暴增（外部域名 forward timeout 5s）
-            [0, 0, 6, 5000],
-            [0, 0, 5, 5000],
-            [0, 0, 6, 4800],
-            [0, 0, 5, 5000],
-            [0, 0, 5, 4500],
-            [0, 0, 5, 3000],
+            [0, 0, 0, 0], [0, 0, 0, 0], [1, 2, 1, 0],
+            [2, 5, 3, 1], [2, 10, 5, 2], [3, 18, 8, 3],
+            [3, 20, 10, 5], [3, 18, 8, 3], [2, 15, 5, 2], [2, 12, 3, 1],
         ],
-        summary="🔴 15:03 DNS Lat 2ms→5000ms（外部域名解析超时，CoreDNS forward指向已下线DNS），无Pod重启/节点NotReady"),
-    "conntrack_and_oom": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 3节点NotReady + Pod重启20次 + 驱逐10次 — 多层叠加, master-1 IO饱和 + worker-3 OOM"),
+    "arp_cache_full": _nodes_default,
+    "mtu_mismatch": _nodes_default,
+    "kubelet_disk_io_starvation": lambda: _fmt("Nodes", "prod-us-east/worker-2", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2],
-            [0, 0, 6, 3],
-            [0, 0, 5, 5],
-            [0, 0, 5, 25],
-            [0, 8, 8, 120],
-            [0, 12, 10, 250],
-            [0, 8, 5, 80],
-            [0, 5, 5, 30],
-            [0, 3, 5, 10],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [1, 0, 0, 0], [1, 0, 1, 0], [1, 5, 3, 0],
+            [1, 10, 5, 0], [1, 8, 3, 0], [1, 5, 2, 0], [1, 3, 1, 0],
         ],
-        summary="🔴 15:05 Pod 重启 8 次 (OOMKilled) + DNS 延迟 2ms→250ms"),
-    "conntrack_table_full": lambda: _fmt("Kubernetes", "prod-us-east", "15:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 15:03 worker-2 NotReady(kubelet lease超时) + 驱逐5次, Pod重启10次"),
+    "node_oom_kubelet_killed": lambda: _fmt("Nodes", "prod-us-east/worker-2", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 5, 2], [0, 0, 5, 2],
-            [0, 0, 6, 2],
-            [0, 0, 5, 2],
-            [2, 0, 8, 25],  # ← 2 nodes NotReady + DNS latency spike
-            [2, 0, 10, 120],
-            [2, 5, 12, 250],
-            [2, 30, 15, 500],
-            [2, 30, 18, 800],
-            [2, 30, 20, 1200],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [1, 0, 0, 8], [1, 0, 0, 12], [1, 0, 0, 10], [1, 0, 0, 6],
         ],
-        summary="🔴 15:04 worker-5/8 NotReady → Pod 驱逐开始 → DNS 延迟暴增"),
-    "etcd_quota_near_full": lambda: _fmt("Kubernetes", "prod-us-east", "18:00",
-        cols=["NotReady", "PodRestarts", "API Lat(ms)", "DNS Lat(ms)"],
+        summary="🔴 15:06 worker-2 NotReady(kubelet被OOM Kill) + 12个Pod Pending(节点不可调度)"),
+    "oom_score_misconfig": lambda: _fmt("Nodes", "prod-us-east/worker-2", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
         rows=[
-            [0, 0, 8, 5],
-            [0, 0, 12, 8],
-            [0, 0, 45, 15],    # ← API Server 写延迟开始升高（etcd compaction）
-            [0, 0, 150, 80],   # ← DNS 延迟开始升高（CoreDNS 查 etcd 变慢）
-            [0, 0, 350, 250],  # ← API Server 写入排队
-            [0, 2, 580, 500],  # ← Pod 重启开始（探针超时）
-            [0, 5, 650, 800],  # ← DNS 严重超时
-            [0, 8, 850, 1200], # ← 峰值: API p99=850ms, DNS p99=1200ms
-            [0, 5, 720, 900],
-            [0, 3, 480, 600],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [1, 0, 0, 5], [1, 0, 0, 8], [1, 0, 0, 6], [1, 0, 0, 4],
         ],
-        summary="🔴 18:02 API Server 延迟8→850ms（etcd slow）→ DNS 随即恶化 → 18:05 Pod 重启8次（探针超时）"),
+        summary="🔴 15:06 worker-2 NotReady(kubelet被误杀, oom_score_adj配置错误), 应用Pod反而存活"),
+    "cpu_throttle_probe_failure": lambda: _fmt("Nodes", "prod-us-east/worker-1", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 2, 0, 0], [0, 5, 0, 0], [0, 8, 0, 0],
+            [0, 10, 0, 0], [0, 8, 0, 0], [0, 5, 0, 0], [0, 3, 0, 0],
+        ],
+        summary="🔴 15:03 Pod重启暴增(CPU节流→探针超时→健康Pod被Kill) — 非OOM/Crash"),
+    "disk_io_and_dns": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[[0, 0, 0, 0]] * 10,
+        summary="✅ 节点和Pod状态正常 — DNS超时不影响Pod生命周期"),
+    "conntrack_and_oom": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 8, 0, 0], [0, 12, 0, 0], [0, 8, 0, 0], [0, 5, 0, 0], [0, 3, 0, 0],
+        ],
+        summary="🔴 15:05 Pod重启 8次(OOMKilled), 无节点NotReady/驱逐"),
+    "conntrack_table_full": lambda: _fmt("Nodes", "prod-us-east", "15:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [2, 0, 3, 0], [2, 0, 5, 0], [2, 5, 8, 0],
+            [2, 30, 15, 0], [2, 30, 20, 0], [2, 30, 22, 0],
+        ],
+        summary="🔴 15:04 worker-5/8 NotReady → 驱逐3→22次 → Pod重启30次(跨节点重建)"),
+    "etcd_quota_near_full": lambda: _fmt("Nodes", "prod-us-east", "18:00",
+        cols=["NotReady", "PodRestarts", "Evictions", "Pending"],
+        rows=[
+            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            [0, 0, 0, 0], [0, 0, 0, 1],
+            [0, 2, 0, 3], [0, 5, 0, 5], [0, 8, 0, 8],
+            [0, 5, 0, 5], [0, 3, 0, 3],
+        ],
+        summary="🔴 18:05 Pod重启8次(探针超时) + Pending Pod堆积(etcd慢导致调度延迟)"),
+}
+
+
+# ═══════════════════ SERVICES DATA (API Lat / etcd Leader / DB Size / DNS Lat / DNS Err) ═══════════════════
+
+_SERVICES_DATA: dict[str, Callable[[], str]] = {
+    "memory_leak_and_disk_full": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [6, 1, 1200, 3, 0],
+            [8, 1, 1200, 3, 0], [12, 1, 1200, 5, 0],
+            [15, 1, 1200, 8, 0], [10, 1, 1200, 5, 0], [8, 1, 1200, 3, 0],
+            [12, 1, 1200, 6, 0], [18, 1, 1200, 10, 0],
+        ],
+        summary="⚠ API Lat 5→18ms + DNS Lat 2→10ms — 轻度升高(节点驱逐增加API请求), etcd稳定"),
+    "container_crash": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [8, 1, 1200, 3, 0], [10, 1, 1200, 4, 0], [12, 1, 1200, 5, 0],
+            [15, 1, 1200, 6, 0], [12, 1, 1200, 5, 0], [10, 1, 1200, 4, 0], [8, 1, 1200, 3, 0],
+        ],
+        summary="⚠ API Lat 5→15ms(重启Pod重建请求增加), etcd/DNS 正常"),
+    "coredns_cache_poison": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [6, 1, 1200, 5, 2], [8, 1, 1200, 15, 8], [10, 1, 1200, 25, 15],
+            [8, 1, 1200, 18, 10], [6, 1, 1200, 10, 5], [5, 1, 1200, 5, 2], [5, 1, 1200, 3, 0],
+        ],
+        summary="🔴 DNS Lat 2→25ms + DNS Err 0→15 — CoreDNS缓存污染返回stale IP, API Server正常"),
+    "etcd_quorum_loss": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [8, 0, 1200, 3, 0], [25, 0, 1200, 5, 0],
+            [150, 0, 1200, 20, 5], [500, 0, 1200, 80, 20],
+            [2000, 0, 1200, 250, 50], [5000, 0, 1200, 500, 80],
+            [3000, 0, 1200, 350, 50], [1500, 0, 1200, 200, 30], [800, 0, 1200, 100, 15],
+        ],
+        summary="🔴 15:03 etcd leader=0(quorum lost, 2/3 down) → API Lat 5→5000ms(只读模式) + DNS级联恶化"),
+    "image_pull_backoff": _services_default,
+    "dns_and_etcd": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [8, 1, 1200, 5, 0], [12, 1, 1200, 8, 2], [30, 0, 1200, 50, 10],
+            [80, 0, 1200, 200, 30], [150, 1, 1200, 500, 60], [200, 0, 1200, 800, 80],
+            [180, 1, 1200, 600, 50], [120, 0, 1200, 400, 30], [80, 1, 1200, 200, 15], [50, 1, 1200, 100, 5],
+        ],
+        summary="🔴 etcd leader频繁切换(0↔1) + API Lat 8→200ms + DNS Lat 5→800ms + DNS Err 0→80"),
+    "multi_layer_cascading": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [8, 1, 1200, 3, 0], [10, 1, 1200, 5, 0], [50, 1, 1200, 25, 5],
+            [150, 1, 1205, 80, 15], [350, 1, 1210, 200, 30], [500, 0, 1220, 500, 60],
+            [600, 1, 1230, 800, 80], [500, 1, 1225, 600, 50], [350, 1, 1215, 400, 30], [250, 1, 1210, 300, 15],
+        ],
+        summary="🔴 API Lat 8→600ms + etcd leader切换 + DB增长1230MB + DNS Lat 3→800ms + DNS Err 0→80"),
+    "arp_cache_full": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [6, 1, 1200, 5, 1], [8, 1, 1200, 15, 3], [10, 1, 1200, 25, 5],
+            [8, 1, 1200, 20, 4], [7, 1, 1200, 15, 3], [6, 1, 1200, 10, 2], [5, 1, 1200, 5, 1],
+        ],
+        summary="⚠ DNS Lat 2→25ms + DNS Err 0→5(ARP丢包影响UDP查询), API Server/etcd正常"),
+    "mtu_mismatch": _services_default,
+    "kubelet_disk_io_starvation": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [8, 1, 1200, 3, 0], [12, 1, 1200, 5, 0], [15, 1, 1200, 8, 0],
+            [12, 1, 1200, 5, 0], [10, 1, 1200, 4, 0], [8, 1, 1200, 3, 0], [6, 1, 1200, 2, 0],
+        ],
+        summary="⚠ API Lat 5→15ms(节点NotReady增加心跳请求), etcd/DNS正常"),
+    "node_oom_kubelet_killed": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [6, 1, 1200, 2, 0], [6, 1, 1200, 3, 0], [8, 1, 1200, 3, 0],
+            [15, 1, 1200, 8, 0], [12, 1, 1200, 5, 0], [10, 1, 1200, 4, 0], [8, 1, 1200, 3, 0],
+        ],
+        summary="⚠ API Lat 5→15ms(kubelet被杀后心跳中断), etcd/DNS正常"),
+    "oom_score_misconfig": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [6, 1, 1200, 2, 0], [6, 1, 1200, 3, 0], [8, 1, 1200, 3, 0],
+            [15, 1, 1200, 8, 0], [12, 1, 1200, 5, 0], [10, 1, 1200, 4, 0], [8, 1, 1200, 3, 0],
+        ],
+        summary="⚠ API Lat 5→15ms(kubelet被误杀), etcd/DNS正常"),
+    "cpu_throttle_probe_failure": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [8, 1, 1200, 3, 0], [10, 1, 1200, 4, 0], [12, 1, 1200, 5, 0],
+            [10, 1, 1200, 4, 0], [8, 1, 1200, 3, 0], [6, 1, 1200, 3, 0], [5, 1, 1200, 2, 0],
+        ],
+        summary="⚠ API Lat 5→12ms(Pod重启增加API请求), etcd/DNS正常"),
+    "disk_io_and_dns": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [5, 1, 1200, 3, 0],
+            [8, 1, 1200, 5000, 120], [6, 1, 1200, 5000, 150],
+            [5, 1, 1200, 5000, 180], [6, 1, 1200, 4800, 160],
+            [5, 1, 1200, 5000, 200], [5, 1, 1200, 4500, 150], [5, 1, 1200, 3000, 80],
+        ],
+        summary="🔴 DNS Lat 2→5000ms + DNS Err 0→200(CoreDNS forward指向已下线DNS), API Server/etcd正常"),
+    "conntrack_and_oom": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [6, 1, 1200, 3, 0],
+            [5, 1, 1200, 5, 0], [5, 1, 1200, 25, 5],
+            [8, 1, 1200, 120, 20], [10, 1, 1200, 250, 40],
+            [5, 1, 1200, 80, 15], [5, 1, 1200, 30, 5], [5, 1, 1200, 10, 2],
+        ],
+        summary="🔴 DNS Lat 2→250ms + DNS Err 0→40(conntrack导致UDP丢包), API Server/etcd正常"),
+    "conntrack_table_full": lambda: _fmt("Services", "prod-us-east", "15:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [5, 1, 1200, 2, 0], [5, 1, 1200, 2, 0], [6, 1, 1200, 2, 0], [5, 1, 1200, 2, 0],
+            [8, 1, 1200, 25, 5], [10, 1, 1200, 120, 20], [12, 1, 1200, 250, 40],
+            [15, 1, 1200, 500, 60], [18, 1, 1200, 800, 80], [20, 1, 1200, 1200, 100],
+        ],
+        summary="🔴 DNS Lat 2→1200ms + DNS Err 0→100(conntrack table full), API Lat轻度升高5→20ms"),
+    "etcd_quota_near_full": lambda: _fmt("Services", "prod-us-east", "18:00",
+        cols=["API Lat(ms)", "etcd Ldr", "DB(MB)", "DNS Lat(ms)", "DNS Err"],
+        rows=[
+            [8, 1, 7000, 5, 0],
+            [12, 1, 7020, 8, 0],
+            [45, 1, 7050, 15, 3],    # ← API Server 写延迟开始升高（etcd compaction）
+            [150, 1, 7080, 80, 15],  # ← DNS 延迟开始升高（CoreDNS 查 etcd 变慢）
+            [350, 1, 7100, 250, 30], # ← API Server 写入排队
+            [580, 1, 7120, 500, 50], # ← Pod 重启开始（探针超时）
+            [650, 1, 7140, 800, 80], # ← DNS 严重超时
+            [850, 1, 7150, 1200, 100], # ← 峰值: DB Size 7.15GB 接近 8GB quota
+            [720, 1, 7145, 900, 80],
+            [480, 1, 7140, 600, 50],
+        ],
+        summary="🔴 etcd DB 7000→7150MB(逼近8GB NOSPACE) + API Lat 8→850ms + DNS Lat 5→1200ms + DNS Err 0→100"),
 }
 
 

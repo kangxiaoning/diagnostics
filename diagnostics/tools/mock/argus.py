@@ -14,9 +14,10 @@ from langchain_core.tools import tool
 from diagnostics.tools.mock.argus_data import (
     query_argus_cpu_metrics,
     query_argus_disk_metrics,
-    query_argus_k8s_metrics,
     query_argus_memory_metrics,
     query_argus_network_metrics,
+    query_argus_nodes_metrics,
+    query_argus_services_metrics,
 )
 from diagnostics.tools.mock.scenarios import get_active_scenario
 
@@ -110,12 +111,12 @@ def query_argus_network(
 
 
 @tool
-def query_argus_kubernetes(
+def query_argus_nodes(
     name_chunk: str = "",
     start_time: str = "",
     end_time: str = "",
 ) -> str:
-    """Query Argus for 1min-granularity K8s cluster metrics (10-min window).
+    """Query Argus for 1min-granularity node & pod stability metrics (10-min window).
 
     Args:
         name_chunk: Endpoint filter — cluster name, node name, or namespace
@@ -125,8 +126,31 @@ def query_argus_kubernetes(
         end_time: Query end time (e.g. "15:10", "2026-06-29T15:10:00").
             Leave empty for default window.
 
-    Returns per-minute: node status changes, pod restart counts, API server latency,
-    etcd metrics, DNS query latency.
-    Use this to identify WHEN K8s anomalies began and their progression.
+    Returns per-minute: NotReady node count, Pod restart count, eviction count, pending Pod count.
+    Use this to identify node health degradation, OOM kills, probe failures, and scheduling issues.
     """
-    return query_argus_k8s_metrics(get_active_scenario(), name_chunk, start_time, end_time)
+    return query_argus_nodes_metrics(get_active_scenario(), name_chunk, start_time, end_time)
+
+
+@tool
+def query_argus_services(
+    name_chunk: str = "",
+    start_time: str = "",
+    end_time: str = "",
+) -> str:
+    """Query Argus for 1min-granularity control plane & service availability metrics (10-min window).
+
+    Args:
+        name_chunk: Endpoint filter — cluster name or namespace
+            (e.g. "prod-us-east"). Leave empty for cluster-wide view.
+        start_time: Query start time (e.g. "15:00", "2026-06-29T15:00:00").
+            Leave empty for default window.
+        end_time: Query end time (e.g. "15:10", "2026-06-29T15:10:00").
+            Leave empty for default window.
+
+    Returns per-minute: API Server latency(ms), etcd leader changes, etcd DB size(MB),
+    DNS query latency(ms), DNS error count.
+    Use this to identify API Server degradation, etcd instability, and DNS resolution failures.
+    """
+    return query_argus_services_metrics(get_active_scenario(), name_chunk, start_time, end_time)
+

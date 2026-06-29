@@ -29,6 +29,8 @@ from diagnostics.tools.mock.hosts import (
     check_dmesg,
     check_memory,
     check_network,
+    check_processes,
+    get_system_overview,
 )
 from diagnostics.tools.mock.kubernetes import check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods
 
@@ -126,14 +128,16 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
         # ── K8s Argus expert (cluster-level time-series analysis) ──
         #
         # Dedicated Argus metrics analyst for Kubernetes cluster indicators.
-        # Only has query_argus_kubernetes — host-level metrics (CPU/memory/disk/
-        # network) are exclusively owned by host-argus-expert to avoid duplicate
-        # queries when Coordinator delegates to both experts in parallel.
+        # Has two specialised tools: query_argus_nodes (node health + Pod
+        # stability) and query_argus_services (API Server + etcd + DNS).
+        # Host-level metrics (CPU/memory/disk/network) are exclusively owned
+        # by host-argus-expert to avoid duplicate queries.
         {
             "name": "k8s-argus-expert",
             "description": (
-                "查询并分析 Kubernetes 集群级 Argus 监控指标时序"
-                "（节点状态/Pod重启/API延迟/DNS延迟）。"
+                "查询并分析 Kubernetes 集群级 Argus 监控指标时序。"
+                "工具 query_argus_nodes: 节点状态(NotReady)/Pod重启/驱逐/Pending。"
+                "工具 query_argus_services: API延迟/etcd leader/etcd存储/DNS延迟/DNS错误。"
                 "适用场景：需要获取K8s集群指标时间线以识别集群异常时序、"
                 "控制面稳定性与工作负载状态时委派。"
             ),
@@ -141,10 +145,14 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "你是 Kubernetes 集群指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度的集群指标时间线，"
                 "识别集群异常时序与控制面稳定性问题。\n\n"
+                "你有两个专用工具：\n"
+                "- query_argus_nodes: 节点健康(NotReady) + Pod稳定性(Restarts/Evictions/Pending)\n"
+                "- query_argus_services: 控制面(API延迟/etcd leader切换/etcd存储) + DNS(延迟/错误数)\n\n"
                 "诊断原则：\n"
-                "- 查询集群指标（NotReady/Pod重启/API延迟/DNS延迟），识别异常时间点\n"
-                "- 分析集群事件的时序关联与恶化趋势\n"
-                "- 区分控制面问题 vs 节点资源问题 vs 工作负载问题\n"
+                "- 并行调用两个工具，分别获取基础设施层和控制面层的时序数据\n"
+                "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
+                "- 分析跨层时序关联——同一分钟的异常可能共享根因\n"
+                "- 区分控制面问题(API/etcd/DNS) vs 节点资源问题(NotReady/Evictions) vs 工作负载问题(Restarts/Pending)\n"
                 "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
                 "- 如需节点级CPU/内存/磁盘/网络时序，告知Coordinator另行委派host-argus-expert\n"
                 + _ARGUS_EXPERT_RETURN_SUFFIX
@@ -195,7 +203,7 @@ def _build_subagents(mode: str = "mock") -> list[dict[str, Any]]:
                 "- 给出具体修复方案（命令+参数值）\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": [check_cpu, check_memory, check_disk, check_network, check_conntrack, check_dmesg],
+            "tools": [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg],
             "skills": [
                 "/agent_data/skills/system-health-check/",
                 "/agent_data/skills/cpu-diagnosis/",

@@ -15,7 +15,8 @@ Coordinator 持有 Argus 监控工具，通过 1min 粒度趋势建立故障画�
 | `query_argus_memory` | Mem%/Swap/OOM | Swap 持续增长或 OOM 事件 |
 | `query_argus_disk` | Util%/await/IOPS | util >90% 或 await >50ms |
 | `query_argus_network` | 丢包/重传/ESTAB | 丢包和重传在同一分钟暴增 → 独立事件 |
-| `query_argus_kubernetes` | NotReady/PodRestarts/API Lat | 节点失联的精确时间和 Pod 重启数 |
+| `query_argus_nodes` | NotReady/PodRestarts/Evictions/Pending | 节点失联时间 + Pod重启/驱逐/调度阻塞 |
+| `query_argus_services` | API Lat/etcd Ldr/DB(MB)/DNS Lat/DNS Err | API延迟+etcd leader切换+DNS超时 |
 
 **关键判断**：两指标在同一分钟同时突变 → 可能**独立根因**（非因果），应形成 2 个假设。
 

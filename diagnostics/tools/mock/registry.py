@@ -6,9 +6,10 @@ from typing import Any
 from diagnostics.tools.mock.argus import (
     query_argus_cpu,
     query_argus_disk,
-    query_argus_kubernetes,
     query_argus_memory,
     query_argus_network,
+    query_argus_nodes,
+    query_argus_services,
 )
 from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
 from diagnostics.tools.mock.hosts import (
@@ -141,12 +142,17 @@ def get_host_argus_tools() -> list[Any]:
 def get_k8s_argus_tools() -> list[Any]:
     """Return K8s-level Argus monitoring tools (for k8s-argus-expert).
 
-    Only the K8s cluster metrics tool — host-level metrics (CPU/memory/disk/
-    network) are exclusively owned by host-argus-expert to avoid duplicate
-    queries when Coordinator delegates to both experts in parallel.
+    Two specialised tools:
+    - query_argus_nodes: node health + Pod stability (NotReady, Restarts, Evictions, Pending)
+    - query_argus_services: control plane + service availability (API Lat, etcd, DNS)
+
+    Host-level metrics (CPU/memory/disk/network) are exclusively owned by
+    host-argus-expert to avoid duplicate queries when Coordinator delegates
+    to both experts in parallel.
     """
     return [
-        query_argus_kubernetes,
+        query_argus_nodes,
+        query_argus_services,
     ]
 
 

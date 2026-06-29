@@ -25,7 +25,8 @@ from diagnostics.tools.mock.data import (
 )
 from diagnostics.tools.mock.argus_data import (
     query_argus_cpu_metrics, query_argus_memory_metrics, query_argus_disk_metrics,
-    query_argus_network_metrics, query_argus_k8s_metrics,
+    query_argus_network_metrics, query_argus_nodes_metrics,
+    query_argus_services_metrics,
 )
 from diagnostics.tools.mock.hosts import check_conntrack, check_dmesg
 
@@ -54,7 +55,8 @@ ALL_ARGUS_FUNCS: list[tuple[str, callable]] = [
     ("argus.memory", query_argus_memory_metrics),
     ("argus.disk", query_argus_disk_metrics),
     ("argus.network", query_argus_network_metrics),
-    ("argus.k8s", query_argus_k8s_metrics),
+    ("argus.nodes", query_argus_nodes_metrics),
+    ("argus.services", query_argus_services_metrics),
 ]
 
 # Scenarios where check_dmesg MUST have specific data (kernel-level symptoms)

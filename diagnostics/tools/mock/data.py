@@ -25,7 +25,6 @@ def _load_avg(scenario: str) -> str:
         "stress_cpu_and_tc_loss": "8.52, 7.85, 6.30",
         "conntrack_and_oom": "3.85, 3.20, 2.90",
         "disk_io_and_dns": "4.85, 4.25, 3.60",
-        "memory_leak_and_disk_full": "3.10, 3.50, 4.20",
         "coredns_cache_poison": "1.50, 1.40, 1.35",
         "etcd_quorum_loss": "3.50, 3.20, 2.80",
         "image_pull_backoff": "1.20, 1.15, 1.10",
@@ -37,6 +36,7 @@ def _load_avg(scenario: str) -> str:
         "swap_thrashing": "7.50, 6.80, 5.90",
         "memory_leak_and_disk_full": "7.20, 6.50, 5.80",
         "dns_and_etcd": "4.50, 4.20, 3.80",
+        "etcd_quota_near_full": "3.80, 3.50, 3.20",
     }
     return loads.get(scenario, "0.5, 0.6, 0.7")
 
@@ -184,9 +184,11 @@ dmesg: VFS: file-max limit 65536 reached (systemd LimitNOFILE截断!)
 vmstat 1 3: r=2 b=0 wa=3 us=15 sy=8 id=72
 CPU util: ~15% user, ~8% sys, ~3% iowait, load average: 1.2/1.1/0.9
 说明: CPU使用率正常，无明显瓶颈—问题不在计算或IO层面"""
+    # ── All other scenarios: CPU is explicitly normal ──
     return base + """
 vmstat 1 3: r=1 b=0 wa=2 us=10 sy=5 id=83
-CPU util: ~10% user, ~5% sys, ~2% iowait, load average: 0.5/0.6/0.7"""
+CPU util: ~10% user, ~5% sys, ~2% iowait, load average: 0.5/0.6/0.7
+说明: 该场景下CPU指标正常 — cpu util<20%, iowait<5%, 无计算瓶颈"""
 
 
 # ════════════════ Memory ════════════════
@@ -234,12 +236,11 @@ dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:69
 说明: Java进程RSS=6.6GB, /proc/meminfo AnonPages持续增长
       conntrack表131072/131072满导致网络丢包, 与OOM同时发生"""
     if scenario == "memory_leak_and_disk_full":
-        return """Mem: 7.6Gi total, 7.2Gi used, 120Mi free, 280Mi buff/cache, 180Mi available (严重不足!)
-Swap: 2.0Gi total, 1.5Gi used, 520Mi free
-/proc/meminfo: AnonPages=7130112kB (异常高 — Java堆外泄漏!), Committed_AS=13500224kB
-dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
-dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:7130112kB
-说明: Java进程RSS=6.8GB触发OOM Killer, 重启后堆外内存泄漏继续(15:09 Mem升至86%)"""
+        return """Mem: 7.6Gi total, 7.3Gi used, 100Mi free, 200Mi buff/cache, 120Mi available (严重不足!)
+Swap: 2.0Gi total, 1.9Gi used, 100Mi free (swap近乎耗尽)
+/proc/meminfo: AnonPages=7012352kB (Java泄漏!), Committed_AS=14800224kB
+dmesg: java invoked oom-killer, process consumed RSS 6.8GB
+说明: Java内存泄漏RSS=6.8GB触发OOM Killer—同时磁盘被日志写满"""
     # ── Multi-root: disk_io_and_dns ── 内存正常
     # ── Additional scenarios ──
     if scenario == "swap_thrashing":
@@ -248,17 +249,24 @@ Swap: 4.0Gi total, 3.8Gi used, 200Mi free (swap几乎耗尽! 频繁换入换出)
 /proc/meminfo: AnonPages=5898240kB, SwapCached=2097152kB (大量swap缓存)
 vmstat: si=8500 so=9200 (swap in/out极高—系统全面减速)
 说明: 内存极度不足导致swap抖动—所有进程响应延迟"""
-    if scenario == "memory_leak_and_disk_full":
-        return """Mem: 7.6Gi total, 7.3Gi used, 100Mi free, 200Mi buff/cache, 120Mi available (严重不足!)
-Swap: 2.0Gi total, 1.9Gi used, 100Mi free (swap近乎耗尽)
-/proc/meminfo: AnonPages=7012352kB (Java泄漏!), Committed_AS=14800224kB
-dmesg: java invoked oom-killer, process consumed RSS 6.8GB
-说明: Java内存泄漏RSS=6.8GB触发OOM Killer—同时磁盘被日志写满"""
     # ── Scenario: etcd_quota_near_full ── 内存正常
     if scenario == "etcd_quota_near_full":
         return """Mem: 7.6Gi total, 3.2Gi used, 2.5Gi free, 1.9Gi buff/cache, 3.8Gi available
 Swap: 2.0Gi total, 0B used, 2.0Gi free
 说明: 内存正常，无swap使用"""
+    # ── Scenarios where memory is explicitly normal (for independence) ──
+    _mem_normal_scenarios = {
+        "stress_cpu_and_tc_loss", "disk_io_and_dns", "dns_and_etcd",
+        "kubelet_disk_io_starvation", "conntrack_table_full",
+        "oom_score_misconfig", "cpu_throttle_probe_failure",
+        "arp_cache_full", "mtu_mismatch", "high_cpu_iowait",
+        "disk_bottleneck", "network_congestion", "softirq_starvation",
+        "tcp_accept_overflow", "coredns_cache_poison", "etcd_quorum_loss",
+        "image_pull_backoff", "disk_full_var_log", "fs_inode_exhaustion",
+        "systemd_limit_nofile", "ebpf_probe_overhead",
+    }
+    if scenario in _mem_normal_scenarios:
+        return base + "\n说明: 该场景下内存指标正常 — 无泄漏/OOM/Swap压力"
     return base
 
 
@@ -267,7 +275,12 @@ Swap: 2.0Gi total, 0B used, 2.0Gi free
 def disk_data(scenario: str) -> str:
     base = """iostat: sda r/s=25 w/s=45 await=1.5ms svctm=0.8ms %util=5.6
 df: /dev/sda1 50G 18G 30G 38% /  /dev/sdb1 100G 45G 55G 45% /data"""
-    if scenario in ("high_cpu_iowait", "disk_bottleneck"):
+    if scenario == "high_cpu_iowait":
+        return """iostat: sda r/s=110 w/s=230 await=48.5ms svctm=19.2ms %util=97.8 (饱和!)
+sdb r/s=160 w/s=290 await=55.8ms svctm=21.5ms %util=98.5 (饱和!)
+avg-cpu: iowait=58.30%
+df: /dev/sda1 50G 38G 10G 78% /  /dev/sdb1 100G 85G 15G 85% /data"""
+    if scenario == "disk_bottleneck":
         return """iostat: sda r/s=120 w/s=250 await=45.2ms svctm=18.5ms %util=98.5 (饱和!)
 sdb r/s=180 w/s=320 await=52.3ms svctm=20.1ms %util=99.2 (饱和!)
 avg-cpu: iowait=55.30%
@@ -287,11 +300,11 @@ avg-cpu: iowait=12.30%
 df: /dev/sda1 50G 42G 6G 88% /  /dev/sdb1 100G 90G 10G 90% /data
 说明: 磁盘IO中等偏高（swap换入换出导致），但非主要瓶颈"""
     if scenario == "multi_layer_cascading":
-        return """iostat (master-1 - etcd节点): sda r/s=280 w/s=520 await=185.5ms svctm=42.3ms %util=99.8 (严重饱和!)
+        return """iostat (master-1 - etcd节点): sda r/s=280 w/s=520 await=185.5ms svctm=42.3ms %util=99.8 (严重饱和! etcd数据盘)
 sdb r/s=45 w/s=80 await=12.5ms svctm=3.2ms %util=15.0
 avg-cpu (master-1): iowait=58.20%
-df: /dev/sda1 50G 44G 4G 92% /  /dev/sdb1 100G 60G 40G 60% /var/lib/etcd (etcd数据目录所在盘!)
-说明: master-1上sda(etcd数据目录所在盘)util 99.8%+await 185ms→etcd fsync严重延迟
+df: /dev/sda1 50G 44G 4G 92% /var/lib/etcd (etcd数据目录! util 99.8%)  /dev/sdb1 100G 60G 40G 60% /data
+说明: master-1上sda为etcd数据盘，util 99.8%+await 185ms→etcd fsync严重延迟→leader切换
       iostat (worker-3): sda r/s=65 w/s=150 await=22.5ms svctm=6.8ms %util=48.0
 df (worker-3): /dev/sda1 50G 38G 10G 78% /"""
     # ── Multi-root: disk_io_and_dns ──
@@ -306,16 +319,17 @@ df: /dev/sda1 50G 38G 10G 78% / (含/var/log目录)
 df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽!)
 df -i: /dev/sda1 6553600/6553600 100% (inode也耗尽!)
 说明: 磁盘空间和inode同时耗尽—/var/log分区写满"""
-    if scenario == "memory_leak_and_disk_full":
-        return """iostat: sda r/s=80 w/s=260 await=35.2ms svctm=12.5ms %util=96.0 (磁盘接近饱和!)
-df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽! 日志写满)
-df: /var/log 占用 42G — Java 重启循环产生大量 crash 日志
-说明: 磁盘 util 96%、100% space used — Java OOMKilled 重启循环产生日志风暴填满磁盘"""
     if scenario == "fs_inode_exhaustion":
         return """iostat: sda r/s=15 w/s=12 await=1.2ms svctm=0.6ms %util=3.5
 df: /dev/sda1 50G 15G 33G 32% / (空间充足!)
 df -i: /dev/sda1 6553600/6553600 100% (inode耗尽—无法创建新文件)
 说明: 小文件过多导致inode耗尽—df有空间但touch失败"""
+    if scenario == "mixed_io_memory":
+        return """iostat: sda r/s=95 w/s=210 await=42.5ms svctm=15.8ms %util=92.5 (饱和!)
+avg-cpu: iowait=32.50%
+df: /dev/sda1 50G 42G 6G 88% /  /dev/sdb1 100G 78G 22G 78% /data
+vmstat: si=4200 so=3800 (swap换入换出活跃—内存压力导致磁盘IO)
+说明: 磁盘IO饱和(util 92.5%, await 42ms)+swap频繁换入换出—内存和IO双重压力"""
     if scenario == "swap_thrashing":
         return """iostat: sda r/s=350 w/s=420 await=85.5ms svctm=35.2ms %util=95.5 (严重饱和! swap IO!)
 df: /dev/sda1 50G 38G 10G 78% /
@@ -340,6 +354,18 @@ iostat (master-1 etcd节点): sda r/s=80 w/s=150 await=22.5ms svctm=6.8ms %util=
 df (master-1): /dev/sda1 50G 38G 10G 78% /  /dev/sdb1 100G 85G 15G 85% /var/lib/etcd
 说明: worker节点磁盘正常；master-1 etcd数据盘IO中等升高(util 45%, await 22ms)因compaction频繁
       注意: disk util 45% 远未饱和，不是IO瓶颈—问题在etcd DB quota逻辑层面"""
+    # ── Scenarios where disk is explicitly normal (for independence) ──
+    _disk_normal_scenarios = {
+        "stress_cpu_and_tc_loss", "conntrack_and_oom",
+        "conntrack_table_full", "oom_score_misconfig",
+        "cpu_throttle_probe_failure", "arp_cache_full", "mtu_mismatch",
+        "container_crash", "memory_leak", "network_congestion",
+        "softirq_starvation", "tcp_accept_overflow",
+        "coredns_cache_poison", "etcd_quorum_loss", "image_pull_backoff",
+        "systemd_limit_nofile", "ebpf_probe_overhead",
+    }
+    if scenario in _disk_normal_scenarios:
+        return base + "\n说明: 该场景下磁盘IO正常 — await<5ms, util<10%, 无IO瓶颈"
     return base
 
 
@@ -501,6 +527,17 @@ CoreDNS日志: [WARN] plugin/kubernetes: failed to list *v1.Endpoints for backen
 说明: 网络接口层正常无丢包，conntrack表远未满(9.6%)
       DNS超时是因为CoreDNS查询etcd时超时—etcd写入延迟高导致Endpoints列表查询变慢
       根因链: etcd DB接近quota→写入延迟→API Server慢→CoreDNS解析service时超时→DNS间歇失败"""
+    # ── Scenarios where network is explicitly normal (for independence) ──
+    _net_normal_scenarios = {
+        "kubelet_disk_io_starvation", "oom_score_misconfig",
+        "node_oom_kubelet_killed", "cpu_throttle_probe_failure",
+        "container_crash", "swap_thrashing", "high_cpu_iowait",
+        "memory_leak", "disk_bottleneck", "mixed_io_memory",
+        "gpu_oom", "etcd_quorum_loss", "disk_full_var_log",
+        "fs_inode_exhaustion",
+    }
+    if scenario in _net_normal_scenarios:
+        return base + "\n说明: 该场景下网络正常 — 无丢包/重传/连接饱和"
     return base
 
 
@@ -607,16 +644,6 @@ dmesg: INFO: task kubelet:2345 blocked for more than 120 seconds (日志写入ha
 CoreDNS日志: [ERROR] plugin/forward: dial tcp 10.0.0.53:53: i/o timeout
 说明: logrotate→磁盘IO飙升→kubelet/应用D状态阻塞
       CoreDNS forward配置指向已下线DNS→解析超时—两个独立根因"""
-    # ── Multi-root: memory_leak_and_disk_full ──
-    if scenario == "memory_leak_and_disk_full":
-        return """PID 8765 java D 35.0% 75.5% java -Xmx6g -jar app.jar (RSS=6.8GB! 堆外泄漏→OOMKilled)
-PID 3210 root D 8.0% 5.0% kubelet (D状态! 磁盘满导致心跳写入失败)
-PID 1234 root D 6.0% 3.5% containerd (D状态! 无法创建新容器—no space left)
-dmesg: java invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), oom_score_adj=750
-dmesg: Out of memory: Killed process 8765 (java) total-vm:12849152kB anon-rss:7130112kB
-dmesg: ext4 journal abort on /dev/sda1 (磁盘满→ext4日志写入失败)
-说明: 两个独立根因—(1)Java RSS 6.8GB堆外泄漏触发OOM Killer
-      (2)磁盘100%满导致kubelet/containerd D状态、无法创建新容器"""
     # ── Additional scenarios ──
     if scenario == "swap_thrashing":
         return """PID 5678 java S 5.0% 72.5% java (RSS=6.8GB—内存不足触发swap)
@@ -643,6 +670,13 @@ dmesg: VFS: file-max limit 65536 reached
 PID 5678 root S 2.0% 1.5% logrotate (无法创建新日志文件—df显示100%)
 df: /dev/sda1 50G 49G 0 100% / (磁盘空间耗尽!)
 说明: /var/log分区写满→容器运行时无法创建容器"""
+    if scenario == "fs_inode_exhaustion":
+        return """PID 5678 app R 12.0% 8.5% session-cleaner (批量创建临时文件! 10万+/小时)
+PID 8901 app S 8.0% 5.0% log-rotator (日志切割产生大量小文件)
+PID 2345 app S 3.5% 4.5% mysqld (tmpdir小文件堆积)
+df -i: /dev/sda1 6553600/6553600 (100%! inode耗尽)
+df: /dev/sda1 50G 15G 33G 32% / (磁盘空间充足但无法创建新文件!)
+说明: session-cleaner和log-rotator产生海量小文件导致inode耗尽—touch失败但df有空间"""
     if scenario == "memory_leak_and_disk_full":
         return """PID 8765 java S 42.0% 72.5% java (RSS=6.8GB—内存泄漏! 频繁Full GC)
 PID 5678 root S 2.0% 1.5% logrotate (无法创建新日志—磁盘满!)
@@ -658,6 +692,13 @@ dmesg: (无OOM/IO hang/panic — 内核层面完全正常)
 说明: etcd进程因compaction产生中等IO，其他进程状态正常
       注意: api-gateway RSS=420MiB 在limit 512Mi内，不是OOM问题
       关键区别: 此场景所有进程RSS正常，不存在内存泄漏或OOM"""
+    # ── Scenarios where processes are explicitly normal (for independence) ──
+    _proc_normal_scenarios = {
+        "dns_and_etcd", "network_congestion", "mixed_io_memory",
+        "coredns_cache_poison", "etcd_quorum_loss", "image_pull_backoff",
+    }
+    if scenario in _proc_normal_scenarios:
+        return base + "\n说明: 该场景下主机进程状态正常 — 无D状态进程/无异常CPU占用"
     return base
 
 def kubernetes_pods_data(scenario: str) -> str:
@@ -902,11 +943,17 @@ def kubernetes_nodes_data(scenario: str) -> str:
 master-1      Ready   25%  45%  v1.28.5
 worker-1      Ready   35%  55%  v1.28.5
 worker-2      Ready   40%  60%  v1.28.5"""
-    if scenario in ("memory_leak", "container_crash"):
+    if scenario == "memory_leak":
         return """NAME          STATUS  CPU% MEM% CONDITIONS
 master-1      Ready   30%  50%  -
 worker-1      Ready   45%  78%  -
 worker-2      Ready   55%  92%  MemoryPressure=True!"""
+    if scenario == "container_crash":
+        return """NAME          STATUS  CPU% MEM% CONDITIONS
+master-1      Ready   30%  50%  -
+worker-1      Ready   45%  78%  -
+worker-2      Ready   55%  85%  -
+说明: container_crash场景节点状态正常，Pod OOMKilled不影响节点级别"""
     if scenario == "gpu_oom":
         return """NAME          STATUS  CPU% MEM% GPU  CONDITIONS
 master-1      Ready   30%  50%  -   -
@@ -1129,4 +1176,14 @@ kube-controller-manager Healthy  leader elected
 etcd-0                 Healthy   raft index: 16552300 (WARNING: leader elections 8x/hour, wal_fsync p99=95ms)
 说明: etcd leader频繁切换→API Server间歇延迟→CoreDNS查询超时→DNS解析失败
       控制面组件表面Healthy但etcd存在性能劣化"""
+    if scenario == "etcd_quorum_loss":
+        return """COMPONENT              STATUS     MESSAGE
+kube-apiserver         Healthy    serving at https://172.16.0.1:6443 (READ-ONLY MODE!)
+kube-scheduler         Unhealthy  unable to create new pods: etcd quorum lost
+kube-controller-manager Unhealthy endpoint sync failed: etcd unreachable
+etcd-0                 Unhealthy  raft index: 12348000 (leader lost! fsync latency 250ms)
+etcd-1                 Unhealthy  raft index: 12347950 (election timeout! disk IO stalled)
+etcd-2                 Healthy    raft index: 12348000 (available, awaiting leader election)
+说明: etcd多数派丢失—2/3节点磁盘延迟→Leader选举失败→API Server降级只读
+      kubectl get 正常(读)但create/update不可用(写)—只读模式"""
     return base

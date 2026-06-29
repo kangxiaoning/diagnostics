@@ -1218,8 +1218,36 @@ def get_cluster_overview(cluster_name: str) -> str:
 def get_pod_logs(cluster_name: str, namespace: str,
                  pod_name: str, tail_lines: int = 200) -> str:
     """Retrieve recent pod logs."""
-    _ = cluster_name, namespace, pod_name, tail_lines
-    return _POD_LOGS.get(get_active_scenario(), _POD_LOGS["normal"])
+    _ = cluster_name, namespace, tail_lines
+    scenario = get_active_scenario()
+    # multi_layer_cascading: differentiate by pod_name
+    if scenario == "multi_layer_cascading" and pod_name:
+        if "etcd" in pod_name:
+            return _ETCD_LOGS.get("multi_layer_cascading", _ETCD_LOGS["normal"])
+        if "kube-apiserver" in pod_name:
+            return (
+                "2026-06-14T07:30:00.123Z WARN  etcd request latency p99=850ms (normal<50ms!)\n"
+                "2026-06-14T07:30:05.456Z ERROR watch closed because: context deadline exceeded\n"
+                "2026-06-14T07:30:10.789Z WARN  storage request timeout: 1.2s on /registry/pods\n"
+                "2026-06-14T07:30:15.012Z ERROR failed to list *v1.Pod: etcdserver: request timed out\n"
+            )
+    # dns_and_etcd: differentiate by pod_name
+    if scenario == "dns_and_etcd" and pod_name:
+        if "coredns-6d4b-def88" in pod_name:
+            return (
+                "2026-06-14T08:50:00.123Z [INFO] CoreDNS-1.11.1 starting\n"
+                "2026-06-14T08:51:00.456Z [INFO] plugin/reload: Running configuration SHA512 = abc123\n"
+                "2026-06-14T08:55:00.789Z [WARN] Memory usage climbing: 52Mi / 64Mi limit\n"
+                "2026-06-14T08:58:00.012Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+                "2026-06-14T08:59:00.345Z [FATAL] OOMKilled — memory limit 64Mi exceeded (need 128Mi!)\n"
+            )
+        elif "coredns" in pod_name:
+            return (
+                "2026-06-14T09:00:00.123Z [INFO] CoreDNS-1.11.1\n"
+                "2026-06-14T09:05:00.456Z [ERROR] plugin/kubernetes: failed to list *v1.Service: etcdserver: request timed out\n"
+                "2026-06-14T09:05:05.789Z [WARN] plugin/forward: max retries exceeded for upstream\n"
+            )
+    return _POD_LOGS.get(scenario, _POD_LOGS["normal"])
 
 
 @tool
@@ -1277,6 +1305,38 @@ def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get full describe output for a pod."""
     _ = cluster_name, namespace
     scenario = get_active_scenario()
+    # multi_layer_cascading: differentiate by pod_name
+    if scenario == "multi_layer_cascading" and pod_name:
+        if "etcd" in pod_name:
+            return (
+                f"Name:             {pod_name}\n"
+                "Namespace:        kube-system\n"
+                "Status:           Running\n"
+                "Node:             master-1\n"
+                "Containers:\n"
+                "  etcd:\n"
+                "    Image: registry.k8s.io/etcd:3.5.9\n"
+                "    State: Running (Started: 30 days ago)\n"
+                "    Restart Count: 0\n"
+                "    Limits: cpu=500m, memory=1Gi\n"
+                "    Args: --data-dir=/var/lib/etcd --wal-dir=/var/lib/etcd/member/wal\n"
+                "    Volume Mounts: /var/lib/etcd from etcd-data (hostPath: /var/lib/etcd)\n"
+                "    Liveness: http-get :2381/health?serializable=true period=10s timeout=15s\n"
+                "Conditions: Initialized=True, Ready=True, ContainersReady=True\n"
+                "说明: etcd Pod 运行在 master-1 节点, WAL 和数据目录均在 /var/lib/etcd (sda盘)\n"
+            )
+        if "kube-apiserver" in pod_name:
+            return (
+                f"Name:             {pod_name}\n"
+                "Namespace:        kube-system\n"
+                "Status:           Running\n"
+                "Node:             master-1\n"
+                "Containers:\n"
+                "  kube-apiserver:\n"
+                "    State: Running (Started: 30 days ago)\n"
+                "    Restart Count: 2\n"
+                "    Args: --etcd-servers=https://127.0.0.1:2379 --etcd-cafile=/etc/kubernetes/pki/etcd/ca.crt\n"
+            )
     # dns_and_etcd: differentiate by pod_name
     if scenario == "dns_and_etcd" and pod_name:
         if "coredns-6d4b-def88" in pod_name:
@@ -1415,8 +1475,21 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
 @tool
 def get_node_info(cluster_name: str, node_name: str) -> str:
     """Get detailed node information."""
-    _ = cluster_name, node_name
+    _ = cluster_name
     scenario = get_active_scenario()
+    # multi_layer_cascading: differentiate master-1 from worker-3
+    if scenario == "multi_layer_cascading" and "master" in (node_name or ""):
+        return (
+            f"Name:               {node_name}\n"
+            "Roles:              master, control-plane\n"
+            "Status:             Ready\n"
+            "OS:                 Ubuntu 22.04 LTS\n"
+            "Kernel:             5.15.0-105-generic\n"
+            "Kubelet Version:    v1.28.5\n"
+            "Conditions:         Ready=True, MemoryPressure=False, DiskPressure=False, PIDPressure=False\n"
+            "Allocated resources: CPU=75%, Memory=68%\n"
+            "说明: master-1 承载 etcd + kube-apiserver, 磁盘 IO 饱和(iowait=58%)\n"
+        )
     node_info_map: dict[str, str] = {
         "normal": (
             f"Name:               {node_name}\n"
@@ -1815,6 +1888,23 @@ def get_configmap(cluster_name: str, configmap_name: str,
                   namespace: str = "default") -> str:
     """Get ConfigMap content."""
     _ = cluster_name, namespace
+    scenario = get_active_scenario()
+    # multi_layer_cascading: differentiate by configmap_name
+    if scenario == "multi_layer_cascading" and "etcd" in (configmap_name or ""):
+        return (
+            f"## ConfigMap: {configmap_name}\n"
+            "apiVersion: v1\n"
+            "kind: ConfigMap\n"
+            "metadata:\n"
+            "  name: etcd-config\n"
+            "  namespace: kube-system\n"
+            "data:\n"
+            "  ETCD_DATA_DIR: /var/lib/etcd\n"
+            "  ETCD_WAL_DIR: /var/lib/etcd/member/wal\n"
+            "  ETCD_QUOTA_BACKEND_BYTES: \"8589934592\"\n"
+            "  ETCD_SNAPSHOT_COUNT: \"10000\"\n"
+            "说明: WAL 目录与数据目录均在同一 sda 盘上 (/var/lib/etcd), 未分离部署\n"
+        )
     configmaps: dict[str, str] = {
         "normal": (
             f"## ConfigMap: {configmap_name}\n"
@@ -1864,7 +1954,7 @@ def get_configmap(cluster_name: str, configmap_name: str,
             "说明: Corefile 配置正常 — CoreDNS CrashLoop 不是配置问题，是 memory limit 64Mi 过小\n"
         ),
     }
-    return configmaps.get(get_active_scenario(), configmaps["normal"])
+    return configmaps.get(scenario, configmaps["normal"])
 
 
 @tool

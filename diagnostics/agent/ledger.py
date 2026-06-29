@@ -33,10 +33,6 @@ Verdict = Literal["confirmed", "refuted", "inconclusive"]
 
 # ── TypedDicts (plain dicts at runtime, typed for clarity) ──
 
-class FaultProfile(dict):
-    """从用户描述提取的故障画像。"""
-
-
 class Evidence(dict):
     """单条证据。"""
 
@@ -69,7 +65,6 @@ class DiagnosisLedgerState(DeepAgentState):
 def new_ledger() -> DiagnosisLedger:
     """Create an empty diagnosis ledger."""
     return DiagnosisLedger(
-        fault_profile=None,
         hypotheses={},
         root_hypothesis_ids=[],
         active_path=[],
@@ -86,24 +81,6 @@ def new_ledger() -> DiagnosisLedger:
         skill_ids=[],
         _inconclusive_streak=0,
         _backtrack_count=0,
-    )
-
-
-def new_fault_profile(
-    entities: list[str],
-    symptoms: list[str],
-    user_raw: str,
-    timeline: str = "",
-    recent_changes: str = "",
-    prior_actions: str = "",
-) -> FaultProfile:
-    return FaultProfile(
-        entities=entities,
-        symptoms=symptoms,
-        timeline=timeline,
-        recent_changes=recent_changes,
-        prior_actions=prior_actions,
-        user_raw=user_raw,
     )
 
 
@@ -389,23 +366,49 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     return _derive_default_phase(ledger)
 
 
+def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
+    """Force-finalize non-terminal hypotheses when entering REPORT phase.
+
+    When the system transitions to REPORT (via derive_phase, timeout,
+    max-rounds, or any safety valve), some hypotheses may remain in
+    'pending' or 'verifying' state.  This function marks them as
+    'deprioritized' so the ledger is clean when the report is generated.
+
+    Returns True if any hypotheses were finalized.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    if not hypotheses:
+        return False
+
+    finalized = False
+    for hid, node in hypotheses.items():
+        status = node.get("status")
+        if status == "verifying":
+            node["status"] = "deprioritized"
+            node["rationale"] = (
+                node.get("rationale", "")
+                + " | [系统] REPORT 阶段自动终结：验证未完成"
+            ).strip(" |")
+            finalized = True
+        elif status == "pending":
+            node["status"] = "deprioritized"
+            node["rationale"] = (
+                node.get("rationale", "")
+                + " | [系统] REPORT 阶段自动终结：未验证的低概率假设"
+            ).strip(" |")
+            finalized = True
+
+    return finalized
+
+
 def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
-    if ledger.get("fault_profile") is None:
-        # If hypotheses have already been committed, UNDERSTAND is complete
-        # even if fault_profile wasn't explicitly populated.  Fall through
-        # to regular phase logic based on hypothesis status.
-        if ledger.get("hypotheses"):
-            pass  # fall through — hypotheses exist, derive phase from their status
-        elif ledger.get("current_round", 0) >= 2:
+    hypotheses: dict = ledger["hypotheses"]
+    if not hypotheses:
+        if ledger.get("current_round", 0) >= 2:
             # LLM had at least one full round but still hasn't called
             # commit_hypotheses — force advance to stop re-collecting data.
             return "hypothesize"
-        else:
-            return "understand"
-
-    hypotheses: dict = ledger["hypotheses"]
-    if not hypotheses:
-        return "hypothesize"
+        return "understand"
 
     # Check if active path has an unverified hypothesis
     if ledger["active_path"]:
@@ -445,9 +448,7 @@ def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
 
 def _derive_skill_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     """Skill mode: UNDERSTAND → SKILL_VERIFY → EVALUATE → REPORT."""
-    if ledger.get("fault_profile") is None:
-        if ledger.get("current_round", 0) >= 2:
-            return "skill_verify"
+    if ledger.get("current_round", 0) < 2 and not ledger.get("hypotheses"):
         return "understand"
     # In skill mode, we stay in skill_verify until done
     return "skill_verify"
@@ -535,7 +536,6 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "ls", "glob", "grep",
     "commit_hypotheses", "select_path", "record_finding", "backtrack",
     "list_diagnostic_capabilities", "get_system_overview",
-    "FaultProfileSchema",  # structured output extraction, not a diagnostic tool
 })
 
 def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
@@ -551,18 +551,6 @@ def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
     lines.append(f"## 当前诊断状态")
     lines.append(f"- 阶段: {phase} | 步骤: {ledger['current_round']} | 活动路径: {active_path_str}")
     lines.append("")
-
-    # Fault profile
-    fp = ledger.get("fault_profile")
-    if fp:
-        lines.append("## 故障画像")
-        lines.append(f"- 实体: {', '.join(fp.get('entities', []))}")
-        lines.append(f"- 症状: {', '.join(fp.get('symptoms', []))}")
-        if fp.get("timeline"):
-            lines.append(f"- 时间线: {fp['timeline']}")
-        if fp.get("recent_changes"):
-            lines.append(f"- 最近变更: {fp['recent_changes']}")
-        lines.append("")
 
     # Hypothesis tree
     if ledger["hypotheses"]:
@@ -668,26 +656,16 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
         return (
             "你当前处于 UNDERSTAND 阶段。\n"
             "- 从用户输入提取故障画像（实体、症状、时间线、变更、已尝试操作）\n"
-            "- 根据症状选择 Argus 模块并行查询：\n"
-            "  CPU/负载 → query_argus_cpu()\n"
-            "  内存/OOM → query_argus_memory()\n"
-            "  磁盘IO → query_argus_disk()\n"
-            "  网络丢包/DNS → query_argus_network()\n"
-            "  K8s → query_argus_kubernetes()\n"
+            "- 委派 Argus 专家采集监控指标（通过 task() 调用）：\n"
+            "  主机相关（CPU/内存/磁盘/网络症状）→ task(\"host-argus-expert\", ...)\n"
+            "  K8s 相关（节点/Pod/集群症状）→ task(\"k8s-argus-expert\", ...)\n"
+            "  复合场景 → 同时委派两个专家（并行 task），分别负责主机级和集群级指标\n"
             "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
             "- 可 read_file 读取实体 HISTORY.md 关联历史\n"
             "- ⚠ 查看上方「诊断历史」，禁止重复调用已执行过的工具\n"
             "- 完成后必须调用 commit_hypotheses 提交初始假设"
         )
     if phase == "hypothesize":
-        # Detect if we were force-promoted (fault_profile still None but round>=2)
-        if ledger.get("fault_profile") is None:
-            return (
-                "【系统强制推进】你已在 UNDERSTAND 阶段停留超过1轮但尚未提交假设。\n"
-                "数据采集已完成，禁止重复调用相同诊断工具。\n"
-                "- 基于上一轮已获取的数据，立即提出最多3个假设（按概率降序）\n"
-                "- 必须立即调用 commit_hypotheses 提交假设，否则诊断无法推进"
-            )
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
             "- 基于当前证据，提出最多3个可能性最大的假设（按概率降序）\n"
@@ -853,6 +831,15 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
                 f"根因确认: {best['id']} {best['statement']}"
                 f" (p={best['probability']}%)"
             ), confirmed_ids[0]
+
+        # When root_ids is non-empty but we reach here, it means:
+        # no confirmed(p>=80) AND no pending(p>15).  The remaining
+        # hypotheses are either refuted, dead_end, deprioritized, or
+        # low-probability pending(p<=15).  In multi-root mode, do NOT
+        # fall through to the single-root/legacy check below — it could
+        # incorrectly pick up a hypothesis that was already assessed
+        # as non-confirmed by the multi-root logic above.
+        return False, "", None
 
     # ── Single-root / legacy: first confirmed hypothesis triggers exit ──
     # Condition 1: Root cause confirmed — a confirmed hypothesis with p>=80%

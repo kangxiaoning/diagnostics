@@ -15,14 +15,14 @@ from diagnostics.tools.mock.argus_data import (
     query_argus_cpu_metrics,
     query_argus_memory_metrics,
     query_argus_network_metrics,
-    query_argus_k8s_metrics,
+    query_argus_nodes_metrics,
 )
 
 for name, fn in [
     ("CPU", query_argus_cpu_metrics),
     ("Memory", query_argus_memory_metrics),
     ("Network", query_argus_network_metrics),
-    ("K8s", query_argus_k8s_metrics),
+    ("Nodes", query_argus_nodes_metrics),
 ]:
     r = fn("conntrack_and_oom")
     summary = r.split("\u6458\u8981")[1] if "\u6458\u8981" in r else r[-100:]

@@ -421,12 +421,6 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     tc_id = _extract_tool_id(tc)
                     tc_name = _extract_tool_name(tc)
                     tc_args = _extract_tool_args(tc)
-                    # ── Skip FaultProfileSchema: it is a structured output
-                    # extraction pseudo-tool from abefore_agent, not a real
-                    # diagnostic tool.  Emitting it as a tool_start event
-                    # confuses the frontend tree and causes "运行中" hang.
-                    if tc_name == "FaultProfileSchema":
-                        continue
                     # Log file tools and task for args inspection
                     if tc_name in ("read_file", "write_file", "edit_file",
                                    "write_todos", "task", "glob", "grep", "ls"):
@@ -479,8 +473,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 output = _extract_text(message)
                 info = state.active_tools.pop(tc_id, None)
                 # Skip orphaned tool_end events — the corresponding
-                # tool_start was filtered out (e.g. FaultProfileSchema
-                # pseudo-tool from abefore_agent structured output).
+                # tool_start was filtered out.
                 if info is None:
                     logger.debug("[round=%d] Skipping orphaned ToolMessage (no tool_start): %s",
                                  state.round_number, tc_id)
@@ -518,7 +511,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 state.done_tools.add(tc_id)
                                 output = _extract_text(last)
                                 info = state.active_tools.pop(tc_id, None)
-                                # Skip orphaned tool_end (e.g. FaultProfileSchema)
+                                # Skip orphaned tool_end (no matching tool_start)
                                 if info is None:
                                     logger.debug("[round=%d] Skipping orphaned ToolMessage (updates): %s",
                                                  state.round_number, tc_id)
