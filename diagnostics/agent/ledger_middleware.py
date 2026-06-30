@@ -12,6 +12,7 @@ See: private/HYPOTHESIS_LEDGER_DESIGN.md
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import pathlib
@@ -71,6 +72,7 @@ _STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding 
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
+_TOOL_FAILURE_BREAKER = 2           # Consecutive failures of same tool → auto-block retry
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -120,6 +122,39 @@ def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
     if len(context) > max_chars:
         context = context[:max_chars] + "\n...(已截断)"
     return context
+
+
+def _make_cache_key(tool_name: str, args: dict) -> str:
+    """Generate a deterministic cache key from tool name + args.
+
+    Args are serialized with sort_keys=True so that dict key order does
+    not cause false cache misses.
+    """
+    canonical = json.dumps(args, sort_keys=True) if args else "{}"
+    return f"{tool_name}:{canonical}"
+
+
+# Patterns that indicate a tool call failed at the transport/network level
+# rather than returning valid (possibly empty) diagnostic data.
+_TOOL_FAILURE_PATTERNS = re.compile(
+    r"timeout|timed out|connection refused|connection reset|"
+    r"network (is )?unreachable|no route to host|"
+    r"OSP.*(?:fail|error|timeout)|remote.*(?:fail|error|timeout)|"
+    r"channel closed|broken pipe",
+    re.IGNORECASE,
+)
+
+
+def _is_tool_failure(content: str) -> bool:
+    """Return True if tool output indicates a transport/network failure."""
+    if not content:
+        return False
+    # Only match if the failure signal dominates: a short error message
+    # is a failure; a long diagnostic output that happens to mention
+    # "timeout" in passing is not.
+    if len(content) > 2000:
+        return False
+    return bool(_TOOL_FAILURE_PATTERNS.search(content))
 
 
 def _sanitize_ledger(ledger: dict) -> dict:
@@ -261,6 +296,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._last_finding_round: int = 0
         self._last_task_round: int = 0
         self._report_phase_start_round: int = 0  # track when REPORT phase began
+        # Tool deduplication: block identical (name, args) calls in same session.
+        # Value is (ToolMessage, failure_count): 0 = success, >0 = consecutive failures.
+        self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
@@ -652,6 +690,49 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
 
+        # ── P0: Tool deduplication + circuit breaker ──
+        # Blocks identical (name, args) calls.  If a tool previously
+        # failed and is being retried, the breaker auto-escalates after
+        # _TOOL_FAILURE_BREAKER consecutive failures.
+        _DEDUP_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}
+        if tool_name not in _DEDUP_SKIP:
+            cache_key = _make_cache_key(tool_name, tool_args)
+            if cache_key in self._tool_call_cache:
+                cached_msg, fail_count = self._tool_call_cache[cache_key]
+                if fail_count == 0:
+                    # Previous call succeeded → normal cache hit
+                    logger.info("去重命中: %s", cache_key)
+                    return ToolMessage(
+                        content=cached_msg.content,
+                        tool_call_id=tool_call_id,
+                        name=cached_msg.name,
+                    )
+                # Previous call(s) failed → this is a retry
+                if fail_count >= _TOOL_FAILURE_BREAKER:
+                    logger.warning("熔断: %s (连续失败%d次)", cache_key, fail_count)
+                    return ToolMessage(
+                        content=(
+                            f"⛔ [系统熔断] {tool_name} 已连续失败"
+                            f"{fail_count}次，网络可能不可达。"
+                            "禁止重试此工具，请基于已有证据继续诊断。"
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=cached_msg.name,
+                    )
+                # Allow one retry with a warning, increment counter
+                logger.info("失败重试: %s (第%d次)", cache_key, fail_count + 1)
+                self._tool_call_cache[cache_key] = (cached_msg, fail_count + 1)
+                return ToolMessage(
+                    content=(
+                        f"{cached_msg.content}\n\n"
+                        f"⚠ [系统提示] {tool_name} 上次调用返回异常，"
+                        f"当前为第{fail_count + 1}次重试。"
+                        f"若累计失败{_TOOL_FAILURE_BREAKER}次将被熔断。"
+                    ),
+                    tool_call_id=tool_call_id,
+                    name=cached_msg.name,
+                )
+
         # ── P1: Block coordinator from calling expert-only tools ──
         # query_argus_* tools are exclusively available to Argus expert
         # subagents (host-argus-expert / k8s-argus-expert).  If the
@@ -715,6 +796,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 pass
 
         result = await handler(request)
+
+        # ── Cache result with failure tracking ──
+        # Only cache ToolMessage results (Command objects indicate
+        # routing overrides and should not be cached).
+        _DEDUP_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}
+        if tool_name not in _DEDUP_SKIP and isinstance(result, ToolMessage):
+            cache_key = _make_cache_key(tool_name, tool_args)
+            content = result.content if isinstance(result.content, str) else str(result.content)
+            fail_count = 1 if _is_tool_failure(content) else 0
+            self._tool_call_cache[cache_key] = (result, fail_count)
 
         # Use the in-memory ledger (shared via self._current_ledger)
         ledger = self._current_ledger
