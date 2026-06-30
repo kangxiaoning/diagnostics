@@ -512,6 +512,126 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_call_count, len(report_md),
                 )
 
+        # ── Post-response: detect UNDERSTAND round-1 zero-tools stall ──
+        # If the model returned no tool calls on the very first round
+        # while still in understand phase with no hypotheses, the agent
+        # loop would exit without collecting any data.
+        # Fix: programmatically inject synthetic task() tool_calls to
+        # force data collection.  This does NOT depend on LLM behaviour
+        # — the agent loop will execute the injected tools normally.
+        try:
+            ledger = self._current_ledger
+            if (
+                ledger
+                and self._model_call_count == 1
+                and ledger.get("current_phase", "understand") == "understand"
+                and not ledger.get("hypotheses")
+            ):
+                ai_msgs = [
+                    m for m in (response.result
+                                if isinstance(response.result, list)
+                                else [response.result])
+                    if hasattr(m, "tool_calls")
+                ]
+                has_tool_calls = any(
+                    getattr(m, "tool_calls", None) for m in ai_msgs
+                )
+                if not has_tool_calls:
+                    import uuid as _uuid
+                    from langchain_core.messages import AIMessage
+
+                    forced_calls = [
+                        {
+                            "name": "task",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {
+                                "subagent_type": "k8s-argus-expert",
+                                "description": (
+                                    "查询 K8s 集群 Argus 监控指标时序"
+                                    "（节点状态、Pod 重启、API 延迟、"
+                                    "DNS 延迟）"
+                                ),
+                            },
+                        },
+                        {
+                            "name": "task",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {
+                                "subagent_type": "host-argus-expert",
+                                "description": (
+                                    "查询主机 Argus 监控指标时序"
+                                    "（CPU、内存、磁盘 IO、网络）"
+                                ),
+                            },
+                        },
+                    ]
+
+                    injected = False
+                    for m in ai_msgs:
+                        if hasattr(m, "tool_calls"):
+                            m.tool_calls = forced_calls
+                            # Replace hallucinated text with a system
+                            # directive so the next LLM round is not
+                            # confused by its own hallucination.
+                            if hasattr(m, "content"):
+                                m.content = (
+                                    "[系统安全阀] 检测到第1轮未调用"
+                                    "任何工具。系统已强制委派 Argus "
+                                    "专家采集监控数据。请等待专家返回"
+                                    "数据后再进行分析。"
+                                )
+                            injected = True
+                            break
+
+                    if injected:
+                        logger.warning(
+                            "Safety: round-1 understand-phase "
+                            "zero-tools stall — injected 2 "
+                            "synthetic task() calls"
+                        )
+                    else:
+                        # No AIMessage with tool_calls attr — fall
+                        # through to server-side fallback below.
+                        raise ValueError(
+                            "No suitable AIMessage for injection"
+                        )
+        except Exception as e:
+            # Fallback: injection failed — generate a minimal report
+            # server-side so the diagnosis is not completely empty.
+            logger.warning(
+                "Safety: round-1 injection failed (%s), "
+                "falling back to server-side report generation", e,
+            )
+            try:
+                ledger = self._current_ledger
+                if ledger and not ledger.get("report"):
+                    report_md = (
+                        "# 诊断未完成\n\n"
+                        "模型在第1轮未调用任何诊断工具，"
+                        "无法采集数据。\n"
+                        "请重新发起诊断。"
+                    )
+                    ledger["report"] = report_md
+                    if self.report_path:
+                        import pathlib as _pathlib
+                        real_path = self.report_path.replace(
+                            "/agent_data/",
+                            str(self._AGENT_DATA_REAL) + "/",
+                        )
+                        path = _pathlib.Path(real_path)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(report_md, encoding="utf-8")
+                    self._persist_ledger(ledger)
+                    logger.info(
+                        "Fallback: wrote minimal report for "
+                        "round-1 zero-tools stall"
+                    )
+            except Exception as e2:
+                logger.error(
+                    "Safety: fallback report generation also "
+                    "failed: %s", e2,
+                )
+
         # Sync ledger back to state via ExtendedModelResponse so it persists
         # across rounds and survives SummarizationMiddleware compression.
         if self._current_ledger is not None:
