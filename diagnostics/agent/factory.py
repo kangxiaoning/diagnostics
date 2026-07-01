@@ -12,6 +12,7 @@ from langchain.chat_models import init_chat_model
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
+from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -382,6 +383,16 @@ def build_agent(
         # exclusive to k8s-expert.
         tools = get_coordinator_mock_tools(extra_tools)
 
+    # Shared backend — used by both FilesystemMiddleware (auto-registered by
+    # create_deep_agent) and ToolOffloadMiddleware so that offloaded files
+    # are accessible via built-in read_file / grep / ls tools.
+    shared_backend = CompositeBackend(
+        default=StateBackend(),
+        routes={"/agent_data/": FilesystemBackend(
+            root_dir=str(AGENT_DATA_ROOT), virtual_mode=True,
+        )},
+    )
+
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state
     ledger_middleware = DiagnosisLedgerMiddleware(
         ledger_path=ledger_path,
@@ -389,19 +400,68 @@ def build_agent(
         model=model,
     )
 
+    # Tool offload middleware — compresses oversized tool results by writing
+    # full content to the backend and replacing with a head+tail preview.
+    # The LLM can then use read_file/grep to retrieve specific information.
+    # hint_keywords provides per-tool search suggestions (starting points,
+    # not exhaustive — the LLM is free to explore other patterns).
+    offload_middleware = ToolOffloadMiddleware(
+        tool_names={
+            # Host diagnostic tools (may return large outputs)
+            "check_cpu", "check_memory", "check_disk", "check_network",
+            "check_processes", "check_conntrack", "check_dmesg",
+            # K8s diagnostic tools
+            "check_kubernetes_pods", "check_kubernetes_nodes",
+            "check_kubernetes_control_plane",
+            # GPU tools
+            "check_gpu_health", "check_gpu_memory", "check_gpu_utilization",
+            # Argus monitoring tools (time-series data can be very large)
+            "query_argus_cpu", "query_argus_memory",
+            "query_argus_disk", "query_argus_network",
+            "query_argus_nodes", "query_argus_services",
+            "query_argus_gpu",
+            "query_argus_cpu_metrics", "query_argus_memory_metrics",
+            "query_argus_disk_metrics", "query_argus_network_metrics",
+            "query_argus_pod_logs",
+        },
+        token_limit=8000,
+        backend=shared_backend,
+        hint_keywords={
+            # Host tools: common fault indicators
+            "check_cpu": ["D-state", "iowait", "ksoftirqd", "kworker", "steal"],
+            "check_memory": ["OOM", "oom_kill", "Swap", "dirty_ratio", "slab"],
+            "check_disk": ["await", "util", "iowait", "D-state", "IO_SCHED"],
+            "check_network": ["retrans", "drops", "conntrack", "softirq", "mtu"],
+            "check_processes": ["OOM", "zombie", "D-state", "RSS", "oom_score"],
+            "check_conntrack": ["table_full", "nf_conntrack_max", "drop", "insert_failed"],
+            "check_dmesg": ["OOM", "oom_kill", "segfault", "BUG", "Call Trace", "error"],
+            # K8s tools: common failure patterns
+            "check_kubernetes_pods": ["CrashLoopBackOff", "OOMKilled", "Error", "ImagePullBackOff", "Evicted", "Pending"],
+            "check_kubernetes_nodes": ["NotReady", "MemoryPressure", "DiskPressure", "PIDPressure", "NetworkUnavailable"],
+            "check_kubernetes_control_plane": ["etcd", "leader", "timeout", "latency", "certificate"],
+            # GPU tools
+            "check_gpu_health": ["XID", "ECC", "throttle", "temperature", "power_limit"],
+            "check_gpu_memory": ["OOM", "leak", "fragmentation", "BAR1"],
+            "check_gpu_utilization": ["stall", "SM", "memory_bandwidth", "pcie"],
+            # Argus monitoring tools: anomaly patterns
+            "query_argus_cpu": ["spike", "iowait", "steal", "softirq"],
+            "query_argus_memory": ["OOM", "swap", "RSS", "available"],
+            "query_argus_disk": ["await", "util", "latency", "IO"],
+            "query_argus_network": ["retransmit", "drops", "DNS", "timeout"],
+            "query_argus_nodes": ["NotReady", "restart", "eviction", "pending"],
+            "query_argus_services": ["etcd", "leader", "DNS", "latency", "error"],
+            "query_argus_pod_logs": ["OOMKilled", "CrashLoop", "OutOfMemory", "exit code", "FATAL"],
+        },
+    )
+
     return create_deep_agent(
         model=model,
         tools=tools,
         system_prompt=system_prompt or make_system_prompt(report_path, ledger_path),
-        backend=CompositeBackend(
-            default=StateBackend(),
-            routes={"/agent_data/": FilesystemBackend(
-                root_dir=str(AGENT_DATA_ROOT), virtual_mode=True,
-            )},
-        ),
+        backend=shared_backend,
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=_build_subagents(mode, entity_type=entity_type),
-        middleware=[ledger_middleware],
+        middleware=[ledger_middleware, offload_middleware],
         state_schema=DiagnosisLedgerState,
     )
