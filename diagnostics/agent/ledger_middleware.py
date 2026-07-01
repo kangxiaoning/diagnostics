@@ -336,10 +336,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         the diagnosis phases.
         """
         if self._current_ledger is not None:
+            logger.info(
+                "台账: 共享已有实例 (agent=%s, object_id=%s)",
+                getattr(runtime, "name", "?"), id(self),
+            )
             return None
 
         ledger = new_ledger()
         self._current_ledger = ledger
+        logger.info(
+            "台账: 创建新台账 (agent=%s, object_id=%s)",
+            getattr(runtime, "name", "?"), id(self),
+        )
 
         return {"_diagnosis_ledger": ledger}
 

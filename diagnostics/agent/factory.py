@@ -13,6 +13,7 @@ from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
+from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -358,6 +359,7 @@ def build_agent(
     report_path: str = "",
     ledger_path: str = "",
     entity_type: str = "",
+    param_overrides: dict | None = None,
 ):
     settings = settings or Settings.from_env()
 
@@ -392,6 +394,11 @@ def build_agent(
             root_dir=str(AGENT_DATA_ROOT), virtual_mode=True,
         )},
     )
+
+    # Parameter override middleware — enforces correct tool call arguments
+    # by replacing LLM-invented values with pre-configured session metadata.
+    # Must run BEFORE ledger middleware so dedup/offload sees corrected args.
+    param_middleware = ToolParamOverrideMiddleware(config=param_overrides) if param_overrides else None
 
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state
     ledger_middleware = DiagnosisLedgerMiddleware(
@@ -463,6 +470,6 @@ def build_agent(
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=_build_subagents(mode, entity_type=entity_type),
-        middleware=[ledger_middleware, offload_middleware],
+        middleware=[m for m in [param_middleware, ledger_middleware, offload_middleware] if m is not None],
         state_schema=DiagnosisLedgerState,
     )

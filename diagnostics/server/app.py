@@ -305,6 +305,7 @@ async def _chat_event_stream(
         report_path=report_path,
         ledger_path=ledger_path,
         entity_type=request.entity_type,
+        param_overrides=request.param_overrides,
     )
 
     state.messages.append(HumanMessage(content=request.message))
