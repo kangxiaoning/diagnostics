@@ -385,7 +385,39 @@ async def _test_inject_all_missing():
 asyncio.run(_test_inject_all_missing())
 
 
+# ── 13. 脚手架/台账/task工具不拦截 ──
+async def _test_skip_scaffolding():
+    config = {"cluster_name": "pks-ehpc-1013-734964"}
+    mw = ToolParamOverrideMiddleware(config=config)
+
+    for skip_tool in ["read_file", "write_file", "commit_hypotheses", "task", "grep", "ls"]:
+        request = MagicMock()
+        request.tool_call = {
+            "name": skip_tool,
+            "id": f"call_skip_{skip_tool}",
+            "args": {},
+        }
+        request.runtime = MagicMock()
+        handler_called = False
+
+        async def handler(req, _name=skip_tool):
+            nonlocal handler_called
+            handler_called = True
+            return ToolMessage(content=f"ok_{_name}", tool_call_id=f"call_skip_{_name}")
+
+        await mw.awrap_tool_call(request, handler)
+        assert handler_called, f"{skip_tool} 应被执行"
+        # 确认 cluster_name 没有被注入到 skip 工具
+        assert "cluster_name" not in request.tool_call["args"], (
+            f"{skip_tool} 不应被注入 cluster_name（脚手架/台账/task工具跳过）"
+        )
+    print("✅ 13. 脚手架/台账/task工具: 全部跳过，不被注入")
+
+
+asyncio.run(_test_skip_scaffolding())
+
+
 # ── 结果 ──
 print("\n" + "=" * 60)
-print("🎉 全部 12 项验证通过 — ToolParamOverrideMiddleware 正确工作")
+print("🎉 全部 13 项验证通过 — ToolParamOverrideMiddleware 正确工作")
 print("=" * 60)

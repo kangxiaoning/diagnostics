@@ -9,14 +9,68 @@ const graphNodes = document.getElementById("graphNodes");
 const graphEdges = document.getElementById("graphEdges");
 const graphEmpty = document.getElementById("graphEmpty");
 const graphStatus = document.getElementById("graphStatus");
-const entityTypeEl = document.getElementById("entityType");
-const entityNameEl = document.getElementById("entityName");
 const toolPopup = document.getElementById("toolPopup");
 const toolPopupTitle = document.getElementById("toolPopupTitle");
 const toolPopupBody = document.getElementById("toolPopupBody");
 const toolPopupClose = document.getElementById("toolPopupClose");
 const skillsBar = document.getElementById("skillsBar");
 const skillSuggestions = document.getElementById("skillSuggestions");
+
+// ── Param override refs ──
+const taskTypeEl = document.getElementById("taskType");
+const paramFieldsContainer = document.getElementById("paramFieldsContainer");
+const paramFieldsHost = document.getElementById("paramFieldsHost");
+const paramFieldsCommon = document.getElementById("paramFieldsCommon");
+
+// ═══════════════════ Param Overrides Toggle ═══════════════════
+taskTypeEl.addEventListener("change", () => {
+  const type = taskTypeEl.value;
+  const show = (el) => el.classList.remove("hidden");
+  const hide = (el) => el.classList.add("hidden");
+
+  if (type === "container") {
+    show(paramFieldsContainer);
+    hide(paramFieldsHost);
+    show(paramFieldsCommon);
+  } else if (type === "host") {
+    hide(paramFieldsContainer);
+    show(paramFieldsHost);
+    show(paramFieldsCommon);
+  } else {
+    hide(paramFieldsContainer);
+    hide(paramFieldsHost);
+    hide(paramFieldsCommon);
+  }
+});
+
+function buildParamOverrides() {
+  const type = taskTypeEl.value;
+  if (!type) return null;
+
+  const overrides = { task_type: type };
+  const startTime = document.getElementById("paramStartTime").value;
+  const endTime = document.getElementById("paramEndTime").value;
+
+  if (startTime || endTime) {
+    overrides.fault_time_range = {};
+    if (startTime) overrides.fault_time_range.start_time = startTime.replace("T", " ") + ":00";
+    if (endTime) overrides.fault_time_range.end_time = endTime.replace("T", " ") + ":00";
+  }
+
+  if (type === "container") {
+    const cn = document.getElementById("paramClusterName").value.trim();
+    const ns = document.getElementById("paramNamespace").value.trim();
+    const pn = document.getElementById("paramPodName").value.trim();
+    if (cn) overrides.cluster_name = cn;
+    if (ns) overrides.namespace = ns;
+    if (pn) overrides.pod_name = pn;
+  } else if (type === "host") {
+    const nc = document.getElementById("paramNameChunk").value.trim();
+    if (nc) overrides.name_chunk = nc;
+  }
+
+  return overrides;
+}
 
 // ═══════════════════ Skills Registry (fetched from API) ═══════════════════
 let SKILLS = [];
@@ -685,8 +739,19 @@ formEl.addEventListener("submit", async (e) => {
       body: JSON.stringify({
         message: prompt,
         session_id: sessionId,
-        entity_type: entityTypeEl.value,
-        entity_name: entityNameEl.value.trim(),
+        entity_type: (() => {
+          const t = taskTypeEl.value;
+          if (t === "host") return "hosts";
+          if (t === "container") return "kubernetes";
+          return "";
+        })(),
+        entity_name: (() => {
+          const t = taskTypeEl.value;
+          if (t === "container") return document.getElementById("paramClusterName").value.trim();
+          if (t === "host") return document.getElementById("paramNameChunk").value.trim();
+          return "";
+        })(),
+        param_overrides: buildParamOverrides(),
       }),
       signal: controller.signal,
     });

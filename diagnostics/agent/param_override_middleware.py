@@ -49,12 +49,27 @@ def _flatten(d: dict, max_depth: int = 1) -> dict:
     return result
 
 
+# Tools that should NOT receive parameter overrides — scaffolding,
+# ledger-management, and delegation tools.  Override/injection is
+# only meaningful for diagnostic tools that collect actual system data.
+_DIAGNOSTIC_ONLY_SKIP = frozenset({
+    # Scaffolding (deepagents built-ins)
+    "write_file", "read_file", "edit_file",
+    "write_todos", "read_todos",
+    "ls", "glob", "grep",
+    # Ledger management
+    "commit_hypotheses", "select_path", "record_finding", "backtrack",
+    # Delegation (args are LLM-generated instructions, not diagnostic params)
+    "task",
+})
+
+
 class ToolParamOverrideMiddleware(AgentMiddleware):
     """Replace tool call arguments with pre-configured session values.
 
-    Every tool call — including those made inside subagents — passes
-    through ``awrap_tool_call``.  If a parameter name matches a key
-    in the flat session config, its value is silently overridden.
+    Only diagnostic tools are intercepted — scaffolding (read_file,
+    write_file, …), ledger-management (commit_hypotheses, …), and
+    delegation (task) calls pass through unchanged.
 
     Typical config shapes:
 
@@ -119,7 +134,9 @@ class ToolParamOverrideMiddleware(AgentMiddleware):
         tool_name = request.tool_call.get("name", "")
         tool_args: dict = request.tool_call.get("args", {})
 
-        if not self._flat_config:
+        # Only intercept diagnostic tools — scaffolding, ledger, and
+        # delegation calls pass through unchanged.
+        if tool_name in _DIAGNOSTIC_ONLY_SKIP or not self._flat_config:
             return await handler(request)
 
         changes: list[str] = []

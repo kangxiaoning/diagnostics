@@ -21,16 +21,6 @@
           </div>
         </header>
 
-        <div class="entity-bar" id="entityBar">
-          <select id="entityType" class="entity-select">
-            <option value="">-- 选择诊断对象类型 --</option>
-            <option value="hosts">🖥 物理/虚拟机</option>
-            <option value="kubernetes">☸ Kubernetes 集群</option>
-          </select>
-          <input id="entityName" class="entity-input" type="text"
-            placeholder="主机名 或 集群名（如 server01, prod-cluster）" />
-        </div>
-
         <!-- History reports list (top-left, always visible) -->
         <div class="history-bar" id="historyBar">
           <div class="history-bar-header">
@@ -38,6 +28,40 @@
           </div>
           <div class="history-bar-list" id="historyBarList">
             <div class="history-item-placeholder">加载中...</div>
+          </div>
+        </div>
+
+        <!-- Param Overrides Bar — per-session diagnostic context -->
+        <div class="param-bar" id="paramBar">
+          <div class="param-bar-header">
+            <span class="param-bar-label">选择诊断对象类型</span>
+            <select id="taskType" class="param-select">
+              <option value="">-- 请选择 --</option>
+              <option value="host">🖥 主机诊断</option>
+              <option value="container">📦 容器诊断</option>
+            </select>
+          </div>
+          <div class="param-fields hidden" id="paramFieldsContainer">
+            <div class="param-row">
+              <input id="paramClusterName" class="param-input" type="text" placeholder="集群名称 (cluster_name)" />
+            </div>
+            <div class="param-row">
+              <input id="paramNamespace" class="param-input" type="text" placeholder="命名空间 (namespace)" />
+            </div>
+            <div class="param-row">
+              <input id="paramPodName" class="param-input" type="text" placeholder="Pod 名称 (pod_name)" />
+            </div>
+          </div>
+          <div class="param-fields hidden" id="paramFieldsHost">
+            <div class="param-row">
+              <input id="paramNameChunk" class="param-input" type="text" placeholder="主机标识 (name_chunk)" />
+            </div>
+          </div>
+          <div class="param-fields hidden" id="paramFieldsCommon">
+            <div class="param-row">
+              <input id="paramStartTime" class="param-input param-time" type="datetime-local" />
+              <input id="paramEndTime" class="param-input param-time" type="datetime-local" />
+            </div>
           </div>
         </div>
 

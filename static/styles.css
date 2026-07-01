@@ -103,6 +103,40 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 }
 .entity-input::placeholder { color: var(--text-3); }
 
+/* ════════════════ Param Override Bar ════════════════ */
+.param-bar {
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.param-bar-header {
+  display: flex; align-items: center; gap: 10px;
+}
+.param-bar-label {
+  font-size: 12px; color: var(--text-2); white-space: nowrap;
+}
+.param-select {
+  padding: 5px 8px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface);
+  font-size: 12px; color: var(--text); flex: 1;
+}
+.param-fields {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.param-fields.hidden { display: none; }
+.param-row {
+  display: flex; gap: 8px;
+}
+.param-input {
+  flex: 1; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); font-size: 11px; color: var(--text);
+}
+.param-input.param-half { flex: 0 0 calc(50% - 4px); }
+.param-input.param-time { flex: 0 0 calc(50% - 4px); }
+.param-input::placeholder { color: var(--text-3); font-size: 10px; }
+
 /* ════════════════ Messages ════════════════ */
 .messages {
   flex: 1; overflow-y: auto;
