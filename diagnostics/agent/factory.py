@@ -398,7 +398,11 @@ def build_agent(
     # Parameter override middleware — enforces correct tool call arguments
     # by replacing LLM-invented values with pre-configured session metadata.
     # Must run BEFORE ledger middleware so dedup/offload sees corrected args.
-    param_middleware = ToolParamOverrideMiddleware(config=param_overrides) if param_overrides else None
+    # tools are passed so the middleware can distinguish "tool accepts this
+    # param → inject" from "param not in tool signature → skip".
+    param_middleware = ToolParamOverrideMiddleware(
+        config=param_overrides, tools=tools,
+    ) if param_overrides else None
 
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state
     ledger_middleware = DiagnosisLedgerMiddleware(
