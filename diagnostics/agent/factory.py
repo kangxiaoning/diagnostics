@@ -398,6 +398,7 @@ def build_agent(
         ledger_path=ledger_path,
         report_path=report_path,
         model=model,
+        backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
     )
 
     # Tool offload middleware — compresses oversized tool results by writing

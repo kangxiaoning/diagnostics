@@ -79,6 +79,7 @@ def new_ledger() -> DiagnosisLedger:
         exhausted=False,
         skill_mode=False,
         skill_ids=[],
+        tool_results={},               # cache_key → {path, round, preview, lines, is_failure}
         _inconclusive_streak=0,
         _backtrack_count=0,
     )
@@ -582,15 +583,35 @@ def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
         lines.append(f"## 根因: {ledger['root_cause']}")
         lines.append("")
 
-    # ── Diagnostic history: tools called per round with key findings ──
-    # Renders a concise timeline so the LLM knows what has been done
-    # and does not re-call tools whose results are already recorded.
+    # ── Offloaded tool results: paths for read_file/grep access ──
+    # LLM can use read_file/grep to pull specific data from previously
+    # executed tools, avoiding redundant re-execution across rounds.
+    tool_results = ledger.get("tool_results", {})
+    if tool_results:
+        lines.append("## 已有工具调用结果 (可通过 read_file/grep 查阅)  ←禁止重复调用")
+        for cache_key, info in sorted(
+            tool_results.items(), key=lambda x: x[1].get("round", 0)
+        ):
+            tool_name = cache_key.split(":")[0]
+            preview = info.get("preview", "")[:80]
+            path = info.get("path", "")
+            fail = " ⚠失败" if info.get("is_failure") else ""
+            lines.append(
+                f"- [{tool_name}] 第{info['round']}轮: {preview}... "
+                f"({info.get('lines', '?')}行) → `read_file(path=\"{path}\")`"
+                f"{fail}"
+            )
+        lines.append("")
+
+    # ── Diagnostic history: round-by-round tool call timeline ──
     rounds_data = ledger.get("rounds", [])
     if rounds_data:
-        lines.append("## 诊断历史 (已调用工具)")
-        # Group by round number
+        lines.append("## 轮次历史")
+        # Sort by (round, _seq) to preserve invocation order even
+        # when concurrent tool calls complete out of order.
+        sorted_rounds = sorted(rounds_data, key=lambda r: (r.get("round", 0), r.get("_seq", 0)))
         round_map: dict[int, list[str]] = {}
-        for rd in rounds_data:
+        for rd in sorted_rounds:
             rn = rd.get("round", 0)
             if rn not in round_map:
                 round_map[rn] = []
@@ -600,7 +621,6 @@ def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
         for rn in sorted(round_map.keys()):
             tools = round_map[rn]
             if tools:
-                # Deduplicate within round
                 unique = list(dict.fromkeys(tools))
                 lines.append(f"- 第{rn}轮: {', '.join(unique)}")
         if any("task" in rd.get("tools_called", []) for rd in rounds_data):
@@ -763,6 +783,7 @@ def record_round(
     action_summary: str = "",
     key_findings: str = "",
     next_plan: str = "",
+    _seq: int = 0,
 ) -> None:
     """Record a tool call within the current diagnosis round.
 
@@ -779,6 +800,7 @@ def record_round(
         tools_called=tools_called,
         key_findings=key_findings,
         next_plan=next_plan,
+        _seq=_seq,  # invocation order; used by render_ledger_context for correct sorting
     ))
 
 

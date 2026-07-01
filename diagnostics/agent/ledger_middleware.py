@@ -32,6 +32,8 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from deepagents.backends.protocol import BackendProtocol
+
 from diagnostics.agent.ledger import (
     DiagnosisLedger,
     DiagnosisLedgerState,
@@ -73,6 +75,7 @@ _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this r
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
 _TOOL_FAILURE_BREAKER = 2           # Consecutive failures of same tool → auto-block retry
+_DEDUP_CACHE_PREFIX = "/_dedup_cache"  # shared_backend path for cross-agent dedup
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -122,6 +125,15 @@ def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
     if len(context) > max_chars:
         context = context[:max_chars] + "\n...(已截断)"
     return context
+
+
+# Match unsafe filesystem path characters
+_UNSAFE_PATH_RE = re.compile(r'[^a-zA-Z0-9_.-]+')
+
+
+def _sanitize_path_component(name: str) -> str:
+    """Convert a tool name to a safe filesystem path component."""
+    return _UNSAFE_PATH_RE.sub("_", name)[:60]
 
 
 def _make_cache_key(tool_name: str, args: dict) -> str:
@@ -283,10 +295,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         ledger_path: str = "",
         report_path: str = "",
         model: BaseChatModel | None = None,
+        backend: BackendProtocol | None = None,
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
         self._model = model
+        self._backend = backend
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
         # Safety mechanism tracking
@@ -296,9 +310,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._last_finding_round: int = 0
         self._last_task_round: int = 0
         self._report_phase_start_round: int = 0  # track when REPORT phase began
+        # Monotonic sequence counter for preserving tool call invocation
+        # order within the same LLM round (LangGraph executes tool calls
+        # concurrently, so completion order ≠ invocation order).
+        self._round_record_seq: int = 0
         # Tool deduplication: block identical (name, args) calls in same session.
         # Value is (ToolMessage, failure_count): 0 = success, >0 = consecutive failures.
         self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
+        # Filesystem path prefix for offloaded tool results.
+        self._tool_results_prefix = "/tool_results"
         self.tools: list = [
             self._make_commit_hypotheses_tool(),
             self._make_select_path_tool(),
@@ -690,6 +710,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
 
+        # ── Capture invocation order BEFORE any async work ──
+        # LangGraph executes multiple tool calls from a single LLM
+        # response concurrently.  Completion order (and thus
+        # record_round insertion order) may not match the LLM's
+        # intended ordering.  This sequence counter preserves the
+        # original invocation order.
+        self._round_record_seq += 1
+        invocation_seq = self._round_record_seq
+
         # ── P0: Tool deduplication + circuit breaker ──
         # Blocks identical (name, args) calls.  If a tool previously
         # failed and is being retried, the breaker auto-escalates after
@@ -732,6 +761,28 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                     name=cached_msg.name,
                 )
+
+            # ── Cross-agent dedup via shared_backend ──
+            # Memory cache miss: check if another agent (subagent or
+            # Coordinator from earlier task) already called this tool
+            # and persisted the result to the shared backend.
+            if self._backend and tool_name not in _DEDUP_SKIP:
+                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+                try:
+                    cached_content = await self._backend.aread(backend_key)
+                except Exception:
+                    cached_content = None
+                if cached_content:
+                    logger.info(
+                        "跨Agent去重命中: %s (from shared_backend)", cache_key,
+                    )
+                    restored = ToolMessage(
+                        content=cached_content,
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                    self._tool_call_cache[cache_key] = (restored, 0)
+                    return restored
 
         # ── P1: Block coordinator from calling expert-only tools ──
         # query_argus_* tools are exclusively available to Argus expert
@@ -807,6 +858,56 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             fail_count = 1 if _is_tool_failure(content) else 0
             self._tool_call_cache[cache_key] = (result, fail_count)
 
+            # ── Persist to shared_backend for cross-agent dedup ──
+            # Both Coordinator and subagents write here so that any
+            # agent can detect duplicate (name, args) calls across
+            # the entire session, not just within its own process.
+            if self._backend and not fail_count:
+                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+                try:
+                    await self._backend.awrite(backend_key, content)
+                except Exception:
+                    pass  # best-effort; memory cache still works
+
+            # ── Offload to shared backend for cross-round access ──
+            # Writes the full tool result to the filesystem so the LLM
+            # can use read_file / grep to retrieve data from previous
+            # rounds instead of re-calling the same tool.
+            if self._backend and content:
+                # Encode tool_name + args hash in path so different
+                # parameters produce distinct files (same tool, different
+                # args = NOT a duplicate call).
+                safe_name = _sanitize_path_component(tool_name)
+                # Use first 12 chars of cache_key suffix for uniqueness
+                args_suffix = cache_key.split(":", 1)[1] if ":" in cache_key else ""
+                safe_suffix = _sanitize_path_component(args_suffix)[:24] if args_suffix else "noargs"
+                file_path = (
+                    f"{self._tool_results_prefix}/r{self._model_call_count}"
+                    f"/{safe_name}_{safe_suffix}.txt"
+                )
+                try:
+                    await self._backend.awrite(file_path, content)
+                    logger.debug("Offloaded tool result: %s → %s", tool_name, file_path)
+                except Exception:
+                    file_path = ""  # best-effort: don't block diagnosis
+                    logger.debug("Offload write skipped for %s (backend error)", tool_name)
+
+                # Store metadata in ledger for context injection
+                lines = content.splitlines()
+                ledger = self._current_ledger
+                if ledger is not None:
+                    ledger.setdefault("tool_results", {})[cache_key] = {
+                        "path": file_path,
+                        "round": self._model_call_count,
+                        "preview": content[:200].replace("\n", " "),
+                        "lines": len(lines),
+                        "is_failure": fail_count > 0,
+                    }
+                logger.info(
+                    "Cross-round tool result saved: %s → %s (%d lines)",
+                    cache_key, file_path, len(lines),
+                )
+
         # Use the in-memory ledger (shared via self._current_ledger)
         ledger = self._current_ledger
         if ledger is None:
@@ -871,6 +972,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 tools_called=[tool_name],
                 action_summary=tool_args.get("description", "") if tool_name == "task" else tool_name,
                 key_findings=key_findings,
+                _seq=invocation_seq,
             )
 
         # After ledger management tools, persist and emit snapshot
