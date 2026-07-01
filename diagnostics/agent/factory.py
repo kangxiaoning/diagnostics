@@ -395,13 +395,21 @@ def build_agent(
         )},
     )
 
+    # Collect ALL tools (Coordinator + subagents) so the param override
+    # middleware has signatures for every tool in the system, including
+    # K8s tools that subagents use.
+    subagent_configs = _build_subagents(mode, entity_type=entity_type)
+    all_tools = list(tools)
+    for sa in subagent_configs:
+        for t in sa.get("tools", []):
+            if t not in all_tools:
+                all_tools.append(t)
+
     # Parameter override middleware — enforces correct tool call arguments
     # by replacing LLM-invented values with pre-configured session metadata.
     # Must run BEFORE ledger middleware so dedup/offload sees corrected args.
-    # tools are passed so the middleware can distinguish "tool accepts this
-    # param → inject" from "param not in tool signature → skip".
     param_middleware = ToolParamOverrideMiddleware(
-        config=param_overrides, tools=tools,
+        config=param_overrides, tools=all_tools,
     ) if param_overrides else None
 
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state
@@ -473,7 +481,7 @@ def build_agent(
         backend=shared_backend,
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
-        subagents=_build_subagents(mode, entity_type=entity_type),
+        subagents=subagent_configs,
         middleware=[m for m in [param_middleware, ledger_middleware, offload_middleware] if m is not None],
         state_schema=DiagnosisLedgerState,
     )
