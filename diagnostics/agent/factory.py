@@ -412,13 +412,28 @@ def build_agent(
         config=param_overrides, tools=all_tools,
     ) if param_overrides else None
 
-    # Diagnosis ledger middleware — maintains hypothesis tree in agent state
+    # Diagnosis ledger middleware — maintains hypothesis tree in agent state.
+    # SHARED instance: injected into subagent specs below so that subagents
+    # benefit from the same in-memory dedup cache, cross-agent shared_backend
+    # dedup, circuit breaker, and ledger state.
     ledger_middleware = DiagnosisLedgerMiddleware(
         ledger_path=ledger_path,
         report_path=report_path,
         model=model,
         backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
     )
+
+    # ── Inject dedup + param-override middleware into every subagent ──
+    # Without this, subagents have zero tool-dedup protection — their tool
+    # calls bypass DiagnosisLedgerMiddleware.awrap_tool_call entirely,
+    # allowing duplicate calls that the Coordinator would have blocked.
+    # See: private/docs/LEDGER.md §5.3 (工具去重)
+    _subagent_middleware = [
+        m for m in [param_middleware, ledger_middleware] if m is not None
+    ]
+    if _subagent_middleware:
+        for sa in subagent_configs:
+            sa["middleware"] = list(_subagent_middleware)
 
     # Tool offload middleware — compresses oversized tool results by writing
     # full content to the backend and replacing with a head+tail preview.
