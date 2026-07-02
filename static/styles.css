@@ -642,7 +642,10 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
 /* Hypothesis tree nodes */
 .hypothesis-tree {
   position: relative; z-index: 2;
-  padding: 16px; overflow-y: auto; height: 100%;
+  padding: 16px;
+  /* Let parent (.graph-canvas) handle scrolling so the SVG overlay
+     (hypothesisEdges, positioned absolute within the same parent)
+     tracks scroll position correctly via canvas.scrollTop. */
 }
 .hyp-node {
   border: 1px solid var(--border); border-radius: 8px;
