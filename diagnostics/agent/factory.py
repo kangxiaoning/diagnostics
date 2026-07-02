@@ -423,18 +423,6 @@ def build_agent(
         backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
     )
 
-    # ── Inject dedup + param-override middleware into every subagent ──
-    # Without this, subagents have zero tool-dedup protection — their tool
-    # calls bypass DiagnosisLedgerMiddleware.awrap_tool_call entirely,
-    # allowing duplicate calls that the Coordinator would have blocked.
-    # See: private/docs/LEDGER.md §5.3 (工具去重)
-    _subagent_middleware = [
-        m for m in [param_middleware, ledger_middleware] if m is not None
-    ]
-    if _subagent_middleware:
-        for sa in subagent_configs:
-            sa["middleware"] = list(_subagent_middleware)
-
     # Tool offload middleware — compresses oversized tool results by writing
     # full content to the backend and replacing with a head+tail preview.
     # The LLM can then use read_file/grep to retrieve specific information.
@@ -488,6 +476,17 @@ def build_agent(
             "query_argus_pod_logs": ["OOMKilled", "CrashLoop", "OutOfMemory", "exit code", "FATAL"],
         },
     )
+
+    # ── Inject all shared middleware into every subagent ──
+    # Subagents are created without these middleware by default.  Without
+    # explicit injection they would lack tool dedup, param correction, and
+    # large-result offloading — causing duplicate calls and context overflow.
+    _subagent_middleware = [
+        m for m in [param_middleware, ledger_middleware, offload_middleware] if m is not None
+    ]
+    if _subagent_middleware:
+        for sa in subagent_configs:
+            sa["middleware"] = list(_subagent_middleware)
 
     return create_deep_agent(
         model=model,
