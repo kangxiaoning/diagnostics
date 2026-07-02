@@ -72,6 +72,35 @@ function buildParamOverrides() {
   return overrides;
 }
 
+function buildDiagnosticScope() {
+  const type = taskTypeEl.value;
+  if (type !== "container") return null;
+
+  const cluster_name = document.getElementById("paramClusterName").value.trim();
+  const namespace = document.getElementById("paramNamespace").value.trim();
+  const workload_type = document.getElementById("paramWorkloadType").value;
+  const workload_name = document.getElementById("paramWorkloadName").value.trim();
+  const pod_name = document.getElementById("paramPodName").value.trim();
+  const start_time = document.getElementById("paramStartTime").value;
+  const end_time = document.getElementById("paramEndTime").value;
+
+  // All fields are required for container diagnosis
+  if (!cluster_name || !namespace || !workload_type ||
+      !workload_name || !pod_name || !start_time || !end_time) {
+    return null;
+  }
+
+  return {
+    cluster_name,
+    allowed_namespace: namespace,
+    allowed_nodename: [],
+    allowed_hostname: [],
+    allowed_podname: [pod_name],
+    start_time: start_time.replace("T", " ") + ":00",
+    end_time: end_time.replace("T", " ") + ":00",
+  };
+}
+
 // ═══════════════════ Skills Registry (fetched from API) ═══════════════════
 let SKILLS = [];
 let skillIdx = new Map();
@@ -752,6 +781,7 @@ formEl.addEventListener("submit", async (e) => {
           return "";
         })(),
         param_overrides: buildParamOverrides(),
+        diagnostic_scope: buildDiagnosticScope(),
       }),
       signal: controller.signal,
     });

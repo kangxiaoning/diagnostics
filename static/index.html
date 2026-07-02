@@ -43,13 +43,28 @@
           </div>
           <div class="param-fields hidden" id="paramFieldsContainer">
             <div class="param-row">
-              <input id="paramClusterName" class="param-input" type="text" placeholder="集群名称 (cluster_name)" />
+              <input id="paramClusterName" class="param-input" type="text"
+                placeholder="集群名称 (cluster_name) *" required />
             </div>
             <div class="param-row">
-              <input id="paramNamespace" class="param-input" type="text" placeholder="命名空间 (namespace)" />
+              <input id="paramNamespace" class="param-input" type="text"
+                placeholder="命名空间 (namespace) *" required />
             </div>
             <div class="param-row">
-              <input id="paramPodName" class="param-input" type="text" placeholder="Pod 名称 (pod_name)" />
+              <select id="paramWorkloadType" class="param-input param-select-inline" required>
+                <option value="">-- 工作负载类型 * --</option>
+                <option value="Deployment">Deployment</option>
+                <option value="DaemonSet">DaemonSet</option>
+                <option value="StatefulSet">StatefulSet</option>
+              </select>
+            </div>
+            <div class="param-row">
+              <input id="paramWorkloadName" class="param-input" type="text"
+                placeholder="工作负载名称 (workload_name) *" required />
+            </div>
+            <div class="param-row">
+              <input id="paramPodName" class="param-input" type="text"
+                placeholder="Pod 名称 (pod_name) *" required />
             </div>
           </div>
           <div class="param-fields hidden" id="paramFieldsHost">

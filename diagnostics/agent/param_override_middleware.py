@@ -1,12 +1,20 @@
 """Tool parameter override middleware — enforce correct tool call arguments.
 
-When a diagnostic session starts with pre-known environment metadata
-(cluster name, namespace, pod name, host name, time range), the LLM
+When a diagnostic session starts with pre-known environment metadata, the LLM
 may invent incorrect values for tool parameters or omit required ones.
-This middleware:
 
-1. Overrides: replaces param values the LLM provided with correct ones
-2. Injects:   adds params the LLM omitted but the tool signature requires
+This middleware operates in two modes based on parameter classification:
+
+**Strict override** (session-immutable):
+    container: cluster_name, start_time, end_time
+    host:      name_chunk, start_time, end_time
+    Always replaces LLM-provided values — these must never change during a
+    diagnosis session.
+
+    **Flexible injection → block on missing** (all other tool params):
+        When LLM omits them: BLOCK the call (can't inject — multiple valid
+        values exist, e.g. 10 pods, 3 nodes).  LLM must explicitly provide.
+        When LLM provides: trusted (ScopeGuardMiddleware enforces range).
 
 Only diagnostic tools are intercepted — scaffolding, ledger-management,
 and delegation calls pass through unchanged.
@@ -16,7 +24,6 @@ Usage (in factory.py):
     config = {
         "task_type": "container",
         "cluster_name": "pks-ehpc-1013-734964",
-        "namespace": "sfe-default",
         "fault_time_range": {
             "start_time": "2026-06-30 14:15:00",
             "end_time": "2026-06-30 14:30:00",
@@ -97,39 +104,30 @@ _DIAGNOSTIC_ONLY_SKIP = frozenset({
 class ToolParamOverrideMiddleware(AgentMiddleware):
     """Replace tool call arguments with pre-configured session values.
 
+    Parameters are classified:
+
+    **Strict** — always override; inject when missing:
+        container: cluster_name, start_time, end_time
+        host:      name_chunk, start_time, end_time
+
+    **Flexible** — trusted when LLM provides; BLOCKED when missing:
+        namespace, pod_name, node_name, and all other tool params.
+        Cannot inject because multiple valid values may exist.
+
+    (ScopeGuardMiddleware enforces resource boundaries downstream.)
+
     Only diagnostic tools are intercepted — scaffolding (read_file,
     write_file, …), ledger-management (commit_hypotheses, …), and
     delegation (task) calls pass through unchanged.
-
-    Typical config shapes:
-
-    **Kubernetes / container scenario**:
-
-        {
-            "task_type": "container",
-            "cluster_name": "pks-ehpc-1013-734964",
-            "namespace": "sfe-default",
-            "pod_name": "eip-assistant-xxx",
-            "fault_time_range": {
-                "start_time": "2026-06-30 14:15:00",
-                "end_time": "2026-06-30 14:30:00",
-            },
-        }
-
-    **Host scenario**:
-
-        {
-            "task_type": "host",
-            "name_chunk": "CQX-L0150660",
-            "fault_time_range": {
-                "start_time": "2026-07-01 18:10:17",
-                "end_time": "2026-07-01 18:17:17",
-            },
-        }
     """
 
     # Config keys that describe the session but are NOT tool parameter names.
     _META_KEYS = frozenset({"task_type", "fault_description", "fault_time_range"})
+
+    # Params that are ALWAYS overridden — session-immutable, LLM must never change.
+    # Scope-specific: container → cluster identity + time; host → host identity + time.
+    _STRICT_CONTAINER = frozenset({"cluster_name", "start_time", "end_time"})
+    _STRICT_HOST = frozenset({"name_chunk", "start_time", "end_time"})
 
     def __init__(
         self,
@@ -166,6 +164,7 @@ class ToolParamOverrideMiddleware(AgentMiddleware):
     ) -> ToolMessage | Command:
         tool_name = request.tool_call.get("name", "")
         tool_args: dict = request.tool_call.get("args", {})
+        tool_call_id = request.tool_call.get("id", "")
 
         # Only intercept diagnostic tools.
         if tool_name in _DIAGNOSTIC_ONLY_SKIP or not self._flat_config:
@@ -174,19 +173,51 @@ class ToolParamOverrideMiddleware(AgentMiddleware):
         changes: list[str] = []
         valid_params = self._param_map.get(tool_name)
 
+        # Determine strict-override set from task type.
+        task_type = self._config.get("task_type", "")
+        strict_set = (
+            self._STRICT_CONTAINER if task_type == "container"
+            else self._STRICT_HOST if task_type == "host"
+            else frozenset()
+        )
+
         for param_name, param_value in self._flat_config.items():
             if param_name in self._META_KEYS:
                 continue  # meta key, not a tool parameter
 
+            # ── Multi-value params (lists) skipped — handled as LLM context ──
+            if isinstance(param_value, (list, tuple, set)):
+                continue
+
             if param_name in tool_args:
-                # ── Override: replace incorrect value ──
-                if tool_args[param_name] != param_value:
-                    tool_args[param_name] = param_value
-                    changes.append(f"{param_name}={param_value!r}")
+                if param_name in strict_set:
+                    # ── Strict: always override — LLM must not change ──
+                    if tool_args[param_name] != param_value:
+                        tool_args[param_name] = param_value
+                        changes.append(f"{param_name}={param_value!r}")
+                # else: Flexible — LLM-provided value is trusted (may have
+                #        discovered new targets).  ScopeGuard enforces range.
             elif valid_params and param_name in valid_params:
-                # ── Inject: LLM omitted a param the tool accepts ──
-                tool_args[param_name] = param_value
-                changes.append(f"+{param_name}={param_value!r}")
+                if param_name in strict_set:
+                    # ── Strict: inject — LLM omitted an immutable param ──
+                    tool_args[param_name] = param_value
+                    changes.append(f"+{param_name}={param_value!r}")
+                else:
+                    # ── Flexible missing → block: can't guess which value
+                    #     to inject (e.g. which pod among dozens).
+                    logger.warning(
+                        "ParamOverride BLOCKED: %s missing %s",
+                        tool_name, param_name,
+                    )
+                    return ToolMessage(
+                        content=(
+                            f"⛔ [参数拦截] {tool_name} 缺少必要参数 {param_name}，"
+                            f"系统无法自动填入（存在多个可选值）。"
+                            f"请在调用时明确指定 {param_name} 参数。"
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
             # else: param not in tool_args AND not in tool signature → skip
 
         if changes:

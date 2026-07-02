@@ -32,7 +32,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from deepagents.backends.protocol import BackendProtocol
+from deepagents.backends.protocol import BackendProtocol, ReadResult
 
 from diagnostics.agent.ledger import (
     DiagnosisLedger,
@@ -296,11 +296,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         report_path: str = "",
         model: BaseChatModel | None = None,
         backend: BackendProtocol | None = None,
+        is_subagent: bool = False,
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
         self._model = model
         self._backend = backend
+        self._is_subagent = is_subagent
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
         # Safety mechanism tracking
@@ -319,12 +321,46 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
         # Filesystem path prefix for offloaded tool results.
         self._tool_results_prefix = "/tool_results"
-        self.tools: list = [
-            self._make_commit_hypotheses_tool(),
-            self._make_select_path_tool(),
-            self._make_record_finding_tool(),
-            self._make_backtrack_tool(),
-        ]
+        # Ledger management tools — only needed by Coordinator; subagents
+        # share the same ledger object but should not expose management tools.
+        self.tools: list = (
+            []
+            if is_subagent
+            else [
+                self._make_commit_hypotheses_tool(),
+                self._make_select_path_tool(),
+                self._make_record_finding_tool(),
+                self._make_backtrack_tool(),
+            ]
+        )
+
+    @classmethod
+    def for_subagent(cls, coordinator: "DiagnosisLedgerMiddleware") -> "DiagnosisLedgerMiddleware":
+        """Create a subagent instance that shares dedup cache and backend.
+
+        The subagent instance reuses the Coordinator's ``_tool_call_cache``
+        (in-memory dedup) and ``_backend`` (cross-agent dedup) so that
+        tool calls made by any subagent are deduplicated against all
+        prior calls across the entire session.
+
+        P1 expert-only blocking and ledger management tools are disabled
+        — subagents own their diagnostic tools and should not manage
+        the hypothesis tree directly.
+        """
+        instance = cls(
+            ledger_path=coordinator.ledger_path,
+            report_path=coordinator.report_path,
+            backend=coordinator._backend,
+            is_subagent=True,
+        )
+        instance._tool_call_cache = coordinator._tool_call_cache
+        instance._current_ledger = coordinator._current_ledger
+        # Inherit the Coordinator's round count so any future code that
+        # references _model_call_count on the subagent instance starts
+        # from the correct baseline.  before_model() is a no-op for
+        # subagents, so this value won't be mutated.
+        instance._model_call_count = coordinator._model_call_count
+        return instance
 
     # ── Fault profile extraction via structured output ──
 
@@ -334,7 +370,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         Runs once before the first LLM invocation.  Creates an empty
         ledger that will be populated as the agent progresses through
         the diagnosis phases.
+
+        Subagents share the Coordinator's ledger — no state update.
         """
+        if self._is_subagent:
+            return None
         if self._current_ledger is not None:
             logger.info(
                 "台账: 共享已有实例 (agent=%s, object_id=%s)",
@@ -364,7 +404,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         hooks like before_model / after_model / before_agent are invoked by
         LangGraph as sync callables; declaring them async returns a coroutine
         object which triggers InvalidUpdateError.
+
+        Subagents must NOT emit round_transition — their LLM calls happen
+        asynchronously inside a task() delegation, and their events can
+        arrive after the Coordinator has already advanced to the next round.
+        Emitting round_transition from subagents would pollute the global
+        round counter and cause subagent tool calls to be mis-attributed
+        to the wrong round in traces.
         """
+        if self._is_subagent:
+            return
         self._model_call_count += 1
         # Sync current_round in ledger with actual LLM call count so that
         # round numbers reflect LLM invocations, not individual tool calls.
@@ -387,6 +436,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse | ExtendedModelResponse:
+        # Subagent: skip ledger context injection and safety warnings.
+        # The Coordinator already passes relevant context via task() description.
+        if self._is_subagent:
+            return await handler(request)
+
         # self._current_ledger takes priority over state — tools update it in-memory
         # between rounds and state may lag behind without Command-based updates.
         ledger = self._current_ledger
@@ -770,54 +824,68 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     name=cached_msg.name,
                 )
 
-            # ── Cross-agent dedup via shared_backend ──
-            # Memory cache miss: check if another agent (subagent or
-            # Coordinator from earlier task) already called this tool
-            # and persisted the result to the shared backend.
-            if self._backend and tool_name not in _DEDUP_SKIP:
-                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
-                try:
-                    cached_content = await self._backend.aread(backend_key)
-                except Exception:
-                    cached_content = None
-                if cached_content:
-                    logger.info(
-                        "跨Agent去重命中: %s (from shared_backend)", cache_key,
-                    )
-                    restored = ToolMessage(
-                        content=cached_content,
-                        tool_call_id=tool_call_id,
-                        name=tool_name,
-                    )
-                    self._tool_call_cache[cache_key] = (restored, 0)
-                    return restored
-
         # ── P1: Block coordinator from calling expert-only tools ──
         # query_argus_* tools are exclusively available to Argus expert
         # subagents (host-argus-expert / k8s-argus-expert).  If the
         # coordinator tries to call them directly, return a redirect.
-        _EXPERT_ONLY_TOOLS = frozenset({
-            "query_argus_cpu", "query_argus_memory",
-            "query_argus_disk", "query_argus_network",
-            "query_argus_nodes", "query_argus_services",
-            "query_argus_gpu",
-        })
-        if tool_name in _EXPERT_ONLY_TOOLS:
-            logger.warning(
-                "Blocked coordinator from calling expert-only tool: %s",
-                tool_name,
-            )
-            return ToolMessage(
-                content=(
-                    f"⚠️ {tool_name} 是专家专用工具，Coordinator 不能直接调用。\n"
-                    "请通过 task() 委派对应专家：\n"
-                    "- 主机指标(CPU/内存/磁盘/网络) → "
-                    "task('host-argus-expert', '查询主机Argus指标时序')\n"
-                    "- K8s集群指标(节点/Pod/API/DNS) → "
-                    "task('k8s-argus-expert', '查询K8s Argus指标时序')"
-                ),
-                tool_call_id=tool_call_id,
-            )
+        # Subagents skip this check — they own these tools.
+        #
+        # Must run BEFORE cross-agent dedup: otherwise the Coordinator
+        # could bypass this check by hitting a subagent's cached result
+        # in shared_backend.
+        if not self._is_subagent:
+            _EXPERT_ONLY_TOOLS = frozenset({
+                "query_argus_cpu", "query_argus_memory",
+                "query_argus_disk", "query_argus_network",
+                "query_argus_nodes", "query_argus_services",
+                "query_argus_gpu",
+            })
+            if tool_name in _EXPERT_ONLY_TOOLS:
+                logger.warning(
+                    "Blocked coordinator from calling expert-only tool: %s",
+                    tool_name,
+                )
+                return ToolMessage(
+                    content=(
+                        f"⚠️ {tool_name} 是专家专用工具，Coordinator 不能直接调用。\n"
+                        "请通过 task() 委派对应专家：\n"
+                        "- 主机指标(CPU/内存/磁盘/网络) → "
+                        "task('host-argus-expert', '查询主机Argus指标时序')\n"
+                        "- K8s集群指标(节点/Pod/API/DNS) → "
+                        "task('k8s-argus-expert', '查询K8s Argus指标时序')"
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+
+        # ── Cross-agent dedup via shared_backend ──
+        # Memory cache miss: check if another agent (subagent or
+        # Coordinator from earlier task) already called this tool
+        # and persisted the result to the shared backend.
+        #
+        # Runs AFTER P1 (above) so Coordinator can't bypass expert-tool
+        # blocking by hitting a subagent's cached result.
+        if self._backend and tool_name not in _DEDUP_SKIP:
+            backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+            try:
+                cached_content = await self._backend.aread(backend_key)
+            except Exception:
+                cached_content = None
+            # StateBackend.aread() returns ReadResult(error=...) for
+            # missing keys — NOT None.  Treat error responses as a
+            # cache miss so the tool actually executes.
+            if cached_content is not None and not (
+                isinstance(cached_content, ReadResult) and cached_content.error
+            ):
+                logger.info(
+                    "跨Agent去重命中: %s (from shared_backend)", cache_key,
+                )
+                restored = ToolMessage(
+                    content=cached_content,
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+                self._tool_call_cache[cache_key] = (restored, 0)
+                return restored
 
         # ── Inject ledger context into task() descriptions ──
         # Subagents normally see only the Coordinator's description and have
@@ -863,8 +931,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if tool_name not in _DEDUP_SKIP and isinstance(result, ToolMessage):
             cache_key = _make_cache_key(tool_name, tool_args)
             content = result.content if isinstance(result.content, str) else str(result.content)
-            fail_count = 1 if _is_tool_failure(content) else 0
-            self._tool_call_cache[cache_key] = (result, fail_count)
+
+            # ── Don't cache empty / nil / error results ──
+            # Caching a "not found" or empty result would lock the LLM
+            # into a failure loop — every subsequent round would hit the
+            # cache and see the same useless data, preventing recovery.
+            # Only cache results that contain actual diagnostic data.
+            _EMPTY_PATTERNS = re.compile(
+                r"not found|no data|no results|error|空",
+                re.IGNORECASE,
+            )
+            if not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
+                logger.debug("Skipped caching empty/error result: %s", cache_key)
+            else:
+                fail_count = 1 if _is_tool_failure(content) else 0
+                self._tool_call_cache[cache_key] = (result, fail_count)
 
             # ── Persist to shared_backend for cross-agent dedup ──
             # Both Coordinator and subagents write here so that any

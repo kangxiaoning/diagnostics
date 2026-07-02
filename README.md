@@ -1,4 +1,3 @@
-故障报告好像包含了think-body内容，按预期故障报告是基于前面所有分析形成的最终报告，请分析原因并解决。
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
 一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 7 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 3:7 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
@@ -799,6 +798,79 @@ flowchart LR
     Graph --> S3
 ```
 
+## 自定义 Middleware
+
+系统通过 4 个自定义 `AgentMiddleware` 实现参数校准、假设台账、范围守卫和结果压缩。它们按顺序链式处理每个工具调用：
+
+```
+Tool Call → param_override → scope_guard → ledger → offload → 实际执行
+```
+
+### 1. ToolParamOverrideMiddleware
+
+**职责**：根据 session 配置强制修正 LLM 生成的工具参数，防止幻觉。
+
+**参数分类**：
+
+| 分类 | 参数（容器） | 参数（主机） | 行为 |
+|------|-------------|-------------|------|
+| **Strict** | `cluster_name`, `start_time`, `end_time` | `name_chunk`, `start_time`, `end_time` | LLM 提供错误值→强制覆盖；未提供→自动注入 |
+| **Flexible** | `namespace`, `pod_name` 等 | — | LLM 提供→信任通过；**未提供→拦截**（中间件无法猜测多个可选值中应填哪个） |
+| **Skip** | `task`, `write_file`, 台账工具 | 同左 | 非诊断工具直接透传 |
+
+**依赖**：通过 `inspect.signature(fn)` 提取工具参数名 → `_param_map: {tool_name → {param_names}}`。仅对签名中**实际存在的参数**注入/检查。
+
+**移植要点**：生产工具必须用 `@tool` 装饰；参数名必须与 config key 一致。
+
+### 2. ScopeGuardMiddleware
+
+**职责**：拦截超出预发现 scope（命名空间/节点/Pod）的 K8s 工具调用。
+
+**被检查的工具集**：
+
+| 参数 | 受检工具 |
+|------|---------|
+| `namespace` | `check_kubernetes_pods`, `get_pod_logs`, `get_pod_events`, `get_namespaces`, `list_deployments`, `list_services` |
+| `node_name` | `get_node_info` |
+| `pod_name` | `get_pod_logs`, `get_pod_events` |
+
+> 依赖 `ScopeLimit` 对象（由 `ScopeLimit.discover()` 从 K8s API 或 mock 数据构建），生产环境下 `discover()` 和 `get_control_plane_metrics()` 需从 K8s API / 监控 API 真实查询。
+
+**移植要点**：受检工具名硬编码在 `frozenset` 中，生产 K8s 工具必须使用**完全相同的函数名**。
+
+### 3. DiagnosisLedgerMiddleware
+
+最复杂的中间件，承担多个职责：
+
+**台账管理**：通过 `commit_hypotheses` / `select_path` / `record_finding` / `backtrack` 四个工具驱动假设树生命周期。自动采集所有诊断工具结果到活跃假设的 evidence。
+
+**P0 工具去重**：`_tool_call_cache` 字典，key = `"工具名:JSON序列化参数"`。相同调用直接返回缓存，避免重复查询。空结果（含 `not found` / `no data` 关键字）不被缓存。
+
+**P1 专家工具阻塞**：Coordinator 调用 `query_argus_*` 工具时直接拦截，返回引导消息让 LLM 通过 `task()` 委派 Argus 专家。Subagent 自动跳过此检查。
+
+**跨Agent去重**：同一 session 内 subagent 调过的工具 → 写入 `StateBackend`（key: `/_dedup_cache/工具名:参数`）→ Coordinator 后续调用命中后直接返回缓存。
+
+**安全机制**：
+
+| 机制 | 阈值 | 行为 |
+|------|------|------|
+| 最大轮次 | 20 | 强制进入 REPORT 阶段 |
+| 停滞检测 | 连续 3 次 `task()` 无 `record_finding` | 自动标记 inconclusive |
+| 工具熔断 | 同一工具连续失败 2 次 | 阻断重试 |
+| 委派饱和 | 连续 2 次委派同一专家验证同一假设 | 警告注入 |
+
+**移植要点**：
+- `_EXPERT_ONLY_TOOLS` 硬编码 `query_argus_*` 工具名 → 生产 Argus 工具必须同名
+- `_TOOL_FAILURE_PATTERNS` 正则匹配超时/连接拒绝 → 生产工具的异常格式需能被匹配
+- `_EMPTY_PATTERNS` 过滤空结果防缓存 → 生产工具返回"无数据"时需含 `not found` / `no data` / `empty` 关键字
+- `for_subagent()` 创建共享缓存的 subagent 实例，`before_model` 已禁用 subagent 轮次事件
+
+### 4. ToolOffloadMiddleware
+
+**职责**：超大工具结果（>32000 字符）写入 `FilesystemBackend`，LLM 收到预览+路径，用 `read_file`/`grep` 按需检索。
+
+**移植要点**：`tool_names` 集合在 `factory.py` 配置 → 需加入生产环境所有诊断工具名。
+
 ## 前端关键实现
 
 ### 诊断树可视化（`static/app.js`）
@@ -966,7 +1038,11 @@ diagnostics/
 │   │   ├── prompt.py                # 中文系统提示词
 │   │   ├── streaming.py             # 事件流处理：阶段路由、工具分组、台账事件分发
 │   │   ├── ledger.py                # 诊断台账：假设树、证据链、阶段推导、退出条件
-│   │   ├── ledger_middleware.py      # 台账中间件：上下文注入、write_file报告捕获
+│   │   ├── ledger_middleware.py      # 台账中间件：假设管理、工具去重、P1阻塞、安全机制
+│   │   ├── param_override_middleware.py  # 参数覆写中间件：strict注入 + flexible拦截
+│   │   ├── scope_guard_middleware.py  # 范围守卫中间件：namespace/node/pod范围检查
+│   │   ├── scope_limit.py            # 诊断范围限制：K8s API发现 + 控制面健康检查
+│   │   ├── offload_middleware.py      # 结果卸载中间件：超大结果→文件系统
 │   │   └── consolidation.py         # 学习记忆整理
 │   ├── server/
 │   │   ├── app.py                   # FastAPI：SSE端点 + 取消 + 树快照协调
@@ -998,6 +1074,10 @@ diagnostics/
 │   │   ├── hosts/                   # 主机故障报告
 │   │   └── kubernetes/              # K8s 集群故障报告（含 GPU）
 ├── test_cases/                       # 验证测试用例（不在agent文件系统中）
+├── scripts/                          # 验证脚本
+│   ├── verify_param_override.py      # param_override middleware 9场景验证
+│   ├── verify_scope_limit.py         # scope_guard middleware 7场景验证
+│   └── verify_cross_round_e2e.py     # 跨轮去重端到端验证
 ├── static/
 │   ├── index.html                   # 双栏布局页面
 │   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格多轮折叠块
@@ -1017,6 +1097,71 @@ diagnostics/
 | `DIAGNOSTICS_API_KEY` | `lm-studio` | API 密钥（也支持 `LM_STUDIO_API_KEY`、`LM_API_TOKEN`） |
 | `DIAGNOSTICS_TEMPERATURE` | `0.2` | LLM 温度参数 |
 | `DIAGNOSTICS_MAX_HISTORY_MESSAGES` | `16` | 上下文窗口大小 |
+
+## 生产环境移植
+
+当前项目在 `DIAGNOSTICS_MODE=mock` 下运行，使用预置场景数据的模拟工具。切换到生产模式（`DIAGNOSTICS_MODE=production`）需要实现以下内容。
+
+### 需要手动实现的代码
+
+| # | 文件 | 实现内容 | 优先级 |
+|---|------|---------|--------|
+| 1 | `tools/live/hosts.py` | 7 个 host 工具的 SSH/agent 远程执行逻辑（`get_system_overview`, `check_cpu/memory/disk/network/processes`）；补充 `check_conntrack` 和 `check_dmesg`（mock 中有但 live 中缺失） | **P0** |
+| 2 | `tools/live/gpu.py` | 3 个 GPU 工具的远程执行逻辑（`check_gpu_health/memory/utilization`） | **P0** |
+| 3 | `tools/live/argus.py`（新建） | 6 个 `query_argus_*` 监控查询工具，函数名和参数签名必须与 mock 版**完全一致** | **P0** |
+| 4 | `tools/live/kubernetes.py` | `check_certificate_expiry` 从占位文本改为真实实现 | **P2** |
+| 5 | `agent/factory.py` | `mode=="production"` 时从 `diagnostics.tools.live` 导入 host/GPU 工具（当前全部硬编码 import from mock）；增加 `get_host_argus_live_tools` / `get_k8s_argus_live_tools` | **P0** |
+| 6 | `agent/scope_limit.py:discover()` | 通过 K8s client 查询 Pod → Node → Host 映射，实现 scope 自动发现 | **P1** |
+| 7 | `agent/scope_limit.py:get_control_plane_metrics()` | 查询监控 API 获取控制面内存指标，实现集群过载保护 | **P1** |
+
+### 移植关键约束
+
+| 约束 | 说明 | 违反后果 |
+|------|------|---------|
+| **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | P1 阻塞和 scope_guard 用 `frozenset` 硬编码工具名，不匹配则不生效 |
+| **参数名一致** | 同一工具的参数名在 mock/live 之间必须相同 | `param_override._param_map` 匹配不上，strict 注入失效 |
+| **必须用 `@tool`** | `_build_param_map` 依赖 `inspect.signature(fn)` | 参数未被识别，strict/flex 检查全部失效 |
+| **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty` | 去重缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
+| **错误格式** | 网络超时类错误需能被 `_TOOL_FAILURE_PATTERNS` 匹配（含 `timeout` / `connection refused`） | 工具熔断器不触发 → 连续失败不被阻断 |
+
+### 工具参数签名对照
+
+生产工具需遵循以下签名（与 mock 一致）：
+
+**Host 工具**（`tools/live/hosts.py`）：
+
+```python
+@tool
+def get_system_overview() -> str: ...
+def check_cpu() -> str: ...
+def check_memory() -> str: ...
+def check_disk() -> str: ...
+def check_network() -> str: ...
+def check_processes() -> str: ...
+def check_conntrack() -> str: ...
+def check_dmesg() -> str: ...
+```
+
+**Argus 工具**（`tools/live/argus.py`，新建）：
+
+```python
+@tool
+def query_argus_cpu(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_memory(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_disk(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_network(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_nodes(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_services(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str: ...
+```
+
+**GPU 工具**（`tools/live/gpu.py`）：
+
+```python
+@tool
+def check_gpu_health() -> str: ...
+def check_gpu_memory() -> str: ...
+def check_gpu_utilization() -> str: ...
+```
 
 ## License
 

@@ -14,6 +14,8 @@ from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
 from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+from diagnostics.agent.scope_guard_middleware import ScopeGuardMiddleware
+from diagnostics.agent.scope_limit import ScopeLimit
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -360,6 +362,7 @@ def build_agent(
     ledger_path: str = "",
     entity_type: str = "",
     param_overrides: dict | None = None,
+    diagnostic_scope: ScopeLimit | None = None,
 ):
     settings = settings or Settings.from_env()
 
@@ -413,15 +416,16 @@ def build_agent(
     ) if param_overrides else None
 
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state.
-    # SHARED instance: injected into subagent specs below so that subagents
-    # benefit from the same in-memory dedup cache, cross-agent shared_backend
-    # dedup, circuit breaker, and ledger state.
+    # Coordinator instance: full features (ledger, P1 expert blocking, safety).
     ledger_middleware = DiagnosisLedgerMiddleware(
         ledger_path=ledger_path,
         report_path=report_path,
         model=model,
         backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
     )
+    # Subagent instance: dedup-only (shares _tool_call_cache + _backend).
+    # P1 expert blocking is disabled so subagents can call their own tools.
+    subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)
 
     # Tool offload middleware — compresses oversized tool results by writing
     # full content to the backend and replacing with a head+tail preview.
@@ -477,12 +481,18 @@ def build_agent(
         },
     )
 
+    # Scope guard middleware — enforces that tool calls only access
+    # resources within the pre-discovered diagnostic scope (namespace,
+    # node, pod).  Must run AFTER param_override (sees corrected args)
+    # and BEFORE ledger (so blocked calls don't waste dedup slots).
+    scope_guard = ScopeGuardMiddleware(scope=diagnostic_scope) if diagnostic_scope else None
+
     # ── Inject all shared middleware into every subagent ──
-    # Subagents are created without these middleware by default.  Without
-    # explicit injection they would lack tool dedup, param correction, and
-    # large-result offloading — causing duplicate calls and context overflow.
+    # Subagents use subagent_ledger (dedup-only, P1 disabled) instead of
+    # ledger_middleware (full Coordinator features including P1 blocking).
     _subagent_middleware = [
-        m for m in [param_middleware, ledger_middleware, offload_middleware] if m is not None
+        m for m in [param_middleware, scope_guard, subagent_ledger, offload_middleware]
+        if m is not None
     ]
     if _subagent_middleware:
         for sa in subagent_configs:
@@ -496,6 +506,6 @@ def build_agent(
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[m for m in [param_middleware, ledger_middleware, offload_middleware] if m is not None],
+        middleware=[m for m in [param_middleware, scope_guard, ledger_middleware, offload_middleware] if m is not None],
         state_schema=DiagnosisLedgerState,
     )

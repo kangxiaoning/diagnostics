@@ -1,197 +1,414 @@
-"""验证 ToolParamOverrideMiddleware — 基于工具签名注入 + 覆盖。"""
+"""Verify ToolParamOverrideMiddleware behavior.
+
+Validates:
+  1. Strict override — container: cluster_name, start_time, end_time
+  2. Strict override — host: name_chunk, start_time, end_time
+  3. Flexible trust: LLM-provided values passed through
+  4. Flexible block: missing non-strict params → blocked
+  5. Scaffolding skip: task, write_file, ledger tools pass through
+  6. No-config: empty config → all calls pass through
+  7. Multi-value params (lists) skipped
+  8. _flat_config: fault_time_range flattened correctly
+"""
+
 from __future__ import annotations
 
 import asyncio
-import json
+import os
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-from langchain_core.messages import ToolMessage
-from langchain_core.tools import tool as langchain_tool
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-# Mock tools
-@langchain_tool
-def get_pod_logs(cluster_name: str, namespace: str, pod_name: str, tail_lines: int = 200) -> str:
-    """Get pod logs."""
-    return "mock"
+# ── Test helpers ──
 
-@langchain_tool
-def get_etcd_status(cluster_name: str) -> str:
-    """Get etcd status."""
-    return "mock"
+def _make_request(tool_name: str, tool_call_id: str, args: dict) -> MagicMock:
+    """Construct a mock ToolCallRequest with the given tool call."""
+    req = MagicMock()
+    req.tool_call = {"name": tool_name, "id": tool_call_id, "args": dict(args)}
+    return req
 
-@langchain_tool
-def check_memory() -> str:
-    """Check memory."""
-    return "mock"
 
-@langchain_tool
-def check_disk() -> str:
-    """Check disk."""
-    return "mock"
+async def _ensure_blocked(result, expected_tool_name: str) -> bool:
+    """Assert the middleware blocked the call, returning a ToolMessage."""
+    from langchain_core.messages import ToolMessage
+    assert isinstance(result, ToolMessage), \
+        f"Expected ToolMessage for blocked call, got {type(result).__name__}"
+    assert result.name == expected_tool_name, \
+        f"Tool name mismatch: {result.name} != {expected_tool_name}"
+    assert "⛔" in result.content or "拦截" in result.content or "缺少" in result.content, \
+        f"Missing block marker in: {result.content[:200]}"
+    return True
 
-@langchain_tool
-def query_argus_cpu(name_chunk: str = "", start_time: str = "", end_time: str = "") -> str:
-    """Query Argus CPU."""
-    return "mock"
 
-MOCK = [get_pod_logs, get_etcd_status, check_memory, check_disk, query_argus_cpu]
+async def _ensure_forwarded(result, expected_content: str) -> bool:
+    """Assert the middleware forwarded the call to the handler."""
+    from langchain_core.messages import ToolMessage
+    assert isinstance(result, ToolMessage), \
+        f"Expected ToolMessage, got {type(result).__name__}"
+    assert result.content == expected_content, \
+        f"Content mismatch: {result.content!r} != {expected_content!r}"
+    return True
 
-from diagnostics.agent.param_override_middleware import _flatten, ToolParamOverrideMiddleware
 
-# 1. _flatten
-f = _flatten({"a":1, "b":{"c":2, "d":3}})
-assert f["a"]==1 and f["c"]==2 and f["d"]==3
-print("✅ 1. _flatten")
+# ═════════════════════════════════════════════════════════════════
+# Container (Kubernetes) scenario
+# ═════════════════════════════════════════════════════════════════
 
-# 2. override
-async def t2():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"pks-ehpc","namespace":"sfe"})
-    req = MagicMock(); req.tool_call = {"name":"get_etcd_status","id":"c2","args":{"cluster_name":"c1","namespace":"ns1"}}
-    req.runtime = MagicMock()
-    async def h(r): return ToolMessage(content="ok",tool_call_id="c2")
-    await mw.awrap_tool_call(req, h)
-    a = req.tool_call["args"]
-    assert a["cluster_name"]=="pks-ehpc" and a["namespace"]=="sfe"
-    print("✅ 2. override")
-asyncio.run(t2())
+async def test_strict_override_container():
+    """LLM provides wrong cluster_name → overridden; missing start_time → injected."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.argus import query_argus_nodes
+    from langchain_core.messages import ToolMessage
 
-# 3. no match
-async def t3():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"prod"})
-    req = MagicMock(); req.tool_call = {"name":"check_memory","id":"c3","args":{}}
-    req.runtime = MagicMock()
-    async def h(r): return ToolMessage(content="ok",tool_call_id="c3")
-    await mw.awrap_tool_call(req, h)
-    assert req.tool_call["args"] == {}
-    print("✅ 3. no match — no inject")
-asyncio.run(t3())
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[query_argus_nodes])
 
-# 4. empty config
-async def t4():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config=None)
-    req = MagicMock(); req.tool_call = {"name":"get_etcd_status","id":"c4","args":{"cluster_name":"x"}}
-    req.runtime = MagicMock()
-    async def h(r): return ToolMessage(content="ok",tool_call_id="c4")
-    await mw.awrap_tool_call(req, h)
-    assert req.tool_call["args"]["cluster_name"]=="x"
-    print("✅ 4. empty config pass-through")
-asyncio.run(t4())
+    # LLM invents wrong name_chunk; start_time omitted
+    req = _make_request("query_argus_nodes", "c1", {"name_chunk": "wrong-cluster"})
+    captured_args = {}
 
-# 5. already correct
-async def t5():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"pks"})
-    req = MagicMock(); req.tool_call = {"name":"get_etcd_status","id":"c5","args":{"cluster_name":"pks"}}
-    req.runtime = MagicMock()
-    async def h(r): return ToolMessage(content="ok",tool_call_id="c5")
-    await mw.awrap_tool_call(req, h)
-    assert req.tool_call["args"]["cluster_name"]=="pks"
-    print("✅ 5. already correct — no-op")
-asyncio.run(t5())
+    async def handler(r):
+        captured_args.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="ok", tool_call_id="c1", name="query_argus_nodes")
 
-# 6. host scenario
-async def t6():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={
-        "task_type":"host","name_chunk":"CQX-L0150660",
-        "fault_time_range":{"start_time":"2026-07-01 18:10:17","end_time":"2026-07-01 18:17:17"},
+    result = await mw.awrap_tool_call(req, handler)
+    assert result.content == "ok"
+    # strict params injected even though LLM omitted them
+    assert captured_args.get("start_time") == "2026-07-01 15:00:00"
+    assert captured_args.get("end_time") == "2026-07-01 15:10:00"
+    # name_chunk is not in strict set for container → trusted as-is
+    assert captured_args.get("name_chunk") == "wrong-cluster"
+    print("  ✓ Container strict: start_time/end_time injected, name_chunk trusted")
+
+
+async def test_flexible_block_on_missing():
+    """LLM omits namespace → blocked (middleware can't guess which)."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.kubernetes import check_kubernetes_pods
+
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "namespace": "default",
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[check_kubernetes_pods])
+
+    # check_kubernetes_pods(namespace: str = "default")
+    # LLM omits namespace → flexible → BLOCK
+    req = _make_request("check_kubernetes_pods", "c2", {})
+    result = await mw.awrap_tool_call(req, _noop_handler)
+    await _ensure_blocked(result, "check_kubernetes_pods")
+    print("  ✓ Flexible block: missing 'namespace' → blocked")
+
+
+async def test_flexible_trust_llm_provided():
+    """LLM provides namespace → trusted, passed through."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.kubernetes import get_pod_logs
+    from langchain_core.messages import ToolMessage
+
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "namespace": "default",
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[get_pod_logs])
+
+    # LLM provides its own namespace → trusted (not overridden)
+    req = _make_request("get_pod_logs", "c3", {
+        "cluster_name": "prod-us-east",
+        "namespace": "kube-system",
+        "pod_name": "coredns-abc",
     })
-    req = MagicMock(); req.tool_call = {"name":"query_argus_cpu","id":"c6","args":{"name_chunk":"x","start_time":"a","end_time":"b"}}
-    req.runtime = MagicMock()
-    async def h(r):
-        a = r.tool_call["args"]
-        assert a["name_chunk"]=="CQX-L0150660" and a["start_time"]=="2026-07-01 18:10:17" and a["end_time"]=="2026-07-01 18:17:17"
-        return ToolMessage(content="ok",tool_call_id="c6")
-    await mw.awrap_tool_call(req, h)
-    print("✅ 6. host scenario")
-asyncio.run(t6())
+    captured = {}
 
-# 7. update_config
-async def t7():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"old"})
-    mw.update_config({"cluster_name":"new"})
-    req = MagicMock(); req.tool_call = {"name":"get_etcd_status","id":"c7","args":{"cluster_name":"x"}}
-    req.runtime = MagicMock()
-    async def h(r):
-        assert r.tool_call["args"]["cluster_name"]=="new"
-        return ToolMessage(content="ok",tool_call_id="c7")
-    await mw.awrap_tool_call(req, h)
-    print("✅ 7. update_config")
-asyncio.run(t7())
+    async def handler(r):
+        captured.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="logs", tool_call_id="c3", name="get_pod_logs")
 
-# 8. ChatRequest
-from diagnostics.server.schemas import ChatRequest
-r = ChatRequest(message="x",entity_type="kubernetes",entity_name="p",param_overrides={"cluster_name":"c"})
-assert r.param_overrides["cluster_name"]=="c"
-assert ChatRequest(message="x",entity_type="hosts",entity_name="h").param_overrides is None
-print("✅ 8. ChatRequest")
+    result = await mw.awrap_tool_call(req, handler)
+    assert result.content == "logs"
+    assert captured.get("namespace") == "kube-system", \
+        f"LLM-provided namespace should be trusted, got {captured.get('namespace')}"
+    # start_time/end_time are NOT in get_pod_logs's signature — correctly NOT injected
+    # cluster_name is in signature AND in strict_set → overridden
+    assert captured.get("cluster_name") == "prod-us-east", \
+        f"Strict cluster_name should be overridden, got {captured.get('cluster_name')}"
+    print("  ✓ Flexible trust: LLM namespace 'kube-system' trusted, strict cluster_name overridden")
 
-# 9. JSON round-trip
-p = {"message":"x","entity_type":"kubernetes","entity_name":"p","param_overrides":{"cluster_name":"c","fault_time_range":{"start_time":"2026-06-30 14:15:00"}}}
-pr = ChatRequest.model_validate_json(json.dumps(p))
-assert pr.param_overrides["cluster_name"]=="c"
-print("✅ 9. JSON round-trip")
 
-# 10. partial match
-async def t10():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"prod","pod_name":"my-pod"})
-    req = MagicMock(); req.tool_call = {"name":"get_pod_logs","id":"c10","args":{"cluster_name":"c1","namespace":"ns1","pod_name":"p1","tail_lines":100}}
-    req.runtime = MagicMock()
-    async def h(r):
-        a = r.tool_call["args"]
-        assert a["cluster_name"]=="prod" and a["pod_name"]=="my-pod" and a["namespace"]=="ns1" and a["tail_lines"]==100 and len(a)==4
-        return ToolMessage(content="ok",tool_call_id="c10")
-    await mw.awrap_tool_call(req, h)
-    print("✅ 10. partial match")
-asyncio.run(t10())
+async def test_strict_params_override_llm_wrong():
+    """LLM provides wrong cluster_name → strict override replaces it."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.kubernetes import get_pod_events
+    from langchain_core.messages import ToolMessage
 
-# 11. scenario A: LLM传3参全错 → 仅替换3参
-async def t11():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={
-        "task_type":"container","cluster_name":"pks-ehpc","namespace":"sfe-default","pod_name":"eip-nginx",
-        "fault_time_range":{"start_time":"2026-06-30 14:15:00","end_time":"2026-06-30 14:30:00"},
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[get_pod_events])
+
+    req = _make_request("get_pod_events", "c4", {
+        "cluster_name": "hallucinated-cluster",
+        "namespace": "default",
+        "pod_name": "my-pod",
     })
-    req = MagicMock(); req.tool_call = {"name":"get_pod_logs","id":"c11","args":{"cluster_name":"c1","namespace":"d","pod_name":"abc"}}
-    req.runtime = MagicMock()
-    async def h(r):
-        a = r.tool_call["args"]
-        assert a=={"cluster_name":"pks-ehpc","namespace":"sfe-default","pod_name":"eip-nginx"}
-        return ToolMessage(content="ok",tool_call_id="c11")
-    await mw.awrap_tool_call(req, h)
-    print("✅ 11. scenario A: 3参全替换,start/end不注入")
-asyncio.run(t11())
+    captured = {}
 
-# 12. scenario B: LLM缺cluster_name → 替换+注入
-async def t12():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={
-        "task_type":"container","cluster_name":"pks-ehpc","namespace":"sfe-default","pod_name":"eip-nginx",
-        "fault_time_range":{"start_time":"2026-06-30 14:15:00","end_time":"2026-06-30 14:30:00"},
+    async def handler(r):
+        captured.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="events", tool_call_id="c4", name="get_pod_events")
+
+    result = await mw.awrap_tool_call(req, handler)
+    assert result.content == "events"
+    assert captured["cluster_name"] == "prod-us-east", \
+        f"Expected override to 'prod-us-east', got {captured['cluster_name']}"
+    print("  ✓ Strict override: wrong cluster_name 'hallucinated-cluster' → 'prod-us-east'")
+
+
+# ═════════════════════════════════════════════════════════════════
+# Host scenario
+# ═════════════════════════════════════════════════════════════════
+
+async def test_strict_override_host():
+    """LLM invents wrong name_chunk → overridden; start_time/end_time injected."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.argus import query_argus_memory
+    from langchain_core.messages import ToolMessage
+
+    config = {
+        "task_type": "host",
+        "name_chunk": "prod-web-01",
+        "fault_time_range": {
+            "start_time": "2026-07-01 18:10:00",
+            "end_time": "2026-07-01 18:17:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[query_argus_memory])
+
+    req = _make_request("query_argus_memory", "h1", {"name_chunk": "wrong-host"})
+    captured = {}
+
+    async def handler(r):
+        captured.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="mem data", tool_call_id="h1", name="query_argus_memory")
+
+    result = await mw.awrap_tool_call(req, handler)
+    assert result.content == "mem data"
+    assert captured["name_chunk"] == "prod-web-01"
+    assert captured.get("start_time") == "2026-07-01 18:10:00"
+    assert captured.get("end_time") == "2026-07-01 18:17:00"
+    print("  ✓ Host strict: name_chunk + start/end_time overridden + injected")
+
+
+# ═════════════════════════════════════════════════════════════════
+# Skip / no-op scenarios
+# ═════════════════════════════════════════════════════════════════
+
+async def test_scaffolding_skip():
+    """task, write_file, ledger tools pass through without interception."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from langchain_core.messages import ToolMessage
+
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[])
+
+    for tool_name in ("task", "write_file", "read_file", "commit_hypotheses",
+                       "record_finding", "select_path", "backtrack"):
+        req = _make_request(tool_name, f"skip_{tool_name}", {"description": "test"})
+
+        async def handler(r, tn=tool_name):
+            return ToolMessage(content=f"{tn}_ok", tool_call_id=f"skip_{tn}", name=tn)
+
+        result = await mw.awrap_tool_call(req, handler)
+        assert result.content == f"{tool_name}_ok", \
+            f"{tool_name} should pass through, got {result.content}"
+    print("  ✓ Scaffolding skip: task/write_file/ledger tools pass through")
+
+
+async def test_no_config():
+    """Empty config → all calls pass through."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.argus import query_argus_nodes
+    from langchain_core.messages import ToolMessage
+
+    mw = ToolParamOverrideMiddleware(config={}, tools=[query_argus_nodes])
+
+    req = _make_request("query_argus_nodes", "nc1", {"name_chunk": "test"})
+    result = await mw.awrap_tool_call(req, _ok_handler)
+    assert result.content == "ok"
+    print("  ✓ No config: empty config → pass through")
+
+
+async def test_multi_value_params_skipped():
+    """List-type params in flat_config are skipped (not injected)."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.kubernetes import get_pod_logs
+    from langchain_core.messages import ToolMessage
+
+    config = {
+        "task_type": "container",
+        "cluster_name": "prod-us-east",
+        "namespace": "default",
+        "allowed_podname": ["p1", "p2", "p3"],  # list → skipped
+        "fault_time_range": {
+            "start_time": "2026-07-01 15:00:00",
+            "end_time": "2026-07-01 15:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config, tools=[get_pod_logs])
+
+    req = _make_request("get_pod_logs", "mv1", {
+        "cluster_name": "prod-us-east",
+        "namespace": "default",
+        "pod_name": "p1",
     })
-    req = MagicMock(); req.tool_call = {"name":"get_pod_logs","id":"c12","args":{"namespace":"d","pod_name":"abc"}}
-    req.runtime = MagicMock()
-    async def h(r):
-        a = r.tool_call["args"]
-        assert a=={"cluster_name":"pks-ehpc","namespace":"sfe-default","pod_name":"eip-nginx"}
-        return ToolMessage(content="ok",tool_call_id="c12")
-    await mw.awrap_tool_call(req, h)
-    print("✅ 12. scenario B: 替换2参+注入cluster_name")
-asyncio.run(t12())
+    captured = {}
 
-# 13. skip scaffolding/ledger/task
-async def t13():
-    mw = ToolParamOverrideMiddleware(tools=MOCK, config={"cluster_name":"pks"})
-    for tn in ["read_file","write_file","commit_hypotheses","task","grep","ls"]:
-        req = MagicMock(); req.tool_call = {"name":tn,"id":f"c13_{tn}","args":{}}
-        req.runtime = MagicMock()
-        ok = False
-        async def h(r): nonlocal ok; ok=True; return ToolMessage(content="ok",tool_call_id=f"c13_{tn}")
-        await mw.awrap_tool_call(req, h)
-        assert ok and "cluster_name" not in req.tool_call["args"]
-    print("✅ 13. skip scaffolding/ledger/task")
-asyncio.run(t13())
+    async def handler(r):
+        captured.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="ok", tool_call_id="mv1", name="get_pod_logs")
 
-print(f"\n{'='*60}\n🎉 全部 13 项验证通过\n{'='*60}")
+    result = await mw.awrap_tool_call(req, handler)
+    assert result.content == "ok"
+    # namespace trusted, not overridden; allowed_podname not injected (it's a list)
+    assert captured.get("namespace") == "default"
+    assert "allowed_podname" not in captured
+    print("  ✓ Multi-value skip: list params not injected")
+
+
+async def test_update_config():
+    """update_config replaces session config — subsequent calls use new values."""
+    from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
+    from diagnostics.tools.mock.argus import query_argus_nodes
+    from langchain_core.messages import ToolMessage
+
+    config_a = {
+        "task_type": "container",
+        "cluster_name": "old-cluster",
+        "fault_time_range": {
+            "start_time": "2026-07-01 10:00:00",
+            "end_time": "2026-07-01 10:10:00",
+        },
+    }
+    mw = ToolParamOverrideMiddleware(config=config_a, tools=[query_argus_nodes])
+
+    # First call with old config
+    req1 = _make_request("query_argus_nodes", "uc1", {"name_chunk": "test"})
+    captured1 = {}
+    async def h1(r):
+        captured1.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="ok", tool_call_id="uc1", name="query_argus_nodes")
+    await mw.awrap_tool_call(req1, h1)
+    assert captured1.get("start_time") == "2026-07-01 10:00:00"
+
+    # Update config
+    mw.update_config({
+        "task_type": "container",
+        "cluster_name": "new-cluster",
+        "fault_time_range": {
+            "start_time": "2026-07-01 20:00:00",
+            "end_time": "2026-07-01 20:10:00",
+        },
+    })
+
+    # Second call with new config
+    req2 = _make_request("query_argus_nodes", "uc2", {"name_chunk": "test"})
+    captured2 = {}
+    async def h2(r):
+        captured2.update(r.tool_call.get("args", {}))
+        return ToolMessage(content="ok", tool_call_id="uc2", name="query_argus_nodes")
+    await mw.awrap_tool_call(req2, h2)
+    assert captured2.get("start_time") == "2026-07-01 20:00:00"
+    print("  ✓ Update config: old→new start_time values respected")
+
+
+# ── Helpers ──
+
+async def _noop_handler(req):
+    from langchain_core.messages import ToolMessage
+    return ToolMessage(
+        content="should_not_reach",
+        tool_call_id=req.tool_call.get("id", "?"),
+        name=req.tool_call.get("name", "?"),
+    )
+
+
+async def _ok_handler(req):
+    from langchain_core.messages import ToolMessage
+    return ToolMessage(
+        content="ok",
+        tool_call_id=req.tool_call.get("id", "?"),
+        name=req.tool_call.get("name", "?"),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════
+
+async def main():
+    print("=" * 60)
+    print("  PARAM OVERRIDE MIDDLEWARE — VERIFICATION SUITE")
+    print("=" * 60)
+    print()
+
+    print("── Container Strict Override ──")
+    await test_strict_override_container()
+    await test_strict_params_override_llm_wrong()
+    print()
+
+    print("── Flexible: Block on Missing ──")
+    await test_flexible_block_on_missing()
+    print()
+
+    print("── Flexible: Trust LLM-Provided ──")
+    await test_flexible_trust_llm_provided()
+    print()
+
+    print("── Host Strict Override ──")
+    await test_strict_override_host()
+    print()
+
+    print("── Skip / No-Op ──")
+    await test_scaffolding_skip()
+    await test_no_config()
+    await test_multi_value_params_skipped()
+    print()
+
+    print("── Dynamic Config ──")
+    await test_update_config()
+    print()
+
+    print("\n✓ ALL PARAM OVERRIDE VERIFICATIONS PASSED")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
