@@ -207,6 +207,19 @@ class ToolOffloadMiddleware(AgentMiddleware):
         if tool_name not in self._tool_names:
             return result
 
+        # ── Never offload scaffolding / filesystem tools ──
+        # These tools let the LLM access file content — offloading their
+        # results would create an infinite loop: read_file returns preview,
+        # LLM calls read_file again to get full content, preview again, ...
+        # Deepagents itself excludes these in its TOO_LARGE_TOOL_MSG.
+        _OFFLOAD_BLACKLIST = frozenset({
+            "read_file", "write_file", "edit_file",
+            "grep", "glob", "ls",
+            "write_todos", "read_todos",
+        })
+        if tool_name in _OFFLOAD_BLACKLIST:
+            return result
+
         # Only process ToolMessage (skip Command objects from sub-agents)
         if not isinstance(result, ToolMessage):
             return result
