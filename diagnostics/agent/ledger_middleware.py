@@ -1548,6 +1548,28 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # the same root cause statement after statement_update.
                     if stmt not in causes:
                         causes.append(stmt)
+            # ── Propagate: deep confirmed hypotheses count as root causes ──
+            # When a non-root hypothesis (depth > 0) is confirmed, its
+            # evidence also supports the root ancestor's overall conclusion.
+            # Without this, a diagnosis with confirmed evidence at depth 2
+            # but a root hypothesis still in "verifying" state would never
+            # enter the REPORT phase.
+            hypotheses = ledger.get("hypotheses", {})
+            for hid, node in hypotheses.items():
+                if node.get("status") != "confirmed":
+                    continue
+                if hid in cids:
+                    continue  # already tracked as a root
+                # Trace up to find the root ancestor
+                root_id = hid
+                while (parent_id := hypotheses.get(root_id, {}).get("parent_id")):
+                    root_id = parent_id
+                if root_id and root_id in ledger.get("root_hypothesis_ids", []):
+                    if root_id not in cids:
+                        cids.append(root_id)
+                    stmt = node["statement"]
+                    if stmt not in causes:
+                        causes.append(stmt)
             # Keep backward-compat fields in sync with first entry
             if cids:
                 ledger["root_cause"] = causes[0]
@@ -1602,6 +1624,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 ]
                 ledger["root_cause"] = causes[0] if causes else ""
                 ledger["root_cause_hypothesis_id"] = cids[0]
+
+            # ── Propagation-aware exit: deep confirmed → force REPORT ──
+            # When a non-root hypothesis is confirmed and its root ancestor
+            # was added to cids via the propagation block above, force exit
+            # even though check_exit_conditions (which runs before propagation)
+            # may have returned False.
+            if not should_exit and cids:
+                should_exit = True
+                reason = ("深层假设已确认，根因已定位"
+                          if len(cids) == 1
+                          else f"{len(cids)} 个根因已确认")
 
             if should_exit:
                 ledger["current_phase"] = "report"

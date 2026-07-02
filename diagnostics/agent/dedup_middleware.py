@@ -92,13 +92,25 @@ def _make_cache_key(tool_name: str, args: dict) -> str:
 
 
 def _is_tool_failure(content: str) -> bool:
-    """Return True if tool output indicates a transport/network failure."""
+    """Return True if tool output indicates a transport/network failure.
+
+    Diagnostic data often contains words like 'timeout' or 'error'
+    when describing the fault being investigated — these must NOT be
+    mistaken for tool failures.  A genuine tool failure is a short,
+    unstructured message; diagnostic output is long, multi-line,
+    and contains headers/tables.
+    """
     if not content:
         return False
-    # Only match if the failure signal dominates: a short error message
-    # is a failure; a long diagnostic output that happens to mention
-    # "timeout" in passing is not.
-    if len(content) > 2000:
+    # Only short content can be a failure message (diagnostic data
+    # is typically >500 chars with multiple lines of structured output).
+    if len(content) > 500:
+        return False
+    # Multiple lines with structure → diagnostic data, not a failure
+    if content.count('\n') > 5:
+        return False
+    # Has markdown-style headers or table separators → diagnostic data
+    if '##' in content or '|-' in content or '| ' in content:
         return False
     return bool(_TOOL_FAILURE_PATTERNS.search(content))
 
