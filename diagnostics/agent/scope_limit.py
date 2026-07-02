@@ -74,6 +74,65 @@ _MOCK_CONTROL_PLANE_HEALTH: dict[str, tuple[float, float]] = {
 }
 
 
+
+
+def _augment_scenario_pods(scope: "ScopeLimit", namespace: str) -> None:
+    """Extract pod names from the active mock scenario's K8s data.
+
+    The static _MOCK_POD_NODE_MAP uses generic pod names that don't match
+    what the scenario data actually returns.  This function reads the
+    scenario's K8s diagnostic output strings and extracts real pod names
+    (e.g. 'api-gateway-abc12' from cluster_overview / check_kubernetes_pods),
+    adding them to the scope's allowed_podname allow-list.
+
+    Only adds pods whose namespace matches *namespace*.
+    """
+    try:
+        from diagnostics.tools.mock.scenarios import get_active_scenario
+        from diagnostics.tools.mock.loader import get_spec
+    except ImportError:
+        return  # mock tools not available
+
+    scenario_id = get_active_scenario()
+    if not scenario_id or scenario_id == "normal":
+        return
+
+    spec = get_spec(scenario_id)
+    if not spec:
+        return
+
+    k8s_keys = [
+        "cluster_overview",
+        "kubernetes_pods",
+        "check_kubernetes_pods",
+    ]
+    seen_pods: set[str] = set(scope.allowed_podname)
+    added = 0
+
+    for key in k8s_keys:
+        data = spec.get(key, "")
+        if not isinstance(data, str):
+            continue
+        # Pod entries follow kubectl-like format:
+        #   default    api-gateway-abc12   0/1   OOMKilled   8   2d
+        # Match: {namespace}  {pod-name}  {ready}/{total}  {status}
+        pattern = re.compile(
+            rf'\b{re.escape(namespace)}\s+(\S+)\s+\d+/\d+\s+\S+'
+        )
+        for match in pattern.finditer(data):
+            name = match.group(1)
+            if name not in seen_pods and not name.startswith("coredns"):
+                scope.allowed_podname.append(name)
+                seen_pods.add(name)
+                added += 1
+
+    if added:
+        logger.info(
+            "ScopeLimit: augmented %d pods from scenario '%s'",
+            added, scenario_id,
+        )
+
+
 @dataclass
 class ScopeLimit:
     """Pre-discovered diagnostic scope — enforced by ScopeGuardMiddleware.
@@ -148,7 +207,14 @@ class ScopeLimit:
         workload_name: str,
         pod_name: str,
     ) -> None:
-        """Populate allowed_nodename / allowed_hostname from mock data."""
+        """Populate allowed_nodename / allowed_hostname from mock data.
+
+        Composes the scope from two sources:
+        1. _MOCK_POD_NODE_MAP — static pod→node→host mapping
+        2. Active scenario K8s data — actual pods used by the scenario
+           (e.g. 'api-gateway-abc12' in conntrack_and_oom vs generic
+           'api-gateway-6f8b7c9d5-xyz01' in the static map)
+        """
         lookup = f"{cluster_name}:{namespace}:{workload_name}"
         entries = _MOCK_POD_NODE_MAP.get(lookup, [])
 
@@ -157,22 +223,10 @@ class ScopeLimit:
             generic_key = f"default:default:{workload_name}"
             entries = _MOCK_POD_NODE_MAP.get(generic_key, [])
 
-        if not entries:
-            logger.warning(
-                "ScopeLimit: no mock data for %s, "
-                "only user-specified pod will be allowed.",
-                lookup,
-            )
-            return
-
         nodes: set[str] = set()
         hosts: set[str] = set()
-        seen_pods: set[str] = set()
-
-        # Always include the user-specified pod first.
-        if pod_name:
-            self.allowed_podname.append(pod_name)
-            seen_pods.add(pod_name)
+        # Start with any pods already set by discover() (e.g. user-provided).
+        seen_pods: set[str] = set(self.allowed_podname)
 
         for name, node, ip in entries:
             if name not in seen_pods:
@@ -181,13 +235,21 @@ class ScopeLimit:
             nodes.add(node)
             hosts.add(ip)
 
+        # ── Augment with pods from the active mock scenario ──
+        # The static _MOCK_POD_NODE_MAP uses generic pod names that
+        # don't match what the scenario actually returns.  Extract
+        # real pod names from the scenario's K8s data strings so
+        # scope_guard doesn't block legitimate queries.
+        _augment_scenario_pods(self, namespace)
+
         self.allowed_nodename = sorted(nodes)
         self.allowed_hostname = sorted(hosts)
 
         logger.info(
             "ScopeLimit mock: %d pods → %d nodes, %d hosts for %s",
-            len(entries), len(nodes), len(hosts), lookup,
+            len(self.allowed_podname), len(nodes), len(hosts), lookup,
         )
+
 
     # ── Control plane health check ──
 
