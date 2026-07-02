@@ -32,7 +32,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from deepagents.backends.protocol import BackendProtocol, ReadResult
+from deepagents.backends.protocol import BackendProtocol
 
 from diagnostics.agent.ledger import (
     DiagnosisLedger,
@@ -74,8 +74,6 @@ _STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding 
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
-_TOOL_FAILURE_BREAKER = 2           # Consecutive failures of same tool → auto-block retry
-_DEDUP_CACHE_PREFIX = "/_dedup_cache"  # shared_backend path for cross-agent dedup
 
 
 def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
@@ -144,29 +142,6 @@ def _make_cache_key(tool_name: str, args: dict) -> str:
     """
     canonical = json.dumps(args, sort_keys=True) if args else "{}"
     return f"{tool_name}:{canonical}"
-
-
-# Patterns that indicate a tool call failed at the transport/network level
-# rather than returning valid (possibly empty) diagnostic data.
-_TOOL_FAILURE_PATTERNS = re.compile(
-    r"timeout|timed out|connection refused|connection reset|"
-    r"network (is )?unreachable|no route to host|"
-    r"OSP.*(?:fail|error|timeout)|remote.*(?:fail|error|timeout)|"
-    r"channel closed|broken pipe",
-    re.IGNORECASE,
-)
-
-
-def _is_tool_failure(content: str) -> bool:
-    """Return True if tool output indicates a transport/network failure."""
-    if not content:
-        return False
-    # Only match if the failure signal dominates: a short error message
-    # is a failure; a long diagnostic output that happens to mention
-    # "timeout" in passing is not.
-    if len(content) > 2000:
-        return False
-    return bool(_TOOL_FAILURE_PATTERNS.search(content))
 
 
 def _sanitize_ledger(ledger: dict) -> dict:
@@ -316,9 +291,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # order within the same LLM round (LangGraph executes tool calls
         # concurrently, so completion order ≠ invocation order).
         self._round_record_seq: int = 0
-        # Tool deduplication: block identical (name, args) calls in same session.
-        # Value is (ToolMessage, failure_count): 0 = success, >0 = consecutive failures.
-        self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
         # Filesystem path prefix for offloaded tool results.
         self._tool_results_prefix = "/tool_results"
         # Ledger management tools — only needed by Coordinator; subagents
@@ -336,12 +308,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     @classmethod
     def for_subagent(cls, coordinator: "DiagnosisLedgerMiddleware") -> "DiagnosisLedgerMiddleware":
-        """Create a subagent instance that shares dedup cache and backend.
+        """Create a subagent instance that shares the ledger and backend.
 
-        The subagent instance reuses the Coordinator's ``_tool_call_cache``
-        (in-memory dedup) and ``_backend`` (cross-agent dedup) so that
-        tool calls made by any subagent are deduplicated against all
-        prior calls across the entire session.
+        Tool dedup is handled separately by ToolDedupMiddleware (shared
+        via its own ``for_subagent()``).  This method only shares the
+        diagnosis ledger state so subagents can't create their own
+        independent ledger.
 
         P1 expert-only blocking and ledger management tools are disabled
         — subagents own their diagnostic tools and should not manage
@@ -353,7 +325,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             backend=coordinator._backend,
             is_subagent=True,
         )
-        instance._tool_call_cache = coordinator._tool_call_cache
         instance._current_ledger = coordinator._current_ledger
         # Inherit the Coordinator's round count so any future code that
         # references _model_call_count on the subagent instance starts
@@ -781,49 +752,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._round_record_seq += 1
         invocation_seq = self._round_record_seq
 
-        # ── P0: Tool deduplication + circuit breaker ──
-        # Blocks identical (name, args) calls.  If a tool previously
-        # failed and is being retried, the breaker auto-escalates after
-        # _TOOL_FAILURE_BREAKER consecutive failures.
-        _DEDUP_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}
-        if tool_name not in _DEDUP_SKIP:
-            cache_key = _make_cache_key(tool_name, tool_args)
-            if cache_key in self._tool_call_cache:
-                cached_msg, fail_count = self._tool_call_cache[cache_key]
-                if fail_count == 0:
-                    # Previous call succeeded → normal cache hit
-                    logger.info("去重命中: %s", cache_key)
-                    return ToolMessage(
-                        content=cached_msg.content,
-                        tool_call_id=tool_call_id,
-                        name=cached_msg.name,
-                    )
-                # Previous call(s) failed → this is a retry
-                if fail_count >= _TOOL_FAILURE_BREAKER:
-                    logger.warning("熔断: %s (连续失败%d次)", cache_key, fail_count)
-                    return ToolMessage(
-                        content=(
-                            f"⛔ [系统熔断] {tool_name} 已连续失败"
-                            f"{fail_count}次，网络可能不可达。"
-                            "禁止重试此工具，请基于已有证据继续诊断。"
-                        ),
-                        tool_call_id=tool_call_id,
-                        name=cached_msg.name,
-                    )
-                # Allow one retry with a warning, increment counter
-                logger.info("失败重试: %s (第%d次)", cache_key, fail_count + 1)
-                self._tool_call_cache[cache_key] = (cached_msg, fail_count + 1)
-                return ToolMessage(
-                    content=(
-                        f"{cached_msg.content}\n\n"
-                        f"⚠ [系统提示] {tool_name} 上次调用返回异常，"
-                        f"当前为第{fail_count + 1}次重试。"
-                        f"若累计失败{_TOOL_FAILURE_BREAKER}次将被熔断。"
-                    ),
-                    tool_call_id=tool_call_id,
-                    name=cached_msg.name,
-                )
-
         # ── P1: Block coordinator from calling expert-only tools ──
         # query_argus_* tools are exclusively available to Argus expert
         # subagents (host-argus-expert / k8s-argus-expert).  If the
@@ -856,36 +784,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     ),
                     tool_call_id=tool_call_id,
                 )
-
-        # ── Cross-agent dedup via shared_backend ──
-        # Memory cache miss: check if another agent (subagent or
-        # Coordinator from earlier task) already called this tool
-        # and persisted the result to the shared backend.
-        #
-        # Runs AFTER P1 (above) so Coordinator can't bypass expert-tool
-        # blocking by hitting a subagent's cached result.
-        if self._backend and tool_name not in _DEDUP_SKIP:
-            backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
-            try:
-                cached_content = await self._backend.aread(backend_key)
-            except Exception:
-                cached_content = None
-            # StateBackend.aread() returns ReadResult(error=...) for
-            # missing keys — NOT None.  Treat error responses as a
-            # cache miss so the tool actually executes.
-            if cached_content is not None and not (
-                isinstance(cached_content, ReadResult) and cached_content.error
-            ):
-                logger.info(
-                    "跨Agent去重命中: %s (from shared_backend)", cache_key,
-                )
-                restored = ToolMessage(
-                    content=cached_content,
-                    tool_call_id=tool_call_id,
-                    name=tool_name,
-                )
-                self._tool_call_cache[cache_key] = (restored, 0)
-                return restored
 
         # ── Inject ledger context into task() descriptions ──
         # Subagents normally see only the Coordinator's description and have
@@ -924,50 +822,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         result = await handler(request)
 
-        # ── Cache result with failure tracking ──
-        # Only cache ToolMessage results (Command objects indicate
-        # routing overrides and should not be cached).
-        _DEDUP_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}
-        if tool_name not in _DEDUP_SKIP and isinstance(result, ToolMessage):
-            cache_key = _make_cache_key(tool_name, tool_args)
+        # ── Offload to shared backend for cross-round access ──
+        # Writes the full tool result to the filesystem so the LLM
+        # can use read_file / grep to retrieve data from previous
+        # rounds instead of re-calling the same tool.
+        # Depends on ToolDedupMiddleware for same-round/cross-agent dedup.
+        _OFFLOAD_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}
+        if self._backend and tool_name not in _OFFLOAD_SKIP and isinstance(result, ToolMessage):
             content = result.content if isinstance(result.content, str) else str(result.content)
-
-            # ── Don't cache empty / nil / error results ──
-            # Caching a "not found" or empty result would lock the LLM
-            # into a failure loop — every subsequent round would hit the
-            # cache and see the same useless data, preventing recovery.
-            # Only cache results that contain actual diagnostic data.
-            _EMPTY_PATTERNS = re.compile(
-                r"not found|no data|no results|error|空",
-                re.IGNORECASE,
-            )
-            if not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
-                logger.debug("Skipped caching empty/error result: %s", cache_key)
-            else:
-                fail_count = 1 if _is_tool_failure(content) else 0
-                self._tool_call_cache[cache_key] = (result, fail_count)
-
-            # ── Persist to shared_backend for cross-agent dedup ──
-            # Both Coordinator and subagents write here so that any
-            # agent can detect duplicate (name, args) calls across
-            # the entire session, not just within its own process.
-            if self._backend and not fail_count:
-                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
-                try:
-                    await self._backend.awrite(backend_key, content)
-                except Exception:
-                    pass  # best-effort; memory cache still works
-
-            # ── Offload to shared backend for cross-round access ──
-            # Writes the full tool result to the filesystem so the LLM
-            # can use read_file / grep to retrieve data from previous
-            # rounds instead of re-calling the same tool.
-            if self._backend and content:
-                # Encode tool_name + args hash in path so different
-                # parameters produce distinct files (same tool, different
-                # args = NOT a duplicate call).
+            if content:
+                cache_key = _make_cache_key(tool_name, tool_args)
                 safe_name = _sanitize_path_component(tool_name)
-                # Use first 12 chars of cache_key suffix for uniqueness
                 args_suffix = cache_key.split(":", 1)[1] if ":" in cache_key else ""
                 safe_suffix = _sanitize_path_component(args_suffix)[:24] if args_suffix else "noargs"
                 file_path = (
@@ -978,24 +843,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     await self._backend.awrite(file_path, content)
                     logger.debug("Offloaded tool result: %s → %s", tool_name, file_path)
                 except Exception:
-                    file_path = ""  # best-effort: don't block diagnosis
+                    file_path = ""
                     logger.debug("Offload write skipped for %s (backend error)", tool_name)
-
                 # Store metadata in ledger for context injection
                 lines = content.splitlines()
-                ledger = self._current_ledger
-                if ledger is not None:
-                    ledger.setdefault("tool_results", {})[cache_key] = {
+                if self._current_ledger is not None:
+                    self._current_ledger.setdefault("tool_results", {})[cache_key] = {
                         "path": file_path,
                         "round": self._model_call_count,
                         "preview": content[:200].replace("\n", " "),
                         "lines": len(lines),
-                        "is_failure": fail_count > 0,
                     }
-                logger.info(
-                    "Cross-round tool result saved: %s → %s (%d lines)",
-                    cache_key, file_path, len(lines),
-                )
 
         # Use the in-memory ledger (shared via self._current_ledger)
         ledger = self._current_ledger

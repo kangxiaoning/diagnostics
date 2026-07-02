@@ -10,6 +10,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from langchain.chat_models import init_chat_model
 
 from diagnostics.agent.prompt import make_system_prompt
+from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
 from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
@@ -415,6 +416,13 @@ def build_agent(
         config=param_overrides, tools=all_tools,
     ) if param_overrides else None
 
+    # Tool dedup middleware — prevents duplicate tool calls (same name+args)
+    # within a session, with circuit breaker for repeated failures and
+    # cross-agent cache sharing via shared_backend.
+    # Must run BEFORE ledger so cache hits bypass P1 blocking + offload.
+    dedup_middleware = ToolDedupMiddleware(backend=shared_backend)
+    dedup_subagent = ToolDedupMiddleware.for_subagent(dedup_middleware)
+
     # Diagnosis ledger middleware — maintains hypothesis tree in agent state.
     # Coordinator instance: full features (ledger, P1 expert blocking, safety).
     ledger_middleware = DiagnosisLedgerMiddleware(
@@ -423,8 +431,7 @@ def build_agent(
         model=model,
         backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
     )
-    # Subagent instance: dedup-only (shares _tool_call_cache + _backend).
-    # P1 expert blocking is disabled so subagents can call their own tools.
+    # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)
 
     # Tool offload middleware — compresses oversized tool results by writing
@@ -488,10 +495,10 @@ def build_agent(
     scope_guard = ScopeGuardMiddleware(scope=diagnostic_scope) if diagnostic_scope else None
 
     # ── Inject all shared middleware into every subagent ──
-    # Subagents use subagent_ledger (dedup-only, P1 disabled) instead of
-    # ledger_middleware (full Coordinator features including P1 blocking).
+    # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
+    # (shared cache) instead of the Coordinator's full-featured instances.
     _subagent_middleware = [
-        m for m in [param_middleware, scope_guard, subagent_ledger, offload_middleware]
+        m for m in [param_middleware, scope_guard, dedup_subagent, subagent_ledger, offload_middleware]
         if m is not None
     ]
     if _subagent_middleware:
@@ -506,6 +513,6 @@ def build_agent(
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[m for m in [param_middleware, scope_guard, ledger_middleware, offload_middleware] if m is not None],
+        middleware=[m for m in [param_middleware, scope_guard, dedup_middleware, ledger_middleware, offload_middleware] if m is not None],
         state_schema=DiagnosisLedgerState,
     )

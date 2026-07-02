@@ -48,14 +48,17 @@ from diagnostics.agent.ledger import (
     derive_phase,
     add_hypotheses,
 )
+from diagnostics.agent.dedup_middleware import _is_tool_failure
 from diagnostics.agent.ledger_middleware import (
     DiagnosisLedgerMiddleware,
     _make_cache_key,
-    _is_tool_failure,
     _sanitize_path_component,
 )
 
 # 创建 middleware 实例
+from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
+
+dedup = ToolDedupMiddleware(backend=backend)
 mw = DiagnosisLedgerMiddleware(
     ledger_path="/tmp/test_ledger.json",
     report_path="/tmp/test_report.md",
@@ -89,9 +92,9 @@ cache_key = _make_cache_key(tool_name, tool_args)
 content = output
 fail_count = 1 if _is_tool_failure(content) else 0
 
-# 内存缓存
+# 内存缓存 — 现在在 dedup middleware 中
 mock_msg = ToolMessage(content=output, tool_call_id="call_test1", name=tool_name)
-mw._tool_call_cache[cache_key] = (mock_msg, fail_count)
+dedup._tool_call_cache[cache_key] = (mock_msg, fail_count)
 
 # Offload 写入
 import asyncio
@@ -136,7 +139,7 @@ output2 = (
 
 cache_key2 = _make_cache_key(tool_name2, {})
 mock_msg2 = ToolMessage(content=output2, tool_call_id="call_test2", name=tool_name2)
-mw._tool_call_cache[cache_key2] = (mock_msg2, 0)
+dedup._tool_call_cache[cache_key2] = (mock_msg2, 0)
 
 
 async def simulate_offload2():
@@ -205,8 +208,8 @@ print("=" * 60)
 
 # 第 3 轮再次"调用" check_memory
 repeat_key = _make_cache_key("check_memory", {})
-if repeat_key in mw._tool_call_cache:
-    cached, fc = mw._tool_call_cache[repeat_key]
+if repeat_key in dedup._tool_call_cache:
+    cached, fc = dedup._tool_call_cache[repeat_key]
     print(f"   ✅ 缓存命中: check_memory (fail_count={fc})")
     print(f"   返回内容前 100 字符: {cached.content[:100]}...")
 else:
