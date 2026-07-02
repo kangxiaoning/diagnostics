@@ -800,76 +800,255 @@ flowchart LR
 
 ## 自定义 Middleware
 
-系统通过 4 个自定义 `AgentMiddleware` 实现参数校准、假设台账、范围守卫和结果压缩。它们按顺序链式处理每个工具调用：
+系统通过 5 个自定义 `AgentMiddleware` 实现参数校准、范围守卫、工具去重、假设台账和结果压缩。它们按顺序链式处理每个工具调用：
 
 ```
-Tool Call → param_override → scope_guard → ledger → offload → 实际执行
+Tool Call → param_override → scope_guard → dedup → ledger → offload → 实际执行
 ```
+
+每个中间件在链中的位置决定了它的预处理（调用前）和后处理（调用后）生效时机：**越靠前的中间件，预处理越早执行；后处理则反向，越靠后的中间件越早拿到工具返回结果**。
+
+---
 
 ### 1. ToolParamOverrideMiddleware
 
 **职责**：根据 session 配置强制修正 LLM 生成的工具参数，防止幻觉。
 
+**工作流程**：
+
+```
+awrap_tool_call 被调用
+  ├─ 工具是 task / write_file / 台账工具？ → 直接透传
+  ├─ 没有 session 配置？ → 直接透传
+  └─ 遍历 _flat_config 中的每个 key：
+       ├─ 是 meta key（task_type / fault_time_range）？ → 跳过
+       ├─ 是列表类型？ → 跳过（无法确定单个值）
+       ├─ LLM 提供了该参数？
+       │   ├─ 属于 strict_set → 强制覆盖为 config 值
+       │   └─ 属于 flexible → 信任 LLM 提供的值
+       └─ LLM 未提供该参数？
+           ├─ 属于 strict_set AND 工具签名接受 → 自动注入
+           └─ 属于 flexible AND 工具签名接受 → ⛔ 拦截
+              （中间件无法猜测多个可选值中应填哪个）
+```
+
 **参数分类**：
 
-| 分类 | 参数（容器） | 参数（主机） | 行为 |
-|------|-------------|-------------|------|
-| **Strict** | `cluster_name`, `start_time`, `end_time` | `name_chunk`, `start_time`, `end_time` | LLM 提供错误值→强制覆盖；未提供→自动注入 |
-| **Flexible** | `namespace`, `pod_name` 等 | — | LLM 提供→信任通过；**未提供→拦截**（中间件无法猜测多个可选值中应填哪个） |
-| **Skip** | `task`, `write_file`, 台账工具 | 同左 | 非诊断工具直接透传 |
+| 分类 | 容器模式参数 | 主机模式参数 | 行为 |
+|------|------------|------------|------|
+| **Strict** | `cluster_name`, `start_time`, `end_time` | `name_chunk`, `start_time`, `end_time` | 无条件覆盖/注入 |
+| **Flexible** | `namespace`, `pod_name` 等 | — | LLM 提供→信任；未提供→拦截 |
+| **Skip** | `task`, `write_file`, 台账工具 | 同左 | 直接透传 |
 
-**依赖**：通过 `inspect.signature(fn)` 提取工具参数名 → `_param_map: {tool_name → {param_names}}`。仅对签名中**实际存在的参数**注入/检查。
+**核心依赖**：`_build_param_map(tools)` — 用 `inspect.signature(fn)` 遍历所有工具，提取 `{工具名 → {参数名集合}}`。**仅对工具签名中实际存在的参数**注入/拦截。
 
-**移植要点**：生产工具必须用 `@tool` 装饰；参数名必须与 config key 一致。
+**典型场景**：
+
+```
+config = {"task_type":"container", "cluster_name":"prod-us-east",
+          "fault_time_range": {"start_time":"2026-07-01 15:00", ...}}
+
+LLM → check_kubernetes_pods(cluster_name="wrong")
+  → strict override → cluster_name="prod-us-east"  ← 修正
+
+LLM → check_kubernetes_pods()  # 无参数
+  → strict inject → cluster_name="prod-us-east"   ← 注入
+  → flexible missing: namespace                    ← ⛔ 拦截
+  → 返回: "⛔ [参数拦截] check_kubernetes_pods 缺少必要参数 namespace"
+
+LLM → check_kubernetes_pods(namespace="kube-system")
+  → strict inject → cluster_name="prod-us-east"
+  → flexible: LLM 提供了 namespace → 信任 "kube-system"  ← 放行
+```
+
+**移植要点**：生产工具必须用 `@tool` 装饰、参数名与 config key 一致、同一工具 mock/live 签名完全相同。`_build_param_map` 依赖工具函数暴露的 `func`/`coroutine` 属性。
+
+---
 
 ### 2. ScopeGuardMiddleware
 
-**职责**：拦截超出预发现 scope（命名空间/节点/Pod）的 K8s 工具调用。
+**职责**：拦截超出预发现 scope 的 K8s 工具调用，防止 LLM 漫游到无关资源。
 
-**被检查的工具集**：
+**工作流程**：
 
-| 参数 | 受检工具 |
-|------|---------|
+```
+awrap_tool_call 被调用
+  ├─ 没有 diagnostic_scope？ → 直接透传（scope 未启用）
+  ├─ namespace 参数存在且不等于 allowed_namespace？
+  │   → ⛔ 拦截: "namespace xxx 不在诊断范围内"
+  ├─ node_name 参数存在且不在 allowed_nodename 中？
+  │   → ⛔ 拦截（精确匹配 + 子串匹配）
+  └─ pod_name 参数存在且不在 allowed_podname 中？
+      → ⛔ 拦截
+```
+
+**被检查的工具集**（`frozenset` 硬编码）：
+
+| 被检查参数 | 受检工具 |
+|-----------|---------|
 | `namespace` | `check_kubernetes_pods`, `get_pod_logs`, `get_pod_events`, `get_namespaces`, `list_deployments`, `list_services` |
 | `node_name` | `get_node_info` |
 | `pod_name` | `get_pod_logs`, `get_pod_events` |
 
-> 依赖 `ScopeLimit` 对象（由 `ScopeLimit.discover()` 从 K8s API 或 mock 数据构建），生产环境下 `discover()` 和 `get_control_plane_metrics()` 需从 K8s API / 监控 API 真实查询。
+**ScopeLimit 创建流程**：
 
-**移植要点**：受检工具名硬编码在 `frozenset` 中，生产 K8s 工具必须使用**完全相同的函数名**。
+```
+用户请求
+  → ScopeLimit.get_control_plane_metrics(cluster)
+     → 控制面内存 >80% AND 可用 <2GB？ → 拒绝诊断
+  → ScopeLimit.discover(cluster, namespace, workload, pod)
+     ├── mock: _MOCK_POD_NODE_MAP 查表
+     │   例: "prod-us-east:default:api-gateway" → 3个Pod,3个节点,3个主机IP
+     └── production: K8s API 查询（待实现）
+  → 返回 ScopeLimit(allowed_namespace, allowed_nodename, allowed_podname, ...)
+```
 
-### 3. DiagnosisLedgerMiddleware
+**匹配策略**：`_is_in_scope(value, allowed)` — 先精确匹配，再子串匹配（如 `"worker-3"` 匹配 `"eklet-worker-3-abc"`），空值直接放行。仅拦截 K8s 资源类工具，Argus 监控工具和 host 诊断工具不受 scope 限制。
 
-最复杂的中间件，承担多个职责：
+**典型场景**：
 
-**台账管理**：通过 `commit_hypotheses` / `select_path` / `record_finding` / `backtrack` 四个工具驱动假设树生命周期。自动采集所有诊断工具结果到活跃假设的 evidence。
+```
+Scope: namespace="default", nodename=["worker-3","worker-5"]
 
-**P0 工具去重**：`_tool_call_cache` 字典，key = `"工具名:JSON序列化参数"`。相同调用直接返回缓存，避免重复查询。空结果（含 `not found` / `no data` 关键字）不被缓存。
+k8s-expert → get_pod_logs(namespace="kube-system", pod_name="coredns")
+  → ⛔ namespace "kube-system" ≠ allowed "default"
 
-**P1 专家工具阻塞**：Coordinator 调用 `query_argus_*` 工具时直接拦截，返回引导消息让 LLM 通过 `task()` 委派 Argus 专家。Subagent 自动跳过此检查。
+k8s-expert → get_pod_logs(namespace="default", pod_name="api-gateway-xyz")
+  → ✅ 放行
 
-**跨Agent去重**：同一 session 内 subagent 调过的工具 → 写入 `StateBackend`（key: `/_dedup_cache/工具名:参数`）→ Coordinator 后续调用命中后直接返回缓存。
+k8s-expert → get_node_info(node_name="worker-7")
+  → ⛔ "worker-7" 不在 ["worker-3","worker-5"] 中
+```
+
+**移植要点**：受检工具名硬编码在三组 `frozenset` 中，生产 K8s 工具必须使用**完全相同的函数名**。`discover()` 和 `get_control_plane_metrics()` 的生产版需实现 K8s API / 监控 API 查询。
+
+---
+
+### 3. ToolDedupMiddleware
+
+**职责**：在 session 内阻止相同（工具名 + 参数）的重复调用，含熔断器防止连续失败重试，跨 Agent 共享缓存。
+
+> 从 `DiagnosisLedgerMiddleware` 中抽出，保持 ledger 专注假设管理。
+
+**工作流程**：
+
+```
+awrap_tool_call 被调用
+  ├─ 工具是 task / write_file / 台账工具？ → 直接透传（不去重）
+  │
+  ├─ P0: 内存缓存查找
+  │   ├─ cache_key 命中 AND fail_count==0？ → 返回缓存结果（去重命中）
+  │   ├─ fail_count >= 2？ → ⛔ 返回熔断消息（禁止重试）
+  │   └─ fail_count==1？ → 返回失败警告 + 累加计数器
+  │
+  ├─ 跨Agent缓存查找（shared_backend）
+  │   └─ key: /_dedup_cache/工具名:JSON参数
+  │       命中？ → 写入内存缓存 + 返回
+  │
+  ├─ 执行工具 → 拿到 result
+  │
+  └─ 缓存结果
+      ├─ 空结果 / 错误结果（<50字符 + "not found"等关键字）？ → 不缓存
+      ├─ 网络失败（timeout等）？ → 缓存 + fail_count=1
+      ├─ 成功结果 → 缓存 + fail_count=0
+      └─ 持久化到 shared_backend（跨Agent共享）
+```
+
+**缓存 key 格式**：`"工具名:JSON序列化参数"`，参数按 key 排序后 JSON 序列化，确保 `{a:1,b:2}` 和 `{b:2,a:1}` 生成相同 key。
+
+**熔断条件**：同一 cache_key 连续失败 `_TOOL_FAILURE_BREAKER` 次（默认 2）→ 返回 `"⛔ [系统熔断] 已连续失败N次，禁止重试此工具"`。
+
+**跨Agent共享**：通过 `for_subagent()` 创建共享缓存的 subagent 实例，Coordinator 和所有 subagent 共用一个 `_tool_call_cache` 字典。缓存命中的结果也写入 `StateBackend`，使后续启动的 agent 也能命中。
+
+**不缓存的场景**：
+- 空字符串或 None
+- 短文本（<50字符）且含 `not found` / `no data` / `no results` / `error` / `空` 关键字
+- 这些结果如果被缓存，会导致后续调用永远返回空 → 诊断死循环
+
+**移植要点**：
+- 生产工具返回"无数据"时字符串需含 `not found` / `no data` / `empty` 关键字（否则会被缓存造成死循环）
+- 网络超时类错误需能被 `_TOOL_FAILURE_PATTERNS` 正则匹配（含 `timeout` / `connection refused`），否则熔断器不触发
+- `for_subagent()` 模式与 ledger 的 `for_subagent()` 完全对称
+
+---
+
+### 4. DiagnosisLedgerMiddleware
+
+**职责**：假设驱动的诊断台账管理 + P1 专家工具阻塞 + 安全机制 + 自动证据采集。
+
+**台账管理**：
+
+通过四个工具驱动假设树生命周期：
+- `commit_hypotheses` — 提交 ≤3 个假设（按概率降序），自动选中最高概率进入 verifying
+- `select_path` — 选择一条路径深入，未选中的自动 deprioritized（可回溯）
+- `record_finding` — 记录 confirmed / refuted / inconclusive，自动检查退出条件
+- `backtrack` — 回溯到最近被降级的假设重新验证
+
+**P1 专家工具阻塞**：
+
+```
+Coordinator 尝试调用 query_argus_nodes(...)
+  → ⛔ 拦截: "query_argus_nodes 是专家专用工具，请通过 task() 委派"
+  → Subagent 调用同样工具 → ✅ 放行（_is_subagent=True）
+```
+
+受拦截工具：`query_argus_cpu/memory/disk/network/nodes/services/gpu`
+
+**自动证据采集**：
+- 每次诊断工具执行后，结果自动写入当前活跃假设的 evidence
+- `task()` 委派的专家输出 → `source="expert:host-expert"` + `supports=True`
+- 直接工具调用 → `source="tool:check_memory"` + `supports=True`
+- `task()` 描述中提及假设 ID（如"验证假设 H1"）→ 证据精确路由到该假设
+- 空结果不记录，台账工具和自我管理的工具（`record_finding` 等）不重复采集
 
 **安全机制**：
 
-| 机制 | 阈值 | 行为 |
-|------|------|------|
-| 最大轮次 | 20 | 强制进入 REPORT 阶段 |
-| 停滞检测 | 连续 3 次 `task()` 无 `record_finding` | 自动标记 inconclusive |
-| 工具熔断 | 同一工具连续失败 2 次 | 阻断重试 |
-| 委派饱和 | 连续 2 次委派同一专家验证同一假设 | 警告注入 |
+| 机制 | 阈值 | 触发后行为 |
+|------|------|-----------|
+| 最大轮次 | ≥20 | 强制进入 REPORT，禁止再调任何诊断工具 |
+| Understand 停滞（有数据） | ≥2轮无假设 | 强制要求 `commit_hypotheses` |
+| Understand 停滞（无数据） | ≥2轮无诊断工具 | 强制要求采集数据 |
+| 委派饱和 | 同 expert+Hn 连续≥2次 | 警告注入：禁止重复委派 |
+| Verify 停滞 | 连续3次 task() 无 record_finding | 自动标记 inconclusive |
+| Verify 卡住 | ≥8轮未见 finalize | 自动处理 + 强制 REPORT |
+| REPORT 停滞 | REPORT 阶段≥2轮未 write_file | 强制要求生成报告 |
 
 **移植要点**：
 - `_EXPERT_ONLY_TOOLS` 硬编码 `query_argus_*` 工具名 → 生产 Argus 工具必须同名
-- `_TOOL_FAILURE_PATTERNS` 正则匹配超时/连接拒绝 → 生产工具的异常格式需能被匹配
-- `_EMPTY_PATTERNS` 过滤空结果防缓存 → 生产工具返回"无数据"时需含 `not found` / `no data` / `empty` 关键字
-- `for_subagent()` 创建共享缓存的 subagent 实例，`before_model` 已禁用 subagent 轮次事件
+- `for_subagent()` 共享 ledger state（非缓存），subagent 的 `before_model` 已禁用
+- 跨轮次 offload 将工具结果写入 `FilesystemBackend`，路径格式 `/tool_results/r{轮次}/{工具名}_{参数hash}.txt`
 
-### 4. ToolOffloadMiddleware
+---
 
-**职责**：超大工具结果（>32000 字符）写入 `FilesystemBackend`，LLM 收到预览+路径，用 `read_file`/`grep` 按需检索。
+### 5. ToolOffloadMiddleware
 
-**移植要点**：`tool_names` 集合在 `factory.py` 配置 → 需加入生产环境所有诊断工具名。
+**职责**：超大工具结果（>32000字符 ≈ 8000 tokens）写入 `FilesystemBackend`，LLM 收到预览+文件路径，用 `read_file`/`grep` 按需检索。
+
+**工作流程**：
+
+```
+工具执行完毕 → result 返回
+  ├─ 工具不在 tool_names 集合中？ → 直接透传原结果
+  ├─ result 是 Command 而非 ToolMessage？ → 直接透传
+  ├─ 内容长度 ≤ 32000 字符？ → 直接透传原结果
+  └─ 超过阈值 → _offload(result):
+       ├─ 完整内容写入 backend: /large_tool_results/{tool_call_id}
+       ├─ 生成 head(5行) + tail(5行) 预览
+       ├─ 附带关键词 grep 建议（如 check_memory → "OOM\n  Swap\n  RSS"）
+       └─ 返回替换后的 ToolMessage（预览 + 文件路径）
+```
+
+**关键词建议**（`hint_keywords`）：为每个工具预设常见故障模式的 grep 关键词，LLM 可按建议搜索，也可自由搜索任意模式。这些是**提示**而非限制。
+
+**offload 与 dedup/cross-round 的区别**：
+
+| 机制 | 目的 | 数据存放位置 | 中间件 |
+|------|------|------------|--------|
+| 去重（dedup） | 阻止同参数重复调用 | `_dedup_cache/工具名:JSON参数`（StateBackend） | ToolDedupMiddleware |
+| 跨轮保存（offload） | 让 LLM 按需检索历史结果 | `/tool_results/r{轮次}/{工具名}_{hash}.txt`（FilesystemBackend） | DiagnosisLedgerMiddleware |
+| 超大截断（offload） | 压缩当前轮的工具输出 | `/large_tool_results/{call_id}`（FilesystemBackend） | ToolOffloadMiddleware |
+
+**移植要点**：`tool_names` 集合在 `factory.py` 配置 → 需加入生产环境所有诊断工具名。`hint_keywords` 可按生产工具的常见异常模式自定义。
 
 ## 前端关键实现
 
@@ -1038,7 +1217,8 @@ diagnostics/
 │   │   ├── prompt.py                # 中文系统提示词
 │   │   ├── streaming.py             # 事件流处理：阶段路由、工具分组、台账事件分发
 │   │   ├── ledger.py                # 诊断台账：假设树、证据链、阶段推导、退出条件
-│   │   ├── ledger_middleware.py      # 台账中间件：假设管理、工具去重、P1阻塞、安全机制
+│   │   ├── dedup_middleware.py       # 工具去重中间件：内存缓存 + 跨Agent共享 + 熔断器
+│   │   ├── ledger_middleware.py      # 台账中间件：假设管理、P1阻塞、安全机制、offload
 │   │   ├── param_override_middleware.py  # 参数覆写中间件：strict注入 + flexible拦截
 │   │   ├── scope_guard_middleware.py  # 范围守卫中间件：namespace/node/pod范围检查
 │   │   ├── scope_limit.py            # 诊断范围限制：K8s API发现 + 控制面健康检查
@@ -1075,9 +1255,9 @@ diagnostics/
 │   │   └── kubernetes/              # K8s 集群故障报告（含 GPU）
 ├── test_cases/                       # 验证测试用例（不在agent文件系统中）
 ├── scripts/                          # 验证脚本
-│   ├── verify_param_override.py      # param_override middleware 9场景验证
-│   ├── verify_scope_limit.py         # scope_guard middleware 7场景验证
-│   └── verify_cross_round_e2e.py     # 跨轮去重端到端验证
+│   ├── verify_param_override.py      # param_override 9场景验证
+│   ├── verify_scope_limit.py         # scope_guard 7场景验证
+│   ├── verify_cross_round_e2e.py     # 去重+跨轮offload端到端验证
 ├── static/
 │   ├── index.html                   # 双栏布局页面
 │   ├── app.js                       # SSE消费 + 树可视化 + DeepSeek风格多轮折叠块
@@ -1114,15 +1294,17 @@ diagnostics/
 | 6 | `agent/scope_limit.py:discover()` | 通过 K8s client 查询 Pod → Node → Host 映射，实现 scope 自动发现 | **P1** |
 | 7 | `agent/scope_limit.py:get_control_plane_metrics()` | 查询监控 API 获取控制面内存指标，实现集群过载保护 | **P1** |
 
+> **无需改动的文件**：`dedup_middleware.py`、`ledger_middleware.py`、`param_override_middleware.py`、`scope_guard_middleware.py`、`offload_middleware.py` — 这些中间件与工具实现解耦，生产环境下直接复用。
+
 ### 移植关键约束
 
-| 约束 | 说明 | 违反后果 |
-|------|------|---------|
-| **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | P1 阻塞和 scope_guard 用 `frozenset` 硬编码工具名，不匹配则不生效 |
-| **参数名一致** | 同一工具的参数名在 mock/live 之间必须相同 | `param_override._param_map` 匹配不上，strict 注入失效 |
-| **必须用 `@tool`** | `_build_param_map` 依赖 `inspect.signature(fn)` | 参数未被识别，strict/flex 检查全部失效 |
-| **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty` | 去重缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
-| **错误格式** | 网络超时类错误需能被 `_TOOL_FAILURE_PATTERNS` 匹配（含 `timeout` / `connection refused`） | 工具熔断器不触发 → 连续失败不被阻断 |
+| 约束 | 说明 | 涉及中间件 | 违反后果 |
+|------|------|----------|---------|
+| **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | scope_guard, ledger(P1) | `frozenset` 硬编码工具名不匹配 → 拦截/守卫失效 |
+| **参数名一致** | 同一工具的参数名在 mock/live 之间必须相同 | param_override | `_param_map` 匹配不上 → strict 注入失效 |
+| **必须用 `@tool`** | `_build_param_map` 依赖 `inspect.signature(fn)` | param_override | 参数未被识别 → strict/flex 检查全部失效 |
+| **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty` | dedup | 缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
+| **错误格式** | 网络超时类错误需含 `timeout` / `connection refused` | dedup | `_TOOL_FAILURE_PATTERNS` 不匹配 → 熔断器不触发 |
 
 ### 工具参数签名对照
 
