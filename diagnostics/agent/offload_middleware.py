@@ -1,16 +1,24 @@
 """Tool offload middleware — configurable per-tool context compression.
 
-When a configured tool returns a result exceeding the token threshold,
-the full content is written to the shared backend filesystem and the
-ToolMessage is replaced with a compact head+tail preview plus the file
-path.  The LLM can then use built-in read_file / grep tools to retrieve
-specific information on demand.
+Uses `wrap_model_call` / `awrap_model_call` to scan messages right before
+they are sent to the LLM.  When a ToolMessage from a configured tool
+exceeds the token threshold, the full content is written to the shared
+backend filesystem and the in-request message is replaced with a compact
+head+tail preview plus the file path.  The LLM can then use built-in
+read_file / grep tools to retrieve specific information on demand.
+
+Because offloading runs in the *model-call* pipeline (not the *tool-execution*
+pipeline), it never interferes with other tool-execution middlewares such as
+ledger recording, dedup caching, or scope guarding.  Those middlewares always
+see the original, unmodified tool result.
 
 Design goals:
 - Only uses public langchain/deepagents APIs (no private _* imports)
 - Shares the same BackendProtocol instance as FilesystemMiddleware so
   that offloaded files are accessible via read_file / grep / ls
 - Configurable tool name set and per-tool token limit
+- Pipe-isolated: tool-execution middlewares see full results; the LLM
+  receives compressed previews — no ordering dependency.
 
 See: private/OFFLOAD_MIDDLEWARE_DESIGN.md (if created)
 """
@@ -19,18 +27,20 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import ToolMessage
-from langgraph.prebuilt.tool_node import ToolCallRequest
-from langgraph.types import Command
+from langchain_core.messages import AnyMessage, ToolMessage
 
 from deepagents.backends.protocol import BackendProtocol
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +136,17 @@ def _create_preview(lines: list[str], head: int, tail: int) -> tuple[str, str, i
 
 
 class ToolOffloadMiddleware(AgentMiddleware):
-    """Configurable per-tool offload middleware.
+    """Configurable per-tool offload middleware — runs in the model-call pipeline.
 
-    When a tool in `tool_names` returns a result exceeding `token_limit`
-    tokens, the full content is written to the shared backend filesystem
-    and the ToolMessage is replaced with a compact preview + file path.
+    When the agent is about to call the LLM, this middleware scans the
+    pending messages for oversized ToolMessages from configured diagnostic
+    tools.  Full content is written to the shared backend filesystem and
+    the in-request message is replaced with a compact head+tail preview.
+
+    Because the hook is `wrap_model_call` (not `awrap_tool_call`), the
+    original ToolMessage in LangGraph state is *never* modified.  Only the
+    copy sent to the LLM is compressed.  Tool-execution middlewares
+    (ledger, dedup, scope guard, etc.) always see the unaltered result.
 
     Args:
         tool_names: Set of tool names that should be subject to offload.
@@ -193,83 +209,160 @@ class ToolOffloadMiddleware(AgentMiddleware):
                 )
         return modified
 
-    # ── Tool call interception ─────────────────────────────────────────────
+    # ── Model-call interception (wrap_model_call pipeline) ──────────────
 
-    async def awrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
-    ) -> ToolMessage | Command:
-        """Intercept tool results and offload if configured and oversized."""
-        result = await handler(request)
+    # Tools whose results must never be offloaded (filesystem scaffolding).
+    # Offloading their results would create an infinite loop: read_file
+    # returns preview → LLM calls read_file again → preview again → ...
+    # Deepagents itself excludes these in its own TOO_LARGE_TOOL_MSG.
+    _OFFLOAD_BLACKLIST: frozenset[str] = frozenset({
+        "read_file", "write_file", "edit_file",
+        "grep", "glob", "ls",
+        "write_todos", "read_todos",
+    })
 
-        tool_name = request.tool_call.get("name", "")
+    # Sentinel string in offloaded messages to prevent double-offloading
+    # when wrap_model_call is invoked multiple times on the same messages
+    # (e.g. during SummarizationMiddleware retry-on-overflow).
+    _OFFLOAD_SENTINEL = "[Tool result offloaded]"
+
+    def _should_offload(self, msg: ToolMessage) -> bool:
+        """Return True if `msg` is a candidate for offloading.
+
+        Does NOT check size — callers are responsible for that fast-path.
+        """
+        tool_name = msg.name or ""
         if tool_name not in self._tool_names:
-            return result
+            return False
+        if tool_name in self._OFFLOAD_BLACKLIST:
+            return False
+        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+        if self._OFFLOAD_SENTINEL in content:
+            return False  # already offloaded
+        return True
 
-        # ── Never offload scaffolding / filesystem tools ──
-        # These tools let the LLM access file content — offloading their
-        # results would create an infinite loop: read_file returns preview,
-        # LLM calls read_file again to get full content, preview again, ...
-        # Deepagents itself excludes these in its TOO_LARGE_TOOL_MSG.
-        _OFFLOAD_BLACKLIST = frozenset({
-            "read_file", "write_file", "edit_file",
-            "grep", "glob", "ls",
-            "write_todos", "read_todos",
-        })
-        if tool_name in _OFFLOAD_BLACKLIST:
-            return result
+    def _try_offload_one_sync(self, msg: ToolMessage) -> ToolMessage:
+        """Check size and, if oversized, write to backend + return preview.
 
-        # Only process ToolMessage (skip Command objects from sub-agents)
-        if not isinstance(result, ToolMessage):
-            return result
-
-        content = result.content
-        if not isinstance(content, str):
-            content = str(content) if content else ""
-
-        # Fast-path: under the limit → no offload
+        Synchronous variant — uses `backend.write`.
+        """
+        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
         if len(content) <= self._char_limit:
-            return result
+            return msg
+        tool_name = msg.name or ""
+        tool_call_id = msg.tool_call_id or "unknown"
+        safe_id = _sanitize_id(tool_call_id)
+        file_path = f"{self._prefix}/{safe_id}"
 
-        # ── Offload triggered ──────────────────────────────────────────
-        return await self._offload(result, content, tool_name)
+        try:
+            write_result = self._backend.write(file_path, content)
+            if write_result is not None and write_result.error:
+                logger.warning("Offload write failed for %s: %s", tool_call_id, write_result.error)
+                return self._fallback_truncate(msg, content, tool_name)
+        except Exception:
+            logger.warning("Offload write exception for %s", tool_call_id, exc_info=True)
+            return self._fallback_truncate(msg, content, tool_name)
 
-    # ── Core offload logic ─────────────────────────────────────────────────
+        return self._build_offloaded_message(msg, content, tool_name, file_path)
 
-    async def _offload(
+    async def _try_offload_one_async(self, msg: ToolMessage) -> ToolMessage:
+        """Check size and, if oversized, write to backend + return preview.
+
+        Asynchronous variant — uses `backend.awrite`.
+        """
+        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+        if len(content) <= self._char_limit:
+            return msg
+        tool_name = msg.name or ""
+        tool_call_id = msg.tool_call_id or "unknown"
+        safe_id = _sanitize_id(tool_call_id)
+        file_path = f"{self._prefix}/{safe_id}"
+
+        try:
+            write_result = await self._backend.awrite(file_path, content)
+            if write_result is not None and write_result.error:
+                logger.warning("Offload write failed for %s: %s", tool_call_id, write_result.error)
+                return self._fallback_truncate(msg, content, tool_name)
+        except Exception:
+            logger.warning("Offload write exception for %s", tool_call_id, exc_info=True)
+            return self._fallback_truncate(msg, content, tool_name)
+
+        return self._build_offloaded_message(msg, content, tool_name, file_path)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """Scan messages for oversized tool results and offload before the LLM sees them.
+
+        Only the in-request message list is modified via `request.override`.
+        State messages are never touched, so tool-execution middlewares
+        (ledger, dedup, scope guard) always receive the original data.
+        """
+        messages = request.messages
+        if not messages:
+            return handler(request)
+
+        # Scan messages and replace oversized ToolMessages with previews.
+        modified = False
+        new_messages: list[AnyMessage] = []
+        for msg in messages:
+            if isinstance(msg, ToolMessage) and self._should_offload(msg):
+                replacement = self._try_offload_one_sync(msg)
+                if replacement is not msg:
+                    modified = True
+                new_messages.append(replacement)
+            else:
+                new_messages.append(msg)
+
+        if modified:
+            return handler(request.override(messages=new_messages))
+        return handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """Async variant of `wrap_model_call`."""
+        messages = request.messages
+        if not messages:
+            return await handler(request)
+
+        modified = False
+        new_messages: list[AnyMessage] = []
+        for msg in messages:
+            if isinstance(msg, ToolMessage) and self._should_offload(msg):
+                replacement = await self._try_offload_one_async(msg)
+                if replacement is not msg:
+                    modified = True
+                new_messages.append(replacement)
+            else:
+                new_messages.append(msg)
+
+        if modified:
+            return await handler(request.override(messages=new_messages))
+        return await handler(request)
+
+    # ── Core offload logic (shared by sync + async paths) ───────────────
+
+    def _build_offloaded_message(
         self,
         original: ToolMessage,
         content: str,
         tool_name: str,
+        file_path: str,
     ) -> ToolMessage:
-        """Write full content to backend and return a preview replacement."""
+        """Build a replacement ToolMessage with preview (pure, no I/O)."""
         tool_call_id = original.tool_call_id or "unknown"
-        safe_id = _sanitize_id(tool_call_id)
-        file_path = f"{self._prefix}/{safe_id}"
 
-        # Write to the shared backend filesystem
-        try:
-            write_result = await self._backend.awrite(file_path, content)
-            if write_result is not None and write_result.error:
-                logger.warning(
-                    "Offload write failed for %s: %s", tool_call_id, write_result.error,
-                )
-                # Fall back to truncated content in-place (no file)
-                return self._fallback_truncate(original, content, tool_name)
-        except Exception as e:
-            logger.warning("Offload write exception for %s: %s", tool_call_id, e)
-            return self._fallback_truncate(original, content, tool_name)
-
-        # Build preview
         lines = content.splitlines()
         total_lines = len(lines)
         approx_tokens = total_lines * 20  # rough estimate
         head_preview, tail_preview, skipped = _create_preview(
             lines, self._head_lines, self._tail_lines,
         )
-
-        # Build keyword hint for this tool (if configured)
         keyword_hint = self._build_keyword_hint(tool_name, file_path)
 
         if not tail_preview:
@@ -303,7 +396,6 @@ class ToolOffloadMiddleware(AgentMiddleware):
             tool_name, tool_call_id, file_path, total_lines,
         )
 
-        # Build replacement ToolMessage preserving identity fields
         return ToolMessage(
             content=notice,
             tool_call_id=original.tool_call_id,
@@ -356,4 +448,5 @@ class ToolOffloadMiddleware(AgentMiddleware):
             name=original.name,
             id=original.id,
             status=original.status,
+            additional_kwargs=dict(original.additional_kwargs),
         )

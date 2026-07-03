@@ -2,7 +2,7 @@
 
 This script demonstrates the complete offload lifecycle:
 1. Simulate a diagnostic tool returning a large result (mock Pod logs)
-2. ToolOffloadMiddleware intercepts → writes to backend → returns preview
+2. ToolOffloadMiddleware.awrap_model_call scans messages → writes to backend → returns preview
 3. Verify the full content is accessible via backend.read() (read_file)
 4. Verify keyword search works via backend.grep() (grep)
 
@@ -17,7 +17,7 @@ import textwrap
 from unittest.mock import MagicMock
 
 from deepagents.backends import FilesystemBackend
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
 
@@ -67,14 +67,30 @@ def _generate_fake_pod_logs(lines: int = 600) -> str:
     return "\n".join(log_lines)
 
 
-# ── Fake ToolCallRequest ────────────────────────────────────────────────────
+# ── Fake ModelRequest for wrap_model_call testing ───────────────────────────
 
-class FakeToolCallRequest:
-    """Minimal stand-in for ToolCallRequest used in simulation."""
+class FakeModelRequest:
+    """Minimal stand-in for ModelRequest used in simulation."""
 
-    def __init__(self, name: str, tool_call_id: str, args: dict | None = None):
-        self.tool_call = {"name": name, "id": tool_call_id, "args": args or {}}
+    def __init__(self, messages: list):
+        self.messages: list = list(messages)
+        self.system_message = None
+        self.tools = []
+        self.state = {}
         self.runtime = MagicMock()
+
+    def override(self, **kwargs):
+        """Return a new FakeModelRequest with overridden fields."""
+        new = FakeModelRequest(self.messages)
+        new.system_message = self.system_message
+        new.tools = self.tools
+        new.state = self.state
+        new.runtime = self.runtime
+        if "messages" in kwargs:
+            new.messages = kwargs["messages"]
+        if "system_message" in kwargs:
+            new.system_message = kwargs["system_message"]
+        return new
 
 
 # ── Main simulation ─────────────────────────────────────────────────────────
@@ -110,27 +126,34 @@ async def main():
         name="get_pod_logs",
     )
 
-    request = FakeToolCallRequest(
-        name="get_pod_logs",
-        tool_call_id="call_abc123def456",
-        args={"pod_name": "my-app-7b9d4f-xk2lp", "namespace": "production"},
-    )
+    # 3. Build a ModelRequest with the large ToolMessage (preceded by an AIMessage
+    #    with the tool call, simulating a realistic message history).
+    request = FakeModelRequest(messages=[
+        AIMessage(content="Let me check the pod logs", tool_calls=[]),
+        original_msg,
+    ])
 
-    # 3. Handler that returns the large result
+    # 4. Handler that simulates the LLM call — returns a trivial ModelResponse.
+    captured_messages = []
+
     async def handler(req):
-        return original_msg
+        captured_messages.clear()
+        captured_messages.extend(req.messages)
+        return MagicMock()  # stand-in for ModelResponse
 
-    # 4. Run through middleware
-    result = await middleware.awrap_tool_call(request, handler)
+    # 5. Run through middleware's awrap_model_call
+    await middleware.awrap_model_call(request, handler)
 
-    assert isinstance(result, ToolMessage), "Result should be a ToolMessage"
+    assert len(captured_messages) == 2, "Should have 2 messages"
+    result = captured_messages[-1]
+    assert isinstance(result, ToolMessage), "Last message should be a ToolMessage"
     print(f"\n{'='*72}")
     print(f"📋 MIDDLEWARE OUTPUT (what LLM sees):")
     print(f"{'='*72}")
     print(result.content)
     print(f"{'='*72}")
 
-    # 5. Verify the offloaded file is readable via backend
+    # 6. Verify the offloaded file is readable via backend
     offload_path = "/large_tool_results/call_abc123def456"
     print(f"\n🔍 Verifying read_file access to: {offload_path}")
     read_result = backend.read(offload_path, offset=0, limit=10)
@@ -143,7 +166,7 @@ async def main():
         for line in lines[:5]:
             print(f"      {line}")
 
-    # 6. Verify grep works on the offloaded file
+    # 7. Verify grep works on the offloaded file
     print(f"\n🔍 Verifying grep access (searching for 'OOMKilled')...")
     grep_result = backend.grep("OOMKilled", path="/large_tool_results/")
     if grep_result.error:
@@ -155,7 +178,7 @@ async def main():
     else:
         print(f"   ⚠️  grep returned no matches (unexpected)")
 
-    # 7. Verify grep for Java OOM
+    # 8. Verify grep for Java OOM
     print(f"\n🔍 Verifying grep (searching for 'OutOfMemoryError')...")
     grep_result2 = backend.grep("OutOfMemoryError", path="/large_tool_results/")
     if grep_result2.matches:
@@ -163,30 +186,58 @@ async def main():
         for m in grep_result2.matches[:3]:
             print(f"      Line {m['line']}: {m['text'][:80]}...")
 
-    # 8. Test: tool NOT in offload list → passes through
+    # 9. Test: tool NOT in offload list → passes through
     print(f"\n{'='*72}")
     print("📋 Testing non-configured tool (pass-through)")
     print(f"{'='*72}")
-    small_request = FakeToolCallRequest(name="ls", tool_call_id="call_xyz789")
-    small_content = "file1.txt\nfile2.txt\nfile3.txt"
+    small_msg = ToolMessage(content="file1.txt\nfile2.txt\nfile3.txt", tool_call_id="call_xyz789", name="ls")
+    small_request = FakeModelRequest(messages=[small_msg])
+    captured_small = []
 
     async def small_handler(req):
-        return ToolMessage(content=small_content, tool_call_id="call_xyz789", name="ls")
+        captured_small.clear()
+        captured_small.extend(req.messages)
+        return MagicMock()
 
-    small_result = await middleware.awrap_tool_call(small_request, small_handler)
-    assert small_result.content == small_content
-    print(f"   ✅ 'ls' tool passed through unchanged: {small_result.content!r}")
+    await middleware.awrap_model_call(small_request, small_handler)
+    assert captured_small[0].content == "file1.txt\nfile2.txt\nfile3.txt"
+    print(f"   ✅ 'ls' tool passed through unchanged: {captured_small[0].content!r}")
 
-    # 9. Test: configured tool but small result → passes through
+    # 10. Test: configured tool but small result → passes through
     print(f"\n📋 Testing configured tool with small result (no offload)")
-    small_pod_request = FakeToolCallRequest(name="get_pod_logs", tool_call_id="call_small001")
+    small_pod_msg = ToolMessage(content="All pods healthy", tool_call_id="call_small001", name="get_pod_logs")
+    small_pod_request = FakeModelRequest(messages=[small_pod_msg])
+    captured_small_pod = []
 
     async def small_pod_handler(req):
-        return ToolMessage(content="All pods healthy", tool_call_id="call_small001", name="get_pod_logs")
+        captured_small_pod.clear()
+        captured_small_pod.extend(req.messages)
+        return MagicMock()
 
-    small_pod_result = await middleware.awrap_tool_call(small_pod_request, small_pod_handler)
-    assert small_pod_result.content == "All pods healthy"
-    print(f"   ✅ Small get_pod_logs passed through: {small_pod_result.content!r}")
+    await middleware.awrap_model_call(small_pod_request, small_pod_handler)
+    assert captured_small_pod[0].content == "All pods healthy"
+    print(f"   ✅ Small get_pod_logs passed through: {captured_small_pod[0].content!r}")
+
+    # 11. Test: already-offloaded message → not double-offloaded
+    print(f"\n📋 Testing idempotency (already-offloaded message)")
+    already_offloaded = ToolMessage(
+        content="[Tool result offloaded] The result of tool call \"call_dup\" (get_pod_logs) was saved to:\n  /large_tool_results/call_dup\n",
+        tool_call_id="call_dup",
+        name="get_pod_logs",
+    )
+    dup_request = FakeModelRequest(messages=[already_offloaded])
+    captured_dup = []
+
+    async def dup_handler(req):
+        captured_dup.clear()
+        captured_dup.extend(req.messages)
+        return MagicMock()
+
+    await middleware.awrap_model_call(dup_request, dup_handler)
+    assert "[Tool result offloaded]" in captured_dup[0].content
+    # Content should be unchanged (no second offload)
+    assert captured_dup[0].content == already_offloaded.content
+    print(f"   ✅ Already-offloaded message passed through unchanged (no double-offload)")
 
     # Summary
     print(f"\n{'='*72}")
@@ -195,11 +246,14 @@ async def main():
     print(textwrap.dedent(f"""
     Key findings:
     1. Large tool results → written to /large_tool_results/{{tool_call_id}}
-    2. LLM receives compact head+tail preview + file path
+    2. LLM receives compact head+tail preview + file path (via wrap_model_call)
     3. LLM can use read_file(path, offset, limit) to page through content
     4. LLM can use grep(pattern, path) to find specific keywords
     5. Non-configured tools pass through unchanged
     6. Small results (below threshold) pass through unchanged
+    7. Already-offloaded messages are not double-offloaded (idempotent)
+    8. Tool-execution middlewares (ledger, dedup) are unaffected — offload
+       runs in the model-call pipeline, not the tool-execution pipeline.
 
     Temp directory: {_TEMP_DIR}
     """))

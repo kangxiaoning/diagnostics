@@ -411,7 +411,7 @@ def build_agent(
 
     # Parameter override middleware — enforces correct tool call arguments
     # by replacing LLM-invented values with pre-configured session metadata.
-    # Must run BEFORE ledger middleware so dedup/offload sees corrected args.
+    # Must run BEFORE ledger middleware so dedup sees corrected args.
     param_middleware = ToolParamOverrideMiddleware(
         config=param_overrides, tools=all_tools,
     ) if param_overrides else None
@@ -419,7 +419,7 @@ def build_agent(
     # Tool dedup middleware — prevents duplicate tool calls (same name+args)
     # within a session, with circuit breaker for repeated failures and
     # cross-agent cache sharing via shared_backend.
-    # Must run BEFORE ledger so cache hits bypass P1 blocking + offload.
+    # Must run BEFORE ledger so cache hits bypass P1 blocking.
     dedup_middleware = ToolDedupMiddleware(backend=shared_backend)
     dedup_subagent = ToolDedupMiddleware.for_subagent(dedup_middleware)
 
@@ -439,6 +439,11 @@ def build_agent(
     # The LLM can then use read_file/grep to retrieve specific information.
     # hint_keywords provides per-tool search suggestions (starting points,
     # not exhaustive — the LLM is free to explore other patterns).
+    #
+    # Pipe-isolated: runs in the `wrap_model_call` pipeline (not
+    # `awrap_tool_call`).  Tool-execution middlewares (ledger, dedup,
+    # scope guard) always see the original, unmodified tool result.
+    # Ordering relative to those middlewares is irrelevant.
     offload_middleware = ToolOffloadMiddleware(
         tool_names={
             # Host diagnostic tools (may return large outputs)
