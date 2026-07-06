@@ -2,7 +2,7 @@
 
 Validates:
   1. Strict override — container: cluster_name, start_time, end_time
-  2. Strict override — host: name_chunk, start_time, end_time
+  2. Strict override — host: hostname, start_time, end_time
   3. Flexible trust: LLM-provided values passed through
   4. Flexible block: missing non-strict params → blocked
   5. Scaffolding skip: task, write_file, ledger tools pass through
@@ -72,8 +72,8 @@ async def test_strict_override_container():
     }
     mw = ToolParamOverrideMiddleware(config=config, tools=[query_argus_nodes])
 
-    # LLM invents wrong name_chunk; start_time omitted
-    req = _make_request("query_argus_nodes", "c1", {"name_chunk": "wrong-cluster"})
+    # LLM invents wrong hostname; start_time omitted
+    req = _make_request("query_argus_nodes", "c1", {"hostname": "wrong-cluster"})
     captured_args = {}
 
     async def handler(r):
@@ -85,9 +85,9 @@ async def test_strict_override_container():
     # strict params injected even though LLM omitted them
     assert captured_args.get("start_time") == "2026-07-01 15:00:00"
     assert captured_args.get("end_time") == "2026-07-01 15:10:00"
-    # name_chunk is not in strict set for container → trusted as-is
-    assert captured_args.get("name_chunk") == "wrong-cluster"
-    print("  ✓ Container strict: start_time/end_time injected, name_chunk trusted")
+    # hostname is not in strict set for container → trusted as-is
+    assert captured_args.get("hostname") == "wrong-cluster"
+    print("  ✓ Container strict: start_time/end_time injected, hostname trusted")
 
 
 async def test_flexible_block_on_missing():
@@ -193,14 +193,14 @@ async def test_strict_params_override_llm_wrong():
 # ═════════════════════════════════════════════════════════════════
 
 async def test_strict_override_host():
-    """LLM invents wrong name_chunk → overridden; start_time/end_time injected."""
+    """LLM invents wrong hostname → overridden; start_time/end_time injected."""
     from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
     from diagnostics.tools.mock.argus import query_argus_memory
     from langchain_core.messages import ToolMessage
 
     config = {
         "task_type": "host",
-        "name_chunk": "prod-web-01",
+        "hostname": "prod-web-01",
         "fault_time_range": {
             "start_time": "2026-07-01 18:10:00",
             "end_time": "2026-07-01 18:17:00",
@@ -208,7 +208,7 @@ async def test_strict_override_host():
     }
     mw = ToolParamOverrideMiddleware(config=config, tools=[query_argus_memory])
 
-    req = _make_request("query_argus_memory", "h1", {"name_chunk": "wrong-host"})
+    req = _make_request("query_argus_memory", "h1", {"hostname": "wrong-host"})
     captured = {}
 
     async def handler(r):
@@ -217,10 +217,10 @@ async def test_strict_override_host():
 
     result = await mw.awrap_tool_call(req, handler)
     assert result.content == "mem data"
-    assert captured["name_chunk"] == "prod-web-01"
+    assert captured["hostname"] == "prod-web-01"
     assert captured.get("start_time") == "2026-07-01 18:10:00"
     assert captured.get("end_time") == "2026-07-01 18:17:00"
-    print("  ✓ Host strict: name_chunk + start/end_time overridden + injected")
+    print("  ✓ Host strict: hostname + start/end_time overridden + injected")
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -263,7 +263,7 @@ async def test_no_config():
 
     mw = ToolParamOverrideMiddleware(config={}, tools=[query_argus_nodes])
 
-    req = _make_request("query_argus_nodes", "nc1", {"name_chunk": "test"})
+    req = _make_request("query_argus_nodes", "nc1", {"hostname": "test"})
     result = await mw.awrap_tool_call(req, _ok_handler)
     assert result.content == "ok"
     print("  ✓ No config: empty config → pass through")
@@ -323,7 +323,7 @@ async def test_update_config():
     mw = ToolParamOverrideMiddleware(config=config_a, tools=[query_argus_nodes])
 
     # First call with old config
-    req1 = _make_request("query_argus_nodes", "uc1", {"name_chunk": "test"})
+    req1 = _make_request("query_argus_nodes", "uc1", {"hostname": "test"})
     captured1 = {}
     async def h1(r):
         captured1.update(r.tool_call.get("args", {}))
@@ -342,7 +342,7 @@ async def test_update_config():
     })
 
     # Second call with new config
-    req2 = _make_request("query_argus_nodes", "uc2", {"name_chunk": "test"})
+    req2 = _make_request("query_argus_nodes", "uc2", {"hostname": "test"})
     captured2 = {}
     async def h2(r):
         captured2.update(r.tool_call.get("args", {}))

@@ -15,8 +15,6 @@ from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
 from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
-from diagnostics.agent.scope_guard_middleware import ScopeGuardMiddleware
-from diagnostics.agent.scope_limit import ScopeLimit
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -363,7 +361,6 @@ def build_agent(
     ledger_path: str = "",
     entity_type: str = "",
     param_overrides: dict | None = None,
-    diagnostic_scope: ScopeLimit | None = None,
 ):
     settings = settings or Settings.from_env()
 
@@ -409,9 +406,10 @@ def build_agent(
             if t not in all_tools:
                 all_tools.append(t)
 
-    # Parameter override middleware — enforces correct tool call arguments
-    # by replacing LLM-invented values with pre-configured session metadata.
-    # Must run BEFORE ledger middleware so dedup sees corrected args.
+    # Parameter override middleware — full replacement of tool call arguments
+    # with frontend-provided values.  All matching params are unconditionally
+    # overwritten, regardless of what the LLM generates.
+    # Must run BEFORE dedup middleware so dedup sees corrected args.
     param_middleware = ToolParamOverrideMiddleware(
         config=param_overrides, tools=all_tools,
     ) if param_overrides else None
@@ -441,8 +439,8 @@ def build_agent(
     # not exhaustive — the LLM is free to explore other patterns).
     #
     # Pipe-isolated: runs in the `wrap_model_call` pipeline (not
-    # `awrap_tool_call`).  Tool-execution middlewares (ledger, dedup,
-    # scope guard) always see the original, unmodified tool result.
+    # `awrap_tool_call`).  Tool-execution middlewares (ledger, dedup)
+    # always see the original, unmodified tool result.
     # Ordering relative to those middlewares is irrelevant.
     offload_middleware = ToolOffloadMiddleware(
         tool_names={
@@ -493,17 +491,11 @@ def build_agent(
         },
     )
 
-    # Scope guard middleware — enforces that tool calls only access
-    # resources within the pre-discovered diagnostic scope (namespace,
-    # node, pod).  Must run AFTER param_override (sees corrected args)
-    # and BEFORE ledger (so blocked calls don't waste dedup slots).
-    scope_guard = ScopeGuardMiddleware(scope=diagnostic_scope) if diagnostic_scope else None
-
     # ── Inject all shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     _subagent_middleware = [
-        m for m in [param_middleware, scope_guard, dedup_subagent, subagent_ledger, offload_middleware]
+        m for m in [param_middleware, dedup_subagent, subagent_ledger, offload_middleware]
         if m is not None
     ]
     if _subagent_middleware:
@@ -518,6 +510,6 @@ def build_agent(
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[m for m in [param_middleware, scope_guard, dedup_middleware, ledger_middleware, offload_middleware] if m is not None],
+        middleware=[m for m in [param_middleware, dedup_middleware, ledger_middleware, offload_middleware] if m is not None],
         state_schema=DiagnosisLedgerState,
     )

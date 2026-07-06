@@ -60,45 +60,20 @@ function buildParamOverrides() {
   if (type === "container") {
     const cn = document.getElementById("paramClusterName").value.trim();
     const ns = document.getElementById("paramNamespace").value.trim();
+    const wt = document.getElementById("paramWorkloadType").value;
+    const wn = document.getElementById("paramWorkloadName").value.trim();
     const pn = document.getElementById("paramPodName").value.trim();
     if (cn) overrides.cluster_name = cn;
     if (ns) overrides.namespace = ns;
+    if (wt) overrides.workload_type = wt;
+    if (wn) overrides.workload_name = wn;
     if (pn) overrides.pod_name = pn;
   } else if (type === "host") {
-    const nc = document.getElementById("paramNameChunk").value.trim();
-    if (nc) overrides.name_chunk = nc;
+    const nc = document.getElementById("paramHostname").value.trim();
+    if (nc) overrides.hostname = nc;
   }
 
   return overrides;
-}
-
-function buildDiagnosticScope() {
-  const type = taskTypeEl.value;
-  if (type !== "container") return null;
-
-  const cluster_name = document.getElementById("paramClusterName").value.trim();
-  const namespace = document.getElementById("paramNamespace").value.trim();
-  const workload_type = document.getElementById("paramWorkloadType").value;
-  const workload_name = document.getElementById("paramWorkloadName").value.trim();
-  const pod_name = document.getElementById("paramPodName").value.trim();
-  const start_time = document.getElementById("paramStartTime").value;
-  const end_time = document.getElementById("paramEndTime").value;
-
-  // All fields are required for container diagnosis
-  if (!cluster_name || !namespace || !workload_type ||
-      !workload_name || !pod_name || !start_time || !end_time) {
-    return null;
-  }
-
-  return {
-    cluster_name,
-    allowed_namespace: namespace,
-    allowed_nodename: [],
-    allowed_hostname: [],
-    allowed_podname: [pod_name],
-    start_time: start_time.replace("T", " ") + ":00",
-    end_time: end_time.replace("T", " ") + ":00",
-  };
 }
 
 // ═══════════════════ Skills Registry (fetched from API) ═══════════════════
@@ -777,11 +752,10 @@ formEl.addEventListener("submit", async (e) => {
         entity_name: (() => {
           const t = taskTypeEl.value;
           if (t === "container") return document.getElementById("paramClusterName").value.trim();
-          if (t === "host") return document.getElementById("paramNameChunk").value.trim();
+          if (t === "host") return document.getElementById("paramHostname").value.trim();
           return "";
         })(),
         param_overrides: buildParamOverrides(),
-        diagnostic_scope: buildDiagnosticScope(),
       }),
       signal: controller.signal,
     });

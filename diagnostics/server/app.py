@@ -296,45 +296,6 @@ async def _chat_event_stream(
     if os.getenv("DIAGNOSTICS_MODE", "mock") == "mock":
         _auto_set_scenario(request.message)
 
-    # ── Pre-diagnosis: scope discovery + control plane health check ──
-    diagnostic_scope = None
-    if request.diagnostic_scope:
-        from diagnostics.agent.scope_limit import ScopeLimit
-
-        scope_input = request.diagnostic_scope
-
-        # Control plane health check — reject if cluster is under stress.
-        mem_usage, mem_free = ScopeLimit.get_control_plane_metrics(
-            scope_input.cluster_name,
-        )
-        safe, reason = ScopeLimit.check_control_plane(mem_usage, mem_free)
-        if not safe:
-            logger.warning(
-                "[session=%s] Control plane health check FAILED: %s",
-                session_id, reason,
-            )
-            yield sse("error", {"message": reason})
-            return
-
-        # Discover affected nodes/hosts from the target workload.
-        diagnostic_scope = ScopeLimit.discover(
-            cluster_name=scope_input.cluster_name,
-            namespace=scope_input.allowed_namespace,
-            pod_name=(
-                scope_input.allowed_podname[0]
-                if scope_input.allowed_podname else ""
-            ),
-            start_time=scope_input.start_time,
-            end_time=scope_input.end_time,
-        )
-        logger.info(
-            "[session=%s] Scope discovered: ns=%s nodes=%d pods=%d",
-            session_id,
-            diagnostic_scope.allowed_namespace,
-            len(diagnostic_scope.allowed_nodename),
-            len(diagnostic_scope.allowed_podname),
-        )
-
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
     ledger_path = _make_ledger_path(report_path)
@@ -345,7 +306,6 @@ async def _chat_event_stream(
         ledger_path=ledger_path,
         entity_type=request.entity_type,
         param_overrides=request.param_overrides,
-        diagnostic_scope=diagnostic_scope,
     )
 
     state.messages.append(HumanMessage(content=request.message))

@@ -93,11 +93,11 @@ assert k5 != k6, "FAIL: 不同工具应生成不同 key"
 
 k7 = _make_cache_key(
     "query_argus_cpu",
-    {"name_chunk": "prod-web-01", "start_time": "15:00", "end_time": "15:09"},
+    {"hostname": "prod-web-01", "start_time": "15:00", "end_time": "15:09"},
 )
 k8 = _make_cache_key(
     "query_argus_cpu",
-    {"name_chunk": "prod-web-01", "start_time": "15:00", "end_time": "15:10"},
+    {"hostname": "prod-web-01", "start_time": "15:00", "end_time": "15:10"},
 )
 assert k7 != k8, "FAIL: 不同时间窗口应生成不同 key"
 
