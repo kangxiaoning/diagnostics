@@ -2,8 +2,10 @@
 
 This middleware:
 1. P0: In-memory cache — blocks identical (name, args) calls in same session
-2. Circuit breaker — auto-escalates after consecutive failures of same tool
-3. Cross-agent dedup — persists results to shared backend so subagents and
+2. P1: In-flight dedup — concurrent identical calls wait for the first instead
+   of executing in parallel (handles LangGraph ToolNode parallel execution)
+3. Circuit breaker — auto-escalates after consecutive failures of same tool
+4. Cross-agent dedup — persists results to shared backend so subagents and
    Coordinator can share cached results
 
 Extracted from DiagnosisLedgerMiddleware to keep ledger focused on
@@ -12,6 +14,7 @@ hypothesis management.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -130,12 +133,17 @@ class ToolDedupMiddleware(AgentMiddleware):
         _tool_call_cache: In-memory cache, keyed by tool_name + sorted
             args JSON.  Value is (ToolMessage, failure_count): 0 = success,
             >0 = consecutive failures.
+        _in_flight: Tracks currently executing calls so that concurrent
+            identical calls (from single LLM response) wait for the first
+            instead of executing in parallel.
     """
 
     def __init__(self, backend: BackendProtocol | None = None) -> None:
         self._backend = backend
         # In-memory cache shared across agents via for_subagent()
         self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
+        # In-flight futures shared across agents via for_subagent()
+        self._in_flight: dict[str, asyncio.Future] = {}
         logger.info(
             "ToolDedupMiddleware: backend=%s, breaker=%d",
             "enabled" if backend else "disabled",
@@ -146,15 +154,57 @@ class ToolDedupMiddleware(AgentMiddleware):
     def for_subagent(cls, coordinator: "ToolDedupMiddleware") -> "ToolDedupMiddleware":
         """Create a subagent instance that shares the Coordinator's cache.
 
-        Subagents and the Coordinator share the same in-memory cache so
-        that a tool call made by the Coordinator is deduplicated when a
-        subagent tries the same call, and vice versa.
+        Subagents and the Coordinator share the same in-memory cache
+        and in-flight tracker so that a tool call made by the Coordinator
+        is deduplicated when a subagent tries the same call, and vice versa.
         """
         instance = cls(backend=coordinator._backend)
         instance._tool_call_cache = coordinator._tool_call_cache
+        instance._in_flight = coordinator._in_flight
         return instance
 
     # ── Tool call interception ─────────────────────────────────────────
+
+    async def _execute_and_cache(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
+        cache_key: str,
+    ) -> ToolMessage | Command:
+        """Execute tool call and populate cache for both memory and backend."""
+        result = await handler(request)
+
+        if isinstance(result, ToolMessage):
+            content = result.content if isinstance(result.content, str) else str(result.content)
+
+            if not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
+                logger.debug("Skipped caching empty/error result: %s", cache_key)
+            else:
+                fail_count = 1 if _is_tool_failure(content) else 0
+                self._tool_call_cache[cache_key] = (result, fail_count)
+
+            # Persist to shared_backend for cross-agent dedup
+            if self._backend and content and not (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
+                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+                try:
+                    await self._backend.awrite(backend_key, content)
+                except Exception:
+                    pass  # best-effort; memory cache still works
+
+        return result
+
+    def _cached_result(
+        self,
+        cache_key: str,
+        tool_call_id: str,
+    ) -> ToolMessage:
+        """Return a fresh ToolMessage from the in-memory cache entry."""
+        cached_msg, _ = self._tool_call_cache[cache_key]
+        return ToolMessage(
+            content=cached_msg.content,
+            tool_call_id=tool_call_id,
+            name=cached_msg.name,
+        )
 
     async def awrap_tool_call(
         self,
@@ -176,11 +226,7 @@ class ToolDedupMiddleware(AgentMiddleware):
             cached_msg, fail_count = self._tool_call_cache[cache_key]
             if fail_count == 0:
                 logger.info("去重命中: %s", cache_key)
-                return ToolMessage(
-                    content=cached_msg.content,
-                    tool_call_id=tool_call_id,
-                    name=cached_msg.name,
-                )
+                return self._cached_result(cache_key, tool_call_id)
             # Previous call(s) failed → this is a retry
             if fail_count >= _TOOL_FAILURE_BREAKER:
                 logger.warning("熔断: %s (连续失败%d次)", cache_key, fail_count)
@@ -207,6 +253,27 @@ class ToolDedupMiddleware(AgentMiddleware):
                 name=cached_msg.name,
             )
 
+        # ── P1: In-flight dedup — concurrent duplicate → skip ──
+        # When the LLM generates multiple identical tool calls in a single
+        # response, only the first executes.  Duplicates return a minimal
+        # skip message so the LLM context is not polluted with repeated data.
+        if cache_key in self._in_flight:
+            logger.info("去重跳过（并发）: %s", cache_key)
+            # Still wait for the first call to complete so its result is
+            # cached for future cross-round dedup.
+            try:
+                await self._in_flight[cache_key]
+            except Exception:
+                pass  # first call failed; its result will be handled by P0
+            return ToolMessage(
+                content=(
+                    f"[系统] {tool_name} 重复调用已跳过，"
+                    f"同批次中已有相同参数的调用，结果以首次调用为准。"
+                ),
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
+
         # ── Cross-agent dedup via shared_backend ──
         if self._backend:
             backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
@@ -214,9 +281,6 @@ class ToolDedupMiddleware(AgentMiddleware):
                 cached_content = await self._backend.aread(backend_key)
             except Exception:
                 cached_content = None
-            # StateBackend.aread() returns ReadResult(error=...) for
-            # missing keys — NOT None.  Treat error responses as a
-            # cache miss so the tool actually executes.
             if cached_content is not None and not (
                 isinstance(cached_content, ReadResult) and cached_content.error
             ):
@@ -231,25 +295,25 @@ class ToolDedupMiddleware(AgentMiddleware):
                 self._tool_call_cache[cache_key] = (restored, 0)
                 return restored
 
-        # ── Execute tool ──
-        result = await handler(request)
-
-        # ── Cache result with failure tracking ──
-        if isinstance(result, ToolMessage):
-            content = result.content if isinstance(result.content, str) else str(result.content)
-
-            if not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
-                logger.debug("Skipped caching empty/error result: %s", cache_key)
-            else:
-                fail_count = 1 if _is_tool_failure(content) else 0
-                self._tool_call_cache[cache_key] = (result, fail_count)
-
-            # ── Persist to shared_backend for cross-agent dedup ──
-            if self._backend and content and not (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
-                backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
-                try:
-                    await self._backend.awrite(backend_key, content)
-                except Exception:
-                    pass  # best-effort; memory cache still works
-
-        return result
+        # ── Register in-flight → execute → cache → signal waiters ──
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._in_flight[cache_key] = future
+        try:
+            result = await self._execute_and_cache(request, handler, cache_key)
+            # On success, resolve the future so waiters can proceed.
+            # Use a local reference because a nested subagent call may
+            # have already cleaned up the _in_flight entry.
+            if not future.done():
+                future.set_result(None)
+            return result
+        except Exception:
+            # On failure, resolve with exception so waiters get unblocked
+            # and can re-execute (cache was not populated for failures).
+            if not future.done():
+                future.set_exception(
+                    RuntimeError("In-flight call failed")
+                )
+            raise
+        finally:
+            self._in_flight.pop(cache_key, None)
