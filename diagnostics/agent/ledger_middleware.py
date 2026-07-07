@@ -1092,12 +1092,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )
 
         # ── Post-response: detect REPORT-phase stall ──
-        # If the model returned no tool calls while in REPORT phase
-        # (without having called write_file), auto-generate the report
-        # from ledger evidence.  Without this safety net, the agent
-        # loop exits with report=null and no .md file is created.
-        # This is the REPORT-phase equivalent of the verify-phase
-        # stall detection above (L410-451).
+        # Two-level escalation (mirrors verify-phase 3-level approach):
+        #   1st stall → force continuation via SystemMessage (LLM gets
+        #     another chance to call write_file with full ledger context)
+        #   2nd+ stall → auto-generate report from ledger evidence as
+        #     last-resort safety net (guarantees .md exists)
         ledger = self._current_ledger
         if ledger and ledger.get("current_phase") == "report":
             ai_msgs = [
@@ -1106,36 +1105,76 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             ]
             has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
             if not has_tool_calls and not ledger.get("report"):
-                # LLM exited REPORT without write_file — auto-generate
-                report_md = self._generate_report_from_ledger(ledger)
-                ledger["report"] = report_md
+                rounds_in_report = (
+                    self._model_call_count
+                    - max(self._report_phase_start_round, 1)
+                )
+                if rounds_in_report < 2:
+                    # ── Level 1: Force LLM to retry write_file ──
+                    logger.warning(
+                        "Safety: REPORT stall level-1 (round %d, %d round(s) "
+                        "in REPORT without write_file) — forcing "
+                        "continuation via SystemMessage",
+                        self._model_call_count, rounds_in_report,
+                    )
+                    from langchain_core.messages import SystemMessage
+                    return ExtendedModelResponse(
+                        model_response=response,
+                        additional_messages=[
+                            SystemMessage(
+                                content=(
+                                    "⛔ [系统强制] 已进入 REPORT 阶段，"
+                                    "但你尚未调用 write_file 生成诊断报告。\n"
+                                    "禁止输出纯文本分析，禁止调用任何诊断工具。\n"
+                                    f"必须立即调用 write_file 将诊断报告写入"
+                                    f" {self.report_path}。\n"
+                                    "请基于上方 <diagnosis_ledger> 中的完整"
+                                    "证据链和根因结论生成报告，包含：\n"
+                                    "1. 故障摘要\n"
+                                    "2. 关键发现时间线\n"
+                                    "3. 根因分析（含置信度和证据链）\n"
+                                    "4. 影响范围\n"
+                                    "5. 修复建议\n"
+                                    "6. 附录（诊断方法、限制说明）\n\n"
+                                    "若不调用 write_file，系统将在下一轮自动"
+                                    "生成报告（可能不完整）。"
+                                ),
+                            ),
+                        ],
+                    )
+                else:
+                    # ── Level 2: Auto-generate as last resort ──
+                    report_md = self._generate_report_from_ledger(ledger)
+                    ledger["report"] = report_md
 
-                # Write .md to filesystem at canonical report_path
-                if self.report_path:
-                    try:
-                        import pathlib as _pathlib
-                        vpath = self.report_path
-                        real_path = vpath.replace(
-                            "/agent_data/",
-                            str(self._AGENT_DATA_REAL) + "/",
-                        )
-                        path = _pathlib.Path(real_path)
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(report_md, encoding="utf-8")
-                        logger.info(
-                            "Auto-generated report written to %s (%d chars)",
-                            path, len(report_md),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to write auto-generated report: %s", e,
-                        )
+                    # Write .md to filesystem at canonical report_path
+                    if self.report_path:
+                        try:
+                            import pathlib as _pathlib
+                            vpath = self.report_path
+                            real_path = vpath.replace(
+                                "/agent_data/",
+                                str(self._AGENT_DATA_REAL) + "/",
+                            )
+                            path = _pathlib.Path(real_path)
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text(report_md, encoding="utf-8")
+                            logger.info(
+                                "Auto-generated report written to %s (%d chars)",
+                                path, len(report_md),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to write auto-generated report: %s", e,
+                            )
 
-                self._persist_ledger(ledger)
-                logger.warning(
-                    "Safety: REPORT-phase stall (no write_file, "
-                    "round %d) — auto-generated report (%d chars)",
-                    self._model_call_count, len(report_md),
+                    self._persist_ledger(ledger)
+                    logger.warning(
+                        "Safety: REPORT-phase stall level-2 "
+                        "(no write_file after %d rounds in REPORT, "
+                        "round %d) — auto-generated report (%d chars)",
+                        rounds_in_report, self._model_call_count,
+                        len(report_md),
                 )
 
         # ── Post-response: detect UNDERSTAND round-1 zero-tools stall ──
@@ -2368,27 +2407,36 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         """Generate a diagnostic report from ledger evidence.
 
         Used as a last-resort safety net when the LLM exits the REPORT
-        phase without calling write_file (P11).
+        phase without calling write_file after being given a second
+        chance (level-2 escalation).
+
+        Extracts: root cause, evidence chain, round timeline, expert
+        delegation summary, and excluded hypotheses — producing a
+        report comparable in structure to an LLM-written one.
         """
         import datetime as _dt
 
+        hypotheses: dict = ledger.get("hypotheses", {})
+        rounds_data: list = ledger.get("rounds", [])
+        root_causes: list = ledger.get("root_causes", [])
         lines: list[str] = []
+
+        # ── Header ──
         lines.append("# 故障诊断报告\n")
         lines.append(
             f"**诊断日期**：{_dt.datetime.now().strftime('%Y-%m-%d')}"
         )
+        lines.append("> ⚠ 本报告由系统自动生成（LLM 未在 REPORT 阶段调用 write_file）。"
+                     "内容基于诊断台账中的结构化证据。\n")
 
-        # Fault overview from root causes
-        root_causes = ledger.get("root_causes", [])
+        # ── Fault overview ──
         if root_causes:
-            lines.append(
-                f"**故障概述**：{root_causes[0]}"
-            )
+            lines.append(f"**故障概述**：{root_causes[0]}")
 
-        # Confidence from confirmed hypotheses
-        hypotheses = ledger.get("hypotheses", {})
+        # ── Confidence ──
         confirmed = [
-            h for h in hypotheses.values() if h.get("status") == "confirmed"
+            h for h in hypotheses.values()
+            if h.get("status") == "confirmed"
         ]
         if confirmed:
             max_p = max(h.get("probability", 0) for h in confirmed)
@@ -2400,35 +2448,59 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             lines.append(f"**根因置信度**：{level}（{max_p}%）")
         lines.append("")
 
-        # Root cause analysis
+        # ── Key findings timeline (from round history) ──
+        if rounds_data:
+            lines.append("## 关键发现时间线\n")
+            sorted_rounds = sorted(
+                rounds_data, key=lambda r: (r.get("round", 0),
+                                            r.get("_seq", 0)),
+            )
+            for r in sorted_rounds:
+                experts = r.get("delegated_experts") or []
+                expert_label = f" [{experts[0]}]" if experts else ""
+                kf = (r.get("key_findings") or "").strip()
+                if "task" not in r.get("tools_called", []):
+                    continue  # skip non-expert rounds
+                # Truncate long findings
+                kf_short = kf[:250] + "..." if len(kf) > 250 else kf
+                if kf_short:
+                    lines.append(
+                        f"- **第{r['round']}轮{expert_label}**: {kf_short}"
+                    )
+            lines.append("")
+
+        # ── Evidence chain (from confirmed hypotheses) ──
+        lines.append("## 证据链\n")
+        if confirmed:
+            for hid, h in sorted(
+                confirmed, key=lambda x: -x[1].get("probability", 0),
+            ):
+                prob = h.get("probability", 0)
+                is_root = hid in set(ledger.get("root_hypothesis_ids", []))
+                lines.append(f"### {hid}{' [根因]' if is_root else ''}"
+                             f" — 置信度 {prob}%\n")
+                lines.append(f"{h.get('statement', '')}\n")
+                for e in h.get("evidence", []):
+                    src = e.get("source", "")
+                    supp = "支持" if e.get("supports") else "反驳"
+                    summary = (e.get("summary") or "")[:400]
+                    if summary:
+                        lines.append(f"- **[{src}]**({supp}): {summary}")
+                rationale = h.get("rationale", "")
+                if rationale:
+                    lines.append(f"\n依据: {rationale[:300]}")
+                lines.append("")
+        else:
+            lines.append("（无已确认假设，无可提取证据链。）\n")
+
+        # ── Root cause analysis ──
         if root_causes:
             lines.append("## 根因分析\n")
             for i, rc in enumerate(root_causes, 1):
                 lines.append(f"{i}. {rc}")
             lines.append("")
 
-        # Evidence chain
-        lines.append("## 证据链与时间线\n")
-        for hid, h in hypotheses.items():
-            status = h.get("status", "unknown")
-            p = h.get("probability", 0)
-            stmt = h.get("statement", "")
-            status_cn = {
-                "confirmed": "✅已确认",
-                "refuted": "❌已排除",
-                "deprioritized": "⬇已降级",
-                "verifying": "🔄验证中",
-                "pending": "⏳待验证",
-            }.get(status, status)
-            lines.append(f"- **{hid}** [{status_cn} p={p}%] {stmt}")
-            for e in h.get("evidence", []):
-                src = e.get("source", "")
-                summ = e.get("summary", "")[:200]
-                if summ:
-                    lines.append(f"  - [{src}] {summ}")
-        lines.append("")
-
-        # Excluded hypotheses
+        # ── Excluded hypotheses ──
         refuted = [
             h for h in hypotheses.values()
             if h.get("status") in ("refuted", "deprioritized")
@@ -2436,15 +2508,37 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if refuted:
             lines.append("## 排除的假设\n")
             for h in refuted:
+                status_cn = {
+                    "refuted": "已排除", "deprioritized": "已降级",
+                }.get(h.get("status", ""), h.get("status", ""))
+                rationale = (h.get("rationale") or "")[:200]
                 lines.append(
-                    f"- {h.get('statement', '')}"
-                    f"（{h.get('status')}，概率{h.get('probability', 0)}%）"
+                    f"- [{status_cn}] {h.get('statement', '')}"
+                    f"（概率{h.get('probability', 0)}%）"
+                    f"{' — ' + rationale if rationale else ''}"
                 )
             lines.append("")
 
-        # Repair suggestions (placeholder)
+        # ── Experts used ──
+        experts_used: set[str] = set()
+        for r in rounds_data:
+            experts_used.update(r.get("delegated_experts", []))
+        if experts_used:
+            lines.append("## 诊断方法\n")
+            lines.append(f"已委派专家: {', '.join(sorted(experts_used))}")
+            lines.append("")
+
+        # ── Repair suggestions ──
         lines.append("## 修复建议\n")
-        lines.append("（请根据根因分析结果制定具体修复方案）")
+        lines.append("（请根据根因分析结果制定具体修复方案。）\n"
+                     "建议优先级：P0 紧急缓解 → P1 短期修复 → P2 长期预防。")
+        lines.append("")
+
+        # ── Limitations ──
+        lines.append("## 限制说明\n")
+        lines.append("本报告由系统自动生成，基于诊断台账中的结构化证据。"
+                     "LLM 未在 REPORT 阶段调用 write_file，"
+                     "报告内容可能缺少手工撰写的叙述细节。")
 
         return "\n".join(lines)
 
