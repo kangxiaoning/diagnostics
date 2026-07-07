@@ -206,6 +206,21 @@ class ToolDedupMiddleware(AgentMiddleware):
             name=cached_msg.name,
         )
 
+    @staticmethod
+    def _emit_dedup_event(tool_call_id: str) -> None:
+        """Notify frontend to suppress the duplicate tool call node.
+
+        The frontend creates tree nodes from tool_start events (pre-middleware),
+        so deduped calls still get visible nodes.  This custom event tells
+        the streaming layer to remove the redundant node.
+        """
+        try:
+            from langgraph.config import get_stream_writer
+            writer = get_stream_writer()
+            writer({"type": "tool_dedup", "id": tool_call_id})
+        except RuntimeError:
+            pass  # stream_writer unavailable outside ToolNode context
+
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -226,6 +241,7 @@ class ToolDedupMiddleware(AgentMiddleware):
             cached_msg, fail_count = self._tool_call_cache[cache_key]
             if fail_count == 0:
                 logger.info("去重命中: %s", cache_key)
+                self._emit_dedup_event(tool_call_id)
                 return self._cached_result(cache_key, tool_call_id)
             # Previous call(s) failed → this is a retry
             if fail_count >= _TOOL_FAILURE_BREAKER:
@@ -259,6 +275,7 @@ class ToolDedupMiddleware(AgentMiddleware):
         # skip message so the LLM context is not polluted with repeated data.
         if cache_key in self._in_flight:
             logger.info("去重跳过（并发）: %s", cache_key)
+            self._emit_dedup_event(tool_call_id)
             # Still wait for the first call to complete so its result is
             # cached for future cross-round dedup.
             try:
@@ -287,6 +304,7 @@ class ToolDedupMiddleware(AgentMiddleware):
                 logger.info(
                     "跨Agent去重命中: %s (from shared_backend)", cache_key,
                 )
+                self._emit_dedup_event(tool_call_id)
                 restored = ToolMessage(
                     content=cached_content,
                     tool_call_id=tool_call_id,

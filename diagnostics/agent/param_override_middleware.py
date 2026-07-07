@@ -185,5 +185,18 @@ class ToolParamOverrideMiddleware(AgentMiddleware):
                 request.tool_call["args"] = tool_args
             except (TypeError, AttributeError):
                 pass
+            # Notify frontend that args were corrected (pre-middleware
+            # streaming events show LLM-generated args, not corrected ones).
+            try:
+                from langgraph.config import get_stream_writer
+                writer = get_stream_writer()
+                writer({
+                    "type": "tool_args_corrected",
+                    "id": request.tool_call.get("id", ""),
+                    "name": tool_name,
+                    "args": tool_args,
+                })
+            except RuntimeError:
+                pass  # stream_writer unavailable outside ToolNode context
 
         return await handler(request)

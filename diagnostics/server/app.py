@@ -23,7 +23,7 @@ from diagnostics.server.schemas import ChatRequest
 from diagnostics.server.sessions import SessionStore
 from diagnostics.server.skills_db import get_all_skills, init_db, sync_skills_from_disk
 from diagnostics.server.sse import sse
-from diagnostics.server.step_tracker import TreeBuilder
+from diagnostics.server.step_tracker import StepStatus, TreeBuilder
 from diagnostics.server.trace_writer import TraceWriter
 
 logger = logging.getLogger(__name__)
@@ -296,6 +296,16 @@ async def _chat_event_stream(
     if os.getenv("DIAGNOSTICS_MODE", "mock") == "mock":
         _auto_set_scenario(request.message)
 
+    # ── Pre-resolve hostname for container scenarios ──
+    # host-argus-expert needs a concrete hostname to query host-level
+    # Argus metrics (CPU/memory/disk/network).  In container scenarios,
+    # the frontend only provides K8s-level params — resolve the underlying
+    # host node name from the workload info and inject it into param_overrides
+    # so that ToolParamOverrideMiddleware can inject it into tool calls.
+    if request.param_overrides:
+        from diagnostics.agent.hostname_resolver import resolve_hostnames
+        request.param_overrides = resolve_hostnames(request.param_overrides)
+
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
     ledger_path = _make_ledger_path(report_path)
@@ -406,12 +416,20 @@ async def _chat_event_stream(
                 yield sse("tool_start", event.payload)
 
             elif event.name == "tool_end":
-                # Feed tool completion to tree (now emits delta, not full snapshot)
-                for snap in tree.handle_update(
-                    {"tool_call_id": event.payload["id"]},
-                    namespace=["tools"],
-                ):
-                    yield _tree_sse(snap)
+                # Deduped nodes: completely remove from the frontend tree
+                # so users don't see duplicated identical calls.
+                if event.payload.get("_deduped"):
+                    tc_id = event.payload.get("id", "")
+                    if tc_id:
+                        for snap in tree.remove_tool_node(tc_id):
+                            yield _tree_sse(snap)
+                else:
+                    # Feed tool completion to tree (now emits delta, not full snapshot)
+                    for snap in tree.handle_update(
+                        {"tool_call_id": event.payload["id"]},
+                        namespace=["tools"],
+                    ):
+                        yield _tree_sse(snap)
 
                 # Trace: tool result
                 trace.tool_end(

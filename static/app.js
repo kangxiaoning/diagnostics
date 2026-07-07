@@ -1161,6 +1161,25 @@ function onTreeDelta(payload) {
 
   let structureChanged = false;
 
+  // Process removed nodes — deduped tool calls that should be
+  // completely removed from the tree (node + edges).
+  if (payload.removed) {
+    for (const rid of payload.removed) {
+      const node = GRAPH.nodes.get(rid);
+      if (node && node.el) {
+        node.el.remove();
+      }
+      GRAPH.nodes.delete(rid);
+      // Remove edges connected to this node
+      GRAPH.edges = GRAPH.edges.filter(
+        e => e.from !== rid && e.to !== rid
+      );
+      const idx = GRAPH.nodeOrder.indexOf(rid);
+      if (idx >= 0) GRAPH.nodeOrder.splice(idx, 1);
+      structureChanged = true;
+    }
+  }
+
   // Process added nodes
   if (payload.added) {
     for (const step of payload.added) {
@@ -1392,20 +1411,21 @@ function renderTree() {
     }
   }, 150);
 
-  // ── Synchronous edge drawing (primary path) ──
-  // drawAllEdges() internally calls getBoundingClientRect() on every node,
-  // which triggers a synchronous forced reflow.  This guarantees correct
-  // coordinates within the SAME frame as the DOM rebuild, eliminating the
-  // async gap that caused edges to be deferred / cancelled by consecutive
-  // renderTree() calls.
-  // Skip when the tab is hidden — all heights would be 0 and the SVG would
-  // be cleared.  The async safety-nets above handle the visibility-change
-  // redraw correctly.
+  // ── Deferred edge drawing (primary path) ──
+  // Use requestAnimationFrame to ensure the browser has completed
+  // layout before reading getBoundingClientRect().  Synchronous
+  // forced-reflow via getBoundingClientRect() is unreliable when
+  // only phase nodes are added (tool nodes haven't arrived yet).
+  // Skip when the tab is hidden — all heights would be 0.
   if (!document.hidden && GRAPH.edges.length > 0) {
-    console.log(`[DIAG] renderTree sync drawAllEdges (document.hidden=${document.hidden})`);
-    drawAllEdges();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        console.log(`[DIAG] renderTree rAF drawAllEdges`);
+        drawAllEdges();
+      });
+    });
   } else if (document.hidden) {
-    console.log(`[DIAG] renderTree skipping sync drawAllEdges — document is hidden`);
+    console.log(`[DIAG] renderTree skipping drawAllEdges — document is hidden`);
   }
 
   // Only auto-scroll if user hasn't scrolled up manually

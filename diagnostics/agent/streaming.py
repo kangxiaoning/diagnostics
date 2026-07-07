@@ -479,7 +479,9 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                  state.round_number, tc_id)
                 else:
                     logger.info("[round=%d] Tool done: %s", state.round_number, info["label"])
-                    events.append(AgentEvent("tool_end", {
+                    # Deduped nodes should be removed from the frontend tree
+                    # so users don't see duplicated identical calls.
+                    end_evt = AgentEvent("tool_end", {
                         "id": tc_id,
                         "name": info["name"],
                         "label": info["label"],
@@ -487,7 +489,10 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         "output": output[:2000],
                         "output_full": output,
                         "round": state.round_number,
-                    }))
+                    })
+                    if info.get("_deduped"):
+                        end_evt.payload["_deduped"] = True
+                    events.append(end_evt)
                     # Emit tool result summary to the current round's think section
                     label = info["label"]
                     summary = _summarize_output(output)
@@ -518,7 +523,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 else:
                                     logger.info("[round=%d] Tool done (updates): %s",
                                                 state.round_number, info["label"])
-                                    events.append(AgentEvent("tool_end", {
+                                    end_evt = AgentEvent("tool_end", {
                                         "id": tc_id,
                                         "name": info["name"],
                                         "label": info["label"],
@@ -526,7 +531,10 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                         "output": output[:2000],
                                         "output_full": output,
                                         "round": state.round_number,
-                                    }))
+                                    })
+                                    if info.get("_deduped"):
+                                        end_evt.payload["_deduped"] = True
+                                    events.append(end_evt)
                 # 🔑 Extract COMPLETE tool call args from model_request (updates mode).
                 #    LM Studio/Qwen streaming sends empty args in messages mode;
                 #    updates mode has the real, complete args from LangGraph state.
@@ -607,6 +615,30 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
             elif data.get("type") in ("tool_executing", "tool_completed"):
                 # Precise tool timing from awrap_tool_call
                 events.append(AgentEvent(data["type"], data))
+            elif data.get("type") == "tool_args_corrected":
+                # Emitted by param_override_middleware after correcting
+                # LLM-invented args.  Re-emit tool_args_available so
+                # frontend tree nodes show correct (post-middleware) args.
+                tc_id = data.get("id")
+                tc_name = data.get("name", "")
+                tc_args = data.get("args", {})
+                if tc_id and tc_args:
+                    info = state.active_tools.get(tc_id)
+                    if info:
+                        info["args"] = tc_args
+                        events.append(AgentEvent("tool_args_available", {
+                            "id": tc_id, "name": tc_name, "args": tc_args,
+                        }))
+            elif data.get("type") == "tool_dedup":
+                # Emitted by dedup_middleware when a duplicate tool call
+                # is caught (P0 cache / P1 in-flight / cross-agent).
+                # Mark the node so tool_end can skip it; the frontend
+                # will remove it via tree_delta.
+                tc_id = data.get("id")
+                if tc_id:
+                    info = state.active_tools.get(tc_id)
+                    if info:
+                        info["_deduped"] = True
 
     return events
 

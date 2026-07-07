@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Real implementation would call the K8s API via kubernetes client.
 # These stubs let the scope mechanism be validated end-to-end.
 
-_MOCK_POD_NODE_MAP: dict[str, list[tuple[str, str, str]]] = {
+MOCK_POD_NODE_MAP: dict[str, list[tuple[str, str, str]]] = {
     # key: "cluster_name:namespace:workload_name"
     # value: [(pod_name, node_name, host_ip), ...]
 
@@ -80,7 +80,7 @@ _MOCK_CONTROL_PLANE_HEALTH: dict[str, tuple[float, float]] = {
 def _augment_scenario_pods(scope: "ScopeLimit", namespace: str) -> None:
     """Extract pod names from the active mock scenario's K8s data.
 
-    The static _MOCK_POD_NODE_MAP uses generic pod names that don't match
+    The static MOCK_POD_NODE_MAP uses generic pod names that don't match
     what the scenario data actually returns.  This function reads the
     scenario's K8s diagnostic output strings and extracts real pod names
     (e.g. 'api-gateway-abc12' from cluster_overview / check_kubernetes_pods),
@@ -211,18 +211,18 @@ class ScopeLimit:
         """Populate allowed_nodename / allowed_hostname from mock data.
 
         Composes the scope from two sources:
-        1. _MOCK_POD_NODE_MAP — static pod→node→host mapping
+        1. MOCK_POD_NODE_MAP — static pod→node→host mapping
         2. Active scenario K8s data — actual pods used by the scenario
            (e.g. 'api-gateway-abc12' in conntrack_and_oom vs generic
            'api-gateway-6f8b7c9d5-xyz01' in the static map)
         """
         lookup = f"{cluster_name}:{namespace}:{workload_name}"
-        entries = _MOCK_POD_NODE_MAP.get(lookup, [])
+        entries = MOCK_POD_NODE_MAP.get(lookup, [])
 
         if not entries:
             # Fallback: try a generic entry
             generic_key = f"default:default:{workload_name}"
-            entries = _MOCK_POD_NODE_MAP.get(generic_key, [])
+            entries = MOCK_POD_NODE_MAP.get(generic_key, [])
 
         nodes: set[str] = set()
         hosts: set[str] = set()
@@ -237,7 +237,7 @@ class ScopeLimit:
             hosts.add(ip)
 
         # ── Augment with pods from the active mock scenario ──
-        # The static _MOCK_POD_NODE_MAP uses generic pod names that
+        # The static MOCK_POD_NODE_MAP uses generic pod names that
         # don't match what the scenario actually returns.  Extract
         # real pod names from the scenario's K8s data strings so
         # scope_guard doesn't block legitimate queries.

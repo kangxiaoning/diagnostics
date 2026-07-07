@@ -75,16 +75,297 @@ _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this r
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
 
+# ── Expert verdict text-signal patterns ───────────────────────────────────
+# Used by verify-stall detection to infer verdict from expert subagent
+# output when the LLM fails to call record_finding.
 
-def _build_subagent_context(ledger: dict, max_chars: int = 1200) -> str:
+_CONFIRMED_PATTERNS = re.compile(
+    r"假设验证[：:]\s*\*{0,2}confirmed|"
+    r"\*{0,2}confirmed\*{0,2}\s*[（(]|"
+    r"假设成立|假设.*已确认|根因确认|验证结论.*成立|"
+    r"verdict.*confirmed",
+    re.IGNORECASE,
+)
+
+_REFUTED_PATTERNS = re.compile(
+    r"假设验证[：:]\s*\*{0,2}refuted|"
+    r"\*{0,2}refuted\*{0,2}\s*[（(]|"
+    r"假设不成立|假设.*已排除|验证结论.*不成立|"
+    r"verdict.*refuted",
+    re.IGNORECASE,
+)
+
+
+def _infer_verdict_from_text(text: str) -> str | None:
+    """Analyze expert output text for explicit verdict signals.
+
+    Returns 'confirmed', 'refuted', or None if no clear signal found.
+    Used by verify-stall detection to make reliable auto-decisions
+    instead of blindly defaulting to inconclusive.
+    """
+    if not text:
+        return None
+    # Check confirmed signals first (more specific patterns)
+    if _CONFIRMED_PATTERNS.search(text):
+        return "confirmed"
+    if _REFUTED_PATTERNS.search(text):
+        return "refuted"
+    return None
+
+
+def _build_evidence_audit(ledger: dict) -> str:
+    """Generate a transparent evidence quality report for REPORT phase.
+
+    Provides the LLM with a multi-dimensional view of evidence quality
+    for each hypothesis so it can calibrate report confidence.  The
+    audit is informational only — no state is modified.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    if not hypotheses:
+        return ""
+
+    root_ids = ledger.get("root_hypothesis_ids", [])
+    confirmed = [(hid, h) for hid, h in hypotheses.items()
+                 if h.get("status") == "confirmed"]
+
+    if not confirmed:
+        return ""
+
+    lines = ["<evidence_audit>"]
+    for hid, node in confirmed:
+        evidence_list = node.get("evidence", [])
+        supporting = [e for e in evidence_list if e.get("supports")]
+        refuting = [e for e in evidence_list if not e.get("supports", True)]
+        expert_sources = {e.get("source") for e in evidence_list
+                         if isinstance(e.get("source"), str)
+                         and e.get("source", "").startswith("expert:")}
+        multi_source = bool(expert_sources) and any(
+            e.get("source") == "coordinator" for e in evidence_list
+        )
+        if len(supporting) >= 2 and multi_source:
+            label = "充分"
+        elif len(supporting) >= 1:
+            label = "基本"
+        else:
+            label = "不足"
+        priority = "根因" if hid in root_ids else "子假设"
+        lines.append(
+            f"  {hid}({priority}): 证据{label} "
+            f"({len(supporting)}条支持/{len(refuting)}条反对, "
+            f"{len(expert_sources)}个专家来源, "
+            f"{'多源交叉验证' if multi_source else '单一来源'})"
+        )
+    lines.append("</evidence_audit>")
+    return "\n".join(lines)
+
+
+def _build_diagnostic_synthesis(ledger: dict, max_rounds: int, report_path: str) -> str:
+    """Generate a comprehensive diagnostic synthesis when the round limit is reached.
+
+    Unlike the blunt "STOP NOW" directive, this produces a structured summary
+    of everything the diagnostic process has learned — hypothesis findings,
+    evidence quality, best conclusions, and a report template — so the LLM
+    can produce a high-quality report even when interrupted mid-diagnosis.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    rounds_data = ledger.get("rounds", [])
+    current_round = ledger.get("current_round", 0)
+
+    lines = ["<diagnostic_synthesis>"]
+    lines.append(
+        f"## 系统通知：已达到最大诊断轮次（{current_round}/{max_rounds}）"
+    )
+    lines.append(
+        "诊断过程已自动终结。下方是你已收集的所有信息的综合总结，"
+        "请基于这些信息调用 write_file 生成诊断报告。"
+    )
+    lines.append("")
+
+    # ── 1. Journey overview ──
+    lines.append("## 1. 诊断历程概览")
+    total_tools = 0
+    total_tasks = 0
+    experts_used: set[str] = set()
+    tools_used: set[str] = set()
+    for rd in rounds_data:
+        tools = rd.get("tools_called", [])
+        total_tools += len(tools)
+        if "task" in tools:
+            total_tasks += 1
+        experts_used.update(rd.get("delegated_experts", []))
+        tools_used.update(tools)
+
+    _scaff = {"task", "write_file", "read_file", "edit_file",
+              "commit_hypotheses", "select_path", "record_finding", "backtrack",
+              "ls", "glob", "grep", "write_todos", "read_todos"}
+    diagnostic = sorted(tools_used - _scaff)
+    lines.append(f"- 总轮次: {current_round} | 工具调用: {total_tools} 次 | 委派专家: {total_tasks} 次")
+    if experts_used:
+        lines.append(f"- 已委派专家: {', '.join(sorted(experts_used))}")
+    if diagnostic:
+        lines.append(f"- 诊断工具: {', '.join(diagnostic)}")
+    lines.append("")
+
+    # ── 2. Hypothesis findings ──
+    if hypotheses:
+        lines.append("## 2. 假设验证结果综合")
+        confirmed = [(hid, h) for hid, h in hypotheses.items()
+                     if h.get("status") == "confirmed"]
+        refuted = [(hid, h) for hid, h in hypotheses.items()
+                   if h.get("status") in ("refuted", "deprioritized", "dead_end")]
+        unfinished = [(hid, h) for hid, h in hypotheses.items()
+                      if h.get("status") in ("pending", "verifying")]
+        root_ids = set(ledger.get("root_hypothesis_ids", []))
+
+        if confirmed:
+            lines.append("### ✅ 已确认假设")
+            for hid, node in sorted(confirmed, key=lambda x: -x[1].get("probability", 0)):
+                prob = node.get("probability", 0)
+                is_root = hid in root_ids
+                evidence = node.get("evidence", [])
+                supporting = [e for e in evidence if e.get("supports")]
+                refuting_ev = [e for e in evidence if not e.get("supports", True)]
+                expert_srcs = {e.get("source") for e in evidence
+                              if isinstance(e.get("source"), str)
+                              and e.get("source", "").startswith("expert:")}
+                multi = (bool(expert_srcs)
+                         and any(e.get("source") == "coordinator" for e in evidence))
+                conf = "高" if prob >= 80 and multi else "中" if prob >= 60 else "低"
+                lines.append(
+                    f"- **{hid}**{' [根因]' if is_root else ''} "
+                    f"置信度:{conf} 概率:{prob}% "
+                    f"证据:{len(supporting)}支持/{len(refuting_ev)}反对 "
+                    f"来源:{len(expert_srcs)}专家 "
+                    f"{'✓交叉验证' if multi else '单一来源'}"
+                )
+                lines.append(f"  {node.get('statement', '')}")
+                rationale = node.get("rationale", "")
+                if rationale:
+                    lines.append(f"  依据: {rationale[:200]}")
+            lines.append("")
+
+        if refuted:
+            lines.append("### ❌ 已排除假设")
+            for hid, node in refuted:
+                rationale = node.get("rationale", "") or "(无记录)"
+                lines.append(f"- **{hid}**: {node.get('statement', '')}")
+                lines.append(f"  原因: {rationale[:150]}")
+            lines.append("")
+
+        if unfinished:
+            lines.append("### ⚠ 因轮次限制中断的假设")
+            lines.append("（应作为'后续排查建议'出现在报告中，不要丢弃）")
+            for hid, node in unfinished:
+                prob = node.get("probability", 0)
+                evidence = node.get("evidence", [])
+                supporting = [e for e in evidence if e.get("supports")]
+                lines.append(
+                    f"- **{hid}**: {node.get('statement', '')} "
+                    f"(概率:{prob}%, 已收集{len(supporting)}条证据)"
+                )
+            lines.append("")
+    else:
+        lines.append("## 2. 假设验证结果")
+        lines.append("（未提交假设 — 诊断在数据采集阶段被中断）")
+        lines.append("")
+
+    # ── 3. Best conclusions ──
+    lines.append("## 3. 最佳结论建议")
+    confirmed = [(hid, h) for hid, h in hypotheses.items()
+                 if h.get("status") == "confirmed"]
+    root_ids = set(ledger.get("root_hypothesis_ids", []))
+    root_causes = ledger.get("root_causes", [])
+    if confirmed:
+        for i, (hid, node) in enumerate(
+            sorted(confirmed, key=lambda x: -x[1].get("probability", 0))
+        ):
+            rc_text = root_causes[i] if i < len(root_causes) else node.get("statement", "")
+            is_root = hid in root_ids
+            lines.append(f"{i + 1}. {'[根因] ' if is_root else ''}{rc_text}")
+    elif hypotheses:
+        refuted_all = all(
+            h.get("status") in ("refuted", "deprioritized", "dead_end")
+            for h in hypotheses.values()
+        )
+        if refuted_all:
+            lines.append("所有假设均已被证伪。")
+            lines.append("报告中应说明：在20轮内无法确定根因，建议延长诊断或扩大排查范围。")
+        else:
+            lines.append("无已确认假设。")
+            lines.append("报告中应基于已收集数据给出初步观察，并明确标注'低置信度'。")
+    else:
+        lines.append("无假设已被验证。请基于原始数据给出判断。")
+    lines.append("")
+
+    # ── 4. Report template ──
+    lines.append("## 4. 报告结构模板")
+    lines.append("请按以下结构调用 write_file 生成报告：")
+    lines.append("")
+    lines.append("```markdown")
+    lines.append("# 诊断报告")
+    lines.append("## 诊断摘要")
+    lines.append("- 故障描述、诊断范围、核心结论（1-2句话）")
+    lines.append("## 关键发现")
+    lines.append("- 按时间线/严重程度列出关键发现")
+    lines.append("## 根因分析")
+    lines.append("### 主要原因")
+    lines.append("- 根因描述 + 置信度 + 完整证据链")
+    if unfinished:
+        lines.append("")
+        lines.append("### 未验证假设（后续排查建议）")
+        for hid, node in unfinished:
+            lines.append(f"- {node.get('statement', hid)}")
+    lines.append("## 建议措施")
+    lines.append("### 紧急措施 / 长期优化")
+    lines.append("## 附录")
+    lines.append("- 诊断过程说明 + 轮次限制声明")
+    lines.append("```")
+    lines.append("")
+
+    # ── 5. Evidence handling guidance ──
+    lines.append("## 5. 不完整证据处理指引")
+    lines.append("- 证据充分的假设 → 高置信度结论")
+    lines.append("- 证据基本的假设 → 给出结论但标注\"存在一定不确定性\"")
+    lines.append("- 证据不足的假设 → 标注\"初步推断\"或\"待进一步验证\"")
+    lines.append("- 未完成的假设 → 放入\"后续排查建议\"，不要丢弃")
+    if not confirmed and hypotheses:
+        lines.append("- ⚠ 无已确认假设 → 聚焦于\"已排除的根因\"和\"排查建议\"")
+        lines.append("- 不要编造根因，但要给出基于已收集数据的最佳判断")
+
+    lines.append("</diagnostic_synthesis>")
+    return "\n".join(lines)
+
+
+def _build_subagent_context(ledger: dict, subagent_type: str = "", max_chars: int = 1200) -> str:
     """Extract already-collected evidence from the ledger for subagent injection.
 
     When a subagent is delegated via task(), it normally sees only the
     Coordinator's description.  This function extracts the key findings
     already recorded in the ledger so the subagent can skip redundant
     tool calls and focus on its specific verification task.
+
+    When *subagent_type* is ``"host-argus-expert"`` and the ledger
+    contains a resolved *hostname*, the hostname is injected as a
+    top-level environment hint so the subagent LLM knows which host
+    to query without asking the Coordinator.
     """
     lines: list[str] = []
+
+    # ── Environment context: resolved hostname for host-argus-expert ──
+    # In container scenarios, the hostname is pre-resolved from K8s
+    # workload info.  Without this hint, host-argus-expert has no way
+    # to discover which host to query and will waste a round asking
+    # the Coordinator for clarification.
+    if subagent_type == "host-argus-expert":
+        hostname = ledger.get("hostname", "")
+        if hostname:
+            lines.append(
+                f"⚠ 诊断环境上下文 — 请勿询问 Coordinator:\n"
+                f"  目标主机: **{hostname}**\n"
+                f"  系统已预解析主机名，请直接使用 {hostname} 作为 "
+                f"query_argus_cpu / query_argus_memory / query_argus_disk "
+                f"/ query_argus_network 的 hostname 参数。\n"
+            )
 
     # ── Diagnostic tools already called (by Coordinator or prior experts) ──
     tools_called: set[str] = set()
@@ -272,12 +553,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         model: BaseChatModel | None = None,
         backend: BackendProtocol | None = None,
         is_subagent: bool = False,
+        entity_type: str = "",
+        hostname: str = "",
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
         self._model = model
         self._backend = backend
         self._is_subagent = is_subagent
+        self._entity_type = entity_type
+        self._hostname = hostname
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
         # Safety mechanism tracking
@@ -287,6 +572,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._last_finding_round: int = 0
         self._last_task_round: int = 0
         self._report_phase_start_round: int = 0  # track when REPORT phase began
+        self._verify_stall_count: int = 0  # consecutive verify-phase stalls
         # Monotonic sequence counter for preserving tool call invocation
         # order within the same LLM round (LangGraph executes tool calls
         # concurrently, so completion order ≠ invocation order).
@@ -353,7 +639,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
             return None
 
-        ledger = new_ledger()
+        ledger = new_ledger(entity_type=self._entity_type, hostname=self._hostname)
         self._current_ledger = ledger
         logger.info(
             "台账: 创建新台账 (agent=%s, object_id=%s)",
@@ -448,9 +734,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # Re-render context so the LLM sees finalized hypothesis tree
                 context_block = render_ledger_context(ledger)
 
+        # ── Evidence audit: inject quality labels when entering REPORT ──
+        # Gives the LLM a transparent, multi-dimensional view of evidence
+        # quality for each confirmed hypothesis so it can make informed
+        # decisions about report confidence.  The LLM is NOT forced to act
+        # on this — it's purely informational.
+        audit_block = ""
+        if (ledger.get("current_phase") == "report"
+                or derive_phase(ledger) == "report"):
+            audit_block = _build_evidence_audit(ledger)
+
         combined_block = context_block
         if safety_block:
             combined_block = f"{combined_block}\n\n{safety_block}" if combined_block else safety_block
+        if audit_block:
+            combined_block = f"{combined_block}\n\n{audit_block}" if combined_block else audit_block
 
         # ── Timeout protection: prevent single LLM call from hanging forever ──
         # REPORT phase generates a long markdown report — use a longer timeout.
@@ -504,7 +802,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if hasattr(m, "tool_calls")
             ]
             has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls and ledger.get("hypotheses"):
+            if has_tool_calls:
+                self._verify_stall_count = 0  # progress made, reset stall counter
+            elif not has_tool_calls and ledger.get("hypotheses"):
                 active_path = ledger.get("active_path", [])
                 active_id = active_path[-1] if active_path else None
                 if active_id and active_id in ledger.get("hypotheses", {}):
@@ -529,32 +829,144 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "\u7cfb\u7edf\u57fa\u4e8e\u5df2\u6709\u534f\u8c03\u5458\u786e\u8ba4\u8bc1\u636e\u81ea\u52a8\u786e\u8ba4\u3002",
                                 node["probability"],
                             )
-                        else:
-                            record_finding(
-                                ledger, active_id, "inconclusive",
-                                "[\u7cfb\u7edf\u81ea\u52a8] LLM \u5728 verify \u9636\u6bb5\u672a\u8c03\u7528\u5de5\u5177\uff0c"
-                                "\u8bc1\u636e\u4e0d\u8db3\u4ee5\u786e\u8ba4\uff0c\u7cfb\u7edf\u6807\u8bb0\u4e3a\u672a\u5b8c\u6210\u3002",
-                                node["probability"],
+                            ledger["current_phase"] = "report"
+                            self._report_phase_start_round = self._model_call_count
+                            self._persist_ledger(ledger)
+                            logger.warning(
+                                "Safety: verify-phase stall (no tool calls, "
+                                "round %d) — auto-confirmed %s, forced REPORT",
+                                self._model_call_count, active_id,
                             )
-                        ledger["current_phase"] = "report"
-                        self._report_phase_start_round = self._model_call_count
-                        self._persist_ledger(ledger)
-                        logger.warning(
-                            "Safety: verify-phase stall (no tool calls, "
-                            "round %d) — auto-confirmed %s, forced REPORT",
-                            self._model_call_count, active_id,
-                        )
-                        # Append directive to the existing response so
-                        # the agent loop continues into REPORT phase.
-                        from langchain_core.messages import AIMessage
-                        for m in ai_msgs:
-                            if hasattr(m, "content") and isinstance(m.content, str):
-                                m.content += (
-                                    "\n\n[\u7cfb\u7edf\u5b89\u5168\u9600] verify \u9636\u6bb5\u5df2\u7ed3\u675f\uff0c"
-                                    f"\u5047\u8bbe {active_id} \u5df2\u81ea\u52a8\u5904\u7406\u3002"
-                                    "\u8bf7\u7acb\u5373\u8c03\u7528 write_file \u751f\u6210\u8bca\u65ad\u62a5\u544a\u3002"
+                            # Append directive to the existing response so
+                            # the agent loop continues into REPORT phase.
+                            from langchain_core.messages import AIMessage
+                            for m in ai_msgs:
+                                if hasattr(m, "content") and isinstance(m.content, str):
+                                    m.content += (
+                                        "\n\n[\u7cfb\u7edf\u5b89\u5168\u9600] verify \u9636\u6bb5\u5df2\u7ed3\u675f\uff0c"
+                                        f"\u5047\u8bbe {active_id} \u5df2\u81ea\u52a8\u5904\u7406\u3002"
+                                        "\u8bf7\u7acb\u5373\u8c03\u7528 write_file \u751f\u6210\u8bca\u65ad\u62a5\u544a\u3002"
+                                    )
+                                    break
+                        else:
+                            # Expert evidence exists but no coordinator
+                            # assessment yet — LLM likely received expert
+                            # results but outputs text instead of calling
+                            # record_finding.  Three-level escalation:
+                            #   1st stall → gentle reminder
+                            #   2nd stall → strong reminder with inferred verdict
+                            #   3rd stall → auto-decision
+                            self._verify_stall_count += 1
+
+                            # Extract expert output text for signal analysis
+                            expert_text = ""
+                            for ev in node.get("evidence", []):
+                                src = ev.get("source", "")
+                                if isinstance(src, str) and src.startswith("expert:"):
+                                    expert_text = ev.get("summary", "")
+                                    break
+
+                            if self._verify_stall_count == 1:
+                                # First stall — inject reminder
+                                logger.info(
+                                    "Verify-phase gentle reminder: expert "
+                                    "evidence exists for %s but no "
+                                    "record_finding (round %d)",
+                                    active_id, self._model_call_count,
                                 )
-                                break
+                                from langchain_core.messages import AIMessage
+                                for m in ai_msgs:
+                                    if hasattr(m, "content") and isinstance(m.content, str):
+                                        m.content += (
+                                            "\n\n[系统提醒] 你已收到专家验证结果，"
+                                            "但还未调用 record_finding 记录验证结论。"
+                                            f"请在本轮调用 record_finding(hypothesis_id={active_id}) "
+                                            "记录验证结果（confirmed/refuted/inconclusive），"
+                                            "并附上关键证据。"
+                                        )
+                                        break
+
+                            elif self._verify_stall_count == 2:
+                                # Second stall — inject strong reminder with
+                                # inferred verdict hint
+                                inferred = _infer_verdict_from_text(expert_text)
+                                logger.info(
+                                    "Verify-phase 2nd stall for %s — "
+                                    "inferred verdict=%s, injecting strong "
+                                    "reminder (round %d)",
+                                    active_id, inferred or "none",
+                                    self._model_call_count,
+                                )
+                                hint = ""
+                                if inferred == "confirmed":
+                                    hint = ("系统从专家输出中检测到 'confirmed/假设成立' "
+                                            "信号，建议 verdict=confirmed。")
+                                elif inferred == "refuted":
+                                    hint = ("系统从专家输出中检测到 'refuted/不成立' "
+                                            "信号，建议 verdict=refuted。")
+                                else:
+                                    hint = "系统无法从专家输出中推断明确结论。"
+                                from langchain_core.messages import AIMessage
+                                for m in ai_msgs:
+                                    if hasattr(m, "content") and isinstance(m.content, str):
+                                        m.content += (
+                                            "\n\n⚠ [系统强制] 已连续 2 轮未调用 "
+                                            "record_finding。\n"
+                                            f"{hint}\n"
+                                            f"必须在下一轮调用 record_finding(hypothesis_id={active_id})，"
+                                            "否则系统将自动处理。"
+                                        )
+                                        break
+
+                            else:
+                                # Third consecutive stall → auto-decision
+                                inferred = _infer_verdict_from_text(expert_text)
+                                if inferred == "confirmed":
+                                    record_finding(
+                                        ledger, active_id, "confirmed",
+                                        "[系统自动] 专家输出含 confirmed 信号，"
+                                        "LLM 连续 3 轮未调用 record_finding，"
+                                        "系统基于专家文本自动确认。",
+                                        node["probability"],
+                                    )
+                                    auto_verdict = "confirmed"
+                                elif inferred == "refuted":
+                                    record_finding(
+                                        ledger, active_id, "refuted",
+                                        "[系统自动] 专家输出含 refuted 信号，"
+                                        "LLM 连续 3 轮未调用 record_finding，"
+                                        "系统基于专家文本自动排除。",
+                                        node["probability"],
+                                    )
+                                    auto_verdict = "refuted"
+                                else:
+                                    record_finding(
+                                        ledger, active_id, "inconclusive",
+                                        "[系统自动] LLM 连续 3 轮未调用 "
+                                        "record_finding，专家输出无明确结论，"
+                                        "系统标记为未完成。",
+                                        node["probability"],
+                                    )
+                                    auto_verdict = "inconclusive"
+                                ledger["current_phase"] = "report"
+                                self._report_phase_start_round = self._model_call_count
+                                self._persist_ledger(ledger)
+                                logger.warning(
+                                    "Safety: verify-phase stall (no tool calls, "
+                                    "round %d) — 3rd stall, auto-%s %s, "
+                                    "forced REPORT",
+                                    self._model_call_count, auto_verdict,
+                                    active_id,
+                                )
+                                from langchain_core.messages import AIMessage
+                                for m in ai_msgs:
+                                    if hasattr(m, "content") and isinstance(m.content, str):
+                                        m.content += (
+                                            "\n\n[系统安全阀] verify 阶段已结束，"
+                                            f"假设 {active_id} 已自动处理。"
+                                            "请立即调用 write_file 生成诊断报告。"
+                                        )
+                                        break
 
         # ── Post-response: detect REPORT-phase stall ──
         # If the model returned no tool calls while in REPORT phase
@@ -793,7 +1205,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if tool_name == "task":
             ledger = self._current_ledger
             if ledger:
-                ctx = _build_subagent_context(ledger)
+                subagent_type = tool_args.get("subagent_type", "")
+                ctx = _build_subagent_context(ledger, subagent_type=subagent_type)
                 if ctx:
                     desc = tool_args.get("description", "")
                     tool_args["description"] = (
@@ -914,12 +1327,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if output:
                 key_findings = output[:200].replace("\n", " ").strip()
 
+            # Track delegated experts for coverage detection
+            delegated = None
+            if tool_name == "task":
+                expert = (tool_args.get("subagent_type")
+                          or tool_args.get("subagent_name")
+                          or tool_args.get("name"))
+                if expert:
+                    delegated = [expert]
+
             record_round(
                 ledger, derive_phase(ledger),
                 tools_called=[tool_name],
                 action_summary=tool_args.get("description", "") if tool_name == "task" else tool_name,
                 key_findings=key_findings,
                 _seq=invocation_seq,
+                delegated_experts=delegated,
             )
 
         # After ledger management tools, persist and emit snapshot
@@ -1095,19 +1518,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         round_num = self._model_call_count
         warnings: list[str] = []
 
-        # ── P1: Hard maximum round limit ──
+        # ── P1: Maximum round limit — diagnostic synthesis + REPORT ──
         if round_num >= _MAX_ROUNDS:
             ledger["current_phase"] = "report"
             self._report_phase_start_round = round_num
-            warnings.append(
-                "⛔ [系统强制] 已达到最大诊断轮次限制"
-                f"（{_MAX_ROUNDS}轮）。\n"
-                "禁止再调用任何诊断工具或委派专家。\n"
-                f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
-                "即使证据不完整，也必须给出最佳判断和建议。"
+            # Replace the blunt "STOP NOW" directive with a comprehensive
+            # diagnostic synthesis that helps the LLM produce a quality
+            # report from everything learned so far.
+            synthesis = _build_diagnostic_synthesis(
+                ledger, _MAX_ROUNDS, self.report_path,
             )
+            warnings.append(synthesis)
             logger.warning(
-                "Safety: max rounds (%d) reached — forcing REPORT phase",
+                "Safety: max rounds (%d) reached — injected diagnostic "
+                "synthesis, forcing REPORT phase",
                 round_num,
             )
 
@@ -1140,21 +1564,75 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
 
             if has_collected_data:
-                # Data collected but no hypotheses — force commit
-                warnings.append(
-                    "⚠ [系统强制] 数据采集已完成（第1轮），当前是第"
-                    f"{round_num}轮。你尚未提交任何假设。\n"
-                    "禁止继续调用诊断工具或输出纯文本分析。\n"
-                    "你必须在本轮调用 commit_hypotheses 提交至少1个假设，"
-                    "否则诊断将提前终止。\n"
-                    "基于上一轮已获取的 Argus 数据，提出假设并立即调用 "
-                    "commit_hypotheses。"
-                )
-                logger.warning(
-                    "Safety: understand stagnation with data (round %d, "
-                    "no hypotheses) — forcing commit",
-                    round_num,
-                )
+                # ── Dual-expert coverage check (container/K8s scenarios) ──
+                # If only one type of Argus expert was delegated, the LLM
+                # likely missed the other.  Force delegation of
+                # the missing expert instead of prematurely forcing
+                # commit_hypotheses.
+                #
+                # NOTE: Coordinator does NOT have Argus tools directly —
+                # detection uses delegated_experts (populated from
+                # task(subagent_type=...) calls), NOT tools_called.
+                experts_delegated: set[str] = set()
+                has_delegated = False
+                for r in rounds_history:
+                    experts_delegated.update(r.get("delegated_experts", []))
+                    if "task" in r.get("tools_called", []):
+                        has_delegated = True
+
+                has_host = "host-argus-expert" in experts_delegated
+                has_k8s = "k8s-argus-expert" in experts_delegated
+                is_host_only = ledger.get("entity_type") == "host"
+
+                # Only intervene when an expert WAS delegated but one
+                # domain is still uncovered — this indicates a container
+                # scenario where both experts are expected.
+                # Host-only scenarios skip this check entirely.
+                if has_delegated and not is_host_only and has_host and not has_k8s:
+                    warnings.append(
+                        "⚠ [系统强制] 已采集主机 Argus 数据但缺少集群级 "
+                        "K8s Argus 数据（query_argus_nodes + "
+                        "query_argus_services）。\n"
+                        "禁止在本轮调用 commit_hypotheses。\n"
+                        "你必须先调用 task(\"k8s-argus-expert\", ...) "
+                        "委派 K8s Argus 专家采集集群指标。\n"
+                        "收到 K8s Argus 专家的分析摘要后再提交假设。"
+                    )
+                    logger.warning(
+                        "Safety: partial Argus coverage (host only, "
+                        "round %d) — forcing k8s-argus-expert delegation",
+                        round_num,
+                    )
+                elif has_delegated and not is_host_only and has_k8s and not has_host:
+                    warnings.append(
+                        "⚠ [系统强制] 已采集 K8s Argus 数据但缺少主机级 "
+                        "Argus 数据（CPU/内存/磁盘/网络）。\n"
+                        "禁止在本轮调用 commit_hypotheses。\n"
+                        "你必须先调用 task(\"host-argus-expert\", ...) "
+                        "委派主机 Argus 专家采集主机指标。\n"
+                        "收到主机 Argus 专家的分析摘要后再提交假设。"
+                    )
+                    logger.warning(
+                        "Safety: partial Argus coverage (k8s only, "
+                        "round %d) — forcing host-argus-expert delegation",
+                        round_num,
+                    )
+                else:
+                    # Data collected but no hypotheses — force commit
+                    warnings.append(
+                        "⚠ [系统强制] 数据采集已完成（第1轮），当前是第"
+                        f"{round_num}轮。你尚未提交任何假设。\n"
+                        "禁止继续调用诊断工具或输出纯文本分析。\n"
+                        "你必须在本轮调用 commit_hypotheses "
+                        "提交至少1个假设，否则诊断将提前终止。\n"
+                        "基于上一轮已获取的 Argus 数据，提出假设并立即调用 "
+                        "commit_hypotheses。"
+                    )
+                    logger.warning(
+                        "Safety: understand stagnation with data (round %d, "
+                        "no hypotheses) — forcing commit",
+                        round_num,
+                    )
             else:
                 # No data collected — force diagnostic data collection
                 warnings.append(
@@ -1358,16 +1836,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Track when REPORT phase started
             if self._report_phase_start_round == 0:
                 self._report_phase_start_round = round_num
-            elif round_num - self._report_phase_start_round >= 1:
-                # LLM has been in REPORT for 2+ rounds without write_file
-                warnings.append(
-                    "⛔ [系统强制] 你已进入 REPORT 阶段"
-                    f"（第{self._report_phase_start_round}轮起）"
-                    f"，但尚未调用 write_file 生成报告。\n"
-                    "禁止调用任何诊断工具或委派专家。\n"
-                    f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
-                    "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
-                )
+            # Fire on the FIRST REPORT round so the LLM never wastes
+            # cycles on record_finding — all pending hypotheses are
+            # already auto-finalized by the Phase guard.
+            warnings.append(
+                "⛔ [系统强制] 已进入 REPORT 阶段"
+                f"（第{self._report_phase_start_round}轮起）。\n"
+                "系统已自动终结所有挂起假设，你无需再调用 "
+                "record_finding / commit_hypotheses。\n"
+                "禁止调用任何诊断工具、委派专家、record_finding、"
+                "commit_hypotheses。\n"
+                f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
+                "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
+            )
+            if round_num - self._report_phase_start_round >= 1:
                 logger.warning(
                     "Safety: REPORT phase round %d without write_file "
                     "(started round %d) — forcing write_file",
@@ -1630,7 +2112,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # was added to cids via the propagation block above, force exit
             # even though check_exit_conditions (which runs before propagation)
             # may have returned False.
-            if not should_exit and cids:
+            # IMPORTANT: do NOT override when check_exit_conditions returned
+            # False because there are still pending root hypotheses with
+            # significant probability (>15%).  The multi-root exit logic
+            # intentionally keeps the diagnosis alive for remaining symptoms.
+            if not should_exit and cids and "部分根因" not in reason:
                 should_exit = True
                 reason = ("深层假设已确认，根因已定位"
                           if len(cids) == 1

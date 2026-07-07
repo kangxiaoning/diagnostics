@@ -437,6 +437,7 @@ class TreeBuilder:
         self,
         added: list[str] | None = None,
         updated: list[str] | None = None,
+        removed: list[str] | None = None,
     ) -> dict[str, Any]:
         """Incremental tree delta — only changed nodes.
 
@@ -458,7 +459,23 @@ class TreeBuilder:
                  "title": self.nodes[nid].title}
                 for nid in updated if nid in self.nodes
             ]
+        if removed:
+            result["removed"] = removed
         return result
+
+    def remove_tool_node(self, tc_id: str) -> list[dict[str, Any]]:
+        """Remove a tool node by its tool_call_id (stored in node.detail).
+
+        Returns a tree_delta with the node in the removed list so the
+        frontend can delete its DOM element and associated edges.
+        """
+        for nid, node in list(self.nodes.items()):
+            if node.node_type == NodeType.TOOL and node.detail == tc_id:
+                del self.nodes[nid]
+                if nid in self.node_order:
+                    self.node_order.remove(nid)
+                return [self._delta_event(removed=[nid])]
+        return []
 
     def _add_node(self, node: TreeNode) -> None:
         if node.parent_id and not node.parent_ids:

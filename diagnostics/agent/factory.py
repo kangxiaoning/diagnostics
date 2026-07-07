@@ -428,6 +428,8 @@ def build_agent(
         report_path=report_path,
         model=model,
         backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
+        entity_type=entity_type,
+        hostname=(param_overrides or {}).get("hostname", ""),
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)

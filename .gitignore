@@ -16,3 +16,4 @@ test_cases/
 
 # Mock tools — local-only, not pushed to GitHub
 diagnostics/tools/mock/
+scripts/

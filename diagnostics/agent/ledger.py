@@ -62,8 +62,20 @@ class DiagnosisLedgerState(DeepAgentState):
 
 # ── Factory functions ──
 
-def new_ledger() -> DiagnosisLedger:
-    """Create an empty diagnosis ledger."""
+def new_ledger(entity_type: str = "", hostname: str = "") -> DiagnosisLedger:
+    """Create an empty diagnosis ledger.
+
+    *entity_type* is used by the expert-coverage gate in
+    ``_derive_default_phase`` to determine which Argus experts
+    are available for delegation (``"host"`` → only host-argus-expert;
+    default/container → both host-argus-expert and k8s-argus-expert).
+
+    *hostname* is the resolved host node name for the target
+    workload (container scenarios) or the user-provided hostname
+    (host scenarios).  It is injected into the ``host-argus-expert``
+    subagent context via ``_build_subagent_context`` so the subagent
+    LLM knows which host to query without asking the Coordinator.
+    """
     return DiagnosisLedger(
         hypotheses={},
         root_hypothesis_ids=[],
@@ -82,6 +94,8 @@ def new_ledger() -> DiagnosisLedger:
         tool_results={},               # cache_key → {path, round, preview, lines, is_failure}
         _inconclusive_streak=0,
         _backtrack_count=0,
+        entity_type=entity_type,
+        hostname=hostname,
     )
 
 
@@ -406,8 +420,44 @@ def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     hypotheses: dict = ledger["hypotheses"]
     if not hypotheses:
         if ledger.get("current_round", 0) >= 2:
-            # LLM had at least one full round but still hasn't called
-            # commit_hypotheses — force advance to stop re-collecting data.
+            # ── Expert coverage gate ──
+            # Don't transition to hypothesize until all REQUIRED Argus
+            # experts have been delegated.  The set of *required* experts
+            # depends on entity_type:
+            #   "host"     → only host-argus-expert
+            #   container  → BOTH host-argus-expert AND k8s-argus-expert
+            #
+            # NOTE: Coordinator does NOT have Argus tools directly —
+            # detection relies on delegated_experts (populated from
+            # task(subagent_type=...) calls), NOT tools_called.
+            experts_delegated: set[str] = set()
+            has_delegated = False
+            for rd in ledger.get("rounds", []):
+                experts_delegated.update(
+                    rd.get("delegated_experts", [])
+                )
+                if "task" in rd.get("tools_called", []):
+                    has_delegated = True
+
+            entity_type = ledger.get("entity_type", "")
+            is_host_only = entity_type == "host"
+
+            has_host = "host-argus-expert" in experts_delegated
+            has_k8s = "k8s-argus-expert" in experts_delegated
+
+            if has_delegated:
+                # Host-only scenario: only host-argus-expert is available
+                if is_host_only:
+                    if not has_host:
+                        return "understand"
+                else:
+                    # Container scenario: need BOTH argus experts
+                    if not has_host or not has_k8s:
+                        return "understand"
+
+            # Required experts covered (or no delegation happened yet —
+            # the LLM may have found enough info without Argus, or may
+            # be about to delegate in this round) → advance.
             return "hypothesize"
         return "understand"
 
@@ -784,6 +834,7 @@ def record_round(
     key_findings: str = "",
     next_plan: str = "",
     _seq: int = 0,
+    delegated_experts: list[str] | None = None,
 ) -> None:
     """Record a tool call within the current diagnosis round.
 
@@ -792,7 +843,7 @@ def record_round(
     numbers reflect actual LLM invocations, not individual tool calls.
     """
     focus_id = ledger["active_path"][-1] if ledger["active_path"] else None
-    ledger["rounds"].append(RoundRecord(
+    entry = RoundRecord(
         round=ledger["current_round"],
         phase=phase,
         focus_hypothesis_id=focus_id,
@@ -800,8 +851,11 @@ def record_round(
         tools_called=tools_called,
         key_findings=key_findings,
         next_plan=next_plan,
-        _seq=_seq,  # invocation order; used by render_ledger_context for correct sorting
-    ))
+        _seq=_seq,
+    )
+    if delegated_experts:
+        entry["delegated_experts"] = delegated_experts
+    ledger["rounds"].append(entry)
 
 
 # ── Exit condition checking ──
