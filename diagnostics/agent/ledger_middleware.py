@@ -159,7 +159,50 @@ def _build_evidence_audit(ledger: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_diagnostic_synthesis(ledger: dict, max_rounds: int, report_path: str) -> str:
+# ── Empty-data patterns ─────────────────────────────────────────────────
+# Patterns found in expert / tool responses that indicate NO meaningful
+# data was returned.  Used by understand-phase safety valves to
+# distinguish "collected rich data" from "collected nothing useful"
+# and trigger early REPORT instead of forcing commit_hypotheses.
+
+_EMPTY_DATA_PATTERNS = (
+    "无监控数据返回",
+    "无数据返回",
+    "需要补充",            # expert asking for missing params
+    "需要更具体的信息",     # expert asking for clarification
+    "全部指标无异常波动",   # all metrics normal (no anomaly to diagnose)
+    "需要补充两个关键参数",  # expert needs hostname/time window
+)
+
+
+def _is_data_empty(ledger: dict) -> bool:
+    """Check if ALL delegated expert responses indicate empty/normal data.
+
+    Returns True when every expert round shows no meaningful diagnostic
+    data — either tools returned empty (wrong hostname/cluster) or all
+    metrics were normal (nothing to diagnose).  In this case the system
+    should short-circuit to REPORT instead of forcing commit_hypotheses
+    on data that cannot support any hypothesis.
+    """
+    rounds = ledger.get("rounds", [])
+    expert_rounds = [
+        r for r in rounds
+        if "task" in r.get("tools_called", [])
+        and r.get("delegated_experts")
+    ]
+    if not expert_rounds:
+        return False  # no experts delegated yet — not "empty", just "not yet"
+
+    for r in expert_rounds:
+        kf = r.get("key_findings", "")
+        if not any(p in kf for p in _EMPTY_DATA_PATTERNS):
+            return False  # at least one expert returned real data
+
+    # All expert responses matched empty/normal patterns
+    return True
+
+
+def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
     """Generate a comprehensive diagnostic synthesis when the round limit is reached.
 
     Unlike the blunt "STOP NOW" directive, this produces a structured summary
@@ -968,6 +1011,86 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         )
                                         break
 
+        # ── Post-response: detect UNDERSTAND-phase stall ──
+        # When the LLM outputs plain text without calling commit_hypotheses
+        # in UNDERSTAND phase (round >= 2, data collected, no hypotheses),
+        # inject a SystemMessage to force the agent loop to continue.
+        # Without this, the LLM can output "🔧提交诊断假设" as text
+        # (not a tool call) and the agent loop exits with no hypotheses.
+        # Mirrors the verify-phase stall detection above.
+        ledger = self._current_ledger
+        if (ledger
+                and not ledger.get("hypotheses")
+                and self._model_call_count >= 2
+                and ledger.get("current_phase") == "understand"):
+            ai_msgs = [
+                m for m in (response.result if isinstance(response.result, list) else [response.result])
+                if hasattr(m, "tool_calls")
+            ]
+            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
+            if not has_tool_calls:
+                data_collected = any(
+                    "task" in r.get("tools_called", [])
+                    for r in ledger.get("rounds", [])
+                )
+                if data_collected:
+                    if _is_data_empty(ledger):
+                        # All expert data is empty — forcing continuation
+                        # to commit_hypotheses would be useless.  Instead,
+                        # set REPORT phase and let the REPORT guard take
+                        # over in the next round with a "no data" directive.
+                        ledger["current_phase"] = "report"
+                        self._report_phase_start_round = self._model_call_count
+                        self._persist_ledger(ledger)
+                        logger.warning(
+                            "Safety: understand stall with EMPTY data "
+                            "(round %d) — forcing REPORT instead of "
+                            "commit_hypotheses",
+                            self._model_call_count,
+                        )
+                        from langchain_core.messages import SystemMessage
+                        return ExtendedModelResponse(
+                            model_response=response,
+                            additional_messages=[
+                                SystemMessage(
+                                    content=(
+                                        "⛔ [系统强制] 所有已采集的监控数据"
+                                        "均为空或无异常。\n"
+                                        "无法基于空数据形成诊断假设。\n"
+                                        "系统已自动进入 REPORT 阶段。\n"
+                                        "请在本轮调用 write_file 生成诊断"
+                                        "报告，说明无可用监控数据的原因，"
+                                        "并建议检查主机名/集群名/数据源配置。"
+                                    ),
+                                ),
+                            ],
+                        )
+                    else:
+                        logger.warning(
+                            "Safety: understand stall (round %d) — LLM "
+                            "output text without commit_hypotheses, "
+                            "forcing continuation via SystemMessage",
+                            self._model_call_count,
+                        )
+                        from langchain_core.messages import SystemMessage
+                        return ExtendedModelResponse(
+                            model_response=response,
+                            additional_messages=[
+                                SystemMessage(
+                                    content=(
+                                        "⛔ [系统强制] 你的上一轮回复是纯文本，"
+                                        "没有调用 commit_hypotheses 工具。\n"
+                                        "禁止继续输出纯文本分析。\n"
+                                        "你必须在本轮调用 commit_hypotheses "
+                                        "提交至少 1 个诊断假设。\n"
+                                        "基于已收集的 Argus 监控数据提出具体假设，"
+                                        "包含假设陈述、概率估计和推理依据。\n"
+                                        "若不调用工具，诊断将再次被强制重启。"
+                                    ),
+                                ),
+                            ],
+                        )
+
         # ── Post-response: detect REPORT-phase stall ──
         # If the model returned no tool calls while in REPORT phase
         # (without having called write_file), auto-generate the report
@@ -1525,9 +1648,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Replace the blunt "STOP NOW" directive with a comprehensive
             # diagnostic synthesis that helps the LLM produce a quality
             # report from everything learned so far.
-            synthesis = _build_diagnostic_synthesis(
-                ledger, _MAX_ROUNDS, self.report_path,
-            )
+            synthesis = _build_diagnostic_synthesis(ledger, _MAX_ROUNDS)
             warnings.append(synthesis)
             logger.warning(
                 "Safety: max rounds (%d) reached — injected diagnostic "
@@ -1618,21 +1739,49 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         round_num,
                     )
                 else:
-                    # Data collected but no hypotheses — force commit
-                    warnings.append(
-                        "⚠ [系统强制] 数据采集已完成（第1轮），当前是第"
-                        f"{round_num}轮。你尚未提交任何假设。\n"
-                        "禁止继续调用诊断工具或输出纯文本分析。\n"
-                        "你必须在本轮调用 commit_hypotheses "
-                        "提交至少1个假设，否则诊断将提前终止。\n"
-                        "基于上一轮已获取的 Argus 数据，提出假设并立即调用 "
-                        "commit_hypotheses。"
-                    )
-                    logger.warning(
-                        "Safety: understand stagnation with data (round %d, "
-                        "no hypotheses) — forcing commit",
-                        round_num,
-                    )
+                    # Data collected but no hypotheses
+                    if _is_data_empty(ledger):
+                        # All expert responses indicate empty/normal data.
+                        # Forcing commit_hypotheses is counterproductive —
+                        # the LLM has nothing to base hypotheses on.
+                        # Short-circuit to REPORT with an explanation.
+                        ledger["current_phase"] = "report"
+                        self._report_phase_start_round = round_num
+                        self._persist_ledger(ledger)
+                        warnings.append(
+                            "⛔ [系统强制] 已完成数据采集，但所有专家均返回"
+                            "空数据或无异常指标。\n"
+                            "无法形成有意义的诊断假设。\n"
+                            "禁止再调用任何诊断工具或委派专家。\n"
+                            f"必须立即调用 write_file 生成诊断报告"
+                            f"（写入 {self.report_path}），\n"
+                            "报告中说明：当前主机/集群无可用监控数据，"
+                            "建议检查以下可能原因：\n"
+                            "1. 主机名或集群名是否正确\n"
+                            "2. Argus 数据源是否可用\n"
+                            "3. 时间窗口范围内是否有有效数据"
+                        )
+                        logger.warning(
+                            "Safety: understand stagnation with EMPTY "
+                            "data (round %d) — forcing REPORT",
+                            round_num,
+                        )
+                    else:
+                        # Data collected but no hypotheses — force commit
+                        warnings.append(
+                            "⚠ [系统强制] 数据采集已完成（第1轮），当前是第"
+                            f"{round_num}轮。你尚未提交任何假设。\n"
+                            "禁止继续调用诊断工具或输出纯文本分析。\n"
+                            "你必须在本轮调用 commit_hypotheses "
+                            "提交至少1个假设，否则诊断将提前终止。\n"
+                            "基于上一轮已获取的 Argus 数据，提出假设并立即调用 "
+                            "commit_hypotheses。"
+                        )
+                        logger.warning(
+                            "Safety: understand stagnation with data (round %d, "
+                            "no hypotheses) — forcing commit",
+                            round_num,
+                        )
             else:
                 # No data collected — force diagnostic data collection
                 warnings.append(
