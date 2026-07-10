@@ -800,131 +800,37 @@ flowchart LR
 
 ## 自定义 Middleware
 
-系统通过 5 个自定义 `AgentMiddleware` 实现参数校准、范围守卫、工具去重、假设台账和结果压缩。它们按顺序链式处理每个工具调用：
+系统通过 2 个活跃 `AgentMiddleware` 实现工具去重和假设台账驱动。原先 5 个中间件的链式架构经过实际验证后简化为 2 个核心中间件，另外 3 个因副作用过大或合并冗余被移除。
 
 ```
-Tool Call → param_override → scope_guard → dedup → ledger → offload → 实际执行
+Tool Call → dedup → ledger（含 offload） → 实际执行
+                   ↑                      ↑
+              ToolDedupMiddleware    DiagnosisLedgerMiddleware
 ```
 
-每个中间件在链中的位置决定了它的预处理（调用前）和后处理（调用后）生效时机：**越靠前的中间件，预处理越早执行；后处理则反向，越靠后的中间件越早拿到工具返回结果**。
+### Middleware 演变经验
 
----
+| 原中间件 | 当前状态 | 移除原因 |
+|---------|:--:|------|
+| `ToolParamOverrideMiddleware` | **已移除** | 强制替换工具参数副作用大：LLM 会按需传入额外参数（如 search pattern），全量替换导致参数错位。改用 **system prompt 注入**替代——在 `<diagnosis_ledger>` 中渲染"诊断会话参数"区块，告知 LLM 时间范围和集群名，由 LLM 自行判断如何在工具调用中使用。 |
+| `ScopeGuardMiddleware` | **已移除** | scope 检查与 mock 场景耦合过紧。生产环境中 scope 应由工具本身（K8s API 查询结果）自然限制，无需中间件强制拦截。 |
+| `ToolOffloadMiddleware` | **已合并入 Ledger** | 超大结果 offload 功能已在 `DiagnosisLedgerMiddleware` 中实现，单独中间件冗余。 |
 
-### 1. ToolParamOverrideMiddleware
+### 关键教训：`Command` 的 `goto` 缺失
 
-**职责**：根据 session 配置强制修正 LLM 生成的工具参数，防止幻觉。
+`DiagnosisLedgerMiddleware` 中有 6 处使用 `ExtendedModelResponse` + `Command(update={"messages": [...]})` 来注入 SystemMessage 提醒 LLM 继续操作（verify/evaluate/understand stall）。**初始实现遗漏了 `goto="model"`，导致 LangGraph router 看到 AIMessage 无 `tool_calls` 后直接路由到 END，LLM 永远看不到提醒，stall 检测形同虚设。** v1.7.0 已全部修复。
 
-**工作流程**：
+### 取消后的考量
 
-```
-awrap_tool_call 被调用
-  ├─ 工具是 task / write_file / 台账工具？ → 直接透传
-  ├─ 没有 session 配置？ → 直接透传
-  └─ 遍历 _flat_config 中的每个 key：
-       ├─ 是 meta key（task_type / fault_time_range）？ → 跳过
-       ├─ 是列表类型？ → 跳过（无法确定单个值）
-       ├─ LLM 提供了该参数？
-       │   ├─ 属于 strict_set → 强制覆盖为 config 值
-       │   └─ 属于 flexible → 信任 LLM 提供的值
-       └─ LLM 未提供该参数？
-           ├─ 属于 strict_set AND 工具签名接受 → 自动注入
-           └─ 属于 flexible AND 工具签名接受 → ⛔ 拦截
-              （中间件无法猜测多个可选值中应填哪个）
-```
+用户点击停止后，`cancel_event.set()` 触发 `streaming.py` 中的主循环取消路径：
+1. 检查 `cancel_event.is_set()` → 调用 `_drain(producer_task)`
+2. `_drain` 调用 `task.cancel()` 取消 producer，捕获 `CancelledError`
+3. v1.7.0 新增 `except Exception` 兜底：当 producer task 已有异常（如 KeyError）时，`task.cancel()` 无效，`await task` 重新抛出异常。兜底捕获防止报错日志暴露给前端。
+4. 返回 `cancelled` SSE 事件 → 前端停止渲染
 
-**参数分类**：
+取消后不生成报告——被取消的诊断必定不完整，强制保存不完整报告可能导致前端渲染历史记录时数据不齐全而报错。
 
-| 分类 | 容器模式参数 | 主机模式参数 | 行为 |
-|------|------------|------------|------|
-| **Strict** | `cluster_name`, `start_time`, `end_time` | `hostname`, `start_time`, `end_time` | 无条件覆盖/注入 |
-| **Flexible** | `namespace`, `pod_name` 等 | — | LLM 提供→信任；未提供→拦截 |
-| **Skip** | `task`, `write_file`, 台账工具 | 同左 | 直接透传 |
-
-**核心依赖**：`_build_param_map(tools)` — 用 `inspect.signature(fn)` 遍历所有工具，提取 `{工具名 → {参数名集合}}`。**仅对工具签名中实际存在的参数**注入/拦截。
-
-**典型场景**：
-
-```
-config = {"task_type":"container", "cluster_name":"prod-us-east",
-          "fault_time_range": {"start_time":"2026-07-01 15:00", ...}}
-
-LLM → check_kubernetes_pods(cluster_name="wrong")
-  → strict override → cluster_name="prod-us-east"  ← 修正
-
-LLM → check_kubernetes_pods()  # 无参数
-  → strict inject → cluster_name="prod-us-east"   ← 注入
-  → flexible missing: namespace                    ← ⛔ 拦截
-  → 返回: "⛔ [参数拦截] check_kubernetes_pods 缺少必要参数 namespace"
-
-LLM → check_kubernetes_pods(namespace="kube-system")
-  → strict inject → cluster_name="prod-us-east"
-  → flexible: LLM 提供了 namespace → 信任 "kube-system"  ← 放行
-```
-
-**移植要点**：生产工具必须用 `@tool` 装饰、参数名与 config key 一致、同一工具 mock/live 签名完全相同。`_build_param_map` 依赖工具函数暴露的 `func`/`coroutine` 属性。
-
----
-
-### 2. ScopeGuardMiddleware
-
-**职责**：拦截超出预发现 scope 的 K8s 工具调用，防止 LLM 漫游到无关资源。
-
-**工作流程**：
-
-```
-awrap_tool_call 被调用
-  ├─ 没有 diagnostic_scope？ → 直接透传（scope 未启用）
-  ├─ namespace 参数存在且不等于 allowed_namespace？
-  │   → ⛔ 拦截: "namespace xxx 不在诊断范围内"
-  ├─ node_name 参数存在且不在 allowed_nodename 中？
-  │   → ⛔ 拦截（精确匹配 + 子串匹配）
-  └─ pod_name 参数存在且不在 allowed_podname 中？
-      → ⛔ 拦截
-```
-
-**被检查的工具集**（`frozenset` 硬编码）：
-
-| 被检查参数 | 受检工具 |
-|-----------|---------|
-| `namespace` | `check_kubernetes_pods`, `get_pod_logs`, `get_pod_events`, `get_namespaces`, `list_deployments`, `list_services` |
-| `node_name` | `get_node_info` |
-| `pod_name` | `get_pod_logs`, `get_pod_events` |
-
-**ScopeLimit 创建流程**：
-
-```
-用户请求
-  → ScopeLimit.get_control_plane_metrics(cluster)
-     → 控制面内存 >80% AND 可用 <2GB？ → 拒绝诊断
-  → ScopeLimit.discover(cluster, namespace, workload, pod)
-     ├── mock: _MOCK_POD_NODE_MAP 查表
-     │   例: "prod-us-east:default:api-gateway" → 3个Pod,3个节点,3个主机IP
-     └── production: K8s API 查询（待实现）
-  → 返回 ScopeLimit(allowed_namespace, allowed_nodename, allowed_podname, ...)
-```
-
-**匹配策略**：`_is_in_scope(value, allowed)` — 先精确匹配，再子串匹配（如 `"worker-3"` 匹配 `"eklet-worker-3-abc"`），空值直接放行。仅拦截 K8s 资源类工具，Argus 监控工具和 host 诊断工具不受 scope 限制。
-
-**典型场景**：
-
-```
-Scope: namespace="default", nodename=["worker-3","worker-5"]
-
-k8s-expert → get_pod_logs(namespace="kube-system", pod_name="coredns")
-  → ⛔ namespace "kube-system" ≠ allowed "default"
-
-k8s-expert → get_pod_logs(namespace="default", pod_name="api-gateway-xyz")
-  → ✅ 放行
-
-k8s-expert → get_node_info(node_name="worker-7")
-  → ⛔ "worker-7" 不在 ["worker-3","worker-5"] 中
-```
-
-**移植要点**：受检工具名硬编码在三组 `frozenset` 中，生产 K8s 工具必须使用**完全相同的函数名**。`discover()` 和 `get_control_plane_metrics()` 的生产版需实现 K8s API / 监控 API 查询。
-
----
-
-### 3. ToolDedupMiddleware
+### 1. ToolDedupMiddleware
 
 **职责**：在 session 内阻止相同（工具名 + 参数）的重复调用，含熔断器防止连续失败重试，跨 Agent 共享缓存。
 
@@ -972,7 +878,7 @@ awrap_tool_call 被调用
 
 ---
 
-### 4. DiagnosisLedgerMiddleware
+### 2. DiagnosisLedgerMiddleware
 
 **职责**：假设驱动的诊断台账管理 + P1 专家工具阻塞 + 安全机制 + 自动证据采集。
 
@@ -1001,17 +907,21 @@ Coordinator 尝试调用 query_argus_nodes(...)
 - `task()` 描述中提及假设 ID（如"验证假设 H1"）→ 证据精确路由到该假设
 - 空结果不记录，台账工具和自我管理的工具（`record_finding` 等）不重复采集
 
-**安全机制**：
+**安全机制**（v1.7.0）：
 
 | 机制 | 阈值 | 触发后行为 |
 |------|------|-----------|
 | 最大轮次 | ≥20 | 强制进入 REPORT，禁止再调任何诊断工具 |
 | Understand 停滞（有数据） | ≥2轮无假设 | 强制要求 `commit_hypotheses` |
 | Understand 停滞（无数据） | ≥2轮无诊断工具 | 强制要求采集数据 |
-| 委派饱和 | 同 expert+Hn 连续≥2次 | 警告注入：禁止重复委派 |
-| Verify 停滞 | 连续3次 task() 无 record_finding | 自动标记 inconclusive |
-| Verify 卡住 | ≥8轮未见 finalize | 自动处理 + 强制 REPORT |
-| REPORT 停滞 | REPORT 阶段≥2轮未 write_file | 强制要求生成报告 |
+| Round-1 零工具 | 首轮纯文本 | 注入合成 task() 委派 Argus 专家（含集群名/主机名/时间窗口） |
+| Verify 停滞 | 连续N次 task() 无 record_finding | **3级递进**：1级温和提醒 → 2级强提醒+推断结论 → 3级自动决策+强制 REPORT |
+| Verify 阶段终结 | verify安全阀自动确认时 | 同步终结所有 verifying 假设为 deprioritized |
+| REPORT 安全阀 | phase=report 但 ledger["report"] 为空 | 注入 "⛔ 必须立即调用 write_file" 强制指令 |
+| REPORT 停滞 | REPORT 阶段 LLM 无 tool_calls | **2级递进**：Level-1 自动生成报告+发前端事件→END；Level-2 last-resort 自动生成 |
+| Phase guard | 进入 REPORT 阶段 | 自动终结所有 pending/verifying 假设为 deprioritized |
+| **Stall 循环保持** | 所有 verify/evaluate/understand stall | `Command(update=..., goto="model")` 强制继续 graph 循环（v1.7.0 修复 6 处缺失 `goto`） |
+| 上下文溢出保护 | ollama 默认 32K→65K | v1.7.0 将 num_ctx 从 32768 提升到 65536，防止 REPORT 阶段截断 |
 
 **移植要点**：
 - `_EXPERT_ONLY_TOOLS` 硬编码 `query_argus_*` 工具名 → 生产 Argus 工具必须同名
@@ -1020,35 +930,9 @@ Coordinator 尝试调用 query_argus_nodes(...)
 
 ---
 
-### 5. ToolOffloadMiddleware
+### 工具结果 Offload（已合并入 Ledger Middleware）
 
-**职责**：超大工具结果（>32000字符 ≈ 8000 tokens）写入 `FilesystemBackend`，LLM 收到预览+文件路径，用 `read_file`/`grep` 按需检索。
-
-**工作流程**：
-
-```
-工具执行完毕 → result 返回
-  ├─ 工具不在 tool_names 集合中？ → 直接透传原结果
-  ├─ result 是 Command 而非 ToolMessage？ → 直接透传
-  ├─ 内容长度 ≤ 32000 字符？ → 直接透传原结果
-  └─ 超过阈值 → _offload(result):
-       ├─ 完整内容写入 backend: /large_tool_results/{tool_call_id}
-       ├─ 生成 head(5行) + tail(5行) 预览
-       ├─ 附带关键词 grep 建议（如 check_memory → "OOM\n  Swap\n  RSS"）
-       └─ 返回替换后的 ToolMessage（预览 + 文件路径）
-```
-
-**关键词建议**（`hint_keywords`）：为每个工具预设常见故障模式的 grep 关键词，LLM 可按建议搜索，也可自由搜索任意模式。这些是**提示**而非限制。
-
-**offload 与 dedup/cross-round 的区别**：
-
-| 机制 | 目的 | 数据存放位置 | 中间件 |
-|------|------|------------|--------|
-| 去重（dedup） | 阻止同参数重复调用 | `_dedup_cache/工具名:JSON参数`（StateBackend） | ToolDedupMiddleware |
-| 跨轮保存（offload） | 让 LLM 按需检索历史结果 | `/tool_results/r{轮次}/{工具名}_{hash}.txt`（FilesystemBackend） | DiagnosisLedgerMiddleware |
-| 超大截断（offload） | 压缩当前轮的工具输出 | `/large_tool_results/{call_id}`（FilesystemBackend） | ToolOffloadMiddleware |
-
-**移植要点**：`tool_names` 集合在 `factory.py` 配置 → 需加入生产环境所有诊断工具名。`hint_keywords` 可按生产工具的常见异常模式自定义。
+超大工具结果（>32000字符 ≈ 8000 tokens）写入 `FilesystemBackend`，LLM 收到预览+文件路径，用 `read_file`/`grep` 按需检索。此功能已在 `DiagnosisLedgerMiddleware` 中实现，与跨轮结果保存共享同一 Backend 路径体系。
 
 ## 前端关键实现
 
@@ -1219,8 +1103,8 @@ diagnostics/
 │   │   ├── ledger.py                # 诊断台账：假设树、证据链、阶段推导、退出条件
 │   │   ├── dedup_middleware.py       # 工具去重中间件：内存缓存 + 跨Agent共享 + 熔断器
 │   │   ├── ledger_middleware.py      # 台账中间件：假设管理、P1阻塞、安全机制、offload
-│   │   ├── param_override_middleware.py  # 参数覆写中间件：strict注入 + flexible拦截
-│   │   ├── scope_guard_middleware.py  # 范围守卫中间件：namespace/node/pod范围检查
+│   │   ├── param_override_middleware.py  # ⚠ 已移除（0 bytes）— 原参数覆写，改用 system prompt 注入
+│   │   ├── offload_middleware.py     # ⚠ 已移除（0 bytes）— 原 offload，已合并入 ledger
 │   │   ├── scope_limit.py            # 诊断范围限制：K8s API发现 + 控制面健康检查
 │   │   ├── offload_middleware.py      # 结果卸载中间件：超大结果→文件系统
 │   │   └── consolidation.py         # 学习记忆整理
@@ -1255,8 +1139,6 @@ diagnostics/
 │   │   └── kubernetes/              # K8s 集群故障报告（含 GPU）
 ├── test_cases/                       # 验证测试用例（不在agent文件系统中）
 ├── scripts/                          # 验证脚本
-│   ├── verify_param_override.py      # param_override 9场景验证
-│   ├── verify_scope_limit.py         # scope_guard 7场景验证
 │   ├── verify_cross_round_e2e.py     # 去重+跨轮offload端到端验证
 ├── static/
 │   ├── index.html                   # 双栏布局页面
@@ -1294,15 +1176,13 @@ diagnostics/
 | 6 | `agent/scope_limit.py:discover()` | 通过 K8s client 查询 Pod → Node → Host 映射，实现 scope 自动发现 | **P1** |
 | 7 | `agent/scope_limit.py:get_control_plane_metrics()` | 查询监控 API 获取控制面内存指标，实现集群过载保护 | **P1** |
 
-> **无需改动的文件**：`dedup_middleware.py`、`ledger_middleware.py`、`param_override_middleware.py`、`scope_guard_middleware.py`、`offload_middleware.py` — 这些中间件与工具实现解耦，生产环境下直接复用。
+> **无需改动的文件**：`dedup_middleware.py`、`ledger_middleware.py` — 这两个中间件与工具实现解耦，生产环境下直接复用。`param_override_middleware.py` 和 `offload_middleware.py` 已移除（功能分别由 system prompt 注入和 ledger 内置 offload 替代）。
 
 ### 移植关键约束
 
-| 约束 | 说明 | 涉及中间件 | 违反后果 |
+| 约束 | 说明 | 涉及组件 | 违反后果 |
 |------|------|----------|---------|
-| **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | scope_guard, ledger(P1) | `frozenset` 硬编码工具名不匹配 → 拦截/守卫失效 |
-| **参数名一致** | 同一工具的参数名在 mock/live 之间必须相同 | param_override | `_param_map` 匹配不上 → strict 注入失效 |
-| **必须用 `@tool`** | `_build_param_map` 依赖 `inspect.signature(fn)` | param_override | 参数未被识别 → strict/flex 检查全部失效 |
+| **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | ledger(P1) | `frozenset` 硬编码工具名不匹配 → P1 阻塞失效 |
 | **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty` | dedup | 缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
 | **错误格式** | 网络超时类错误需含 `timeout` / `connection refused` | dedup | `_TOOL_FAILURE_PATTERNS` 不匹配 → 熔断器不触发 |
 
