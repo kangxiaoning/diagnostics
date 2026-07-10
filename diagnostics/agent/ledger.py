@@ -62,7 +62,8 @@ class DiagnosisLedgerState(DeepAgentState):
 
 # ── Factory functions ──
 
-def new_ledger(entity_type: str = "", hostname: str = "") -> DiagnosisLedger:
+def new_ledger(entity_type: str = "", hostname: str = "",
+               entity_name: str = "") -> DiagnosisLedger:
     """Create an empty diagnosis ledger.
 
     *entity_type* is used by the expert-coverage gate in
@@ -75,6 +76,11 @@ def new_ledger(entity_type: str = "", hostname: str = "") -> DiagnosisLedger:
     (host scenarios).  It is injected into the ``host-argus-expert``
     subagent context via ``_build_subagent_context`` so the subagent
     LLM knows which host to query without asking the Coordinator.
+
+    *entity_name* is the cluster/host name from the frontend
+    (e.g. ``"prod-us-east"``).  It is injected into the
+    ``k8s-argus-expert`` subagent context so the subagent LLM
+    knows which cluster to query without asking the Coordinator.
     """
     return DiagnosisLedger(
         hypotheses={},
@@ -96,6 +102,7 @@ def new_ledger(entity_type: str = "", hostname: str = "") -> DiagnosisLedger:
         _backtrack_count=0,
         entity_type=entity_type,
         hostname=hostname,
+        entity_name=entity_name,
     )
 
 
@@ -141,6 +148,18 @@ def new_evidence(
 
 # ── ID generation ──
 
+def _norm_parent_id(parent_id: str | None) -> str | None:
+    """Normalize parent_id so empty string is treated as None.
+
+    LLMs may pass ``""`` for optional parameters instead of omitting them.
+    This helper prevents KeyError on ``hypotheses[""]`` in all code paths
+    that read ``parent_id`` from a hypothesis node.
+    """
+    if not parent_id:
+        return None
+    return parent_id
+
+
 def _next_hypothesis_id(parent_id: str | None, hypotheses: dict[str, HypothesisNode]) -> str:
     """Generate next hypothesis ID like H1, H2, H1.1, H1.2.
 
@@ -174,7 +193,12 @@ def add_hypotheses(
     hypothesis_specs: list[dict],
     parent_id: str | None,
 ) -> list[HypothesisNode]:
-    """Add up to 3 hypotheses under a parent. Returns created nodes."""
+    """Add up to 3 hypotheses under a parent. Returns created nodes.
+
+    Existing hypotheses with the same statement (trimmed + lowercased)
+    are rejected to prevent duplicate creation.  Use ``record_finding``
+    to update an existing hypothesis's probability or verdict.
+    """
     if len(hypothesis_specs) > 3:
         raise ValueError(
             f"最多3个假设，收到 {len(hypothesis_specs)} 个。请只提交可能性最大的3个。"
@@ -182,7 +206,33 @@ def add_hypotheses(
 
     created: list[HypothesisNode] = []
     hypotheses = ledger["hypotheses"]
+
+    # ── Normalize parent_id ──
+    # LLMs may pass an empty string "" for an optional parameter instead
+    # of omitting it.  Treat falsy values (None, "") uniformly as
+    # "root-level hypothesis" to avoid KeyError on hypotheses[""].
+    if not parent_id:
+        parent_id = None
+
     parent_depth = hypotheses[parent_id]["depth"] if parent_id else -1
+
+    # Detect duplicate statements — only scan root-level hypotheses
+    # (parent_id is None), since sub-hypotheses naturally contain
+    # parent context.
+    if parent_id is None:
+        existing_stmts = {
+            h["statement"].strip().lower()
+            for h in hypotheses.values()
+            if h["parent_id"] is None and h.get("status") not in ("refuted", "dead_end")
+        }
+        for spec in hypothesis_specs:
+            norm = spec["statement"].strip().lower()
+            if norm in existing_stmts:
+                raise ValueError(
+                    f"假设 '{spec['statement'][:80]}' 已存在。"
+                    f"如需更新其概率或结论，请使用 record_finding 工具，"
+                    f"而非 commit_hypotheses 重复提交。"
+                )
 
     for spec in hypothesis_specs:
         hid = _next_hypothesis_id(parent_id, hypotheses)
@@ -236,7 +286,7 @@ def select_path(
         selected["rationale"] = rationale
 
     # Update active_path: remove siblings, keep ancestors
-    parent_id = selected["parent_id"]
+    parent_id = _norm_parent_id(selected["parent_id"])
     siblings: list[str] = []
     if parent_id is None:
         siblings = ledger["root_hypothesis_ids"]
@@ -249,7 +299,7 @@ def select_path(
     while cursor:
         new_path.insert(0, cursor)
         node = hypotheses[cursor]
-        cursor = node["parent_id"]
+        cursor = _norm_parent_id(node["parent_id"])
     ledger["active_path"] = new_path
 
     # Mark non-selected siblings as deprioritized
@@ -514,7 +564,7 @@ def _get_current_layer(ledger: DiagnosisLedger) -> list[str]:
     if node and node["sub_hypothesis_ids"]:
         return node["sub_hypothesis_ids"]
     # Check siblings at same depth
-    parent_id = node["parent_id"] if node else None
+    parent_id = _norm_parent_id(node["parent_id"]) if node else None
     if parent_id is None:
         return ledger["root_hypothesis_ids"]
     return ledger["hypotheses"][parent_id]["sub_hypothesis_ids"]
@@ -548,7 +598,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
         if current is None:
             path.pop()
             continue
-        parent_id = current["parent_id"]
+        parent_id = _norm_parent_id(current["parent_id"])
 
         # Look for deprioritized or pending siblings
         if parent_id is None:
@@ -567,7 +617,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
                 cursor = sid
                 while cursor:
                     new_path.insert(0, cursor)
-                    cursor = ledger["hypotheses"][cursor]["parent_id"]
+                    cursor = _norm_parent_id(ledger["hypotheses"][cursor]["parent_id"])
                 ledger["active_path"] = new_path
                 return sid
 
@@ -589,12 +639,26 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "list_diagnostic_capabilities", "get_system_overview",
 })
 
-def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
+def render_ledger_context(ledger: DiagnosisLedger | None,
+                          report_path: str = "",
+                          start_time: str = "",
+                          end_time: str = "") -> str:
     """Render a compact, structured summary of the ledger for LLM context."""
     if not ledger:
         return ""
 
     lines: list[str] = ["<diagnosis_ledger>"]
+
+    # ── Session parameters (user-provided, use as authoritative time range) ──
+    if start_time or end_time:
+        lines.append("## 诊断会话参数（用户已指定，禁止自行推断）")
+        if start_time:
+            lines.append(f"- 开始时间: {start_time}")
+        if end_time:
+            lines.append(f"- 结束时间: {end_time}")
+        if not start_time or not end_time:
+            lines.append("- 若未指定，使用最近 6 小时作为默认时间窗口")
+        lines.append("")
 
     # Current status
     phase = derive_phase(ledger)
@@ -678,7 +742,7 @@ def render_ledger_context(ledger: DiagnosisLedger | None) -> str:
         lines.append("")
 
     # Current step guidance
-    guidance = _phase_guidance(phase, ledger)
+    guidance = _phase_guidance(phase, ledger, report_path)
     if guidance:
         lines.append("## 本步要求")
         lines.append(guidance)
@@ -720,12 +784,14 @@ def _render_hypothesis_tree(
             _render_hypothesis_tree(lines, ledger, node["sub_hypothesis_ids"], indent + 1)
 
 
-def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
+def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
+                     report_path: str = "") -> str:
     """Generate guidance text for the current phase."""
     if phase == "understand":
         return (
             "你当前处于 UNDERSTAND 阶段。\n"
             "- 从用户输入提取故障画像（实体、症状、时间线、变更、已尝试操作）\n"
+            "- 委派 Argus 专家时使用上方「诊断会话参数」中的时间范围（禁止自行推断）\n"
             "- 委派 Argus 专家采集监控指标（通过 task() 调用）：\n"
             "  主机相关（CPU/内存/磁盘/网络症状）→ task(\"host-argus-expert\", ...)\n"
             "  K8s 相关（节点/Pod/集群症状）→ task(\"k8s-argus-expert\", ...)\n"
@@ -800,13 +866,18 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger) -> str:
             f"\n- 已确认 {n_causes} 个根因，报告中需分别列出每个根因的证据链和修复建议"
             if n_causes > 1 else ""
         )
+        path_hint = (
+            f"必须立即调用 write_file 将报告写入 {report_path}"
+            if report_path else "必须立即调用 write_file 生成诊断报告"
+        )
         return (
             "你当前处于 REPORT 阶段。\n"
-            "- 在生成报告前，对所有已验证但未 record_finding 的假设调用 record_finding 记录结论\n"
-            "- 基于诊断台账生成报告（台账即证据链）\n"
-            "- 报告必须包含: 根因（如有多个，按条目分别列出）、证据链、排除的假设及排除原因"
+            f"⛔ {path_hint}。\n"
+            "⛔ 禁止输出文本分析、总结或复盘 — 报告内容写入 write_file，不写在对话里。\n"
+            "- 系统已自动终结所有挂起假设，你无需再调用 record_finding / commit_hypotheses\n"
+            "- 报告基于上方 <diagnosis_ledger> 中的证据链和根因"
             + multi_hint +
-            f"\n- 使用 write_file 将报告写入 {{report_path}}\n"
+            "\n- 报告模板参考系统提示中的 REPORT 阶段说明\n"
             "- ⚠ 诊断台账（ledger JSON）已由系统自动持久化，无需手动写入"
         )
     return ""

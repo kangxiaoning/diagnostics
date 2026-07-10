@@ -205,6 +205,8 @@ async def stream_agent_events(
             await task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            pass  # Task already failed — don't re-raise its exception
 
     try:
         while True:
@@ -469,15 +471,17 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
         elif msg_type == "ToolMessage":
             tc_id = getattr(message, "tool_call_id", "")
             if tc_id and tc_id not in state.done_tools:
-                state.done_tools.add(tc_id)
                 output = _extract_text(message)
                 info = state.active_tools.pop(tc_id, None)
                 # Skip orphaned tool_end events — the corresponding
-                # tool_start was filtered out.
+                # tool_start was filtered out.  Do NOT add to
+                # done_tools here — that would inflate the counter
+                # and cause tools_active to go negative.
                 if info is None:
                     logger.debug("[round=%d] Skipping orphaned ToolMessage (no tool_start): %s",
                                  state.round_number, tc_id)
                 else:
+                    state.done_tools.add(tc_id)
                     logger.info("[round=%d] Tool done: %s", state.round_number, info["label"])
                     # Deduped nodes should be removed from the frontend tree
                     # so users don't see duplicated identical calls.
@@ -513,14 +517,16 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         if _message_type(last) == "ToolMessage":
                             tc_id = getattr(last, "tool_call_id", "")
                             if tc_id and tc_id not in state.done_tools:
-                                state.done_tools.add(tc_id)
                                 output = _extract_text(last)
                                 info = state.active_tools.pop(tc_id, None)
-                                # Skip orphaned tool_end (no matching tool_start)
+                                # Skip orphaned tool_end (no matching tool_start).
+                                # Do NOT add to done_tools here — same reason
+                                # as the messages-mode handler above.
                                 if info is None:
                                     logger.debug("[round=%d] Skipping orphaned ToolMessage (updates): %s",
                                                  state.round_number, tc_id)
                                 else:
+                                    state.done_tools.add(tc_id)
                                     logger.info("[round=%d] Tool done (updates): %s",
                                                 state.round_number, info["label"])
                                     end_evt = AgentEvent("tool_end", {

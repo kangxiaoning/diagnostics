@@ -13,8 +13,6 @@ from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
 from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
-from diagnostics.agent.offload_middleware import ToolOffloadMiddleware
-from diagnostics.agent.param_override_middleware import ToolParamOverrideMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
 from diagnostics.tools import get_k8s_live_tools
@@ -151,6 +149,12 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "你是 Linux 主机指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度的分项指标时间线，"
                 "识别异常突变点、跨子系统时序关联、异常严重程度排序。\n\n"
+                "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
+                "所有必需参数必须从以下来源获取（按优先级）：\n"
+                "1. Coordinator 的 task 描述\n"
+                "2. 系统注入的「诊断实体」提示（上文中的目标主机）\n"
+                "如果两处都未提供足够的参数，回复'需要 hostname 参数'——"
+                "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
                 "- 并行查询所有相关 Argus 指标（CPU/内存/磁盘/网络）\n"
                 "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
@@ -184,6 +188,12 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "你有两个专用工具：\n"
                 "- query_argus_nodes: 节点健康(NotReady) + Pod稳定性(Restarts/Evictions/Pending)\n"
                 "- query_argus_services: 控制面(API延迟/etcd leader切换/etcd存储) + DNS(延迟/错误数)\n\n"
+                "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
+                "所有必需参数必须从以下来源获取（按优先级）：\n"
+                "1. Coordinator 的 task 描述\n"
+                "2. 系统注入的「诊断实体」提示（上文中的目标集群）\n"
+                "如果两处都未提供足够的参数，回复'需要 cluster_name 参数'——"
+                "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
                 "- 并行调用两个工具，分别获取基础设施层和控制面层的时序数据\n"
                 "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
@@ -360,7 +370,10 @@ def build_agent(
     report_path: str = "",
     ledger_path: str = "",
     entity_type: str = "",
-    param_overrides: dict | None = None,
+    hostname: str = "",
+    entity_name: str = "",
+    start_time: str = "",
+    end_time: str = "",
 ):
     settings = settings or Settings.from_env()
 
@@ -386,9 +399,8 @@ def build_agent(
         # exclusive to k8s-expert.
         tools = get_coordinator_mock_tools(extra_tools)
 
-    # Shared backend — used by both FilesystemMiddleware (auto-registered by
-    # create_deep_agent) and ToolOffloadMiddleware so that offloaded files
-    # are accessible via built-in read_file / grep / ls tools.
+    # Shared backend — used by FilesystemMiddleware (auto-registered by
+    # create_deep_agent) and DedupMiddleware for cross-agent cache sharing.
     shared_backend = CompositeBackend(
         default=StateBackend(),
         routes={"/agent_data/": FilesystemBackend(
@@ -396,23 +408,7 @@ def build_agent(
         )},
     )
 
-    # Collect ALL tools (Coordinator + subagents) so the param override
-    # middleware has signatures for every tool in the system, including
-    # K8s tools that subagents use.
     subagent_configs = _build_subagents(mode, entity_type=entity_type)
-    all_tools = list(tools)
-    for sa in subagent_configs:
-        for t in sa.get("tools", []):
-            if t not in all_tools:
-                all_tools.append(t)
-
-    # Parameter override middleware — full replacement of tool call arguments
-    # with frontend-provided values.  All matching params are unconditionally
-    # overwritten, regardless of what the LLM generates.
-    # Must run BEFORE dedup middleware so dedup sees corrected args.
-    param_middleware = ToolParamOverrideMiddleware(
-        config=param_overrides, tools=all_tools,
-    ) if param_overrides else None
 
     # Tool dedup middleware — prevents duplicate tool calls (same name+args)
     # within a session, with circuit breaker for repeated failures and
@@ -427,82 +423,22 @@ def build_agent(
         ledger_path=ledger_path,
         report_path=report_path,
         model=model,
-        backend=shared_backend,  # shared with FilesystemMiddleware + OffloadMiddleware
+        backend=shared_backend,
         entity_type=entity_type,
-        hostname=(param_overrides or {}).get("hostname", ""),
+        hostname=hostname,
+        entity_name=entity_name,
+        start_time=start_time,
+        end_time=end_time,
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)
 
-    # Tool offload middleware — compresses oversized tool results by writing
-    # full content to the backend and replacing with a head+tail preview.
-    # The LLM can then use read_file/grep to retrieve specific information.
-    # hint_keywords provides per-tool search suggestions (starting points,
-    # not exhaustive — the LLM is free to explore other patterns).
-    #
-    # Pipe-isolated: runs in the `wrap_model_call` pipeline (not
-    # `awrap_tool_call`).  Tool-execution middlewares (ledger, dedup)
-    # always see the original, unmodified tool result.
-    # Ordering relative to those middlewares is irrelevant.
-    offload_middleware = ToolOffloadMiddleware(
-        tool_names={
-            # Host diagnostic tools (may return large outputs)
-            "check_cpu", "check_memory", "check_disk", "check_network",
-            "check_processes", "check_conntrack", "check_dmesg",
-            # K8s diagnostic tools
-            "check_kubernetes_pods", "check_kubernetes_nodes",
-            "check_kubernetes_control_plane",
-            # GPU tools
-            "check_gpu_health", "check_gpu_memory", "check_gpu_utilization",
-            # Argus monitoring tools (time-series data can be very large)
-            "query_argus_cpu", "query_argus_memory",
-            "query_argus_disk", "query_argus_network",
-            "query_argus_nodes", "query_argus_services",
-            "query_argus_gpu",
-            "query_argus_cpu_metrics", "query_argus_memory_metrics",
-            "query_argus_disk_metrics", "query_argus_network_metrics",
-            "query_argus_pod_logs",
-        },
-        token_limit=8000,
-        backend=shared_backend,
-        hint_keywords={
-            # Host tools: common fault indicators
-            "check_cpu": ["D-state", "iowait", "ksoftirqd", "kworker", "steal"],
-            "check_memory": ["OOM", "oom_kill", "Swap", "dirty_ratio", "slab"],
-            "check_disk": ["await", "util", "iowait", "D-state", "IO_SCHED"],
-            "check_network": ["retrans", "drops", "conntrack", "softirq", "mtu"],
-            "check_processes": ["OOM", "zombie", "D-state", "RSS", "oom_score"],
-            "check_conntrack": ["table_full", "nf_conntrack_max", "drop", "insert_failed"],
-            "check_dmesg": ["OOM", "oom_kill", "segfault", "BUG", "Call Trace", "error"],
-            # K8s tools: common failure patterns
-            "check_kubernetes_pods": ["CrashLoopBackOff", "OOMKilled", "Error", "ImagePullBackOff", "Evicted", "Pending"],
-            "check_kubernetes_nodes": ["NotReady", "MemoryPressure", "DiskPressure", "PIDPressure", "NetworkUnavailable"],
-            "check_kubernetes_control_plane": ["etcd", "leader", "timeout", "latency", "certificate"],
-            # GPU tools
-            "check_gpu_health": ["XID", "ECC", "throttle", "temperature", "power_limit"],
-            "check_gpu_memory": ["OOM", "leak", "fragmentation", "BAR1"],
-            "check_gpu_utilization": ["stall", "SM", "memory_bandwidth", "pcie"],
-            # Argus monitoring tools: anomaly patterns
-            "query_argus_cpu": ["spike", "iowait", "steal", "softirq"],
-            "query_argus_memory": ["OOM", "swap", "RSS", "available"],
-            "query_argus_disk": ["await", "util", "latency", "IO"],
-            "query_argus_network": ["retransmit", "drops", "DNS", "timeout"],
-            "query_argus_nodes": ["NotReady", "restart", "eviction", "pending"],
-            "query_argus_services": ["etcd", "leader", "DNS", "latency", "error"],
-            "query_argus_pod_logs": ["OOMKilled", "CrashLoop", "OutOfMemory", "exit code", "FATAL"],
-        },
-    )
-
-    # ── Inject all shared middleware into every subagent ──
+    # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
-    _subagent_middleware = [
-        m for m in [param_middleware, dedup_subagent, subagent_ledger, offload_middleware]
-        if m is not None
-    ]
-    if _subagent_middleware:
-        for sa in subagent_configs:
-            sa["middleware"] = list(_subagent_middleware)
+    _subagent_middleware = [dedup_subagent, subagent_ledger]
+    for sa in subagent_configs:
+        sa["middleware"] = list(_subagent_middleware)
 
     return create_deep_agent(
         model=model,
@@ -512,6 +448,6 @@ def build_agent(
         memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[m for m in [param_middleware, dedup_middleware, ledger_middleware, offload_middleware] if m is not None],
+        middleware=[dedup_middleware, ledger_middleware],
         state_schema=DiagnosisLedgerState,
     )

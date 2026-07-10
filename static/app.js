@@ -705,6 +705,13 @@ formEl.addEventListener("submit", async (e) => {
   const rawPrompt = inputEl.value.trim();
   if (!rawPrompt || controller) return;
 
+  // Always create a new session per send so that parameters
+  // from the frontend bind to a fresh diagnostic context.
+  // Without this, the backend reuses the previous session and
+  // parameter-dependent fixes cannot be tested in isolation.
+  sessionId = null;
+  localStorage.removeItem("diagnostics.sessionId");
+
   const skillPrefix = buildSkillPrefix();
   const prompt = skillPrefix + rawPrompt;
   const displayText = activeSkills.length > 0

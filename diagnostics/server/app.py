@@ -178,6 +178,11 @@ def _save_result(
         "event_counts": dict(event_counters),
         "tree": {"steps": _serialize_tree(tree)},
     }
+    # ── Performance metrics ──
+    if ledger:
+        metrics = ledger.get("metrics") or {}
+        if metrics:
+            data["metrics"] = metrics
     if ledger:
         data["ledger"] = ledger
     result_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -300,11 +305,17 @@ async def _chat_event_stream(
     # host-argus-expert needs a concrete hostname to query host-level
     # Argus metrics (CPU/memory/disk/network).  In container scenarios,
     # the frontend only provides K8s-level params — resolve the underlying
-    # host node name from the workload info and inject it into param_overrides
-    # so that ToolParamOverrideMiddleware can inject it into tool calls.
+    # host node name from the workload info and pass it to the agent.
+    hostname = ""
+    start_time = ""
+    end_time = ""
     if request.param_overrides:
         from diagnostics.agent.hostname_resolver import resolve_hostnames
         request.param_overrides = resolve_hostnames(request.param_overrides)
+        hostname = (request.param_overrides or {}).get("hostname", "")
+        time_range = (request.param_overrides or {}).get("fault_time_range", {}) or {}
+        start_time = time_range.get("start_time", "")
+        end_time = time_range.get("end_time", "")
 
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
@@ -315,7 +326,10 @@ async def _chat_event_stream(
         report_path=report_path,
         ledger_path=ledger_path,
         entity_type=request.entity_type,
-        param_overrides=request.param_overrides,
+        hostname=hostname,
+        entity_name=request.entity_name,
+        start_time=start_time,
+        end_time=end_time,
     )
 
     state.messages.append(HumanMessage(content=request.message))
@@ -529,6 +543,19 @@ async def _chat_event_stream(
                          session_id, elapsed, exc)
         for snap in tree.finalize():
             yield _tree_sse(snap)
+        # ── Fallback: save whatever we have ──
+        # The graph may crash after the timeout handler fires (e.g.
+        # KeyError on orphaned tool_call_ids during END routing).
+        # Save .result.json with whatever ledger/tree data exists so
+        # the frontend can still render a partial diagnosis tree and
+        # the user doesn't lose all evidence.
+        try:
+            _save_result(report_path, tree,
+                         request.entity_type, request.entity_name,
+                         elapsed, event_counters, len("".join(assistant_text)),
+                         ledger=latest_ledger, content="".join(report_text))
+        except Exception:
+            pass  # best-effort; don't mask the original error
         trace.finalize()
         yield sse(
             "error",
