@@ -30,7 +30,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from deepagents.backends.protocol import BackendProtocol
 
@@ -660,6 +660,7 @@ class RecordFindingInput(BaseModel):
     )
     evidence_summary: str = Field(description="验证证据摘要")
     probability_update: int = Field(
+        validation_alias=AliasChoices("probability_update", "probability"),
         description="更新后的概率 0-100", ge=0, le=100,
     )
     new_insights: str = Field(
@@ -715,8 +716,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._last_finding_round: int = 0
         self._last_task_round: int = 0
         self._report_phase_start_round: int = 0  # track when REPORT phase began
-        self._report_synthetic_count: int = 0   # synthetic write_file injection guard
         self._verify_stall_count: int = 0  # consecutive verify-phase stalls
+        self._verify_stuck_emitted: bool = False  # prevent duplicate verify-stuck warnings
+        self._evaluate_stall_count: int = 0  # consecutive evaluate-phase stalls
+        self._round_emitted: bool = False  # prevent duplicate round_transition on goto re-entry
+        self._last_commit_round: int = -1  # round when commit_hypotheses last ran
         # ── Performance metrics ──
         self._inference_start: float = 0.0      # monotonic timestamp per round
         self._round_metrics: list[dict] = []    # [{round, phase, duration_s, input_tokens, output_tokens}, ...]
@@ -827,15 +831,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # round numbers reflect LLM invocations, not individual tool calls.
         if self._current_ledger is not None:
             self._current_ledger["current_round"] = self._model_call_count
-        try:
-            sw = getattr(runtime, "stream_writer", None)
-            if sw:
-                sw({
-                    "type": "round_transition",
-                    "round": self._model_call_count,
-                })
-        except Exception:
-            pass  # stream_writer not available in all contexts
+        # Emit round_transition ONLY on the first before_model of each
+        # round.  Re-entry via Command(goto="model") (stall handling)
+        # triggers before_model again but is NOT a new round — suppress
+        # duplicate emission to avoid inflating the round counter.
+        if not self._round_emitted:
+            self._round_emitted = True
+            try:
+                sw = getattr(runtime, "stream_writer", None)
+                if sw:
+                    sw({
+                        "type": "round_transition",
+                        "round": self._model_call_count,
+                    })
+            except Exception as exc:
+                logger.warning(
+                    "before_model: stream_writer unavailable "
+                    "(round %d): %s", self._model_call_count, exc,
+                )
 
     # ── Context injection ──
 
@@ -1110,7 +1123,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "立即调用 task() 委派 Argus 专家开始数据采集。"
                                 ),
                             ),
-                        ]}),
+                        ]}, goto="model"),
                     )
 
         # ── Post-response: detect verify-phase stall ──
@@ -1170,14 +1183,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "round %d) — auto-confirmed %s, forced REPORT",
                                 self._model_call_count, active_id,
                             )
-                            # Inject synthetic write_file to force
-                            # loop continuation.  Appending text to
-                            # AIMessage is insufficient — the graph
-                            # router checks tool_calls for loop
-                            # decisions and would END the loop
-                            # immediately without tool_calls.
-                            # Pre-generate the report from the ledger
-                            # so the write_file call writes real content.
+                            # Auto-generate report as backup, then
+                            # inject synthetic write_file to keep the
+                            # graph loop alive (Command(goto) is not
+                            # supported by langchain wrap_model_call).
                             report_md = self._generate_report_from_ledger(ledger)
                             ledger["report"] = report_md
                             _write_report_file(
@@ -1186,6 +1195,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                             self._persist_ledger(ledger)
                             import uuid as _uuid
+                            from langchain_core.messages import AIMessage
                             synthetic = [{
                                 "name": "write_file",
                                 "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
@@ -1194,14 +1204,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "content": report_md,
                                 },
                             }]
-                            _inject_tool_calls(
-                                response, synthetic,
-                                content_override=(
-                                    "[\u7cfb\u7edf\u5b89\u5168\u9600] verify \u9636\u6bb5\u5df2\u7ed3\u675f\uff0c"
-                                    f"\u5047\u8bbe {active_id} \u5df2\u81ea\u52a8\u5904\u7406\u3002"
-                                    "\u7cfb\u7edf\u5df2\u81ea\u52a8\u751f\u6210\u8bca\u65ad\u62a5\u544a\u3002"
+                            response = ModelResponse(result=[AIMessage(
+                                content=(
+                                    "[系统安全阀] verify 阶段已结束，"
+                                    f"假设 {active_id} 已自动确认。"
+                                    "系统已自动生成诊断报告。"
                                 ),
-                            )
+                            )])
+                            _inject_tool_calls(response, synthetic)
                         else:
                             # Expert evidence exists but no coordinator
                             # assessment yet — LLM likely received expert
@@ -1236,23 +1246,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "record_finding (round %d)",
                                     active_id, self._model_call_count,
                                 )
-                                from langchain_core.messages import SystemMessage
-                                return ExtendedModelResponse(
-                                    model_response=response,
-                                    command=Command(update={"messages": [
-                                        SystemMessage(
-                                            content=(
-                                                "⛔ [系统提醒] 你已收到专家验证结果，"
-                                                "但还未调用 record_finding 记录验证结论。\n"
-                                                f"请在本轮调用 record_finding("
-                                                f"hypothesis_id={active_id}) "
-                                                "记录验证结果（confirmed/refuted/"
-                                                "inconclusive），并附上关键证据。\n"
-                                                "禁止继续输出纯文本分析。"
-                                            ),
+                                import uuid as _uuid
+                                from langchain_core.messages import AIMessage
+                                synthetic = [{
+                                    "name": "record_finding",
+                                    "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                                    "args": {
+                                        "hypothesis_id": active_id,
+                                        "verdict": "confirmed",
+                                        "evidence_summary": (
+                                            "[系统自动] LLM 未调用 record_finding，"
+                                            "系统基于已有专家证据自动确认。"
                                         ),
-                                    ]}, goto="model"),
-                                )
+                                        "probability_update": node["probability"],
+                                    },
+                                }]
+                                response = ModelResponse(result=[AIMessage(
+                                    content=(
+                                        "[系统提醒] 你已收到专家验证结果但未调用 "
+                                        "record_finding。系统已自动记录验证结论，"
+                                        "请在下一轮基于台账继续诊断。"
+                                    ),
+                                )])
+                                _inject_tool_calls(response, synthetic)
+                                self._verify_stall_count = 0  # reset after auto-action
 
                             elif self._verify_stall_count == 2:
                                 # Second stall — inject strong reminder with
@@ -1276,23 +1293,29 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                             "信号，建议 verdict=refuted。")
                                 else:
                                     hint = "系统无法从专家输出中推断明确结论。"
-                                from langchain_core.messages import SystemMessage
-                                return ExtendedModelResponse(
-                                    model_response=response,
-                                    command=Command(update={"messages": [
-                                        SystemMessage(
-                                            content=(
-                                                "⛔ [系统强制] 已连续 2 轮未调用 "
-                                                "record_finding。\n"
-                                                f"{hint}\n"
-                                                f"必须在下一轮调用 record_finding("
-                                                f"hypothesis_id={active_id})，"
-                                                "否则系统将自动处理。\n"
-                                                "禁止继续输出纯文本分析。"
-                                            ),
+                                import uuid as _uuid
+                                from langchain_core.messages import AIMessage
+                                synthetic = [{
+                                    "name": "record_finding",
+                                    "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                                    "args": {
+                                        "hypothesis_id": active_id,
+                                        "verdict": inferred if inferred else "inconclusive",
+                                        "evidence_summary": (
+                                            "[系统自动] LLM 连续 2 轮未调用 record_finding，"
+                                            f"系统基于专家文本自动{'确认' if inferred else '标记'}。"
                                         ),
-                                    ]}, goto="model"),
-                                )
+                                        "probability_update": node["probability"],
+                                    },
+                                }]
+                                response = ModelResponse(result=[AIMessage(
+                                    content=(
+                                        f"[系统强制] 已连续 2 轮未调用 record_finding。"
+                                        f"系统已自动处理假设 {active_id}。"
+                                    ),
+                                )])
+                                _inject_tool_calls(response, synthetic)
+                                self._verify_stall_count = 0
 
                             else:
                                 # Third consecutive stall → auto-decision
@@ -1344,10 +1367,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     self._model_call_count, auto_verdict,
                                     active_id,
                                 )
-                                # Inject synthetic write_file to force
-                                # loop continuation — same reason as the
-                                # has_coordinator_support path above.
-                                # Pre-generate report from ledger.
+                                # Auto-generate report as backup, then
+                                # inject synthetic write_file to keep loop
+                                # alive (Command(goto) not supported by
+                                # langchain wrap_model_call).
                                 report_md = self._generate_report_from_ledger(ledger)
                                 ledger["report"] = report_md
                                 _write_report_file(
@@ -1356,6 +1379,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 )
                                 self._persist_ledger(ledger)
                                 import uuid as _uuid
+                                from langchain_core.messages import AIMessage
                                 synthetic = [{
                                     "name": "write_file",
                                     "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
@@ -1364,14 +1388,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         "content": report_md,
                                     },
                                 }]
-                                _inject_tool_calls(
-                                    response, synthetic,
-                                    content_override=(
+                                response = ModelResponse(result=[AIMessage(
+                                    content=(
                                         "[系统安全阀] verify 阶段已结束，"
-                                        f"假设 {active_id} 已自动处理。"
+                                        f"假设 {active_id} 已自动{auto_verdict}。"
                                         "系统已自动生成诊断报告。"
                                     ),
-                                )
+                                )])
+                                _inject_tool_calls(response, synthetic)
 
         # ── Post-response: detect UNDERSTAND-phase stall ──
         # When the LLM outputs plain text without calling commit_hypotheses
@@ -1410,23 +1434,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "commit_hypotheses",
                             self._model_call_count,
                         )
-                        from langchain_core.messages import SystemMessage
-                        return ExtendedModelResponse(
-                            model_response=response,
-                            command=Command(update={"messages": [
-                                SystemMessage(
-                                    content=(
-                                        "⛔ [系统强制] 所有已采集的监控数据"
-                                        "均为空或无异常。\n"
-                                        "无法基于空数据形成诊断假设。\n"
-                                        "系统已自动进入 REPORT 阶段。\n"
-                                        "请在本轮调用 write_file 生成诊断"
-                                        "报告，说明无可用监控数据的原因，"
-                                        "并建议检查主机名/集群名/数据源配置。"
-                                    ),
-                                ),
-                            ]}, goto="model"),
-                        )
+                        from langchain_core.messages import AIMessage
+                        import uuid as _uuid
+                        report_md = self._generate_report_from_ledger(ledger)
+                        ledger["report"] = report_md
+                        _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
+                        self._persist_ledger(ledger)
+                        synthetic = [{
+                            "name": "write_file",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {"file_path": self.report_path, "content": report_md},
+                        }]
+                        response = ModelResponse(result=[AIMessage(
+                            content="[系统强制] 所有已采集的监控数据均为空。系统已生成诊断报告。",
+                        )])
+                        _inject_tool_calls(response, synthetic)
                     else:
                         logger.warning(
                             "Safety: understand stall (round %d) — LLM "
@@ -1434,24 +1456,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "forcing continuation via SystemMessage",
                             self._model_call_count,
                         )
-                        from langchain_core.messages import SystemMessage
-                        return ExtendedModelResponse(
-                            model_response=response,
-                            command=Command(update={"messages": [
-                                SystemMessage(
-                                    content=(
-                                        "⛔ [系统强制] 你的上一轮回复是纯文本，"
-                                        "没有调用 commit_hypotheses 工具。\n"
-                                        "禁止继续输出纯文本分析。\n"
-                                        "你必须在本轮调用 commit_hypotheses "
-                                        "提交至少 1 个诊断假设。\n"
-                                        "基于已收集的 Argus 监控数据提出具体假设，"
-                                        "包含假设陈述、概率估计和推理依据。\n"
-                                        "若不调用工具，诊断将再次被强制重启。"
-                                    ),
-                                ),
-                            ]}, goto="model"),
-                        )
+                        from langchain_core.messages import AIMessage
+                        import uuid as _uuid
+                        synthetic = [{
+                            "name": "commit_hypotheses",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {
+                                "hypotheses": [
+                                    {"statement": "诊断假设待补充", "probability": 50, "rationale": "系统自动创建"},
+                                ],
+                            },
+                        }]
+                        response = ModelResponse(result=[AIMessage(
+                            content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
+                        )])
+                        _inject_tool_calls(response, synthetic)
 
         # ── Post-response: detect EVALUATE-phase stall ──
         # When the LLM outputs plain text instead of calling select_path
@@ -1479,34 +1498,86 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     and node.get("probability", 0) > 15
                 ]
                 if pending:
+                    self._evaluate_stall_count += 1
                     logger.warning(
                         "Safety: evaluate stall (round %d, %d pending "
-                        "roots: %s) — forcing continuation",
+                        "roots: %s, count=%d) — forcing continuation",
                         self._model_call_count, len(pending),
                         ", ".join(pending),
+                        self._evaluate_stall_count,
                     )
-                    from langchain_core.messages import SystemMessage
-                    return ExtendedModelResponse(
-                        model_response=response,
-                        command=Command(update={"messages": [
-                            SystemMessage(
-                                content=(
-                                    "⛔ [系统强制] 当前处于 EVALUATE 阶段，"
-                                    "但你的回复是纯文本，没有调用工具。\n"
-                                    "以下根因假设尚未得到处理："
-                                    f" {', '.join(pending)}。\n"
-                                    "你必须做出决策：\n"
-                                    "1. 若某假设有足够证据 → 调用"
-                                    " record_finding 记录结论\n"
-                                    "2. 若需切换假设 → 调用 select_path\n"
-                                    "3. 若需深化 → 调用 commit_hypotheses"
-                                    " 提交子假设\n"
-                                    "禁止输出纯文本分析。若不调用工具，"
-                                    "诊断将强制重启。"
+                    if self._evaluate_stall_count == 1:
+                        # First stall — inject synthetic record_finding
+                        # for the first pending hypothesis.  Command(goto)
+                        # is not supported by langchain wrap_model_call.
+                        hid = pending[0]
+                        node = all_h.get(hid, {})
+                        from langchain_core.messages import AIMessage
+                        import uuid as _uuid
+                        synthetic = [{
+                            "name": "record_finding",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {
+                                "hypothesis_id": hid,
+                                "verdict": "inconclusive",
+                                "evidence_summary": (
+                                    "[系统自动] LLM 在 EVALUATE 阶段未调用工具，"
+                                    "系统自动标记。"
                                 ),
+                                "probability_update": node.get("probability", 50),
+                            },
+                        }]
+                        response = ModelResponse(result=[AIMessage(
+                            content=(
+                                f"[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
+                                f"系统已自动记录假设 {hid} 为 inconclusive。"
                             ),
-                        ]}, goto="model"),
-                    )
+                        )])
+                        _inject_tool_calls(response, synthetic)
+                    else:
+                        # Second+ consecutive stall — auto-resolve
+                        # pending hypotheses as inconclusive, then
+                        # force REPORT with synthetic write_file.
+                        for hid in pending:
+                            node = all_h.get(hid)
+                            if node:
+                                node["status"] = "inconclusive"
+                                node["rationale"] = (
+                                    ((node.get("rationale", "") or "")
+                                     + " | [系统自动] LLM 连续 "
+                                     f"{self._evaluate_stall_count} 轮"
+                                     "未处理此假设，系统标记为 inconclusive")
+                                )
+                        ledger["current_phase"] = "report"
+                        self._report_phase_start_round = self._model_call_count
+                        self._persist_ledger(ledger)
+                        self._evaluate_stall_count = 0
+                        logger.warning(
+                            "Safety: evaluate stall resolved — "
+                            "auto-inconclusive %s, forced REPORT",
+                            ", ".join(pending),
+                        )
+                        report_md = self._generate_report_from_ledger(ledger)
+                        ledger["report"] = report_md
+                        _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
+                        self._persist_ledger(ledger)
+                        from langchain_core.messages import AIMessage
+                        import uuid as _uuid
+                        synthetic = [{
+                            "name": "write_file",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {"file_path": self.report_path, "content": report_md},
+                        }]
+                        response = ModelResponse(result=[AIMessage(
+                            content=(
+                                f"[系统自动] 以下假设已被标记为 inconclusive："
+                                f"{', '.join(pending)}。系统已自动生成诊断报告。"
+                            ),
+                        )])
+                        _inject_tool_calls(response, synthetic)
+                else:
+                    # Tool call made (not a stall) — reset counter
+                    self._evaluate_stall_count = 0
 
         # ── Post-response: detect VERIFY ledger-only stall ──
         # When the LLM uses ledger tools (select_path, commit_hypotheses)
@@ -1531,9 +1602,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         e.get("source", "").startswith("expert:")
                         for e in node.get("evidence", [])
                     )
-                    # If no expert evidence yet, the LLM needs to
-                    # delegate a diagnostic expert
-                    if not has_expert_evidence:
+                    # If no expert evidence yet, the LLM usually needs
+                    # to delegate a diagnostic expert — BUT don't stall
+                    # on hypotheses just created by commit_hypotheses
+                    # (this or the previous round).  They naturally have
+                    # no evidence yet and the LLM should have a chance
+                    # to delegate before we intervene.
+                    if (not has_expert_evidence
+                            and self._model_call_count
+                            - self._last_commit_round > 1):
                         ai_msgs = [
                             m for m in (response.result if isinstance(response.result, list) else [response.result])
                             if hasattr(m, "tool_calls")
@@ -1557,37 +1634,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 logger.warning(
                                     "Safety: verify ledger-only stall "
                                     "(round %d, active=%s, "
-                                    "no expert evidence) — injecting "
-                                    "SystemMessage directive",
+                                    "no expert evidence) — appending "
+                                    "reminder inline",
                                     self._model_call_count, active_id,
                                 )
-                                # Use ExtendedModelResponse with a
-                                # SystemMessage instead of injecting
-                                # synthetic tool_calls.  _inject_tool_calls
-                                # corrupts the graph state when applied to
-                                # an already-processed AIMessage, causing
-                                # deadlocks (No AIMessage found in input).
-                                from langchain_core.messages import SystemMessage
-                                return ExtendedModelResponse(
-                                    model_response=response,
-                                    command=Command(update={"messages": [
-                                        SystemMessage(
-                                            content=(
-                                                "⛔ [系统强制] 检测到台账管理工具调用"
-                                                "（commit_hypotheses/select_path）"
-                                                "后未委派诊断专家验证假设 "
-                                                f"{active_id}。\n"
-                                                "如果你需要更新已有假设的概率或结论，"
-                                                "请使用 record_finding 而非 "
-                                                "commit_hypotheses。\n"
-                                                "你必须在本轮委派 host-expert "
-                                                "验证此假设（使用 task 工具，"
-                                                "subagent_type=host-expert）。\n"
-                                                "禁止继续输出纯文本分析或仅操作台账。"
-                                            ),
-                                        ),
-                                    ]}, goto="model"),
+                                # Append a reminder directly into the
+                                # AIMessage content instead of using
+                                # Command(goto="model").  goto re-entry
+                                # has been observed to cause the model
+                                # response to be silently dropped,
+                                # leaving the session permanently hung.
+                                result_list = (
+                                    response.result
+                                    if isinstance(response.result, list)
+                                    else [response.result]
                                 )
+                                for m in result_list:
+                                    if hasattr(m, "content") and isinstance(m.content, str):
+                                        m.content = m.content.rstrip() + (
+                                            "\n\n⛔ [系统提醒] 当前活跃假设 "
+                                            f"{active_id} 尚无专家验证证据。"
+                                            "请在本轮委派 host-expert "
+                                            "（task, subagent_type=host-expert）"
+                                            "验证此假设后，再调用 "
+                                            "record_finding 记录结论。"
+                                        )
+                                        break
 
         # ── Post-response: detect REPORT-phase stall ──
         # Two-level escalation:
@@ -1703,11 +1775,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     getattr(m, "tool_calls", None) for m in ai_msgs
                 )
                 if not has_tool_calls:
-                    import uuid as _uuid
-                    from langchain_core.messages import AIMessage
-
                     # Extract context from ledger or environment for
-                    # subagent delegation parameters.
+                    # subagent delegation parameters used in the
+                    # SystemMessage reminder below.
                     _ledger = self._current_ledger or {}
                     _cluster = _ledger.get("entity_name", "")
                     _hostname = _ledger.get("hostname", "")
@@ -1736,54 +1806,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "（CPU、内存、磁盘 IO、网络）"
                     )
 
-                    forced_calls = [
-                        {
-                            "name": "task",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {
-                                "subagent_type": "k8s-argus-expert",
-                                "description": _k8s_desc,
-                            },
-                        },
-                        {
-                            "name": "task",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {
-                                "subagent_type": "host-argus-expert",
-                                "description": _host_desc,
-                            },
-                        },
-                    ]
-
-                    injected = False
-                    for m in ai_msgs:
-                        if hasattr(m, "tool_calls"):
-                            m.tool_calls = forced_calls
-                            # Replace hallucinated text with a system
-                            # directive so the next LLM round is not
-                            # confused by its own hallucination.
-                            if hasattr(m, "content"):
-                                m.content = (
-                                    "[系统安全阀] 检测到第1轮未调用"
-                                    "任何工具。系统已强制委派 Argus "
-                                    "专家采集监控数据。请等待专家返回"
-                                    "数据后再进行分析。"
-                                )
-                            injected = True
-                            break
-
-                    if injected:
-                        logger.warning(
-                            "Safety: round-1 understand-phase "
-                            "zero-tools stall — injected 2 "
-                            "synthetic task() calls"
-                        )
-                    else:
-                        # No AIMessage with tool_calls attr — fall
-                        # through to server-side fallback below.
-                        raise ValueError(
-                            "No suitable AIMessage for injection"
-                        )
+                    logger.warning(
+                        "Safety: round-1 understand-phase "
+                        "zero-tools stall — routing back to model "
+                        "via Command(goto=\"model\")",
+                    )
+                    from langchain_core.messages import SystemMessage
+                    return ExtendedModelResponse(
+                        model_response=response,
+                        command=Command(update={"messages": [
+                            SystemMessage(
+                                content=(
+                                    "⛔ [系统强制] 你的回复是纯文本，没有调用任何工具。\n"
+                                    "禁止输出纯文本分析。你必须从 UNDERSTAND "
+                                    "阶段开始，立即委派 Argus 专家采集数据：\n\n"
+                                    "1. task(subagent_type=\"k8s-argus-expert\",\n"
+                                    f"   description=\"{_k8s_desc}\")\n\n"
+                                    "2. task(subagent_type=\"host-argus-expert\",\n"
+                                    f"   description=\"{_host_desc}\")\n\n"
+                                    "收到专家摘要后，调用 commit_hypotheses 提交假设。\n"
+                                    "禁止跳过步骤，禁止复述历史结论。"
+                                ),
+                            ),
+                        ]}, goto="model"),
+                    )
         except Exception as e:
             # Fallback: injection failed — generate a minimal report
             # server-side so the diagnosis is not completely empty.
@@ -1823,6 +1869,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         # Sync ledger back to state via ExtendedModelResponse so it persists
         # across rounds and survives SummarizationMiddleware compression.
+        # Reset round_emitted here — this is the NORMAL return path (LLM
+        # produced tool_calls or graph END).  The next before_model will
+        # represent a genuinely new round and should emit round_transition.
+        self._round_emitted = False
         if self._current_ledger is not None:
             return ExtendedModelResponse(
                 model_response=response,
@@ -1840,6 +1890,49 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_name = request.tool_call.get("name", "")
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
+
+        # ── write_file gate: enforce "verify before report" ──
+        # The state machine requires all hypotheses to reach a terminal
+        # state (confirmed/refuted/deprioritized) before entering REPORT
+        # phase.  This gate prevents the LLM from short-circuiting the
+        # process by calling write_file directly from evaluate/verify.
+        if tool_name == "write_file":
+            ledger = self._current_ledger
+            if ledger and ledger.get("hypotheses"):
+                should_exit, reason, _ = check_exit_conditions(ledger)
+                if not should_exit:
+                    return ToolMessage(
+                        content=(
+                            f"⛔ 无法生成诊断报告: {reason}\n"
+                            "请先调用 record_finding 完成所有假设的验证，"
+                            "再调用 write_file。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
+
+        # ── REPORT-phase gate: prevent restarting diagnosis after
+        # a root cause has been confirmed.  Creating new hypotheses
+        # or backtracking after confirmation would create confusing
+        # frontend trees (write_file → commit_hypotheses → ...).
+        #
+        # Exception: if ALL root hypotheses are exhausted (refuted /
+        # dead-end) and NO root cause has been confirmed, allow
+        # commit_hypotheses / backtrack — the first attempt failed
+        # and the LLM should be able to propose a new round.
+        if tool_name in ("commit_hypotheses", "backtrack"):
+            ledger = self._current_ledger
+            if ledger and ledger.get("current_phase") == "report":
+                cids = ledger.get("root_cause_hypothesis_ids", [])
+                if cids:
+                    # At least one confirmed root cause — no restart
+                    return ToolMessage(
+                        content=(
+                            f"⛔ 当前处于 REPORT 阶段，根因已确认。"
+                            f"禁止调用 {tool_name}。"
+                            "请调用 write_file 生成诊断报告。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
 
         # ── Capture invocation order BEFORE any async work ──
         # LangGraph executes multiple tool calls from a single LLM
@@ -2482,7 +2575,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             round_num >= 8
             and ledger.get("current_phase") == "verify"
             and ledger.get("hypotheses")
-            and "verify" not in "\n".join(warnings)  # no verify warning already
+            and not self._verify_stuck_emitted
         ):
             active_path = ledger.get("active_path", [])
             active_id = active_path[-1] if active_path else None
@@ -2524,37 +2617,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._same_delegate_count = 0
                     self._last_delegate_key = ""
                     self._last_finding_round = round_num
+                    self._verify_stuck_emitted = True
                     logger.warning(
                         "Safety: verify-phase stuck for %s (round %d) "
                         "— auto-confirmed, forced REPORT",
                         active_id, round_num,
                     )
 
-        # ── EVALUATE-phase guard: suppress REPORT messages while
-        # actionable root hypotheses are still pending.  Prevents the
-        # system from prematurely injecting REPORT-directives (via
-        # safety valves or phase-derivation edge cases) when the LLM
-        # should be evaluating remaining hypotheses first.
-        current_phase = ledger.get("current_phase", "")
-        _pending_roots: list[str] = []  # only populated in evaluate phase
-        if current_phase == "evaluate":
-            root_ids = ledger.get("root_hypothesis_ids", [])
-            _all_hypotheses = ledger.get("hypotheses", {})
-            _pending_roots = [
-                hid for hid in root_ids
-                if (node := _all_hypotheses.get(hid))
-                and node.get("status") in ("pending", "verifying")
-                and node.get("probability", 0) > 15
-            ]
-        # _pending_roots is empty for non-evaluate phases (initialized above)
-
         # ── REPORT phase write_file safety valve ──
         # If the LLM entered REPORT phase but didn't call write_file,
         # inject a progressively stronger directive.
-        # SKIP when pending root hypotheses remain in EVALUATE phase.
+        current_phase = ledger.get("current_phase", "")
         if (current_phase == "report"
-                and not ledger.get("report")
-                and not _pending_roots):
+                and not ledger.get("report")):
             # Track when REPORT phase started
             if self._report_phase_start_round == 0:
                 self._report_phase_start_round = round_num
@@ -2580,9 +2655,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     round_num, self._report_phase_start_round,
                 )
         elif current_phase != "report":
-            # Reset tracker when leaving REPORT phase (e.g. backtrack)
+            # Reset trackers when leaving REPORT phase (e.g. backtrack)
             self._report_phase_start_round = 0
-            self._report_synthetic_count = 0
+            self._verify_stuck_emitted = False
 
         return "\n\n".join(warnings) if warnings else ""
 
@@ -2606,8 +2681,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             except ValueError as e:
                 return f"假设提交失败: {e}"
 
-            # Update phase
+            # Update phase and track creation round
             ledger["current_phase"] = derive_phase(ledger)
+            mw._last_commit_round = mw._model_call_count
 
             # Build confirmation
             lines = [f"已提交 {len(created)} 个假设:"]

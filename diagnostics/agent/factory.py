@@ -85,7 +85,13 @@ _EXPERT_RETURN_SUFFIX = (
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个资源异常则需全部核查），不对正常的节点/Pod/资源逐一调用同名查询工具。"
     "若多个工具返回同一资源的数据且结论一致，取最早返回的结果即可，无需重复验证。\n"
-    "\n**返回格式（严格遵循，不超过 2000 字）**:\n"
+    "\n**工具调用预算与停止条件（严格遵守）**:\n"
+    "- 简单验证（单一症状/单一子系统）：≤5 次工具调用\n"
+    "- 中等验证（跨子系统关联）：≤8 次工具调用\n"
+    "- 复杂验证（跨层诊断）：≤12 次工具调用\n"
+    "- 收益递减时立即停止：当连续 2 次工具调用未获得新证据时，直接返回已有结论\n"
+    "- 关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
+    "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
     "- 假设验证: {confirmed|refuted|inconclusive}\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
     "- 根因判断: 如已定位根因则陈述，否则说明还需什么数据\n"
@@ -100,7 +106,8 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "\n\n**工具使用边界（严格遵守）**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
-    "\n**返回格式（严格遵循，不超过 600 字）**:\n"
+    "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
+    "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
     "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
     "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 / ✅正常，每条标注具体数值\n"
     "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
@@ -224,6 +231,9 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
             ),
             "system_prompt": (
                 "你是 Linux 主机全栈诊断专家，覆盖 CPU、内存、磁盘 IO、网络四个子系统。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告或修复方案——那是 Coordinator 的职责。\n"
+                "你的输出将被 Coordinator 解析为 record_finding 调用的输入。\n\n"
                 "诊断原则：\n"
                 "- 先看全局（system-health-check），再按症状选择对应技能深入\n"
                 "- 注意跨域关联——同一根因常表现跨子系统症状\n\n"
@@ -246,7 +256,7 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "- RSS 远超 heap limit → 识别堆外内存泄漏\n"
                 "- TCP 重传率 > 10% 但接口无丢包 → 排查 MTU/tc/conntrack\n"
                 "- DNS 超时 + conntrack table full → conntrack 导致 UDP 丢包\n"
-                "- 给出具体修复方案（命令+参数值）\n"
+                "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据，供 Coordinator 综合判断\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [t for t in [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg] if t is not None],
@@ -273,7 +283,9 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "适用场景：GPU 密集型工作负载出现异常时。"
             ),
             "system_prompt": (
-                "你是 GPU 诊断专家。\n"
+                "你是 GPU 诊断专家。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定 GPU 假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告——那是 Coordinator 的职责。\n"
                 "诊断工作流：\n"
                 "1. 优先使用 gpu-diagnosis 技能执行结构化 GPU 诊断流程。\n"
                 "2. 如技能工具不足，使用 check_gpu_health、check_gpu_memory、check_gpu_utilization 深入分析。\n"
@@ -307,6 +319,9 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
             ),
             "system_prompt": (
                 "你是 Kubernetes 全栈诊断专家，覆盖集群基础设施和工作负载。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告或修复方案——那是 Coordinator 的职责。\n"
+                "你的输出将被 Coordinator 解析为 record_finding 调用的输入。\n\n"
                 "职责范围：\n"
                 "- 控制面：API Server、etcd、scheduler、controller-manager\n"
                 "- 节点：kubelet、状态（NotReady/MemoryPressure/DiskPressure）、驱逐\n"
@@ -334,7 +349,7 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "- CrashLoopBackOff → 退出码分析：137=SIGKILL，1=应用错误，255=镜像/运行时\n"
                 "- Service 不可达 → EndpointSlices、标签选择器、就绪探针\n"
                 "- 评估影响范围：受影响节点数和工作负载数\n"
-                "- 给出具体修复方案（如 memory limit 512Mi→768Mi）\n"
+                "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据，供 Coordinator 综合判断\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
             "tools": [

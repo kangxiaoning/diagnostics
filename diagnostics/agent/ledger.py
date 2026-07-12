@@ -26,6 +26,7 @@ DiagnosisPhase = Literal[
 HypothesisStatus = Literal[
     "pending", "verifying", "confirmed",
     "refuted", "deprioritized", "dead_end",
+    "inconclusive",  # safety-valve auto-marked undetermined state
 ]
 
 Verdict = Literal["confirmed", "refuted", "inconclusive"]
@@ -280,7 +281,7 @@ def select_path(
     # Mark selected
     selected = hypotheses[selected_id]
     selected["selected"] = True
-    if selected["status"] == "pending":
+    if selected["status"] in ("pending", "inconclusive"):
         selected["status"] = "verifying"
     if rationale:
         selected["rationale"] = rationale
@@ -410,7 +411,7 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
             status = node.get("status")
             # deprioritized is a terminal state — the LLM chose to focus
             # on a higher-priority path and should not be blocked by it.
-            if status in ("refuted", "dead_end", "deprioritized"):
+            if status in ("refuted", "dead_end", "deprioritized", "inconclusive"):
                 continue
             # Low-probability pending hypotheses (p ≤ 15%) should not
             # block the transition to REPORT — they are unlikely to be
@@ -420,6 +421,11 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
                 continue
             return "evaluate"  # still has actionable root hypotheses
     if ledger.get("root_cause") or ledger.get("report"):
+        # Sub-hypotheses check: a confirmed root cause may still have
+        # sub-hypotheses awaiting verification (deepening analysis).
+        # Block REPORT entry until they are resolved.
+        if _has_pending_sub_hypotheses(ledger):
+            return "evaluate"
         return "report"
     if ledger.get("exhausted"):
         return "report"
@@ -518,10 +524,16 @@ def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
         if active and active["status"] == "verifying":
             return "verify"
 
-    # Check current layer for verdict completion
+    # Check current layer for verdict completion.
+    # Aligned with check_exit_conditions._EXHAUSTED: any status that
+    # represents a terminal verdict (including safety-valve-injected
+    # "inconclusive" and "deprioritized") satisfies this check.
+    _TERMINAL_STATUSES = frozenset({
+        "confirmed", "refuted", "dead_end", "deprioritized", "inconclusive",
+    })
     current_layer = _get_current_layer(ledger)
     all_have_verdict = all(
-        hypotheses[hid]["status"] in ("confirmed", "refuted", "dead_end")
+        hypotheses[hid]["status"] in _TERMINAL_STATUSES
         for hid in current_layer
     )
 
@@ -532,10 +544,9 @@ def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
         if confirmed:
             best = max(confirmed, key=lambda h: h["probability"])
             if best["probability"] >= 80:
-                # Check if it can be deepened (no sub-hypotheses yet)
+                # Check if it can be deepened (no sub-hypotheses yet).
+                # No sub-hypotheses → diagnosis is complete on this path → REPORT.
                 if not best["sub_hypothesis_ids"]:
-                    if _inconclusive_exhausted(ledger):
-                        return "report"
                     return "report"
                 return "evaluate"
             return "evaluate"
@@ -571,9 +582,36 @@ def _get_current_layer(ledger: DiagnosisLedger) -> list[str]:
 
 
 def _can_backtrack(ledger: DiagnosisLedger) -> bool:
-    """Check if there are deprioritized or pending siblings to backtrack to."""
+    """Check if there are deprioritized, pending, or inconclusive siblings to backtrack to."""
     for node in ledger["hypotheses"].values():
-        if node["status"] in ("deprioritized", "pending"):
+        if node["status"] in ("deprioritized", "pending", "inconclusive"):
+            return True
+    return False
+
+
+def _has_pending_sub_hypotheses(ledger: DiagnosisLedger) -> bool:
+    """Check if any confirmed root hypothesis has actionable sub-hypotheses.
+
+    Returns True if there exists a sub-hypothesis under a confirmed root
+    that still needs verification (not terminal, not low-probability pending).
+    Prevents premature REPORT entry when root causes are confirmed but
+    sub-hypotheses (deepening analysis) remain unverified.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    confirmed_ids = set(ledger.get("root_cause_hypothesis_ids", []))
+    for cid in confirmed_ids:
+        node = hypotheses.get(cid)
+        if not node:
+            continue
+        for sub_id in node.get("sub_hypothesis_ids", []):
+            sub = hypotheses.get(sub_id)
+            if not sub:
+                continue
+            status = sub.get("status")
+            if status in ("refuted", "dead_end", "deprioritized", "inconclusive"):
+                continue
+            if status == "pending" and sub.get("probability", 0) <= 15:
+                continue
             return True
     return False
 
@@ -584,7 +622,7 @@ def _inconclusive_exhausted(ledger: DiagnosisLedger) -> bool:
 
 
 def backtrack(ledger: DiagnosisLedger) -> str | None:
-    """Backtrack to the nearest deprioritized or pending hypothesis.
+    """Backtrack to the nearest deprioritized, pending, or inconclusive hypothesis.
 
     Returns new active ID or None if exhausted.
     """
@@ -600,7 +638,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
             continue
         parent_id = _norm_parent_id(current["parent_id"])
 
-        # Look for deprioritized or pending siblings
+        # Look for deprioritized, pending, or inconclusive siblings
         if parent_id is None:
             siblings = ledger["root_hypothesis_ids"]
         else:
@@ -608,7 +646,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
 
         for sid in siblings:
             sibling = ledger["hypotheses"][sid]
-            if sibling["status"] in ("deprioritized", "pending"):
+            if sibling["status"] in ("deprioritized", "pending", "inconclusive"):
                 # Found a backtrack target
                 sibling["status"] = "verifying"
                 sibling["selected"] = True
@@ -660,8 +698,10 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             lines.append("- 若未指定，使用最近 6 小时作为默认时间窗口")
         lines.append("")
 
-    # Current status
-    phase = derive_phase(ledger)
+    # Current status — prefer current_phase (may be set by safety valves)
+    # over derive_phase() so the LLM sees consistent phase information
+    # when safety overrides are active (e.g. max-rounds → force REPORT).
+    phase = ledger.get("current_phase") or derive_phase(ledger)
     active_path_str = " → ".join(ledger["active_path"]) if ledger["active_path"] else "(无)"
     lines.append(f"## 当前诊断状态")
     lines.append(f"- 阶段: {phase} | 步骤: {ledger['current_round']} | 活动路径: {active_path_str}")
@@ -971,7 +1011,11 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             ), confirmed_ids[0]
 
         if confirmed_ids and not pending_ids:
-            # All roots resolved, at least one confirmed → exit
+            # All roots resolved, at least one confirmed.
+            # Still need to check sub-hypotheses: confirmed roots may
+            # have sub-hypotheses awaiting verification (deepening).
+            if _has_pending_sub_hypotheses(ledger):
+                return False, "仍有待验证的子假设，需继续深化分析", confirmed_ids[0]
             best = hypotheses[confirmed_ids[0]]
             return True, (
                 f"根因确认: {best['id']} {best['statement']}"
@@ -981,10 +1025,18 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         # When root_ids is non-empty but we reach here, it means:
         # no confirmed(p>=80) AND no pending(p>15).  The remaining
         # hypotheses are either refuted, dead_end, deprioritized, or
-        # low-probability pending(p<=15).  In multi-root mode, do NOT
-        # fall through to the single-root/legacy check below — it could
-        # incorrectly pick up a hypothesis that was already assessed
-        # as non-confirmed by the multi-root logic above.
+        # low-probability pending(p<=15).  Check whether ALL roots
+        # are truly exhausted (all terminal) — if so, allow exit
+        # with "假设穷尽" (same as the single-root legacy path).
+        _EXHAUSTED = frozenset({
+            "refuted", "dead_end", "deprioritized", "inconclusive",
+        })
+        all_exhausted = all(
+            hypotheses.get(hid, {}).get("status") in _EXHAUSTED
+            for hid in root_ids
+        )
+        if all_exhausted:
+            return True, "假设穷尽: 所有假设已验证但未确认根因", None
         return False, "", None
 
     # ── Single-root / legacy: first confirmed hypothesis triggers exit ──
@@ -1003,7 +1055,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
 
     # Condition 2: All hypotheses exhausted
     all_terminal = all(
-        h["status"] in ("refuted", "dead_end", "confirmed")
+        h["status"] in ("refuted", "dead_end", "confirmed", "inconclusive", "deprioritized")
         for h in hypotheses.values()
     )
     if all_terminal and not _can_backtrack(ledger):
