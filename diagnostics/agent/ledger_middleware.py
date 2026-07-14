@@ -458,7 +458,7 @@ def _inject_tool_calls(response, tool_calls: list[dict],
 
 
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
-                             max_chars: int = 1200) -> str:
+                             max_chars: int = 1500) -> str:
     """Extract already-collected evidence from the ledger for subagent injection.
 
     When a subagent is delegated via task(), it normally sees only the
@@ -466,43 +466,66 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
     already recorded in the ledger so the subagent can skip redundant
     tool calls and focus on its specific verification task.
 
-    When *subagent_type* is ``"host-argus-expert"`` and the ledger
-    contains a resolved *hostname*, the hostname is injected as a
-    top-level environment hint so the subagent LLM knows which host
-    to query without asking the Coordinator.
+    Injects three layers of context:
+    1. Session baseline — original user message + time range (all subagents)
+    2. Entity identifiers — hostname/cluster_name mapped to tool parameter names
+    3. Diagnostic evidence — already-collected data the subagent should not re-query
     """
     lines: list[str] = []
 
-    # ── Environment context: pre-resolved entity identifiers ──
-    # The Coordinator's task description may omit key parameters like
-    # hostname or cluster_name.  Inject system-resolved identifiers as
-    # fallback hints so the subagent can call its tools directly instead
-    # of wasting a round asking the Coordinator for clarification.
-    #
-    # NOTE: hints describe the entity ("目标主机: worker-3") but do NOT
-    # prescribe specific tool parameter names (like "use as hostname").
-    # The subagent LLM uses its own reasoning to map entity info to tool
-    # parameters based on the tool schemas it has access to.  This stays
-    # correct when new tools with different parameter names are added.
-    if subagent_type == "host-argus-expert":
-        hostname = ledger.get("hostname", "")
-        if hostname:
-            lines.append(
-                "⚠ 系统已预解析的诊断实体（可直接作为工具参数，"
-                "无需询问 Coordinator）:\n"
-                f"  - 目标主机: **{hostname}**\n"
-            )
+    # ── Layer 1: Session baseline (all subagents) ──
+    user_message = ledger.get("user_message", "")
+    if user_message:
+        lines.append("## 诊断会话基线\n")
+        lines.append(f"用户原始输入: {user_message}\n")
 
-    if subagent_type == "k8s-argus-expert":
-        entity_name = ledger.get("entity_name", "")
-        entity_type = ledger.get("entity_type", "")
-        if entity_name and entity_type == "kubernetes":
-            lines.append(
-                "⚠ 系统已预解析的诊断实体（可直接作为工具参数，"
-                "无需询问 Coordinator）:\n"
-                f"  - 目标集群: **{entity_name}**\n"
-                "  - 实体类型: kubernetes\n"
-            )
+    # ── Layer 2: Entity identifiers ──
+    # Mapped to ACTUAL tool parameter names so the subagent LLM doesn't
+    # need to infer the mapping from descriptive labels.
+    entity_name = ledger.get("entity_name", "")
+    entity_type = ledger.get("entity_type", "")
+    hostname = ledger.get("hostname", "")
+    _host_experts = ("host-argus-expert", "host-expert", "gpu-expert")
+    _k8s_experts = ("k8s-argus-expert", "k8s-expert")
+
+    entity_hints: list[str] = []
+    if subagent_type in _host_experts and hostname:
+        entity_hints.append(f"  - hostname: **{hostname}**")
+    if subagent_type in _k8s_experts and entity_name and entity_type == "kubernetes":
+        entity_hints.append(f"  - cluster_name: **{entity_name}**")
+        entity_hints.append("  - 实体类型: kubernetes")
+
+    if entity_hints:
+        lines.append(
+            "## 系统预解析的诊断实体"
+            "（所有工具调用必须使用以下参数值，优先级高于 Coordinator 描述）:\n"
+            + "\n".join(entity_hints) + "\n"
+        )
+
+    # ── Layer 3: Frontend param_overrides (JSON) ──
+    param_overrides = ledger.get("param_overrides", {})
+    start_time = ledger.get("start_time", "")
+    end_time = ledger.get("end_time", "")
+    if param_overrides or start_time or end_time:
+        try:
+            # Exclude fields already covered in Layer 1/2 to avoid duplication
+            _redundant = {"hostname", "fault_time_range"}
+            clean = {k: v for k, v in param_overrides.items() if k not in _redundant}
+            # Add time window from ledger if present
+            if start_time:
+                clean["start_time"] = start_time
+            if end_time:
+                clean["end_time"] = end_time
+            if clean:
+                import json as _json
+                lines.append(
+                    "## 前端参数覆盖（可直接作为工具参数使用）:\n"
+                    "```json\n"
+                    + _json.dumps(clean, ensure_ascii=False, indent=2)
+                    + "\n```\n"
+                )
+        except Exception:
+            pass  # non-critical; skip on serialization failure
 
     # ── Diagnostic tools already called (by Coordinator or prior experts) ──
     tools_called: set[str] = set()
@@ -696,6 +719,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         entity_name: str = "",
         start_time: str = "",
         end_time: str = "",
+        param_overrides: dict | None = None,
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
@@ -707,6 +731,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._entity_name = entity_name
         self._start_time = start_time
         self._end_time = end_time
+        self._param_overrides = param_overrides or {}
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
         # Safety mechanism tracking
@@ -793,6 +818,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         ledger = new_ledger(entity_type=self._entity_type, hostname=self._hostname,
                             entity_name=self._entity_name)
+        # ── Store user-facing session parameters in the ledger ──
+        # These are injected into subagent context via _build_subagent_context
+        # so subagents have the same baseline as the Coordinator.
+        ledger["start_time"] = self._start_time
+        ledger["end_time"] = self._end_time
+        ledger["param_overrides"] = dict(self._param_overrides)
+        # Extract the original user message from state (first HumanMessage)
+        for msg in (state.get("messages") or []):
+            if hasattr(msg, "type") and msg.type == "human":
+                ledger["user_message"] = str(getattr(msg, "content", ""))[:2000]
+                break
         self._current_ledger = ledger
         logger.info(
             "台账: 创建新台账 (agent=%s, object_id=%s)",
@@ -1988,12 +2024,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 ctx = _build_subagent_context(ledger, subagent_type=subagent_type)
                 if ctx:
                     desc = tool_args.get("description", "")
+                    # System-resolved session context (user message, time
+                    # range, entity identifiers) must take priority over
+                    # the Coordinator's description.  Placing the system
+                    # context FIRST gives it higher attention weight and
+                    # ensures authoritative parameter values are used.
                     tool_args["description"] = (
-                        f"{desc}\n\n---\n"
-                        f"[Coordinator 基线数据 — 供交叉验证]\n"
-                        f"⚠ 不得重复调用下面列出的工具。基线数据可作为时序趋势参考，"
-                        f"但你的分析必须有独立推理，不能仅重述 Coordinator 数据\n"
-                        f"{ctx}"
+                        f"{ctx}\n\n---\n"
+                        f"[Coordinator 委派指令]\n{desc}"
                     )
                     try:
                         request.tool_call["args"] = tool_args

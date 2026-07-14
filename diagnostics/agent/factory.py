@@ -158,8 +158,8 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "识别异常突变点、跨子系统时序关联、异常严重程度排序。\n\n"
                 "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
-                "1. Coordinator 的 task 描述\n"
-                "2. 系统注入的「诊断实体」提示（上文中的目标主机）\n"
+                "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 hostname 参数值，优先级最高）\n"
+                "2. Coordinator 的 task 描述\n"
                 "如果两处都未提供足够的参数，回复'需要 hostname 参数'——"
                 "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
@@ -197,8 +197,8 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "- query_argus_services: 控制面(API延迟/etcd leader切换/etcd存储) + DNS(延迟/错误数)\n\n"
                 "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
-                "1. Coordinator 的 task 描述\n"
-                "2. 系统注入的「诊断实体」提示（上文中的目标集群）\n"
+                "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 cluster_name 参数值，优先级最高）\n"
+                "2. Coordinator 的 task 描述\n"
                 "如果两处都未提供足够的参数，回复'需要 cluster_name 参数'——"
                 "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
@@ -389,6 +389,7 @@ def build_agent(
     entity_name: str = "",
     start_time: str = "",
     end_time: str = "",
+    param_overrides: dict | None = None,
 ):
     settings = settings or Settings.from_env()
 
@@ -444,6 +445,7 @@ def build_agent(
         entity_name=entity_name,
         start_time=start_time,
         end_time=end_time,
+        param_overrides=param_overrides,
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)

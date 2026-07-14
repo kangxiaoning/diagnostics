@@ -330,6 +330,7 @@ async def _chat_event_stream(
         entity_name=request.entity_name,
         start_time=start_time,
         end_time=end_time,
+        param_overrides=request.param_overrides,
     )
 
     state.messages.append(HumanMessage(content=request.message))
