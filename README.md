@@ -1,6 +1,6 @@
 # Diagnostics — AI 驱动的系统故障诊断 Agent
 
-一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 初筛 + 7 个 Domain Expert (Skills-First) 深度分析** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 3:7 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
+一个结合 LLM 与领域 Tool、自动执行 Linux / Kubernetes / GPU 故障排查的智能诊断平台。采用 **Coordinator 调度 + 5 个 Domain Expert + 1 个通用 Subagent（deepagents 自动注入）** 架构，假设驱动、证据收束。报告路径由程序预生成（UUID 命名）并通过 Prompt 变量注入，按实体（主机 / K8s 集群）层级化持久归档到文件系统，诊断前自动关联同一运维对象的历史故障。Frontend 3:7 双栏布局：左侧按诊断 Round 展示可折叠的推理过程与 Markdown 报告，右侧实时渲染诊断执行树。
 
 ![界面截图 1](static/1.png)
 ![界面截图 2](static/2.png)
@@ -403,8 +403,8 @@ graph TD
     P1 --> T3["check_kubernetes_pods"]
 
     P2["Round 2 Analysis<br/>（parent_ids from Round 1 Tool nodes）"]
-    P2 --> T4["Delegate cpu-expert<br/>（task Subagent）"]
-    P2 --> T5["Delegate k8s-workload-expert"]
+    P2 --> T4["Delegate host-expert<br/>（task Subagent）"]
+    P2 --> T5["Delegate k8s-expert"]
 
     T1 -.-> P2
     T2 -.-> P2
@@ -762,11 +762,17 @@ async def _chat_event_stream(request, session_id, state, agent, settings):
 
 使用 `deepagents` 的 `create_deep_agent()` 构建主 Agent，核心配置如下：
 
-- **7 个 Subagent**（系统层 + K8s 层）：
-  - 系统层：`cpu-expert`, `memory-expert`, `disk-io-expert`, `network-expert`, `gpu-expert`
-  - K8s 层（二合一，遵循 Kubernetes 控制面/数据面边界）：
-    - `k8s-cluster-expert` — 集群基础设施：控制面 + 节点 + CoreDNS + etcd + 跨层级联
-    - `k8s-workload-expert` — 工作负载：Pod/Deployment/Service/Helm 应用层诊断
+- **5 个 Domain Expert Subagent**（2 Argus 时序分析 + 3 深度诊断）：
+  - **Argus 时序分析**：
+    - `host-argus-expert` — 主机级 CPU/内存/磁盘/网络 Argus 1min 指标时序
+    - `k8s-argus-expert` — K8s 集群级 Argus 指标（节点/Pod/控制面/DNS）
+  - **深度诊断**（已合并为统一专家，避免跨子系统委派遗漏）：
+    - `host-expert` — Linux 主机全栈诊断（CPU+内存+磁盘+网络，13 个技能）
+    - `k8s-expert` — K8s 全栈诊断（控制面+节点+网络+存储+工作负载，7 个技能）
+    - `gpu-expert` — GPU 诊断（CUDA OOM/温度/利用率/ECC）
+  - 注：`host-expert` 由原先的 `cpu-expert`、`memory-expert`、`disk-io-expert`、`network-expert` 四合一合并而成；`k8s-expert` 由 `k8s-cluster-expert` 和 `k8s-workload-expert` 二合一合并而成。合并后避免了跨子系统症状时"委派了正确专家吗"的协调问题。
+  - 主机场景（`entity_type="host"`）下仅保留 `host-argus-expert`、`host-expert`、`gpu-expert`，排除 K8s 相关专家。
+  - **deepagents 框架自动注入 1 个 `general-purpose` Subagent**，总 Subagent 数为 6（容器场景）或 4（主机场景）。
 - **双层存储 Backend**：`CompositeBackend` — `/agent_data/` 路径 Route 到 `FilesystemBackend`（虚拟文件系统，支持 `read_file`/`write_file`/`edit_file`），其他使用 `StateBackend`（内存 State）。所有诊断报告通过此 Backend 写入 `reports/` 目录层级归档。
 - **报告目录初始化**：`build_agent()` 时自动创建 `agent_data/reports/hosts/` 和 `agent_data/reports/kubernetes/` 目录，确保 Agent 首次写入就绪。
 - **Memory 与 Skill 加载**：
