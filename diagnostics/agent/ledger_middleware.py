@@ -2501,14 +2501,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     node.get("probability", 75),
                                 )
                             else:
-                                # No explicit coordinator confirmation —
-                                # mark as dead_end (inconclusive) to preserve
-                                # the actual verification state.
-                                record_finding(
-                                    ledger, hid, "inconclusive",
-                                    "诊断报告已生成，该假设验证未得出明确结论，系统标记为未完成。",
-                                    node.get("probability", 50),
+                                # No explicit coordinator confirmation.
+                                # NOTE: record_finding(inconclusive) does NOT
+                                # change node status by design (it only bumps
+                                # the streak counter for the verify loop) —
+                                # finalize directly at this hard endpoint.
+                                node["status"] = "inconclusive"
+                                node["verdict_reason"] = (
+                                    "诊断报告已生成，该假设验证未得出明确结论，"
+                                    "系统标记为未完成。"
                                 )
+                                node["selected"] = False
+                                node["evidence"].append(new_evidence(
+                                    source="coordinator",
+                                    summary=node["verdict_reason"],
+                                    supports=False,
+                                ))
                             finalized_any = True
                         elif status == "pending":
                             record_finding(
@@ -2516,6 +2524,29 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "诊断报告已生成，核心假设已确认，该假设未被验证，系统自动关闭。",
                                 node.get("probability", 5),
                             )
+                            finalized_any = True
+                        elif status == "deprioritized":
+                            # Deprioritized hypotheses were never verified.
+                            # The multi-root exit condition may skip them,
+                            # yet the report can still cite them as root
+                            # causes (observed 2026-07-19 session cd94408a:
+                            # H6 deprioritized but written as a confirmed
+                            # root cause).  Finalize as inconclusive so the
+                            # ledger accurately reflects "not verified"
+                            # after the report is written, instead of
+                            # leaving a resumable-looking state.  Direct
+                            # assignment is required (see NOTE above).
+                            node["status"] = "inconclusive"
+                            node["verdict_reason"] = (
+                                "诊断报告已生成，该假设降级后未完成验证，"
+                                "系统标记为未验证。"
+                            )
+                            node["selected"] = False
+                            node["evidence"].append(new_evidence(
+                                source="coordinator",
+                                summary=node["verdict_reason"],
+                                supports=False,
+                            ))
                             finalized_any = True
                     if finalized_any:
                         ledger["current_phase"] = derive_phase(ledger)
@@ -2874,6 +2905,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 )
                 if has_expert and node.get("status") == "verifying":
                     if has_coordinator_support:
+                        auto_verdict = "confirmed"
                         record_finding(
                             ledger, active_id, "confirmed",
                             f"[\u7cfb\u7edf\u81ea\u52a8] \u5df2\u83b7\u5f97\u4e13\u5bb6\u9a8c\u8bc1\u8bc1\u636e\u4e14\u534f\u8c03\u5458\u5df2\u786e\u8ba4"
@@ -2881,6 +2913,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             node["probability"],
                         )
                     else:
+                        auto_verdict = "inconclusive"
                         record_finding(
                             ledger, active_id, "inconclusive",
                             f"[\u7cfb\u7edf\u81ea\u52a8] \u5df2\u83b7\u5f97\u4e13\u5bb6\u9a8c\u8bc1\u8bc1\u636e\u4f46\u672a\u5f97\u5230\u534f\u8c03\u5458\u786e\u8ba4"
@@ -2903,8 +2936,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._verify_stuck_emitted = True
                     logger.warning(
                         "Safety: verify-phase stuck for %s (round %d) "
-                        "— auto-confirmed, forced REPORT",
-                        active_id, round_num,
+                        "— auto-%s, forced REPORT",
+                        active_id, round_num, auto_verdict,
                     )
 
         # ── REPORT phase write_file safety valve ──
@@ -3288,6 +3321,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 " | refuted(证据明确证伪，该假设不成立)"
                 " | inconclusive(证据不足)。"
                 "注意：多个假设可以同时为confirmed（多根因场景），refuted仅用于证据明确否定的假设。"
+                "⚠ 若假设仅**部分不成立**（因果链中某一环节被证伪，但核心机制已被证据确认"
+                "——例如'I/O饱和→leader切换→API延迟'中切换未发生、但饱和与延迟均真实），"
+                "应调用 confirmed + statement_update=剔除不成立环节后的表述，"
+                "而非整体 refuted——整体 refuted 会把已确认的真实机制从根因列表中丢弃，"
+                "导致台账根因与报告结论不一致。"
                 "所有root假设均到达终态且至少1个confirmed时自动进入REPORT阶段。"
             ),
             coroutine=_run,

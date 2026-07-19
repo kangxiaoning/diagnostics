@@ -1132,6 +1132,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "- GPU 假设 → task(\"gpu-expert\", ...) 委派验证\n"
             "- 委派时明确\"验证假设{active_id}\"并传入假设上下文\n"
             "- 收到结果后必须调用 record_finding 记录结论\n"
+            "- ⚠ 若假设仅部分不成立（某环节被证伪但核心机制已确认），用"
+            " confirmed + statement_update 修正表述，禁止整体 refuted\n"
             "- ⚠ 查看上方「已有工具调用结果」和假设的「证据」字段，禁止重复调用已有结果的工具\n"
             "- 禁止调用与当前假设无关的工具"
         )
