@@ -16,6 +16,18 @@ class AgentEvent:
     payload: dict[str, Any]
 
 
+class _ProducerError:
+    """Queue marker carrying a producer-side exception to the consumer.
+
+    Distinct from astream's tuple chunks (checked with isinstance), so
+    the consumer can surface the failure as an "error" AgentEvent and
+    terminate the stream gracefully instead of hanging forever.
+    """
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+
 from diagnostics.server.step_tracker import TOOL_LABELS as _TOOL_LABELS
 
 
@@ -193,9 +205,23 @@ async def stream_agent_events(
                 subgraphs=True,
             ):
                 await chunk_queue.put(raw)
-            await chunk_queue.put(None)
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            # Node-level failures (e.g. NotImplementedError raised for a
+            # middleware Command(goto=...)) previously killed this task
+            # silently: the exception was never retrieved and the None
+            # sentinel never reached the consumer, which then hung on
+            # chunk_queue.get() forever — observed as a 10-minute silent
+            # stall on 2026-07-19.  Surface the failure and always emit
+            # the sentinel so the stream ends promptly.
+            logger.exception(
+                "[session=%s] Stream producer failed: %s",
+                session_id, exc,
+            )
+            await chunk_queue.put(_ProducerError(exc))
+        finally:
+            await chunk_queue.put(None)
 
     producer_task = asyncio.ensure_future(_producer())
 
@@ -262,6 +288,13 @@ async def stream_agent_events(
             raw = await get_task
             if raw is None:
                 break
+            if isinstance(raw, _ProducerError):
+                exc = raw.exc
+                yield AgentEvent("error", {
+                    "session_id": session_id,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
 
             for evt in _process_chunk(raw, state, session_id):
                 yield evt

@@ -7,20 +7,28 @@
 
 ## Argus 监控协作模型
 
-Coordinator 持有 Argus 监控工具，通过 1min 粒度趋势建立故障画像：
+Coordinator **不持有** `query_argus_*` 工具——这些工具仅 Argus 专家 subagent 可用，
+Coordinator 直接调用会被系统拦截。监控时序一律通过 `task()` 委派获取：
 
-| Argus 工具 | 关注指标 | 异常信号 |
-|-----------|---------|---------|
-| `query_argus_cpu` | CPU%/Load/iowait | 1min 内 CPU 突变 >50% 或 iowait 突变 >30% |
-| `query_argus_memory` | Mem%/Swap/OOM | Swap 持续增长或 OOM 事件 |
-| `query_argus_disk` | Util%/await/IOPS | util >90% 或 await >50ms |
-| `query_argus_network` | 丢包/重传/ESTAB | 丢包和重传在同一分钟暴增 → 独立事件 |
-| `query_argus_nodes` | NotReady/PodRestarts/Evictions/Pending | 节点失联时间 + Pod重启/驱逐/调度阻塞 |
-| `query_argus_services` | API Lat/etcd Ldr/DB(MB)/DNS Lat/DNS Err | API延迟+etcd leader切换+DNS超时 |
+- 主机级指标（CPU/内存/磁盘/网络）→ `task("host-argus-expert", ...)`
+- 集群级指标（节点/Pod/API/etcd/DNS）→ `task("k8s-argus-expert", ...)`
+
+专家返回的时序摘要中，各类指标的异常信号参考：
+
+| 指标域 | 异常信号 |
+|--------|---------|
+| CPU/Load/iowait | 1min 内 CPU 突变 >50% 或 iowait 突变 >30% |
+| Mem/Swap/OOM | Swap 持续增长或 OOM 事件 |
+| 磁盘 Util/await/IOPS | util >90% 或 await >50ms |
+| 网络丢包/重传 | 丢包和重传在同一分钟暴增 → 独立事件 |
+| NotReady/Pod重启/驱逐/Pending | 节点失联时间 + Pod重启/驱逐/调度阻塞 |
+| API延迟/etcd/DNS | API延迟+etcd leader切换+DNS超时 |
 
 **关键判断**：两指标在同一分钟同时突变 → 可能**独立根因**（非因果），应形成 2 个假设。
 
 ## 委派决策速查
+
+（详细委派规则与必含参数以系统指令 UNDERSTAND/VERIFY 阶段说明为准）
 
 | 症状域 | 委派专家 | 典型指令 |
 |--------|---------|---------|

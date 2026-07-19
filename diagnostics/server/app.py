@@ -127,6 +127,54 @@ def _auto_set_scenario(message: str) -> None:
             pass
 
 
+def _build_augmented_message(
+    user_message: str,
+    param_overrides: dict | None,
+    entity_type: str,
+    entity_name: str,
+    hostname: str,
+    start_time: str,
+    end_time: str,
+) -> str:
+    """Prepend diagnostic parameters to the user message for the Coordinator.
+
+    The Coordinator needs cluster_name / hostname / time window in its first
+    HumanMessage so it can immediately delegate to argus experts without
+    wasting rounds guessing parameters or searching non-existent config files.
+    """
+    if not param_overrides and not hostname and not entity_name:
+        return user_message
+
+    lines: list[str] = ["## 诊断参数\n"]
+
+    if entity_name and entity_type == "kubernetes":
+        lines.append(f"- 集群: {entity_name}")
+    elif entity_name and entity_type == "hosts" and not hostname:
+        lines.append(f"- 主机名: {entity_name}")
+    if hostname:
+        lines.append(f"- 主机名: {hostname}")
+    _ns = (param_overrides or {}).get("namespace", "")
+    if _ns:
+        lines.append(f"- 命名空间: {_ns}")
+    _wl_type = (param_overrides or {}).get("workload_type", "")
+    _wl_name = (param_overrides or {}).get("workload_name", "")
+    if _wl_type and _wl_name:
+        lines.append(f"- 工作负载: {_wl_type}/{_wl_name}")
+    elif _wl_name:
+        lines.append(f"- 工作负载: {_wl_name}")
+    _pod = (param_overrides or {}).get("pod_name", "")
+    if _pod:
+        lines.append(f"- Pod: {_pod}")
+    if start_time and end_time:
+        lines.append(f"- 故障时间: {start_time} ~ {end_time}")
+    elif start_time:
+        lines.append(f"- 故障时间起点: {start_time}")
+
+    lines.append("\n---\n")
+    lines.append(f"用户问题: {user_message}")
+    return "\n".join(lines)
+
+
 def _make_report_path(entity_type: str, entity_name: str) -> str:
     """Generate a UUID-based report path from entity info."""
     import uuid as _uuid
@@ -317,6 +365,20 @@ async def _chat_event_stream(
         start_time = time_range.get("start_time", "")
         end_time = time_range.get("end_time", "")
 
+    # ── Build the full user message with injected diagnostic parameters ──
+    # The Coordinator must see cluster_name / hostname / time window in its
+    # first HumanMessage, otherwise it will waste rounds guessing or searching
+    # for config files (e.g. glob /agent_data/configs/**).
+    augmented_message = _build_augmented_message(
+        request.message,
+        request.param_overrides,
+        request.entity_type,
+        request.entity_name,
+        hostname,
+        start_time,
+        end_time,
+    )
+
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
     ledger_path = _make_ledger_path(report_path)
@@ -333,7 +395,7 @@ async def _chat_event_stream(
         param_overrides=request.param_overrides,
     )
 
-    state.messages.append(HumanMessage(content=request.message))
+    state.messages.append(HumanMessage(content=augmented_message))
     state.messages = state.messages[-settings.max_history_messages :]
     assistant_text: list[str] = []
     report_text: list[str] = []   # only answering-phase text → .md file
@@ -490,6 +552,17 @@ async def _chat_event_stream(
             elif event.name == "tool_completed":
                 # awrap_tool_call: tool just finished (precise timing)
                 yield sse("tool_completed", event.payload)
+
+            elif event.name == "error":
+                # Producer-side graph failure (e.g. node exception) —
+                # forward so the frontend can surface it instead of
+                # silently waiting for a stream that will never produce
+                # further events.
+                logger.error(
+                    "[session=%s] Stream error: %s",
+                    session_id, event.payload.get("error", ""),
+                )
+                yield sse("error", event.payload)
 
         # Finalize tree
         for snap in tree.finalize():

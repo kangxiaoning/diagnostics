@@ -82,6 +82,8 @@ _EXPERT_RETURN_SUFFIX = (
     "- 禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
     "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "- 禁止调用 `write_todos`——你的任务边界明确（查询→分析→返回结论），"
+    "直接执行无需计划跟踪，调用 write_todos 只会浪费诊断轮次。\n"
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个资源异常则需全部核查），不对正常的节点/Pod/资源逐一调用同名查询工具。"
     "若多个工具返回同一资源的数据且结论一致，取最早返回的结果即可，无需重复验证。\n"
@@ -106,6 +108,8 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "\n\n**工具使用边界（严格遵守）**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "- 禁止调用 `write_todos`——你的任务边界明确（查询→分析→返回结论），"
+    "直接执行无需计划跟踪，调用 write_todos 只会浪费诊断轮次。\n"
     "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
     "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
     "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
@@ -406,6 +410,16 @@ def build_agent(
         model_kwargs={"tool_choice": "auto"},
     )
 
+    # NOTE: write_todos (TodoListMiddleware) must stay ENABLED.  An
+    # experiment on 2026-07-19 showed that removing it (via a harness
+    # profile excluding TodoListMiddleware) destabilizes qwen3.6's
+    # tool-call serialization — malformed XML tool calls / mangled
+    # tool names rose from ~0% to ~75% across three diagnosis sessions
+    # (13:05, 13:53, 14:50), and an A/B replay against ollama confirmed
+    # 25% vs 100% clean rate with/without the tool+prompt block.
+    # Subagents are instead restrained by a prompt-level ban in their
+    # shared return suffixes below.
+
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
     mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
     if mode == "production":
@@ -462,7 +476,11 @@ def build_agent(
         tools=tools,
         system_prompt=system_prompt or make_system_prompt(report_path, ledger_path),
         backend=shared_backend,
-        memory=["/agent_data/AGENTS.md", "/agent_data/LEARNINGS.md"],
+        # NOTE: deepagents' memory= parameter is intentionally NOT used.
+        # AGENTS.md is loaded and injected by DiagnosisLedgerMiddleware
+        # instead — this drops the irrelevant ~5KB <memory_guidelines>
+        # and places memory BEFORE the diagnosis ledger so the live
+        # diagnosis state stays at the prompt tail.
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
         middleware=[dedup_middleware, ledger_middleware],
