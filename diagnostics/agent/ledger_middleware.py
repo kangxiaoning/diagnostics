@@ -100,24 +100,35 @@ def _force_report(ledger: dict) -> None:
 # allowed; read-only scaffolding (read_file/grep/glob/ls/write_todos) is
 # never gated.  The gate exists to make illegal phases fail fast with a
 # corrective message instead of silently corrupting the ledger.
+# NOTE: write_file appears in NO phase gate — it is guarded exclusively
+# by the dedicated write_file gate in awrap_tool_call (exit conditions
+# based), so a legitimate report write from any phase is never killed by
+# phase bookkeeping lag (see the evaluate comment below).
 _PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
     # UNDERSTAND collects data only — committing hypotheses before the
     # coverage gate opens would skip HYPOTHESIZE entirely.
     "understand": frozenset({
         "commit_hypotheses", "record_finding", "select_path", "backtrack",
-        "write_file",
     }),
-    # HYPOTHESIZE only commits; no findings/paths/report yet.
+    # HYPOTHESIZE only commits; no findings/paths yet.
     "hypothesize": frozenset({
-        "record_finding", "select_path", "backtrack", "write_file",
+        "record_finding", "select_path", "backtrack",
     }),
-    # VERIFY delegates + records findings; no commits/paths/report.
+    # VERIFY delegates + records findings; no commits/paths.
     "verify": frozenset({
-        "commit_hypotheses", "select_path", "backtrack", "write_file",
+        "commit_hypotheses", "select_path", "backtrack",
     }),
-    # EVALUATE picks direction; findings belong to VERIFY, report to REPORT.
+    # EVALUATE picks direction; findings belong to VERIFY.  write_file is
+    # deliberately NOT gated here — the dedicated write_file gate above
+    # (check_exit_conditions / _forced_terminal / report) is the correct
+    # guard for "may I write the report now".  Gating write_file by phase
+    # would kill the legitimate escape hatch where exit conditions are
+    # met while the derived phase still reads "evaluate" (observed
+    # 2026-07-20 32-round session: round-14/18 write_file from evaluate
+    # was rejected by the phase gate, the report content was lost twice,
+    # and diagnosis wandered for 18 more rounds).
     "evaluate": frozenset({
-        "record_finding", "write_file",
+        "record_finding",
     }),
     # REPORT only writes the report; diagnosis tools are locked out.
     "report": frozenset({
