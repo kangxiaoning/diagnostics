@@ -621,6 +621,35 @@ async def _chat_event_stream(
         state.cancel_event.set()
         for snap in tree.finalize():
             yield _tree_sse(snap)
+        # ── Disconnect fallback: preserve everything gathered so far ──
+        # A cancelled stream means the CLIENT went away (lock screen /
+        # network drop), not that the diagnosis failed.  Without this
+        # save, a 30+ round diagnosis loses its report entirely
+        # (observed 2026-07-20 session be0c5650: 32 rounds, stream
+        # cancelled at the final write_file round, nothing persisted).
+        # Save result.json with the current ledger, and synthesize a
+        # report .md from the ledger when the LLM never got to write one.
+        try:
+            elapsed = time.monotonic() - t_start
+            report_text_str = "".join(report_text)
+            if not report_text_str and latest_ledger and latest_ledger.get("hypotheses"):
+                try:
+                    from diagnostics.agent.ledger_middleware import (
+                        DiagnosisLedgerMiddleware,
+                    )
+                    report_text_str = (
+                        DiagnosisLedgerMiddleware._generate_report_from_ledger(
+                            latest_ledger,
+                        )
+                    )
+                except Exception:
+                    report_text_str = ""  # best-effort; result.json still saved
+            _save_result(report_path, tree,
+                         request.entity_type, request.entity_name,
+                         elapsed, event_counters, len("".join(assistant_text)),
+                         ledger=latest_ledger, content=report_text_str)
+        except Exception:
+            logger.exception("[session=%s] disconnect fallback save failed", session_id)
         trace.finalize()
         return
     except Exception as exc:

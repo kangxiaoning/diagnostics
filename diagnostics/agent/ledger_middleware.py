@@ -3655,12 +3655,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     # ── Auto-report generation (P11 safety net) ──
 
-    def _generate_report_from_ledger(self, ledger: DiagnosisLedger) -> str:
+    @staticmethod
+    def _generate_report_from_ledger(ledger: DiagnosisLedger) -> str:
         """Generate a diagnostic report from ledger evidence.
 
         Used as a last-resort safety net when the LLM exits the REPORT
         phase without calling write_file after being given a second
-        chance (level-2 escalation).
+        chance (level-2 escalation), and by the server-side disconnect
+        fallback (app.py CancelledError handler) — hence a staticmethod
+        callable without a middleware instance.
 
         Extracts: root cause, evidence chain, round timeline, expert
         delegation summary, and excluded hypotheses — producing a
