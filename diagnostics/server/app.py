@@ -242,7 +242,14 @@ def _save_result(
         if metrics:
             data["metrics"] = metrics
     if ledger:
-        data["ledger"] = ledger
+        # The ledger object arriving here is the ledger_snapshot EVENT
+        # payload — streaming._sanitize_ledger_for_event injects a derived
+        # "current_phase" for the frontend banner.  The persisted result
+        # must store the RAW ledger (phase is derived, not persisted;
+        # state-machine-v2 §10), so strip the injected key.
+        data["ledger"] = {
+            k: v for k, v in ledger.items() if k != "current_phase"
+        }
     result_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     logger.info("Result saved to %s", result_path)
 
