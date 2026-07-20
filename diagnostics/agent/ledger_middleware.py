@@ -3521,9 +3521,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "禁止调用任何诊断工具，禁止输出纯文本分析。"
                     "立即基于 <diagnosis_ledger> 中的证据链生成报告并调用 write_file。"
                 )
-                # Pre-set report phase tracker so safety valve fires
-                # immediately if LLM ignores the directive.
-                mw._report_phase_start_round = mw._model_call_count
                 # ── Do NOT auto-generate report here ──
                 # The safety valve in _build_safety_warnings fires on the
                 # next round when ledger["report"] is still empty, giving
@@ -3531,6 +3528,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # report.  If the LLM still doesn't call write_file, the
                 # REPORT stall fallback (level 1/2 escalation) handles
                 # auto-generation as a last resort.
+                #
+                # NOTE: deliberately do NOT pre-set _report_phase_start_round
+                # here.  The REPORT-stall valve (G6) timestamps the FIRST
+                # round where the derived phase actually renders as report
+                # (i.e. the next before_model call) — pre-setting it to
+                # THIS round would fire the "without write_file" warning on
+                # the very first REPORT round, before the LLM had any
+                # chance to comply (observed 2026-07-20 conntrack session:
+                # warning at round 8 after record_finding triggered exit
+                # at round 7).
             elif (_phase(ledger) == "hypothesize"
                     and ledger.get("_root_commit_count", 0) > 0):
                 # All prior root hypotheses hard-failed and the retry
@@ -3602,8 +3609,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 _force_report(ledger)
                 mw._persist_ledger(ledger)
                 mw._current_ledger = ledger
-                # Pre-set report phase tracker for safety valve
-                mw._report_phase_start_round = mw._model_call_count
+                # NOTE: _report_phase_start_round intentionally NOT
+                # pre-set — G6 timestamps the first derived REPORT round
+                # itself (see record_finding for rationale).
                 return (
                     "回溯失败: 没有可回溯的假设，且根假设批次预算已用尽"
                     f"（{MAX_ROOT_COMMIT_BATCHES} 批）。\n"
