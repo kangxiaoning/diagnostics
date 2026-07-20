@@ -168,7 +168,15 @@ class TraceWriter:
         """
         if not ledger or not isinstance(ledger, dict):
             return
-        phase = ledger.get("current_phase", "?")
+        # Phase: prefer derived value (new ledgers no longer persist the
+        # key); fall back to a stale persisted key for legacy traces.
+        phase = ledger.get("current_phase")
+        if not phase:
+            try:
+                from diagnostics.agent.ledger import derive_phase
+                phase = derive_phase(ledger)
+            except Exception:
+                phase = "?"
         round_num = ledger.get("current_round", 0)
         active = ledger.get("active_path", [])
         hypotheses = ledger.get("hypotheses", {})

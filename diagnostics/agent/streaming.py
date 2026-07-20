@@ -606,9 +606,10 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 if isinstance(value, dict) and "_diagnosis_ledger" in value:
                     ledger = value["_diagnosis_ledger"]
                     if ledger and isinstance(ledger, dict):
+                        from diagnostics.agent.ledger import derive_phase
                         logger.info("[round=%d] Diagnosis ledger updated (state): phase=%s, hypotheses=%d",
                                     state.round_number,
-                                    ledger.get("current_phase", "?"),
+                                    derive_phase(ledger),
                                     len(ledger.get("hypotheses", {})))
                         events.append(AgentEvent("ledger_snapshot", {
                             "ledger": _sanitize_ledger_for_event(ledger),
@@ -622,9 +623,10 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
             if data.get("type") == "ledger_snapshot":
                 ledger = data.get("ledger")
                 if ledger and isinstance(ledger, dict):
+                    from diagnostics.agent.ledger import derive_phase
                     logger.info("[round=%d] Diagnosis ledger updated (custom): phase=%s, hypotheses=%d",
                                 state.round_number,
-                                ledger.get("current_phase", "?"),
+                                derive_phase(ledger),
                                 len(ledger.get("hypotheses", {})))
                     events.append(AgentEvent("ledger_snapshot", {
                         "ledger": _sanitize_ledger_for_event(ledger),
@@ -703,9 +705,20 @@ def _serialize_sr(sr: Any) -> dict[str, Any]:
 
 
 def _sanitize_ledger_for_event(ledger: dict[str, Any]) -> dict[str, Any]:
-    """Strip internal fields from the ledger before sending to frontend."""
+    """Strip internal fields from the ledger before sending to frontend.
+
+    Also injects the derived ``current_phase`` — the ledger itself no
+    longer persists it (state-machine-v2 §3), but the frontend banner
+    still consumes this key, so we compute it on the way out.
+    """
     internal_keys = {"_inconclusive_streak", "_backtrack_count"}
-    return {k: v for k, v in ledger.items() if k not in internal_keys}
+    out = {k: v for k, v in ledger.items() if k not in internal_keys}
+    try:
+        from diagnostics.agent.ledger import derive_phase
+        out["current_phase"] = derive_phase(ledger)
+    except Exception:
+        pass  # best-effort; banner falls back to "understand"
+    return out
 
 
 # ════════════════ ToolMessage handling ════════════════
