@@ -163,7 +163,14 @@ _LEDGER_TOOLS = frozenset({
 })
 
 # ── Safety mechanism thresholds ──
-_MAX_ROUNDS = 40                    # Hard limit: force REPORT after this many LLM rounds
+_MAX_ROUNDS = 40                    # Hard limit (simple scenario): force REPORT after this many LLM rounds
+_MAX_ROUNDS_COMPLEX = 24            # Hard limit when diagnosis went deep (retry batch / depth ≥ 1):
+                                    # a diagnosis that needed a second batch or sub-hypotheses is
+                                    # already past the healthy budget — further rounds show
+                                    # diminishing returns (observed 2026-07-20 32-round session:
+                                    # 18 unproductive rounds after the root cause was already
+                                    # confirmed at p=75).
+_MAX_ROUNDS_COMPLEX_GRACE = 5       # Smaller grace for the complex-scenario cap
                                     # (24→40: room for 2 root batches + sub-hypothesis
                                     # deepening + multi-root diagnosis; progress-aware
                                     # grace means this only fires on true stagnation)
@@ -2787,7 +2794,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # grace extension instead of interrupting mid-verification.  Only
         # fire when the process has gone quiet — no ledger progress in the
         # last _PROGRESS_WINDOW rounds — or after the grace was consumed.
-        if round_num >= _MAX_ROUNDS and not ledger.get("_forced_terminal"):
+        # ── Scenario-aware round cap ──
+        # "Complex" = the diagnosis already needed a retry root batch OR
+        # sub-hypotheses (depth ≥ 1) — signals the straightforward path
+        # failed.  Such sessions get a tighter cap: history shows rounds
+        # beyond ~24 in this state are unproductive wandering.
+        is_complex = bool(
+            ledger.get("_root_commit_count", 0) > 1
+            or any(h.get("depth", 0) >= 1
+                   for h in ledger.get("hypotheses", {}).values())
+        )
+        cap = _MAX_ROUNDS_COMPLEX if is_complex else _MAX_ROUNDS
+        grace = _MAX_ROUNDS_COMPLEX_GRACE if is_complex else _MAX_ROUNDS_GRACE
+
+        if round_num >= cap and not ledger.get("_forced_terminal"):
             last_progress = max(
                 self._last_finding_round,
                 self._last_commit_round,
@@ -2802,19 +2822,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._max_rounds_grace_used = True
                 warnings.append(
                     f"⚠ [系统提醒] 已接近诊断轮次上限（第{round_num}轮"
-                    f"/上限{_MAX_ROUNDS}轮），检测到诊断仍在推进"
+                    f"/上限{cap}轮），检测到诊断仍在推进"
                     f"（最近进展在第{last_progress}轮）。\n"
-                    f"已给予 {_MAX_ROUNDS_GRACE} 轮宽限：请在 "
-                    f"{_MAX_ROUNDS + _MAX_ROUNDS_GRACE} 轮内完成当前验证"
+                    f"已给予 {grace} 轮宽限：请在 "
+                    f"{cap + grace} 轮内完成当前验证"
                     "并生成诊断报告，优先收敛已有假设而非开启新方向。"
                 )
                 logger.info(
-                    "Safety: max rounds (%d) reached but diagnosis "
+                    "Safety: max rounds (%d, complex=%s) reached but diagnosis "
                     "progressing (last progress round %d) — granted %d-round "
-                    "grace", round_num, last_progress, _MAX_ROUNDS_GRACE,
+                    "grace", round_num, is_complex, last_progress, grace,
                 )
-            elif round_num >= _MAX_ROUNDS + (
-                _MAX_ROUNDS_GRACE if self._max_rounds_grace_used else 0
+            elif round_num >= cap + (
+                grace if self._max_rounds_grace_used else 0
             ):
                 _force_report(ledger)
                 ledger["_forced_terminal"] = True
@@ -2822,13 +2842,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # Replace the blunt "STOP NOW" directive with a comprehensive
                 # diagnostic synthesis that helps the LLM produce a quality
                 # report from everything learned so far.
-                synthesis = _build_diagnostic_synthesis(ledger, _MAX_ROUNDS)
+                synthesis = _build_diagnostic_synthesis(ledger, cap)
                 warnings.append(synthesis)
                 logger.warning(
-                    "Safety: max rounds (%d, grace_used=%s) reached with no "
-                    "recent progress — injected diagnostic synthesis, "
+                    "Safety: max rounds (%d, complex=%s, grace_used=%s) reached "
+                    "with no recent progress — injected diagnostic synthesis, "
                     "forcing REPORT phase",
-                    round_num, self._max_rounds_grace_used,
+                    round_num, is_complex, self._max_rounds_grace_used,
                 )
 
         # ── Understand-phase stagnation safety valve ──
