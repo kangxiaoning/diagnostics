@@ -19,9 +19,13 @@ from langchain.agents.middleware.types import PrivateStateAttr
 
 # ── Phase & status types ──
 
+# ── Phase & status types ──
+# 5-phase state machine (private/design/state-machine-v2.md):
+# understand → hypothesize → verify → evaluate → report.
+# backtrack/skill_verify are NOT phases: backtrack is an EVALUATE action,
+# skill mode is delegation guidance inside VERIFY.
 DiagnosisPhase = Literal[
     "understand", "hypothesize", "verify", "evaluate", "report",
-    "skill_verify", "backtrack",
 ]
 
 HypothesisStatus = Literal[
@@ -103,11 +107,13 @@ def new_ledger(entity_type: str = "", hostname: str = "",
     ``k8s-argus-expert`` subagent context so the subagent LLM
     knows which cluster to query without asking the Coordinator.
     """
+    # NOTE: no ``current_phase`` field — the phase is derived on demand
+    # by ``derive_phase`` (single source of truth).  Legacy ledger JSON
+    # files that still carry the key are tolerated: readers must ignore it.
     return DiagnosisLedger(
         hypotheses={},
         root_hypothesis_ids=[],
         active_path=[],
-        current_phase="understand",
         current_round=0,
         rounds=[],
         root_cause=None,               # backward-compat: first confirmed root cause
@@ -535,81 +541,123 @@ def add_evidence_to_active(
 
 
 # ── Phase derivation ──
+# 5-phase state machine (private/design/state-machine-v2.md §3).
+# The phase is NEVER persisted: ``derive_phase`` is the single source of
+# truth, called by rendering, tool gating, and guardrails alike.
+#
+# Transition table (normal flow):
+#
+#   | from        | event / guard                                    | to          |
+#   |-------------|--------------------------------------------------|-------------|
+#   | understand  | T1  coverage ready (system)                      | hypothesize |
+#   | hypothesize | T10 commit_hypotheses success                    | verify      |
+#   | verify      | T3  record_finding                               | evaluate    |
+#   | evaluate    | T4  exit conditions E1-E4                        | report      |
+#   | evaluate    | T5  select_path on pending/deprioritized/…       | verify      |
+#   | evaluate    | T7  backtrack target exists                      | verify      |
+#   | evaluate    | T8  layer all-hard-failed + budget left          | hypothesize |
+#   | evaluate    | T9  all-hard-failed + budget exhausted (= E2)    | report      |
+#   | report      | T11 write_file done → terminal summary mode      | report      |
+#
+# Forced transitions (guardrails, any phase): max-rounds / model-timeout /
+# verify-stuck / REPORT-stall / empty-data → ``report`` (pending hypotheses
+# auto-finalized by ``finalize_pending_for_report``).
 
 def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
-    """Derive the current diagnosis phase from ledger state.
+    """Derive the current diagnosis phase from ledger state (pure function).
 
-    ── Phase transition table (single source of truth) ──
-
-    Normal transitions (driven by ledger tools / task delegation):
-
-    | from        | trigger                                                        | to          |
-    |-------------|----------------------------------------------------------------|-------------|
-    | understand  | commit_hypotheses (first root batch; best auto-selected)       | verify      |
-    | hypothesize | commit_hypotheses (retry batch / deepening under a parent)     | verify      |
-    | verify      | record_finding → active still verifying                        | verify      |
-    | verify      | record_finding → exit conditions met (root cause confirmed     | report      |
-    |             |   p≥80 / exhaustion / evidence saturation)                       |             |
-    | verify      | record_finding → some roots confirmed, others actionable       | evaluate    |
-    | verify      | record_finding → layer all-terminal + backtrackable            | backtrack   |
-    | verify      | record_finding → layer all-hard-failed + batch budget left     | hypothesize |
-    | evaluate    | select_path on pending/deprioritized/inconclusive              | verify      |
-    | evaluate    | task() delegation targeting such a hypothesis (auto-heal via   | verify      |
-    |             |   ``activate_hypothesis`` — select_path semantics)             |             |
-    | evaluate    | backtrack tool: no target + batch budget left                  | hypothesize |
-    | evaluate    | backtrack tool: no target + budget exhausted                   | report      |
-    | backtrack   | backtrack tool: target found                                   | verify      |
-    | report      | write_file done → terminal (guidance switches to summary mode) | report      |
-
-    Forced transitions (safety valves in ledger_middleware, any phase):
-    max-rounds / model-timeout / verify-stuck / REPORT-stall / empty-data
-    → ``report`` (with pending hypotheses auto-finalized by the Phase
-    guard ``finalize_pending_for_report``).
-
-    Rendering note: ``render_ledger_context`` prefers the committed
-    ``current_phase`` (updated by ledger tools and safety valves) over
-    this derivation, so safety-override phases stay consistent.
+    Decision order (fixed, state-machine-v2.md §3):
+      1. REPORT terminal lock — report already written.
+      2. No hypotheses yet → understand (coverage not ready) or
+         hypothesize (coverage ready).
+      3. Active hypothesis still verifying → verify.
+      4. EVALUATE: the direction is decided HERE, not left to the LLM —
+         retry-batch (T8) and deepening (T6) precede the exit check so a
+         last-standing failed root (root_causes empty) routes to
+         hypothesize instead of being shadowed by the legacy exhaustion
+         exit; only genuinely terminal states fall through to REPORT.
+      5. Exit conditions E1-E4 → report; otherwise evaluate.
     """
-    # Multi-root: if some roots are confirmed but others still pending,
-    # stay in evaluate to continue diagnosing remaining symptoms.
-    root_causes = ledger.get("root_causes", [])
-    root_ids = ledger.get("root_hypothesis_ids", [])
-    if root_causes and root_ids:
-        confirmed_ids = set(ledger.get("root_cause_hypothesis_ids", []))
-        hypotheses = ledger.get("hypotheses", {})
-        for hid in root_ids:
-            if hid in confirmed_ids:
-                continue
-            node = hypotheses.get(hid)
-            if not node:
-                continue
-            status = node.get("status")
-            # deprioritized is a terminal state — the LLM chose to focus
-            # on a higher-priority path and should not be blocked by it.
-            if status in ("refuted", "dead_end", "deprioritized", "inconclusive"):
-                continue
-            # Low-probability pending hypotheses (p ≤ 15%) should not
-            # block the transition to REPORT — they are unlikely to be
-            # the root cause and spending rounds verifying them yields
-            # diminishing returns.
-            if status == "pending" and node.get("probability", 0) <= 15:
-                continue
-            return "evaluate"  # still has actionable root hypotheses
-    if ledger.get("root_cause") or ledger.get("report"):
-        # Sub-hypotheses check: a confirmed root cause may still have
-        # sub-hypotheses awaiting verification (deepening analysis).
-        # Block REPORT entry until they are resolved.
-        if _has_pending_sub_hypotheses(ledger):
-            return "evaluate"
+    # 1. REPORT terminal lock.
+    if ledger.get("report"):
         return "report"
+
+    hypotheses = ledger.get("hypotheses", {})
+
+    # 2. No hypotheses yet → understand / hypothesize by coverage gate.
+    if not hypotheses:
+        if _coverage_ready(ledger):
+            return "hypothesize"
+        return "understand"
+
+    # 3. Active hypothesis under verification → verify.
+    if ledger["active_path"]:
+        active = hypotheses.get(ledger["active_path"][-1])
+        if active and active["status"] == "verifying":
+            return "verify"
+
+    # 4. EVALUATE direction split (BEFORE exit check):
+    #    T8 retry batch — all root hypotheses hard-failed and budget left.
+    #    A hard-failed layer with no resumable sibling can only move
+    #    forward via a fresh batch (or exit when the budget is gone);
+    #    presenting "evaluate" here would offer no executable action.
+    #    Exception: E3 (evidence saturation) always wins — a ledger that
+    #    hit 3 consecutive inconclusive verdicts exits to REPORT even if
+    #    the active node subsequently flipped to dead_end (the streak
+    #    marks evidence exhaustion, retrying the same data is futile).
+    root_ids = ledger.get("root_hypothesis_ids", [])
+    if (
+            root_ids
+            and ledger.get("_inconclusive_streak", 0) < 3
+            and all(
+                hypotheses.get(hid, {}).get("status") in _HARD_FAILED_STATUSES
+                for hid in root_ids)):
+        if can_commit_root_hypotheses(ledger):
+            return "hypothesize"
+        return "report"  # T9 == E2
+
+    #    T6 deepening — exit conditions not met but actionable
+    #    sub-hypotheses exist under a confirmed node (the confirmed
+    #    root itself already yielded its verdict; work continues below
+    #    it).  Only route to hypothesize when NO sub-hypothesis exists
+    #    yet (otherwise the pending sub would be verifying → step 3).
+    #    When exit conditions ARE met, step 5 wins (report).
+
+    # 5. Exit conditions E1-E4 → report; otherwise evaluate.
     if ledger.get("exhausted"):
         return "report"
+    should_exit, _reason, _cid = check_exit_conditions(ledger)
+    if should_exit:
+        return "report"
+    return "evaluate"
 
-    # Skill mode
-    if ledger.get("skill_mode"):
-        return _derive_skill_phase(ledger)
 
-    return _derive_default_phase(ledger)
+def _coverage_ready(ledger: DiagnosisLedger) -> bool:
+    """UNDERSTAND→HYPOTHESIZE gate (T1): required Argus data collected.
+
+    Rules (see state-machine-v2.md §4):
+    - At least 2 rounds have passed (delegation needs time to return).
+    - If any task() delegation happened: host scenarios require
+      host-argus-expert; container scenarios require BOTH host-argus-expert
+      and k8s-argus-expert.
+    - If no delegation happened at all, coverage is considered ready
+      after the 2-round grace (the LLM may legitimately diagnose
+      without Argus in data-free scenarios).
+    """
+    if ledger.get("current_round", 0) < 2:
+        return False
+    experts_delegated: set[str] = set()
+    has_delegated = False
+    for rd in ledger.get("rounds", []):
+        experts_delegated.update(rd.get("delegated_experts", []))
+        if "task" in rd.get("tools_called", []):
+            has_delegated = True
+    if not has_delegated:
+        return True
+    if ledger.get("entity_type", "") == "host":
+        return "host-argus-expert" in experts_delegated
+    return ("host-argus-expert" in experts_delegated
+            and "k8s-argus-expert" in experts_delegated)
 
 
 def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
@@ -645,104 +693,6 @@ def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
             finalized = True
 
     return finalized
-
-
-def _derive_default_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
-    hypotheses: dict = ledger["hypotheses"]
-    if not hypotheses:
-        if ledger.get("current_round", 0) >= 2:
-            # ── Expert coverage gate ──
-            # Don't transition to hypothesize until all REQUIRED Argus
-            # experts have been delegated.  The set of *required* experts
-            # depends on entity_type:
-            #   "host"     → only host-argus-expert
-            #   container  → BOTH host-argus-expert AND k8s-argus-expert
-            #
-            # NOTE: Coordinator does NOT have Argus tools directly —
-            # detection relies on delegated_experts (populated from
-            # task(subagent_type=...) calls), NOT tools_called.
-            experts_delegated: set[str] = set()
-            has_delegated = False
-            for rd in ledger.get("rounds", []):
-                experts_delegated.update(
-                    rd.get("delegated_experts", [])
-                )
-                if "task" in rd.get("tools_called", []):
-                    has_delegated = True
-
-            entity_type = ledger.get("entity_type", "")
-            is_host_only = entity_type == "host"
-
-            has_host = "host-argus-expert" in experts_delegated
-            has_k8s = "k8s-argus-expert" in experts_delegated
-
-            if has_delegated:
-                # Host-only scenario: only host-argus-expert is available
-                if is_host_only:
-                    if not has_host:
-                        return "understand"
-                else:
-                    # Container scenario: need BOTH argus experts
-                    if not has_host or not has_k8s:
-                        return "understand"
-
-            # Required experts covered (or no delegation happened yet —
-            # the LLM may have found enough info without Argus, or may
-            # be about to delegate in this round) → advance.
-            return "hypothesize"
-        return "understand"
-
-    # Check if active path has an unverified hypothesis
-    if ledger["active_path"]:
-        active_id = ledger["active_path"][-1]
-        active = hypotheses.get(active_id)
-        if active and active["status"] == "verifying":
-            return "verify"
-
-    # Check current layer for verdict completion.
-    # Aligned with check_exit_conditions._EXHAUSTED: any status that
-    # represents a terminal verdict (including safety-valve-injected
-    # "inconclusive" and "deprioritized") satisfies this check.
-    _TERMINAL_STATUSES = frozenset({
-        "confirmed", "refuted", "dead_end", "deprioritized", "inconclusive",
-    })
-    current_layer = _get_current_layer(ledger)
-    all_have_verdict = all(
-        hypotheses[hid]["status"] in _TERMINAL_STATUSES
-        for hid in current_layer
-    )
-
-    if all_have_verdict:
-        # Check exit conditions
-        confirmed = [hypotheses[hid] for hid in current_layer
-                     if hypotheses[hid]["status"] == "confirmed"]
-        if confirmed:
-            best = max(confirmed, key=lambda h: h["probability"])
-            if best["probability"] >= 80:
-                # Check if it can be deepened (no sub-hypotheses yet).
-                # No sub-hypotheses → diagnosis is complete on this path → REPORT.
-                if not best["sub_hypothesis_ids"]:
-                    return "report"
-                return "evaluate"
-            return "evaluate"
-        # All refuted / dead_end (any resumable status would already
-        # have routed to backtrack above).
-        if _can_backtrack(ledger):
-            return "backtrack"
-        # Retry budget remains → allow a fresh batch of root hypotheses.
-        if can_commit_root_hypotheses(ledger):
-            return "hypothesize"
-        return "report"
-
-    return "evaluate"
-
-
-def _derive_skill_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
-    """Skill mode: UNDERSTAND → SKILL_VERIFY → EVALUATE → REPORT."""
-    if ledger.get("current_round", 0) < 2 and not ledger.get("hypotheses"):
-        return "understand"
-    # In skill mode, we stay in skill_verify until done
-    return "skill_verify"
 
 
 def _get_current_layer(ledger: DiagnosisLedger) -> list[str]:
@@ -904,10 +854,10 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             lines.append("- 若未指定，使用最近 6 小时作为默认时间窗口")
         lines.append("")
 
-    # Current status — prefer current_phase (may be set by safety valves)
-    # over derive_phase() so the LLM sees consistent phase information
-    # when safety overrides are active (e.g. max-rounds → force REPORT).
-    phase = ledger.get("current_phase") or derive_phase(ledger)
+    # Current status — phase is always derived (single source of truth);
+    # legacy ledgers may still carry a stale ``current_phase`` key which
+    # is deliberately ignored here.
+    phase = derive_phase(ledger)
     active_path_str = " → ".join(ledger["active_path"]) if ledger["active_path"] else "(无)"
     batch_info = ""
     if ledger.get("_root_commit_count"):
@@ -1102,7 +1052,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "  复合场景 → 同时委派两个专家（并行 task），分别负责主机级和集群级指标\n"
             "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
             "- ⚠ 查看上方「已有工具调用结果」，禁止重复调用已执行过的工具\n"
-            "- 完成后必须调用 commit_hypotheses 提交初始假设"
+            "- ⚠ 本阶段只采集信息，不提交假设——必需专家数据齐备后"
+            "系统自动进入 HYPOTHESIZE，届时再调用 commit_hypotheses"
         )
     if phase == "hypothesize":
         retry_hint = ""
@@ -1138,6 +1089,11 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "- 禁止调用与当前假设无关的工具"
         )
     if phase == "evaluate":
+        # Direction is computed by the state machine and presented as
+        # THE action for this step — the LLM does not choose freely.
+        # Mutually exclusive by construction (state-machine-v2.md §5):
+        # exit was already ruled out by derive_phase (evaluate reached),
+        # so exactly one of select/deepen/backtrack/retry applies.
         pending_hint = ""
         root_cause_hyp_ids = ledger.get("root_cause_hypothesis_ids", [])
         root_ids = ledger.get("root_hypothesis_ids", [])
@@ -1147,36 +1103,20 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             pending_hint = f"\n- ⚠ 仍有待验证的假设: {', '.join(pending)}，使用 select_path 切换验证"
         return (
             "你当前处于 EVALUATE 阶段。\n"
-            "- 评估本层所有假设的验证结果\n"
-            "- 调用 select_path 选择1条最可能的根因深入验证\n"
+            "- 评估本层所有假设的验证结果，选择下一步路径：\n"
+            "  · 有待验证假设 → select_path 切换到最可能的继续验证\n"
+            "  · confirmed 假设需更具体 → commit_hypotheses(parent_hypothesis_id=...) 提交子假设深化\n"
+            "  · 本层全部 refuted/dead_end 且有可回溯假设 → backtrack\n"
+            "  · 本层全部 refuted/dead_end 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向提交新一批根假设\n"
+            "  · 退出条件满足时系统已自动进入 REPORT（无需你判断）\n"
             "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
             "refuted 仅用于证据明确证伪的假设。多个假设可同时为 confirmed。\n"
-            "- 若本层存在 confirmed(p≥80%)，其他假设均达终态 → 进入 REPORT\n"
-            "- 若需深化 → 调用 commit_hypotheses(parent_hypothesis_id=...) 在 confirmed 假设下提交子假设\n"
-            "- 若全部 refuted/dead_end → 先调用 backtrack 回溯；"
-            "无可回溯且批次预算未用尽（<2批）→ 调用 commit_hypotheses 换方向提交新一批根假设；"
-            "预算已用尽 → 进入 REPORT 并标注假设穷尽\n"
             "- ⚠ 概率判断原则：若核心因果关系已由证据确认"
             "（如「异常进程占满资源→服务响应超时」），"
             "仅次要细节未知（如触发者、启动源），"
             "应保持高概率(≥80%)。"
             "不要因为次要信息缺失而过度降低根因概率。"
             + pending_hint
-        )
-    if phase == "skill_verify":
-        skill_ids = ledger.get("skill_ids", [])
-        return (
-            f"你当前处于技能驱动模式（{', '.join(skill_ids)}）。\n"
-            "- 严格按 SKILL.md 的 Workflow 步骤顺序执行\n"
-            "- 每步完成后用 record_finding 记录发现\n"
-            "- 技能步骤完成后进入 EVALUATE；若结论不明确，降级为默认假设循环"
-        )
-    if phase == "backtrack":
-        return (
-            "你当前处于 BACKTRACK 阶段。\n"
-            "- 当前路径已走入死胡同，需要回溯\n"
-            "- 调用 backtrack 工具回溯到最近的 deprioritized/pending 假设\n"
-            "- 若明确要切换到某个特定假设，也可调用 select_path 指定"
         )
     if phase == "report":
         n_causes = len(ledger.get("root_causes", []))
@@ -1292,6 +1232,16 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     if not hypotheses:
         return False, "", None
 
+    # ── E3 evidence saturation: global, takes precedence over every
+    # branch below.  3+ consecutive inconclusive verdicts mean the
+    # available evidence cannot decide ANY hypothesis — retrying with a
+    # fresh batch against the same data is futile.  Placed first so a
+    # saturated ledger that also happens to be all-hard-failed (the
+    # streak flips the active node to dead_end) still exits HERE with
+    # the saturation reason, not the retry hint.
+    if ledger.get("_inconclusive_streak", 0) >= 3:
+        return True, "证据饱和: 连续3次验证结果不明确", None
+
     root_ids: list[str] = ledger.get("root_hypothesis_ids", [])
 
     # ── Multi-root: assess each root hypothesis independently ──
@@ -1406,9 +1356,9 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             f"{best['id']} {best['statement']} (p={best['probability']}%)"
         ), best["id"]
 
-    # Condition 3: Evidence saturated (3+ consecutive inconclusive)
-    if ledger.get("_inconclusive_streak", 0) >= 3:
-        return True, "证据饱和: 连续3次验证结果不明确", None
+    # (Condition 3 — evidence saturation — is handled at the top of this
+    # function so it takes precedence over both the multi-root and the
+    # single-root branches.)
 
     # Remaining: some hypotheses still non-terminal, no saturation yet.
     unfinished = [
