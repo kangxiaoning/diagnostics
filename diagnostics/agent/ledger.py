@@ -42,6 +42,24 @@ Verdict = Literal["confirmed", "refuted", "inconclusive"]
 # hypotheses from prior batches are hard-failed (refuted/dead_end).
 MAX_ROOT_COMMIT_BATCHES = 2
 
+# ── Hypothesis-tree hard invariants (deterministic, code-enforced) ──
+# These are BUSINESS invariants — they cannot be expressed by tool-input
+# schemas (Pydantic validates a single call, not cumulative tree state),
+# so they are enforced here at the data-structure layer.  Rationale and
+# evidence: private/design/state-machine-v2.md §11; the 2026-07-20
+# 32-round session (root layer grew to 6 via batch accumulation, depth
+# reached 2 with unproductive H1.1.x exploration).
+MAX_LAYER_SIZE = 3
+"""Max sibling hypotheses sharing the same parent (cumulative, not per
+commit call).  Root layer obeys the same limit per CURRENT batch —
+a retry batch REPLACES the current root layer instead of appending."""
+
+import os as _os
+MAX_DEPTH = int(_os.getenv("DIAGNOSTICS_MAX_DEPTH", "2"))
+"""Max hypothesis-tree depth.  0=root, 1=sub, 2=grandchild.  Depth-2
+nodes are leaves by construction; deeper refinement must go through
+record_finding (sharpen the statement) instead of a new sub-hypothesis."""
+
 # Statuses that permanently close a hypothesis with a negative verdict.
 # The retry budget opens only when every root hypothesis reaches one of
 # these; deprioritized / inconclusive remain backtrackable and must be
@@ -284,6 +302,32 @@ def add_hypotheses(
 
     parent_depth = hypotheses[parent_id]["depth"] if parent_id else -1
 
+    # ── Hard invariant: depth limit ──
+    # Reject ANY commit (first batch, retry, or deepening) that would
+    # exceed MAX_DEPTH.  Checked before dedup/budget so a rejected call
+    # consumes nothing.
+    if parent_depth + 1 > MAX_DEPTH:
+        raise ValueError(
+            f"假设树已达最大深化层级（{MAX_DEPTH} 层），禁止继续细化。"
+            "请调用 record_finding 用 statement_update 修正当前假设表述，"
+            "或评估是否满足退出条件进入 REPORT。"
+        )
+
+    # ── Hard invariant: cumulative layer-size limit (non-root) ──
+    # Root layer is handled separately below (retry batch REPLACES the
+    # current root layer).  For sub-hypotheses, the TOTAL sibling count
+    # under one parent must not exceed MAX_LAYER_SIZE — the per-call
+    # check above alone would allow 3+3+… commits under one parent.
+    if parent_id is not None:
+        current_siblings = len(hypotheses[parent_id]["sub_hypothesis_ids"])
+        if current_siblings + len(hypothesis_specs) > MAX_LAYER_SIZE:
+            raise ValueError(
+                f"父假设 {parent_id} 下已有 {current_siblings} 个子假设，"
+                f"本次提交 {len(hypothesis_specs)} 个将超过每层上限"
+                f"（{MAX_LAYER_SIZE} 个）。请只提交可能性最高的子假设，"
+                "或先用 record_finding 终结已有的低价值子假设。"
+            )
+
     # Detect duplicate statements — only scan root-level hypotheses
     # (parent_id is None), since sub-hypotheses naturally contain
     # parent context.  Refuted/dead_end hypotheses also participate in
@@ -327,6 +371,17 @@ def add_hypotheses(
                 "（parent_hypothesis_id）或生成报告。"
             )
         ledger["_root_commit_count"] = ledger.get("_root_commit_count", 0) + 1
+
+        # ── Hard invariant: root layer = CURRENT batch only ──
+        # A retry batch REPLACES the root layer instead of appending to
+        # it.  Prior-batch hypotheses stay in ``hypotheses`` (rendered
+        # under "已排除/降级假设") but no longer count as the current
+        # root layer — otherwise two batches accumulate to 6 roots and
+        # the "layer ≤ 3" invariant breaks (observed 2026-07-20 session:
+        # H1-H3 + H4-H6 coexisting as the root layer).
+        # First batch (no existing roots or all stale) keeps append
+        # semantics via a fresh list.
+        ledger["root_hypothesis_ids"] = []
 
     for spec in hypothesis_specs:
         hid = _next_hypothesis_id(parent_id, hypotheses)
