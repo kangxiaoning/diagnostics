@@ -295,6 +295,7 @@ function renderHistoryGraph(steps) {
       detail: s.detail || "",
       toolName: s.tool_name || "",
       toolArgs: s.tool_args || "",
+      dedup: s.dedup || false,
       el: null,
     });
     hg.nodeOrder.push(s.id);
@@ -1141,6 +1142,7 @@ function onTreeSnapshot(payload) {
         description: step.description || "",
         toolName: step.tool_name || "",
         toolArgs: step.tool_args || "",
+        dedup: step.dedup || false,
         el: null,
       });
       structureChanged = true;
@@ -1168,8 +1170,8 @@ function onTreeDelta(payload) {
 
   let structureChanged = false;
 
-  // Process removed nodes — deduped tool calls that should be
-  // completely removed from the tree (node + edges).
+  // Process removed nodes (currently unused — deduped tool calls are
+  // kept in the tree with a "dedup" badge instead of being removed).
   if (payload.removed) {
     for (const rid of payload.removed) {
       const node = GRAPH.nodes.get(rid);
@@ -1208,6 +1210,7 @@ function onTreeDelta(payload) {
         description: step.description || "",
         toolName: step.tool_name || "",
         toolArgs: step.tool_args || "",
+        dedup: step.dedup || false,
         el: null,
       });
       if (!alreadyExists) {
@@ -1249,6 +1252,10 @@ function onTreeDelta(payload) {
       }
       if (upd.description !== undefined && upd.description !== existing.description) {
         existing.description = upd.description;
+        domDirty = true;
+      }
+      if (upd.dedup !== undefined && upd.dedup !== existing.dedup) {
+        existing.dedup = upd.dedup;
         domDirty = true;
       }
       if (upd.title !== undefined && upd.title !== existing.title) {
@@ -1352,6 +1359,23 @@ function _watchReflowThenDraw(sentinelEl) {
   _edgeReflowObserver.observe(sentinelEl);
 }
 
+// ── Fix B: persistent ResizeObserver on the nodes container ──
+// A single long-lived observer that fires a debounced edge redraw whenever
+// ANY node's size settles after mount (font loading, content stabilization,
+// wrap/dpi changes). This fixes the secondary "endpoint lag" defect where a
+// node's height keeps growing after the one-time triggers already fired.
+let _persistentResizeObserver = null;
+function _ensurePersistentResizeObserver() {
+  if (_persistentResizeObserver) return;
+  if (typeof ResizeObserver === "undefined") return;
+  _persistentResizeObserver = new ResizeObserver(() => {
+    if (GRAPH.hasContent && GRAPH.edges.length > 0) {
+      _scheduleEdgeRedraw();
+    }
+  });
+  _persistentResizeObserver.observe(graphNodes);
+}
+
 function renderTree() {
   graphNodes.innerHTML = "";
 
@@ -1390,6 +1414,24 @@ function renderTree() {
   }
 
   graphNodes.appendChild(container);
+
+  // Keep a persistent observer watching the container for ANY size change
+  // (new nodes, font loading, wrap/dpi changes). This replaces reliance on
+  // one-time sentinel observers for post-mount height settling.
+  _ensurePersistentResizeObserver();
+
+  // ── Fix A: same-frame deterministic edge drawing (primary path) ──
+  // Force a synchronous layout flush, then read geometry and draw edges in
+  // the SAME task. Per spec, reading offsetHeight forces reflow, so the
+  // subsequent getBoundingClientRect() inside drawAllEdges() returns
+  // up-to-date coordinates — nodes and their connectors appear together.
+  // This does NOT depend on rAF / ResizeObserver frame production, so it
+  // works even when the tab is backgrounded/occluded.
+  if (!document.hidden && GRAPH.edges.length > 0) {
+    void container.offsetHeight; // force synchronous reflow
+    console.log(`[DIAG] renderTree sync forced-reflow drawAllEdges`);
+    drawAllEdges();
+  }
 
   // ── Diagnostic: snapshot all node.el states right after DOM mount ──
   if (GRAPH.edges.length > 0) {
@@ -1531,9 +1573,13 @@ function createNodeDOM(node) {
       <div class="tnode-content">
         <div class="tnode-title">${esc(node.title)}</div>
         ${funcCall ? `<div class="tnode-func">${esc(funcCall)}</div>` : ""}
+        ${node.dedup ? `<div class="tnode-dedup-badge">已去重 · 复用缓存结果</div>` : ""}
         ${node.description ? `<div class="tnode-desc">${esc(node.description)}</div>` : ""}
       </div>
     `;
+    if (node.dedup) {
+      el.classList.add("dedup");
+    }
     el.addEventListener("click", () => showToolPopup(node));
   }
 
@@ -1548,6 +1594,13 @@ function drawAllEdges() {
   const sx = canvas.scrollLeft;
   const sy = canvas.scrollTop;
   const canvasRect = canvas.getBoundingClientRect();
+  // Panel not visible (e.g. user is on the hypothesis tab — #graphCanvas is
+  // display:none, so every node rect is zero). Drawing is impossible; return
+  // WITHOUT touching the SVG so previously drawn edges survive. switchTab()
+  // triggers a redraw when the execution panel becomes visible again.
+  if (canvasRect.width === 0 && canvasRect.height === 0) {
+    return;
+  }
   const sw = canvas.scrollWidth;
   const sh = canvas.scrollHeight;
 
@@ -1570,8 +1623,9 @@ function drawAllEdges() {
   const arrowH = Math.round(4 * scale);
   const arrowRefX = Math.round(4.2 * scale);
 
-  const baseSw = Math.max(1.2, 1.6 * scale);
-  const accentSw = Math.max(1.5, 2.2 * scale);
+  // All edges share the accent (thick) width — the thin base width is gone.
+  // Color/dash/glow keep the original status-based scheme.
+  const edgeSw = Math.max(1.5, 2.2 * scale);
 
   const arrowColor = "#8e94a8";
   let svgContent = `<defs>
@@ -1584,7 +1638,7 @@ function drawAllEdges() {
     </filter>
   </defs>`;
 
-  let skippedNoEl = [], skippedZeroH = [], drawn = 0;
+  let skippedNoEl = [], skippedZeroH = [], drawn = 0, rewatched = false;
 
   for (const edge of GRAPH.edges) {
     const fromNode = GRAPH.nodes.get(edge.from);
@@ -1605,8 +1659,14 @@ function drawAllEdges() {
     // once that node's reflow completes (instead of waiting 300ms).
     if (fromRect.height === 0 || toRect.height === 0) {
       skippedZeroH.push(`${edge.from}("${fromNode.title}" h=${fromRect.height.toFixed(1)})->${edge.to}("${toNode.title}" h=${toRect.height.toFixed(1)})`);
-      const zeroEl = fromRect.height === 0 ? fromNode.el : toNode.el;
-      _watchReflowThenDraw(zeroEl);
+      // Re-watch at most once per draw: _watchReflowThenDraw disconnects the
+      // previous observer, so re-watching per skipped edge would leave only
+      // the last zero-height node observed.
+      if (!rewatched) {
+        rewatched = true;
+        const zeroEl = fromRect.height === 0 ? fromNode.el : toNode.el;
+        _watchReflowThenDraw(zeroEl);
+      }
       continue;
     }
     drawn++;
@@ -1620,27 +1680,24 @@ function drawAllEdges() {
     const midY1 = y1 + Math.max(20, (y2 - y1) * 0.35);
     const midY2 = y2 - Math.max(20, (y2 - y1) * 0.35);
 
-    let strokeSw, color, dash, extraStyle;
     // Tool→Phase edges: the tool (parent) is always completed when a new
     // Phase is created — use green to show the transition is done.
-    const isToolToPhase = (fromNode.nodeType === "tool" && toNode.nodeType === "phase");
-    if (isToolToPhase) {
-      strokeSw = baseSw; color = "#4ade80"; dash = ""; extraStyle = "";
+    let color = "#8e94a8", dash = "", extraStyle = "";
+    if (fromNode.nodeType === "tool" && toNode.nodeType === "phase") {
+      color = "#4ade80";
     } else if (toNode.status === "running") {
-      strokeSw = accentSw; color = "#6c8cff";
+      color = "#6c8cff";
       dash = 'stroke-dasharray="6 3"';
       extraStyle = 'filter="url(#edgeGlow)"';
     } else if (toNode.status === "completed") {
-      strokeSw = baseSw; color = "#4ade80"; dash = ""; extraStyle = "";
+      color = "#4ade80";
     } else if (toNode.status === "error") {
-      strokeSw = baseSw; color = "#f87171"; dash = ""; extraStyle = "";
-    } else {
-      strokeSw = baseSw; color = "#8e94a8"; dash = ""; extraStyle = "";
+      color = "#f87171";
     }
 
     svgContent += `<path
       d="M${x1},${y1} C${x1},${midY1} ${x2},${midY2} ${x2},${y2}"
-      stroke="${color}" stroke-width="${strokeSw.toFixed(1)}" ${dash}
+      stroke="${color}" stroke-width="${edgeSw.toFixed(1)}" ${dash}
       fill="none" stroke-linecap="round" marker-end="url(#arrowHead)"
       ${extraStyle} class="gedge"/>`;
   }
@@ -2018,7 +2075,15 @@ function switchTab(tab) {
       if (_historyGraph) _scheduleHistoryEdgeRedraw();
     } else {
       document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-      document.querySelector('[data-panel="execution"]').classList.add("active");
+      const execPanel = document.querySelector('[data-panel="execution"]');
+      execPanel.classList.add("active");
+      // While the panel was display:none, every edge draw was skipped and
+      // previously drawn edges may have been erased. Redraw now that layout
+      // is available again (sync forced reflow → correct coordinates).
+      if (GRAPH.hasContent && GRAPH.edges.length > 0) {
+        void execPanel.offsetHeight;
+        drawAllEdges();
+      }
     }
   } else {
     tabHypothesis.classList.add("active");

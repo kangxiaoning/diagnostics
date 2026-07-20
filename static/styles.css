@@ -406,6 +406,13 @@ button:disabled { opacity: 0.35; cursor: not-allowed; }
   line-height: 1.45; word-break: break-word;
   max-height: 54px; overflow: hidden; text-overflow: ellipsis;
 }
+.tnode-dedup-badge {
+  display: inline-block; margin-top: 3px; padding: 1px 6px;
+  font-size: 9.5px; line-height: 1.5; border-radius: 6px;
+  color: var(--text-2); background: var(--border);
+  opacity: 0.85;
+}
+.tnode.tool.dedup { opacity: 0.62; }
 
 /* ════════════════ Tool Popup ════════════════ */
 .tool-popup {

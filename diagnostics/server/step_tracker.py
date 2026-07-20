@@ -120,6 +120,7 @@ class TreeNode:
     tool_name: str = ""
     tool_args: str = ""
     parent_ids: list[str] = field(default_factory=list)
+    dedup: bool = False  # tool call was deduplicated (cached preview served)
 
 
 @dataclass
@@ -245,6 +246,8 @@ class TreeBuilder:
                         node.detail == tc_id and
                         node.status == StepStatus.RUNNING):
                     node.status = StepStatus.COMPLETED
+                    if _data.get("dedup"):
+                        node.dedup = True
                     changed_ids.append(node.id)
                     break
 
@@ -420,6 +423,7 @@ class TreeBuilder:
             "description": node.description,
             "tool_name": node.tool_name,
             "tool_args": node.tool_args,
+            "dedup": node.dedup,
         }
 
     def _snapshot_event(self) -> dict[str, Any]:

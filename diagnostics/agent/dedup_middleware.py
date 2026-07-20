@@ -193,17 +193,38 @@ class ToolDedupMiddleware(AgentMiddleware):
 
         return result
 
-    def _cached_result(
+    def _dedup_hit_result(
         self,
         cache_key: str,
         tool_call_id: str,
+        tool_name: str,
+        full_content: str,
     ) -> ToolMessage:
-        """Return a fresh ToolMessage from the in-memory cache entry."""
-        cached_msg, _ = self._tool_call_cache[cache_key]
+        """Build the dedup-hit ToolMessage: short preview + retrieval path.
+
+        The full result stays in the in-memory/backend cache.  Returning
+        only a preview keeps duplicate content out of the LLM context.
+        The deterministic backend path lets the agent re-read the full
+        result when the preview is insufficient — this matters for
+        cross-agent hits, where the original result is NOT present in
+        this agent's message history (each task() delegation starts a
+        fresh subagent context).
+        """
+        preview = full_content[:300].rstrip()
+        if len(full_content) > 300:
+            preview += "…"
+        backend_path = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
         return ToolMessage(
-            content=cached_msg.content,
+            content=(
+                f"[系统去重] {tool_name} 与此前一次调用的参数完全相同，"
+                "本次未重复执行。结果开头预览：\n"
+                f"---\n{preview}\n---\n"
+                f"完整结果（{len(full_content)} 字符）与此前一致"
+                "（若上方历史消息中已有该结果，直接引用即可）；"
+                f"如需全文可 read_file \"{backend_path}\"。"
+            ),
             tool_call_id=tool_call_id,
-            name=cached_msg.name,
+            name=tool_name,
         )
 
     @staticmethod
@@ -242,7 +263,12 @@ class ToolDedupMiddleware(AgentMiddleware):
             if fail_count == 0:
                 logger.info("去重命中: %s", cache_key)
                 self._emit_dedup_event(tool_call_id)
-                return self._cached_result(cache_key, tool_call_id)
+                full = cached_msg.content if isinstance(
+                    cached_msg.content, str) else str(cached_msg.content)
+                return self._dedup_hit_result(
+                    cache_key, tool_call_id, cached_msg.name or tool_name,
+                    full,
+                )
             # Previous call(s) failed → this is a retry
             if fail_count >= _TOOL_FAILURE_BREAKER:
                 logger.warning("熔断: %s (连续失败%d次)", cache_key, fail_count)
@@ -311,7 +337,11 @@ class ToolDedupMiddleware(AgentMiddleware):
                     name=tool_name,
                 )
                 self._tool_call_cache[cache_key] = (restored, 0)
-                return restored
+                full = cached_content if isinstance(
+                    cached_content, str) else str(cached_content)
+                return self._dedup_hit_result(
+                    cache_key, tool_call_id, tool_name, full,
+                )
 
         # ── Register in-flight → execute → cache → signal waiters ──
         loop = asyncio.get_running_loop()

@@ -1354,7 +1354,19 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             ), None
         # Resumable hypotheses remain (deprioritized / inconclusive /
         # low-probability pending) — diagnosis continues via backtrack.
-        return False, "", None
+        resumable = [
+            f"{hid}({hypotheses[hid].get('status')})"
+            for hid in root_ids
+            if hypotheses.get(hid, {}).get("status")
+            in ("pending", "verifying", "inconclusive", "deprioritized")
+        ]
+        return False, (
+            "尚无 confirmed 根因，仍有可恢复验证的假设: "
+            + (", ".join(resumable) if resumable else "(无)")
+            + "。请用 record_finding 给出明确 verdict（confirmed/refuted），"
+            "或用 backtrack 恢复 inconclusive/deprioritized 假设继续验证；"
+            "全部证伪后可提交新一批根假设"
+        ), None
 
     # ── Single-root / legacy: first confirmed hypothesis triggers exit ──
     # Condition 1: Root cause confirmed — a confirmed hypothesis with p>=80%
@@ -1398,4 +1410,14 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     if ledger.get("_inconclusive_streak", 0) >= 3:
         return True, "证据饱和: 连续3次验证结果不明确", None
 
-    return False, "", None
+    # Remaining: some hypotheses still non-terminal, no saturation yet.
+    unfinished = [
+        f"{h['id']}({h['status']})"
+        for h in hypotheses.values()
+        if h["status"] in ("pending", "verifying")
+    ]
+    return False, (
+        "假设尚未全部终结"
+        + (f": {', '.join(unfinished)}" if unfinished else "")
+        + "。请先调用 record_finding 完成所有假设的验证"
+    ), None

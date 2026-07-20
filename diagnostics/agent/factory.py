@@ -7,8 +7,8 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
-from langchain.chat_models import init_chat_model
 
+from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
 from diagnostics.agent.ledger import DiagnosisLedgerState
@@ -400,9 +400,12 @@ def build_agent(
     # Disable stream chunk timeout for local LLMs (LM Studio)
     os.environ.setdefault("LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S", "0")
 
-    model = init_chat_model(
-        settings.model,
-        model_provider="openai",
+    # NOTE: use the OllamaChatOpenAI subclass (not plain ChatOpenAI /
+    # init_chat_model) so requests carry the legacy top-level
+    # "max_tokens" field — the only form ollama honors (see the class
+    # docstring in ollama_chat.py for the evidence).
+    model = OllamaChatOpenAI(
+        model=settings.model,
         base_url=settings.base_url,
         api_key=settings.api_key,
         temperature=settings.temperature,

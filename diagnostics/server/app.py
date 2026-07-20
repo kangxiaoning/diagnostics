@@ -41,6 +41,16 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     app = FastAPI(title=settings.app_title)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        # Force revalidation on every load for the HTML shell and static
+        # assets (ETag/Last-Modified make unchanged files a cheap 304).
+        # Prevents stale JS after frontend changes when the page is kept open.
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     @app.get("/favicon.ico")
     async def favicon():
         return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
@@ -493,20 +503,15 @@ async def _chat_event_stream(
                 yield sse("tool_start", event.payload)
 
             elif event.name == "tool_end":
-                # Deduped nodes: completely remove from the frontend tree
-                # so users don't see duplicated identical calls.
+                # Deduped nodes are KEPT in the tree with a "dedup" badge:
+                # the dedup middleware served a cached preview, and removing
+                # the node after it appeared caused visible flicker.
+                update = {"tool_call_id": event.payload["id"]}
                 if event.payload.get("_deduped"):
-                    tc_id = event.payload.get("id", "")
-                    if tc_id:
-                        for snap in tree.remove_tool_node(tc_id):
-                            yield _tree_sse(snap)
-                else:
-                    # Feed tool completion to tree (now emits delta, not full snapshot)
-                    for snap in tree.handle_update(
-                        {"tool_call_id": event.payload["id"]},
-                        namespace=["tools"],
-                    ):
-                        yield _tree_sse(snap)
+                    update["dedup"] = True
+                # Feed tool completion to tree (now emits delta, not full snapshot)
+                for snap in tree.handle_update(update, namespace=["tools"]):
+                    yield _tree_sse(snap)
 
                 # Trace: tool result
                 trace.tool_end(

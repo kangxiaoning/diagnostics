@@ -671,8 +671,8 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
             elif data.get("type") == "tool_dedup":
                 # Emitted by dedup_middleware when a duplicate tool call
                 # is caught (P0 cache / P1 in-flight / cross-agent).
-                # Mark the node so tool_end can skip it; the frontend
-                # will remove it via tree_delta.
+                # Mark the node so tool_end carries the dedup flag; the
+                # frontend keeps the node and renders a "dedup" badge.
                 tc_id = data.get("id")
                 if tc_id:
                     info = state.active_tools.get(tc_id)
