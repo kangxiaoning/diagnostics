@@ -365,9 +365,9 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
         confirmed = [(hid, h) for hid, h in hypotheses.items()
                      if h.get("status") == "confirmed"]
         refuted = [(hid, h) for hid, h in hypotheses.items()
-                   if h.get("status") in ("refuted", "deprioritized", "dead_end")]
+                   if h.get("status") == "refuted"]
         unfinished = [(hid, h) for hid, h in hypotheses.items()
-                      if h.get("status") in ("pending", "verifying")]
+                      if h.get("status") in ("pending", "inconclusive")]
         root_ids = set(ledger.get("root_hypothesis_ids", []))
 
         if confirmed:
@@ -437,7 +437,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
             lines.append(f"{i + 1}. {'[根因] ' if is_root else ''}{rc_text}")
     elif hypotheses:
         refuted_all = all(
-            h.get("status") in ("refuted", "deprioritized", "dead_end")
+            h.get("status") == "refuted" or h.get("deferred")
             for h in hypotheses.values()
         )
         if refuted_all:
@@ -677,7 +677,7 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
                 # Truncate each evidence entry to keep context compact
                 summaries.append(s[:250])
         if summaries:
-            status_label = {"confirmed": "✓", "refuted": "✗", "verifying": "⟳"}.get(h["status"], "?")
+            status_label = {"confirmed": "✓", "refuted": "✗", "inconclusive": "?"}.get(h["status"], "⟳")
             lines.append(f"\n假设 {hid} [{status_label}] {h.get('statement', '')}:")
             for s in summaries:
                 lines.append(f"  - {s}")
@@ -1249,12 +1249,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             try:
                 # ── Finalize pending hypotheses ──
                 # Any hypothesis still in "pending" state was never
-                # reached by the LLM.  Mark them as dead_end so the
-                # report reflects that diagnosis was interrupted
+                # reached by the LLM.  Hard-close as refuted with
+                # terminal_reason=timeout_unreached (former dead_end)
+                # so the report reflects that diagnosis was interrupted
                 # before verifying them.
                 for hid, node in ledger.get("hypotheses", {}).items():
                     if node.get("status") == "pending":
-                        node["status"] = "dead_end"
+                        node["status"] = "refuted"
+                        node["terminal_reason"] = "timeout_unreached"
+                        node["selected"] = False
                         if not node.get("evidence"):
                             node["evidence"] = []
                         from datetime import datetime as _dt, timezone as _tz
@@ -1406,19 +1409,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         e.get("supports") and e.get("source") == "coordinator"
                         for e in node.get("evidence", [])
                     )
-                    if node.get("status") == "verifying":
+                    if node.get("status") in ("pending", "inconclusive"):
                         # Only auto-confirm when coordinator evidence with
                         # supports=True exists.  Expert evidence alone is
                         # insufficient — it always has supports=True
                         # regardless of actual verdict.
                         # NOTE: entering this safety net only requires the
-                        # hypothesis to still be "verifying".  Whether it has
-                        # expert evidence only decides *which* branch runs;
-                        # it must NOT gate the whole safety net (otherwise a
-                        # verifying hypothesis with NO recorded evidence —
+                        # active hypothesis to still be undecided (the
+                        # verify focus).  Whether it has expert evidence
+                        # only decides *which* branch runs; it must NOT
+                        # gate the whole safety net (otherwise an
+                        # undecided hypothesis with NO recorded evidence —
                         # e.g. Coordinator skipped record_finding after an
-                        # inconclusive expert result — silently ends the loop
-                        # without writing a report).
+                        # inconclusive expert result — silently ends the
+                        # loop without writing a report).
                         if has_expert and has_coordinator_support:
                             record_finding(
                                 ledger, active_id, "confirmed",
@@ -1426,16 +1430,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "\u7cfb\u7edf\u57fa\u4e8e\u5df2\u6709\u534f\u8c03\u5458\u786e\u8ba4\u8bc1\u636e\u81ea\u52a8\u786e\u8ba4\u3002",
                                 node["probability"],
                             )
-                            # Auto-finalize ALL other verifying hypotheses
+                            # Auto-finalize ALL other undecided hypotheses
                             # so the LLM has no reason to continue after
                             # the report is generated.
                             for _hid, _node in ledger.get("hypotheses", {}).items():
-                                if _hid != active_id and _node.get("status") == "verifying":
-                                    _node["status"] = "deprioritized"
-                                    _node["rationale"] = (
-                                        ((_node.get("rationale", "") or "") + " | "
-                                         "[系统] REPORT 阶段自动降级")
-                                    )
+                                if _hid != active_id and _node.get("status") in (
+                                        "pending", "inconclusive"):
+                                    _node["deferred"] = True
+                                    _node["selected"] = False
+                                    if not _node.get("deferred_reason"):
+                                        _node["deferred_reason"] = (
+                                            "[系统] REPORT 阶段自动搁置")
                             _force_report(ledger)
                             self._report_phase_start_round = self._model_call_count
                             self._persist_ledger(ledger)
@@ -1606,16 +1611,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         node["probability"],
                                     )
                                     auto_verdict = "inconclusive"
-                                # Auto-finalize ALL other verifying hypotheses
+                                # Auto-finalize ALL other undecided hypotheses
                                 # so the LLM has no reason to continue after
                                 # the report is generated.
                                 for _hid, _node in ledger.get("hypotheses", {}).items():
-                                    if _hid != active_id and _node.get("status") == "verifying":
-                                        _node["status"] = "deprioritized"
-                                        _node["rationale"] = (
-                                            ((_node.get("rationale", "") or "") + " | "
-                                             "[系统] REPORT 阶段自动降级")
-                                        )
+                                    if _hid != active_id and _node.get("status") in (
+                                            "pending", "inconclusive"):
+                                        _node["deferred"] = True
+                                        _node["selected"] = False
+                                        if not _node.get("deferred_reason"):
+                                            _node["deferred_reason"] = (
+                                                "[系统] REPORT 阶段自动搁置")
                                 _force_report(ledger)
                                 self._report_phase_start_round = self._model_call_count
                                 self._persist_ledger(ledger)
@@ -1677,26 +1683,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "\u81ea\u52a8\u6807\u8bb0\u672a\u5b8c\u6210\u5e76\u8f6c\u5165\u62a5\u544a\u9636\u6bb5\u3002",
                                 node["probability"],
                             )
-                            # NOTE: record_finding(verdict="inconclusive") does
-                            # NOT flip status out of "verifying" — it only bumps
-                            # _inconclusive_streak and only dead-ends after 3
-                            # consecutive inconclusive verdicts.  Since we are
-                            # ending the verify loop here, explicitly terminate
-                            # the hypothesis so no "verifying" node enters REPORT
-                            # (that would both violate the prompt's "no verifying
-                            # hypothesis in REPORT" rule and make derive_phase
-                            # loop forever).  "inconclusive" is a terminal status
-                            # recognized by derive_phase (see ledger.derive_phase).
-                            node["status"] = "inconclusive"
-                            # Auto-finalize ALL other verifying hypotheses
+                            # record_finding(inconclusive) already marks the
+                            # node inconclusive and clears its selected flag
+                            # (5-state model) — it is no longer the verify focus.
+                            node["selected"] = False
+                            # Auto-finalize ALL other undecided hypotheses
                             # so the ledger is clean when the report is generated.
                             for _hid, _node in ledger.get("hypotheses", {}).items():
-                                if _hid != active_id and _node.get("status") == "verifying":
-                                    _node["status"] = "deprioritized"
-                                    _node["rationale"] = (
-                                        ((_node.get("rationale", "") or "") + " | "
-                                         "[系统] REPORT 阶段自动降级")
-                                    )
+                                if _hid != active_id and _node.get("status") in (
+                                        "pending", "inconclusive"):
+                                    _node["deferred"] = True
+                                    _node["selected"] = False
+                                    if not _node.get("deferred_reason"):
+                                        _node["deferred_reason"] = (
+                                            "[系统] REPORT 阶段自动搁置")
                             # Transition to REPORT phase.  We deliberately do
                             # NOT generate/write the report here — that belongs
                             # to the report phase.  The reliable post-response
@@ -1806,7 +1806,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 pending = [
                     hid for hid in root_ids
                     if (node := all_h.get(hid))
-                    and node.get("status") in ("pending", "verifying")
+                    and node.get("status") in ("pending", "inconclusive")
+                    and not node.get("deferred")
                     and node.get("probability", 0) > 15
                 ]
                 if pending:
@@ -1847,12 +1848,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         _inject_tool_calls(response, synthetic)
                     else:
                         # Second+ consecutive stall — auto-resolve
-                        # pending hypotheses as inconclusive, then
+                        # undecided hypotheses as inconclusive, then
                         # force REPORT with synthetic write_file.
                         for hid in pending:
                             node = all_h.get(hid)
                             if node:
                                 node["status"] = "inconclusive"
+                                node["selected"] = False
+                                node["_inconclusive_count"] = (
+                                    node.get("_inconclusive_count", 0) + 1)
                                 node["rationale"] = (
                                     ((node.get("rationale", "") or "")
                                      + " | [系统自动] LLM 连续 "
@@ -1952,8 +1956,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             active_id = active_path[-1] if active_path else None
             if active_id and active_id in ledger.get("hypotheses", {}):
                 node = ledger["hypotheses"][active_id]
-                # Only intervene for hypotheses still in verifying state
-                if node.get("status") == "verifying":
+                # Only intervene while the active hypothesis is undecided
+                # (the verify focus in the 5-state model).
+                if node.get("status") in ("pending", "inconclusive"):
                     has_expert_evidence = any(
                         e.get("source", "").startswith("expert:")
                         for e in node.get("evidence", [])
@@ -2267,10 +2272,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_args = request.tool_call.get("args", {})
 
         # ── write_file gate: enforce "verify before report" ──
-        # The state machine requires all hypotheses to reach a terminal
-        # state (confirmed/refuted/deprioritized) before entering REPORT
-        # phase.  This gate prevents the LLM from short-circuiting the
-        # process by calling write_file directly from evaluate/verify.
+        # The state machine requires the quantified exit criteria
+        # (S1 confidence ∧ S2 gain<cost, or a fast lane) before entering
+        # REPORT phase.  This gate prevents the LLM from short-circuiting
+        # the process by calling write_file directly from evaluate/verify.
         #
         # Pass conditions (any of):
         #   1. check_exit_conditions — root cause confirmed / hypotheses
@@ -2391,22 +2396,63 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 subagent_type = tool_args.get("subagent_type", "")
                 desc = tool_args.get("description", "")
 
+                # ── S2 gain<cost delegation gate (state-machine-v2.md §6) ──
+                # A delegation whose expected information gain per unit cost
+                # falls below κ is hard-blocked with a quantified reason.
+                # Only applies to VERIFY-phase delegations targeting a
+                # known hypothesis — UNDERSTAND-phase Argus data collection
+                # (no hypothesis yet) is always allowed.
+                _gate_hid = _parse_hypothesis_id_from_description(
+                    desc, ledger.get("hypotheses", {}),
+                )
+                if _gate_hid and ledger.get("hypotheses"):
+                    _gate_node = ledger["hypotheses"].get(_gate_hid)
+                    if (_gate_node is not None
+                            and _gate_node.get("status") in ("pending", "inconclusive")):
+                        from diagnostics.agent.ledger import (
+                            delegation_value, KAPPA_STOP,
+                        )
+                        _v = delegation_value(_gate_node)
+                        if _v < KAPPA_STOP:
+                            logger.warning(
+                                "Delegation blocked by gain<cost gate: "
+                                "%s value=%.3f < κ=%.2f (delegated=%d, "
+                                "inconclusive=%d, round=%d)",
+                                _gate_hid, _v, KAPPA_STOP,
+                                _gate_node.get("_delegate_count", 0),
+                                _gate_node.get("_inconclusive_count", 0),
+                                self._model_call_count,
+                            )
+                            return ToolMessage(
+                                content=(
+                                    f"⛔ 委派被信息增益门控拦截：假设 {_gate_hid} "
+                                    f"当前验证动作价值 {_v:.3f} < κ={KAPPA_STOP}"
+                                    f"（已委派 {_gate_node.get('_delegate_count', 0)} 次、"
+                                    f"inconclusive {_gate_node.get('_inconclusive_count', 0)} 次，"
+                                    "重复验证的期望信息增益低于成本）。\n"
+                                    "请选择：\n"
+                                    "- record_finding 对该假设给出结论（confirmed/refuted/inconclusive）\n"
+                                    "- select_path 切换到其他未决假设\n"
+                                    "- 若无 confirmed 根因且换批预算未用尽：commit_hypotheses 换方向\n"
+                                    "- 若退出判据已满足：系统将自动进入 REPORT"
+                                ),
+                                tool_call_id=tool_call_id,
+                            )
+
                 # ── Auto-heal: delegation implies verification focus ──
                 # The Coordinator may skip select_path and delegate
-                # verification of a pending/deprioritized/inconclusive
+                # verification of a pending/deferred/inconclusive
                 # hypothesis directly.  Without this heal, active_path
                 # stays pinned to a stale (possibly refuted) hypothesis,
                 # auto-collected evidence falls back to the wrong node,
                 # and the VERIFY-phase guidance never targets the real
                 # hypothesis.  Parse the ORIGINAL description (before the
                 # context wrap below) and activate the target.
-                target_hid = _parse_hypothesis_id_from_description(
-                    desc, ledger.get("hypotheses", {}),
-                )
+                target_hid = _gate_hid
                 if target_hid:
                     target_node = ledger["hypotheses"].get(target_hid, {})
                     if target_node.get("status") in (
-                        "pending", "deprioritized", "inconclusive",
+                        "pending", "inconclusive",
                     ):
                         activate_hypothesis(ledger, target_hid)
                         self._persist_ledger(ledger)
@@ -2619,6 +2665,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._same_delegate_count = 1
                 self._last_delegate_key = delegate_key
 
+            # Persist per-hypothesis delegation count on the node —
+            # drives the freshness decay F in the gain<cost model
+            # (delegation_value in ledger.py).  Count only successful
+            # returns; tool failures never reach this post-handler.
+            if hid != "?":
+                _node = ledger.get("hypotheses", {}).get(hid)
+                if _node is not None:
+                    _node["_delegate_count"] = (
+                        _node.get("_delegate_count", 0) + 1)
+                    self._persist_ledger(ledger)
+
         # Capture report content when write_file writes to the pre-generated
         # report path — emit for frontend answer-body without text parsing.
         if tool_name == "write_file" and self.report_path:
@@ -2656,7 +2713,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     finalized_any = False
                     for hid, node in hypotheses.items():
                         status = node.get("status")
-                        if status == "verifying":
+                        if status in ("pending", "inconclusive") and node.get("selected"):
+                            # The active (selected) hypothesis at report time.
                             # Only auto-confirm when coordinator (record_finding)
                             # evidence with supports=True exists — this indicates
                             # the LLM explicitly confirmed the hypothesis but
@@ -2669,19 +2727,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 and e.get("source") == "coordinator"
                                 for e in node.get("evidence", [])
                             )
-                            if has_coordinator_support:
+                            if has_coordinator_support and status == "pending":
                                 record_finding(
                                     ledger, hid, "confirmed",
                                     "诊断报告已生成，系统根据已有协调员确认证据自动确认。",
                                     node.get("probability", 75),
                                 )
                             else:
-                                # No explicit coordinator confirmation.
-                                # NOTE: record_finding(inconclusive) does NOT
-                                # change node status by design (it only bumps
-                                # the streak counter for the verify loop) —
-                                # finalize directly at this hard endpoint.
                                 node["status"] = "inconclusive"
+                                node["_inconclusive_count"] = (
+                                    node.get("_inconclusive_count", 0) + 1)
                                 node["verdict_reason"] = (
                                     "诊断报告已生成，该假设验证未得出明确结论，"
                                     "系统标记为未完成。"
@@ -2693,27 +2748,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     supports=False,
                                 ))
                             finalized_any = True
-                        elif status == "pending":
+                        elif status == "pending" and not node.get("deferred"):
+                            # Never-verified, never-shelved hypothesis:
+                            # close as refuted by the system so the report
+                            # does not cite it as an open question.
                             record_finding(
                                 ledger, hid, "refuted",
                                 "诊断报告已生成，核心假设已确认，该假设未被验证，系统自动关闭。",
                                 node.get("probability", 5),
                             )
+                            node["terminal_reason"] = "auto_finalized"
                             finalized_any = True
-                        elif status == "deprioritized":
-                            # Deprioritized hypotheses were never verified.
-                            # The multi-root exit condition may skip them,
-                            # yet the report can still cite them as root
-                            # causes (observed 2026-07-19 session cd94408a:
-                            # H6 deprioritized but written as a confirmed
-                            # root cause).  Finalize as inconclusive so the
-                            # ledger accurately reflects "not verified"
-                            # after the report is written, instead of
-                            # leaving a resumable-looking state.  Direct
-                            # assignment is required (see NOTE above).
+                        elif status in ("pending", "inconclusive") and node.get("deferred"):
+                            # Deferred (shelved) hypotheses were never
+                            # verified.  The report can still cite them as
+                            # root causes (observed 2026-07-19 session
+                            # cd94408a: H6 shelved but written as a
+                            # confirmed root cause).  Mark inconclusive so
+                            # the ledger accurately reflects "not
+                            # verified" after the report is written.
                             node["status"] = "inconclusive"
+                            node["_inconclusive_count"] = (
+                                node.get("_inconclusive_count", 0) + 1)
                             node["verdict_reason"] = (
-                                "诊断报告已生成，该假设降级后未完成验证，"
+                                "诊断报告已生成，该假设搁置后未完成验证，"
                                 "系统标记为未验证。"
                             )
                             node["selected"] = False
@@ -3134,7 +3192,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # window has not genuinely elapsed.  Count the stall from
                 # the last delegation round, not from the last finding.
                 if (has_expert
-                        and node.get("status") == "verifying"
+                        and node.get("status") in ("pending", "inconclusive")
                         and round_num - max(stall_ref, self._last_task_round) >= _VERIFY_STUCK_GAP):
                     has_coordinator_support = any(
                         e.get("supports") and e.get("source") == "coordinator"
@@ -3156,12 +3214,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             f"（第{round_num}轮），系统标记为未完成。",
                             node["probability"],
                         )
-                        # record_finding keeps status "verifying" until the
-                        # inconclusive streak hits 3 — promote to a terminal
-                        # (but backtrackable) status so derive_phase can
-                        # advance the state machine now.
-                        if ledger["hypotheses"][active_id].get("status") == "verifying":
-                            ledger["hypotheses"][active_id]["status"] = "inconclusive"
+                        # record_finding already marks the node
+                        # inconclusive and clears selected (5-state
+                        # model); ensure the node is no longer the
+                        # verify focus so derive_phase can advance now.
+                        ledger["hypotheses"][active_id]["selected"] = False
                     # Let the state machine decide the next phase — REPORT
                     # only when exit conditions are genuinely met (the
                     # write_file gate passes then); otherwise continue the
@@ -3324,13 +3381,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             target = hypotheses.get(selected_hypothesis_id, {})
             active_id = (ledger.get("active_path") or [None])[-1]
             if (selected_hypothesis_id == active_id
-                    and target.get("status") == "verifying"
+                    and target.get("status") in ("pending", "inconclusive")
                     and target.get("selected")):
                 for dep in dep_dicts:
                     dep_id = dep.get("id", "")
                     if dep_id in hypotheses and dep_id != selected_hypothesis_id:
-                        hypotheses[dep_id]["status"] = "deprioritized"
-                        hypotheses[dep_id]["rationale"] = dep.get("reason", "")
+                        hypotheses[dep_id]["deferred"] = True
+                        hypotheses[dep_id]["selected"] = False
+                        hypotheses[dep_id]["deferred_reason"] = dep.get("reason", "")
                 mw._persist_ledger(ledger)
                 mw._current_ledger = ledger
                 return (
@@ -3359,7 +3417,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="select_path",
             description=(
                 "选择1条最接近根因的假设路径深入（EVALUATE阶段必须调用）。"
-                "未选中的假设自动降级为deprioritized，可后续回溯。"
+                "未选中的假设自动搁置（deferred），可后续 backtrack 恢复。"
             ),
             coroutine=_run,
             args_schema=SelectPathInput,
@@ -3666,8 +3724,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         return StructuredTool.from_function(
             name="backtrack",
             description=(
-                "回溯到最近的 deprioritized 或 pending 假设重新验证"
-                "（BACKTRACK 阶段必须调用，或在 EVALUATE 阶段全部 refuted 时调用）。"
+                "回溯到最近的搁置（deferred）或 pending/inconclusive 假设重新验证"
+                "（EVALUATE 阶段当前层全部 refuted 时调用）。"
                 "如果没有可回溯的假设，自动进入 REPORT 阶段。"
             ),
             coroutine=_run,
@@ -3779,22 +3837,39 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 lines.append(f"{i}. {rc}")
             lines.append("")
 
-        # ── Excluded hypotheses ──
+        # ── Excluded / shelved hypotheses ──
+        _TERMINAL_REASON_CN = {
+            "evidence_saturated": "证据饱和",
+            "timeout_unreached": "未及验证",
+            "auto_finalized": "系统自动关闭",
+        }
         refuted = [
             h for h in hypotheses.values()
-            if h.get("status") in ("refuted", "deprioritized")
+            if h.get("status") == "refuted"
         ]
-        if refuted:
+        shelved = [
+            h for h in hypotheses.values()
+            if h.get("deferred") and h.get("status") != "refuted"
+        ]
+        if refuted or shelved:
             lines.append("## 排除的假设\n")
             for h in refuted:
-                status_cn = {
-                    "refuted": "已排除", "deprioritized": "已降级",
-                }.get(h.get("status", ""), h.get("status", ""))
-                rationale = (h.get("rationale") or "")[:200]
+                status_cn = _TERMINAL_REASON_CN.get(
+                    h.get("terminal_reason", ""), "已排除")
+                rationale = (
+                    (h.get("verdict_reason") or h.get("rationale") or ""))[:200]
                 lines.append(
                     f"- [{status_cn}] {h.get('statement', '')}"
                     f"（概率{h.get('probability', 0)}%）"
                     f"{' — ' + rationale if rationale else ''}"
+                )
+            for h in shelved:
+                reason = (
+                    (h.get("deferred_reason") or h.get("rationale") or ""))[:200]
+                lines.append(
+                    f"- [未验证(搁置)] {h.get('statement', '')}"
+                    f"（概率{h.get('probability', 0)}%）"
+                    f"{' — ' + reason if reason else ''}"
                 )
             lines.append("")
 

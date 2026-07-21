@@ -28,11 +28,21 @@ DiagnosisPhase = Literal[
     "understand", "hypothesize", "verify", "evaluate", "report",
 ]
 
+# 5-state model (state-machine-v2.md §5, v2.1 精简):
+# - verifying   → removed: the verification focus is active_path[-1]
+# - deprioritized → demoted to the ``deferred`` boolean field on the node
+# - dead_end    → merged into ``refuted`` with ``terminal_reason`` set
 HypothesisStatus = Literal[
-    "pending", "verifying", "confirmed",
-    "refuted", "deprioritized", "dead_end",
-    "inconclusive",  # safety-valve auto-marked undetermined state
+    "pending", "confirmed",
+    "refuted",     # includes former dead_end (see terminal_reason)
+    "inconclusive",  # evidence insufficient, backtrackable
 ]
+
+# Why a hypothesis was closed without a verdict (refuted sub-classification):
+#   "evidence_saturated" — 3 consecutive inconclusive verdicts (former dead_end)
+#   "timeout_unreached"  — session interrupted before verification (former dead_end)
+#   "auto_finalized"     — closed by a safety valve / report-time finalize
+TerminalReason = Literal["evidence_saturated", "timeout_unreached", "auto_finalized"]
 
 Verdict = Literal["confirmed", "refuted", "inconclusive"]
 
@@ -61,10 +71,40 @@ nodes are leaves by construction; deeper refinement must go through
 record_finding (sharpen the statement) instead of a new sub-hypothesis."""
 
 # Statuses that permanently close a hypothesis with a negative verdict.
-# The retry budget opens only when every root hypothesis reaches one of
-# these; deprioritized / inconclusive remain backtrackable and must be
-# explored via backtrack before a fresh batch is allowed.
-_HARD_FAILED_STATUSES = frozenset({"refuted", "dead_end"})
+# (dead_end merged into refuted in the 5-state model.)
+_HARD_FAILED_STATUSES = frozenset({"refuted"})
+
+# ── Quantified exit model (state-machine-v2.md §6, v2.1) ──
+# 退出时机 = 继续验证的期望信息增益 < 成本，且当前把握足够。
+# Value of a verification action: value(a) = EIG(a) / c(a), where
+#   EIG(a) = U(h) × D(a,h) × F(a,h)
+#     U(h)   residual uncertainty of the target hypothesis
+#            = 4·p·(1-p), p = probability/100  (1.0 at p=50, ~0 at extremes)
+#     D(a,h) discriminativeness: 1.0 targeted delegation / 0.5 indirect
+#     F(a,h) freshness decay = 0.5^n_prior_delegations(h) (inconclusive
+#            verdicts add an extra halving each — D6)
+#   c(a)   cost in round-equivalents (D3): delegation 2.0 / state-op 0.5 /
+#          batch commit 1.0 / direct query 0.3
+# Exit requires BOTH:
+#   S1 (confidence sufficient): a confirmed root cause with p ≥ 80 AND
+#       residual uncertainty R < R_THRESHOLD, where
+#       R = Σ U(h) over undecided h (deferred nodes excluded — D4)
+#   S2 (gain < cost): max available action value < KAPPA_STOP
+# Fast lanes (kept from v2): E2 exhaustion, E3 saturation, E4 quick path.
+KAPPA_STOP = 0.15
+"""Stop threshold on max action value (D2).  Calibrated so a targeted
+delegation is allowed ~2 times on the same hypothesis (0.25 > κ) but a
+3rd is blocked (0.125 < κ)."""
+
+R_THRESHOLD = 0.8
+"""Max residual uncertainty allowed for S1 (D4).  A single fresh p=50
+hypothesis contributes U=1.0, so R<0.8 tolerates at most one partially
+resolved side hypothesis (U≈0.64 at p=20/80)."""
+
+COST_DELEGATION = 2.0
+COST_STATE_OP = 0.5
+COST_BATCH_COMMIT = 1.0
+COST_QUERY = 0.3
 
 # LLMs sometimes prefix hypothesis statements with the ledger ID they
 # expect (e.g. "H1: 磁盘故障"), producing doubled prefixes in rendering
@@ -174,6 +214,11 @@ def new_hypothesis(
         selected=False,
         rationale=rationale,
         created_at_round=round_num,
+        deferred=False,          # v2.1: scheduling mark (ex-deprioritized)
+        deferred_reason="",      # why the LLM shelved this hypothesis
+        terminal_reason="",      # refuted sub-classification (ex-dead_end)
+        _delegate_count=0,       # successful expert delegations targeting it
+        _inconclusive_count=0,   # inconclusive verdicts on this node (D6)
     )
 
 
@@ -243,14 +288,16 @@ def _next_hypothesis_id(parent_id: str | None, hypotheses: dict[str, HypothesisN
 def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
     """Check if a new batch of ROOT hypotheses may be submitted.
 
-    Budget rules (see ``MAX_ROOT_COMMIT_BATCHES``):
+    Budget rules (see ``MAX_ROOT_COMMIT_BATCHES``, v2.1 H2 relaxed):
 
     - First batch: always allowed (no root hypotheses yet).
-    - Subsequent batches: only when ALL existing root hypotheses are
-      hard-failed (refuted / dead_end).  This prevents overlap with the
-      multi-root-cause mechanism — when any root hypothesis is confirmed,
-      pending, or backtrackable, the LLM must use ``select_path`` /
-      ``backtrack`` / deepening instead of opening a new batch.
+    - Subsequent batches: allowed when the current batch has NO confirmed
+      hypothesis AND no ACTIVE pending hypothesis.  Refuted, inconclusive,
+      and deferred hypotheses do NOT block a retry batch — deferred /
+      inconclusive nodes stay backtrackable but must not force the LLM to
+      "bury" them one by one before changing direction (observed
+      2026-07-21 session: round-8 batch rejection + 4 wasted rounds of
+      ritual verification on a deprioritized H3).
     """
     if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
         return False
@@ -258,10 +305,15 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
     if not root_ids:
         return True
     hypotheses = ledger.get("hypotheses", {})
-    return all(
-        hypotheses.get(hid, {}).get("status") in _HARD_FAILED_STATUSES
-        for hid in root_ids
-    )
+    for hid in root_ids:
+        node = hypotheses.get(hid)
+        if not node:
+            continue
+        if node.get("status") == "confirmed":
+            return False
+        if node.get("status") == "pending" and not node.get("deferred"):
+            return False
+    return True
 
 
 def add_hypotheses(
@@ -365,10 +417,9 @@ def add_hypotheses(
                     "请基于已有假设的验证结果生成报告。"
                 )
             raise ValueError(
-                "仅当前批根假设全部 refuted/dead_end 后才可提交新一批。"
-                "若仍有 pending/deprioritized 假设，请用 select_path 或 "
-                "backtrack 继续验证；若已有 confirmed 假设，请在其下深化"
-                "（parent_hypothesis_id）或生成报告。"
+                "当前批仍有活跃 pending 或已 confirmed 的根假设，不可换批。"
+                "请先用 record_finding 终结活跃假设，或用 select_path "
+                "切换验证焦点（deferred/inconclusive 假设不阻塞换批）。"
             )
         ledger["_root_commit_count"] = ledger.get("_root_commit_count", 0) + 1
 
@@ -403,15 +454,16 @@ def add_hypotheses(
             parent = hypotheses[parent_id]
             parent["sub_hypothesis_ids"].append(hid)
 
-    # Auto-select the highest probability as verifying.  Clear stale
-    # selected markers first so exactly one node carries the ★ marker —
-    # nodes from a prior batch or a refuted path must not stay selected.
+    # Auto-select the highest probability as the verification focus.
+    # Clear stale selected markers first so exactly one node carries the
+    # ★ marker — nodes from a prior batch or a refuted path must not stay
+    # selected.  (v2.1: no "verifying" status — focus == selected flag.)
     if created:
         for n in hypotheses.values():
             n["selected"] = False
         best = max(created, key=lambda h: h["probability"])
-        best["status"] = "verifying"
         best["selected"] = True
+        best["deferred"] = False
         if parent_id is None:
             # New root batch: reset the active path — a stale path from
             # a failed batch must not prefix the new root hypothesis.
@@ -428,24 +480,21 @@ def select_path(
     rationale: str = "",
     deprioritized: list[dict] | None = None,
 ) -> None:
-    """Select one hypothesis to deepen, mark others as deprioritized."""
+    """Select one hypothesis to deepen, mark others as deferred."""
     if deprioritized is None:
         deprioritized = []
     hypotheses = ledger["hypotheses"]
     if selected_id not in hypotheses:
         raise ValueError(f"假设 {selected_id} 不存在")
 
-    # Mark selected.  deprioritized is re-activatable as well — without
-    # this, select_path on a backtrack target leaves the status at
-    # deprioritized and derive_phase returns "backtrack" again instead
-    # of "verify".  Clear all other selected markers first so exactly
-    # one node carries ★.
+    # Mark selected.  Deferred hypotheses are re-activatable — selecting
+    # one clears the shelved mark.  Clear all other selected markers
+    # first so exactly one node carries ★.
     for n in hypotheses.values():
         n["selected"] = False
     selected = hypotheses[selected_id]
     selected["selected"] = True
-    if selected["status"] in ("pending", "inconclusive", "deprioritized"):
-        selected["status"] = "verifying"
+    selected["deferred"] = False
     if rationale:
         selected["rationale"] = rationale
 
@@ -466,33 +515,35 @@ def select_path(
         cursor = _norm_parent_id(node["parent_id"])
     ledger["active_path"] = new_path
 
-    # Mark non-selected siblings as deprioritized
+    # Mark non-selected siblings as deferred (v2.1: flag, not status)
     for sid in siblings:
         if sid == selected_id:
             continue
         sibling = hypotheses[sid]
-        if sibling["status"] in ("pending", "verifying"):
-            sibling["status"] = "deprioritized"
-    # Apply explicit deprioritized reasons
+        if sibling["status"] == "pending":
+            sibling["deferred"] = True
+            sibling["selected"] = False
+    # Apply explicit defer reasons
     for dep in deprioritized:
         dep_id = dep.get("id", "")
         if dep_id in hypotheses:
-            hypotheses[dep_id]["status"] = "deprioritized"
-            hypotheses[dep_id]["rationale"] = dep.get("reason", "")
+            hypotheses[dep_id]["deferred"] = True
+            hypotheses[dep_id]["selected"] = False
+            hypotheses[dep_id]["deferred_reason"] = dep.get("reason", "")
 
 
 def activate_hypothesis(ledger: DiagnosisLedger, hid: str) -> None:
     """Activate a hypothesis for verification (auto select_path semantics).
 
     Used when the Coordinator delegates task() verification targeting a
-    pending / deprioritized / inconclusive hypothesis without calling
+    pending / deferred / inconclusive hypothesis without calling
     ``select_path`` first.  The ledger's invariant "active hypothesis ==
     hypothesis under verification" is restored automatically.
 
-    Unlike ``select_path``, this does NOT deprioritize siblings: the
+    Unlike ``select_path``, this does NOT defer siblings: the
     Coordinator's intent is verification, not path pruning — multi-root
-    scenarios verify sibling root hypotheses one by one, and depriori-
-    tizing them would misrepresent that intent in the ledger.
+    scenarios verify sibling root hypotheses one by one, and deferring
+    them would misrepresent that intent in the ledger.
     """
     hypotheses = ledger["hypotheses"]
     node = hypotheses.get(hid)
@@ -501,7 +552,7 @@ def activate_hypothesis(ledger: DiagnosisLedger, hid: str) -> None:
     for n in hypotheses.values():
         n["selected"] = False
     node["selected"] = True
-    node["status"] = "verifying"
+    node["deferred"] = False
 
     # Rebuild active_path: ancestors + self
     new_path: list[str] = []
@@ -555,21 +606,27 @@ def record_finding(
         # (showing the original supporting argument as the reason for
         # exclusion).
         node["verdict_reason"] = evidence_summary
+        node["selected"] = False
+        node["deferred"] = False
         ledger["_inconclusive_streak"] = 0
     elif verdict == "refuted":
         node["status"] = "refuted"
         node["verdict_reason"] = evidence_summary
         node["selected"] = False  # terminal — no longer the focus
+        node["deferred"] = False
         ledger["_inconclusive_streak"] = 0
     else:  # inconclusive
         ledger["_inconclusive_streak"] += 1
-        # After 3+ consecutive inconclusive, mark as dead_end to break
-        # the verify loop — derive_phase would otherwise keep returning
-        # "verify" because the node status remained "verifying".
+        node["_inconclusive_count"] = node.get("_inconclusive_count", 0) + 1
+        node["status"] = "inconclusive"
+        node["selected"] = False
+        # After 3+ consecutive inconclusive (global streak), hard-close
+        # as refuted + evidence_saturated (former dead_end) to break the
+        # verify loop — retrying the same data is futile.
         if ledger["_inconclusive_streak"] >= 3:
-            node["status"] = "dead_end"
+            node["status"] = "refuted"
+            node["terminal_reason"] = "evidence_saturated"
             node["verdict_reason"] = evidence_summary
-            node["selected"] = False
 
     if new_insights:
         node["rationale"] = (node.get("rationale", "") + " | 新发现: " + new_insights).strip(" |")
@@ -646,20 +703,23 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
         return "understand"
 
     # 3. Active hypothesis under verification → verify.
+    # (v2.1: the focus is active_path[-1] carrying selected=True with a
+    # non-terminal status — there is no "verifying" status anymore.)
     if ledger["active_path"]:
         active = hypotheses.get(ledger["active_path"][-1])
-        if active and active["status"] == "verifying":
+        if (active and active.get("selected")
+                and active.get("status") in ("pending", "inconclusive")):
             return "verify"
 
     # 4. EVALUATE direction split (BEFORE exit check):
-    #    T8 retry batch — all root hypotheses hard-failed and budget left.
-    #    A hard-failed layer with no resumable sibling can only move
-    #    forward via a fresh batch (or exit when the budget is gone);
-    #    presenting "evaluate" here would offer no executable action.
+    #    T8 retry batch — all root hypotheses refuted and budget left.
+    #    A refuted layer with no resumable sibling can only move forward
+    #    via a fresh batch (or exit when the budget is gone); presenting
+    #    "evaluate" here would offer no executable action.
     #    Exception: E3 (evidence saturation) always wins — a ledger that
     #    hit 3 consecutive inconclusive verdicts exits to REPORT even if
-    #    the active node subsequently flipped to dead_end (the streak
-    #    marks evidence exhaustion, retrying the same data is futile).
+    #    the active node was subsequently hard-closed (the streak marks
+    #    evidence exhaustion, retrying the same data is futile).
     root_ids = ledger.get("root_hypothesis_ids", [])
     if (
             root_ids
@@ -719,9 +779,10 @@ def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
     """Force-finalize non-terminal hypotheses when entering REPORT phase.
 
     When the system transitions to REPORT (via derive_phase, timeout,
-    max-rounds, or any safety valve), some hypotheses may remain in
-    'pending' or 'verifying' state.  This function marks them as
-    'deprioritized' so the ledger is clean when the report is generated.
+    max-rounds, or any safety valve), some hypotheses may remain
+    undecided.  This function shelves them (deferred=True, selected
+    cleared) so the ledger is clean when the report is generated — the
+    report's "未验证假设" section lists them with their defer reasons.
 
     Returns True if any hypotheses were finalized.
     """
@@ -731,20 +792,13 @@ def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
 
     finalized = False
     for hid, node in hypotheses.items():
-        status = node.get("status")
-        if status == "verifying":
-            node["status"] = "deprioritized"
-            node["rationale"] = (
-                node.get("rationale", "")
-                + " | [系统] REPORT 阶段自动终结：验证未完成"
-            ).strip(" |")
-            finalized = True
-        elif status == "pending":
-            node["status"] = "deprioritized"
-            node["rationale"] = (
-                node.get("rationale", "")
-                + " | [系统] REPORT 阶段自动终结：未验证的低概率假设"
-            ).strip(" |")
+        if node.get("status") in ("pending", "inconclusive"):
+            node["deferred"] = True
+            node["selected"] = False
+            if not node.get("deferred_reason"):
+                node["deferred_reason"] = (
+                    "[系统] REPORT 阶段自动搁置：验证未完成"
+                )
             finalized = True
 
     return finalized
@@ -766,9 +820,9 @@ def _get_current_layer(ledger: DiagnosisLedger) -> list[str]:
 
 
 def _can_backtrack(ledger: DiagnosisLedger) -> bool:
-    """Check if there are deprioritized, pending, or inconclusive siblings to backtrack to."""
+    """Check if there are deferred, pending, or inconclusive nodes to backtrack to."""
     for node in ledger["hypotheses"].values():
-        if node["status"] in ("deprioritized", "pending", "inconclusive"):
+        if node["status"] in ("pending", "inconclusive"):
             return True
     return False
 
@@ -792,9 +846,10 @@ def _has_pending_sub_hypotheses(ledger: DiagnosisLedger) -> bool:
             if not sub:
                 continue
             status = sub.get("status")
-            if status in ("refuted", "dead_end", "deprioritized", "inconclusive"):
+            if status in ("refuted", "inconclusive"):
                 continue
-            if status == "pending" and sub.get("probability", 0) <= 15:
+            if status == "pending" and (
+                    sub.get("deferred") or sub.get("probability", 0) <= 15):
                 continue
             return True
     return False
@@ -806,7 +861,7 @@ def _inconclusive_exhausted(ledger: DiagnosisLedger) -> bool:
 
 
 def backtrack(ledger: DiagnosisLedger) -> str | None:
-    """Backtrack to the nearest deprioritized, pending, or inconclusive hypothesis.
+    """Backtrack to the nearest deferred, pending, or inconclusive hypothesis.
 
     Returns new active ID or None if exhausted.
     """
@@ -822,7 +877,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
             continue
         parent_id = _norm_parent_id(current["parent_id"])
 
-        # Look for deprioritized, pending, or inconclusive siblings
+        # Look for deferred / pending / inconclusive siblings
         if parent_id is None:
             siblings = ledger["root_hypothesis_ids"]
         else:
@@ -830,10 +885,11 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
 
         for sid in siblings:
             sibling = ledger["hypotheses"][sid]
-            if sibling["status"] in ("deprioritized", "pending", "inconclusive"):
-                # Found a backtrack target
-                sibling["status"] = "verifying"
+            if sibling["status"] in ("pending", "inconclusive"):
+                # Found a backtrack target — re-activate (clear shelved mark)
                 sibling["selected"] = True
+                sibling["deferred"] = False
+                sibling["deferred_reason"] = ""
                 # Rebuild active path
                 new_path: list[str] = []
                 cursor = sid
@@ -930,21 +986,23 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
         _render_hypothesis_tree(lines, ledger, ledger["root_hypothesis_ids"], indent=0)
         lines.append("")
 
-    # Refuted/deprioritized hypotheses summary.  Status tags are
-    # rendered explicitly: deprioritized hypotheses are NOT excluded —
-    # they remain backtrackable, and presenting them as "已排除" biases
-    # the LLM against revisiting them (observed in the 2026-07-19
-    # conntrack_and_oom session where a p=30% deprioritized hypothesis
-    # was rendered as excluded).
-    _STATUS_TAG = {
-        "refuted": "已证伪",
-        "dead_end": "死路",
-        "deprioritized": "降级待回溯",
+    # Refuted / deferred hypotheses summary.  Tags are rendered
+    # explicitly: deferred (shelved) hypotheses are NOT excluded — they
+    # remain backtrackable, and presenting them as "已排除" biases the
+    # LLM against revisiting them (observed in the 2026-07-19
+    # conntrack_and_oom session where a p=30% shelved hypothesis was
+    # rendered as excluded).
+    _TERMINAL_REASON_TAG = {
+        "evidence_saturated": "证据饱和",
+        "timeout_unreached": "未及验证(超时)",
+        "auto_finalized": "系统自动关闭",
     }
     refuted = [h for h in ledger["hypotheses"].values()
-               if h["status"] in ("refuted", "deprioritized", "dead_end")]
-    if refuted:
-        lines.append("## 已排除/降级假设")
+               if h["status"] == "refuted"]
+    deferred = [h for h in ledger["hypotheses"].values()
+                if h.get("deferred") and h["status"] != "refuted"]
+    if refuted or deferred:
+        lines.append("## 已排除/搁置假设")
         for h in refuted:
             # verdict_reason (written by record_finding at terminal
             # verdict) is the actual exclusion reason.  Falling back to
@@ -953,10 +1011,20 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             # is self-contradictory.
             reason = (h.get("verdict_reason") or h.get("rationale", "")
                       or "(无记录)")
-            tag = _STATUS_TAG.get(h["status"], h["status"])
+            tag = "已证伪"
+            tr = h.get("terminal_reason")
+            if tr:
+                tag = _TERMINAL_REASON_TAG.get(tr, "已证伪")
             lines.append(
                 f"- [{tag}] {h['id']} {h['statement']}: "
                 f"{_clean_evidence_text(reason, 200)}"
+            )
+        for h in deferred:
+            reason = (h.get("deferred_reason") or h.get("rationale", "")
+                      or "(无记录)")
+            lines.append(
+                f"- [搁置待回溯 p={h['probability']}%] {h['id']} "
+                f"{h['statement']}: {_clean_evidence_text(reason, 200)}"
             )
         lines.append("")
 
@@ -1049,9 +1117,13 @@ def _render_hypothesis_tree(
         if node is None:
             continue
         marker = " ★" if node["selected"] else ""
-        active_marker = " ← 当前聚焦" if (node["selected"] and node["status"] == "verifying") else ""
+        active_marker = (" ← 当前聚焦" if (
+            node["selected"] and node["status"] in ("pending", "inconclusive"))
+            else "")
+        deferred_tag = " [搁置]" if node.get("deferred") else ""
         lines.append(
-            f"{prefix}### {node['id']} [{node['status']} p={node['probability']}%]{marker} "
+            f"{prefix}### {node['id']} [{node['status']}{deferred_tag} "
+            f"p={node['probability']}%]{marker} "
             f"{node['statement']}{active_marker}"
         )
         # Evidence.  Once a coordinator verdict exists (verdict_reason
@@ -1153,7 +1225,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         root_cause_hyp_ids = ledger.get("root_cause_hypothesis_ids", [])
         root_ids = ledger.get("root_hypothesis_ids", [])
         pending = [h for h in root_ids if h not in root_cause_hyp_ids
-                   and ledger["hypotheses"].get(h, {}).get("status") not in ("refuted", "dead_end")]
+                   and ledger["hypotheses"].get(h, {}).get("status") != "refuted"]
         if root_cause_hyp_ids and pending:
             pending_hint = f"\n- ⚠ 仍有待验证的假设: {', '.join(pending)}，使用 select_path 切换验证"
         return (
@@ -1161,8 +1233,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "- 评估本层所有假设的验证结果，选择下一步路径：\n"
             "  · 有待验证假设 → select_path 切换到最可能的继续验证\n"
             "  · confirmed 假设需更具体 → commit_hypotheses(parent_hypothesis_id=...) 提交子假设深化\n"
-            "  · 本层全部 refuted/dead_end 且有可回溯假设 → backtrack\n"
-            "  · 本层全部 refuted/dead_end 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向提交新一批根假设\n"
+            "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
+            "  · 本层全部 refuted 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向提交新一批根假设\n"
             "  · 退出条件满足时系统已自动进入 REPORT（无需你判断）\n"
             "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
             "refuted 仅用于证据明确证伪的假设。多个假设可同时为 confirmed。\n"
@@ -1196,20 +1268,20 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"必须立即调用 write_file 将报告写入 {report_path}"
             if report_path else "必须立即调用 write_file 生成诊断报告"
         )
-        # Surface never-verified hypotheses so the report labels them
-        # accurately.  A deprioritized root hypothesis may be a real
-        # (secondary) root cause the Coordinator chose not to pursue —
-        # silently presenting it as "已排除" would misrepresent the
-        # diagnosis (observed: deprioritized H2/H3 rendered as excluded
+        # Surface never-verified (shelved) hypotheses so the report
+        # labels them accurately.  A deferred root hypothesis may be a
+        # real (secondary) root cause the Coordinator chose not to
+        # pursue — silently presenting it as "已排除" would misrepresent
+        # the diagnosis (observed: shelved H2/H3 rendered as excluded
         # in a dual-root-cause session).
         unverified_ids = [
             h["id"] for h in ledger.get("hypotheses", {}).values()
-            if h.get("status") == "deprioritized" and not h.get("verdict_reason")
+            if h.get("deferred") and h.get("status") in ("pending", "inconclusive")
         ]
         unverified_hint = ""
         if unverified_ids:
             unverified_hint = (
-                f"\n- ⚠ 以下假设未实际验证（降级未查）：{', '.join(unverified_ids)}"
+                f"\n- ⚠ 以下假设未实际验证（已搁置）：{', '.join(unverified_ids)}"
                 " — 报告中应标注为「未验证」并列入后续排查建议，"
                 "不得写入「已排除假设」"
             )
@@ -1272,157 +1344,156 @@ def record_round(
     ledger["rounds"].append(entry)
 
 
+# ── Quantified exit model (v2.1) ──
+
+def _uncertainty(node: HypothesisNode) -> float:
+    """Residual uncertainty U(h) = 4·p·(1-p), p = probability/100.
+
+    1.0 at p=50 (maximally undecided), →0 near the extremes.  A confirmed
+    hypothesis has zero residual uncertainty by definition (its verdict
+    closed the question), likewise refuted; callers filter by status.
+    """
+    p = max(0, min(100, node.get("probability", 50))) / 100.0
+    return 4.0 * p * (1.0 - p)
+
+
+def residual_uncertainty(ledger: DiagnosisLedger) -> float:
+    """R = Σ U(h) over undecided hypotheses.
+
+    Undecided = pending or inconclusive AND NOT deferred.  Deferred nodes
+    are explicitly shelved by the LLM — their residual uncertainty does
+    not count against "把握足够" (D4); they remain backtrackable and
+    re-enter R when re-activated (deferred cleared by select_path /
+    activate_hypothesis / backtrack).  Low-probability pending nodes
+    (p ≤ 15) are excluded on the same grounds as the legacy E1 rule.
+    """
+    total = 0.0
+    for node in ledger.get("hypotheses", {}).values():
+        if node.get("status") not in ("pending", "inconclusive"):
+            continue
+        if node.get("deferred"):
+            continue
+        if node.get("status") == "pending" and node.get("probability", 0) <= 15:
+            continue
+        total += _uncertainty(node)
+    return total
+
+
+def delegation_value(node: HypothesisNode) -> float:
+    """value(a) = EIG(a)/c(a) for a targeted expert delegation on *node*.
+
+    EIG = U(h) × D × F, D=1.0 (targeted), F = 0.5^(n_deleg + n_inc)
+    (D6: inconclusive verdicts add freshness decay — the same evidence
+    re-examined rarely flips the outcome).  Cost = COST_DELEGATION.
+    """
+    n = node.get("_delegate_count", 0) + node.get("_inconclusive_count", 0)
+    eig = _uncertainty(node) * (0.5 ** n)
+    return eig / COST_DELEGATION
+
+
+def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
+    """Max value over still-executable verification actions.
+
+    Actions considered (deterministic, ledger-derived):
+    - delegation on each pending (non-deferred) / inconclusive hypothesis
+    - batch retry (if budget open): fresh hypotheses carry U≈1, D=1, F=1
+    Returns (value, detail) — detail names the best action for logging.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    best_v, best_d = 0.0, "(无可执行验证动作)"
+    for hid, node in hypotheses.items():
+        if node.get("status") not in ("pending", "inconclusive"):
+            continue
+        if node.get("deferred"):
+            continue
+        if node.get("status") == "pending" and node.get("probability", 0) <= 15:
+            continue
+        v = delegation_value(node)
+        if v > best_v:
+            best_v = v
+            best_d = (
+                f"委派验证 {hid} (p={node.get('probability')}%, "
+                f"已委派{node.get('_delegate_count', 0)}次/"
+                f"inconclusive {node.get('_inconclusive_count', 0)}次)"
+            )
+    if ledger.get("root_hypothesis_ids") and can_commit_root_hypotheses(ledger):
+        v = 1.0 / COST_BATCH_COMMIT  # fresh batch: U=1, D=1, F=1
+        if v > best_v:
+            best_v = v
+            best_d = "换批提交新根假设"
+    return best_v, best_d
+
+
 # ── Exit condition checking ──
 
 def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | None]:
     """Check if diagnosis should exit to REPORT.
 
     Returns (should_exit, reason, confirmed_hypothesis_id).
-    Multi-root-cause: exits only when ALL root hypotheses have reached a
-    terminal state AND at least one is confirmed.  If some are confirmed
-    but others are still pending/verifying, the LLM is encouraged to
-    continue diagnosing the remaining symptoms.
+
+    v2.1 quantified model (state-machine-v2.md §6):
+      exit = S1 (把握足够) AND S2 (增益<成本), plus fast lanes:
+      - E3 evidence saturation (3 consecutive inconclusive)
+      - E2 exhaustion (all roots refuted, batch budget spent)
+      - E4 quick path (confirmed leaf, nothing pending below)
+    S1: ≥1 confirmed root with p≥80 AND residual uncertainty R < 0.8
+        (deferred / low-p nodes excluded — they were explicitly shelved).
+    S2: max action value EIG/c < κ=0.15, or no executable actions left.
     """
     hypotheses: dict = ledger["hypotheses"]
     if not hypotheses:
         return False, "", None
 
-    # ── E3 evidence saturation: global, takes precedence over every
-    # branch below.  3+ consecutive inconclusive verdicts mean the
-    # available evidence cannot decide ANY hypothesis — retrying with a
-    # fresh batch against the same data is futile.  Placed first so a
-    # saturated ledger that also happens to be all-hard-failed (the
-    # streak flips the active node to dead_end) still exits HERE with
-    # the saturation reason, not the retry hint.
+    # ── E3 evidence saturation (fast lane): global, takes precedence ──
     if ledger.get("_inconclusive_streak", 0) >= 3:
         return True, "证据饱和: 连续3次验证结果不明确", None
 
     root_ids: list[str] = ledger.get("root_hypothesis_ids", [])
+    confirmed_ids = [
+        hid for hid in (root_ids or list(hypotheses.keys()))
+        if hypotheses.get(hid, {}).get("status") == "confirmed"
+        and hypotheses[hid].get("probability", 0) >= 80
+    ]
 
-    # ── Multi-root: assess each root hypothesis independently ──
-    if root_ids:
-        pending_ids: list[str] = []
-        confirmed_ids: list[str] = []
-        for hid in root_ids:
-            node = hypotheses.get(hid)
-            if not node:
-                continue
-            if node["status"] == "confirmed" and node["probability"] >= 80:
-                confirmed_ids.append(hid)
-            elif node["status"] in ("pending", "verifying"):
-                # Low-probability pending hypotheses (p ≤ 15%) do not
-                # block exit — they are unlikely root causes and the
-                # LLM should synthesize a report with confirmed causes.
-                if node.get("probability", 0) > 15:
-                    pending_ids.append(hid)
-
-        if confirmed_ids and pending_ids:
-            # Some roots confirmed, others still pending → continue
-            return False, (
-                f"部分根因已确认: {', '.join(confirmed_ids)}"
-                f"，仍需验证: {', '.join(pending_ids)}"
-            ), confirmed_ids[0]
-
-        if confirmed_ids and not pending_ids:
-            # All roots resolved, at least one confirmed.
-            # Still need to check sub-hypotheses: confirmed roots may
-            # have sub-hypotheses awaiting verification (deepening).
-            if _has_pending_sub_hypotheses(ledger):
-                return False, "仍有待验证的子假设，需继续深化分析", confirmed_ids[0]
-            best = hypotheses[confirmed_ids[0]]
-            return True, (
-                f"根因确认: {best['id']} {best['statement']}"
-                f" (p={best['probability']}%)"
-            ), confirmed_ids[0]
-
-        # When root_ids is non-empty but we reach here, it means:
-        # no confirmed(p>=80) AND no pending(p>15).
-        # ── Hard failure (all roots refuted/dead_end) ──
-        # Only a fully hard-failed batch opens the retry budget.
-        # deprioritized / inconclusive hypotheses are resumable — they
-        # must be explored via backtrack before exiting, so they do
-        # NOT count as exhaustion here.
-        all_hard_failed = all(
+    # ── E2 exhaustion (fast lane): all roots refuted, budget spent ──
+    if root_ids and not confirmed_ids:
+        all_refuted = all(
             hypotheses.get(hid, {}).get("status") in _HARD_FAILED_STATUSES
             for hid in root_ids
         )
-        if all_hard_failed:
-            if can_commit_root_hypotheses(ledger):
-                return False, (
-                    "全部根假设已证伪，批次预算未用尽"
-                    f"（已用 {ledger.get('_root_commit_count', 0)}"
-                    f"/{MAX_ROOT_COMMIT_BATCHES} 批），可提交新一批假设"
-                ), None
+        if all_refuted and not can_commit_root_hypotheses(ledger):
             return True, (
-                f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批根假设全部 "
-                "refuted/dead_end，未确认根因"
+                f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批根假设全部证伪，"
+                "未确认根因"
             ), None
-        # Resumable hypotheses remain (deprioritized / inconclusive /
-        # low-probability pending) — diagnosis continues via backtrack.
-        resumable = [
-            f"{hid}({hypotheses[hid].get('status')})"
-            for hid in root_ids
-            if hypotheses.get(hid, {}).get("status")
-            in ("pending", "verifying", "inconclusive", "deprioritized")
-        ]
+
+    # ── S1: confidence sufficient ──
+    if not confirmed_ids:
+        # No confident root cause yet — never exit on the gain<cost
+        # rule alone; the LLM still owes a direction (retry / backtrack).
+        return False, "", None
+    r = residual_uncertainty(ledger)
+    if r >= R_THRESHOLD:
         return False, (
-            "尚无 confirmed 根因，仍有可恢复验证的假设: "
-            + (", ".join(resumable) if resumable else "(无)")
-            + "。请用 record_finding 给出明确 verdict（confirmed/refuted），"
-            "或用 backtrack 恢复 inconclusive/deprioritized 假设继续验证；"
-            "全部证伪后可提交新一批根假设"
-        ), None
+            f"已有确认根因 {confirmed_ids[0]}，但残余不确定性 "
+            f"R={r:.2f} ≥ {R_THRESHOLD}，仍有值得验证的未决假设"
+        ), confirmed_ids[0]
+    if _has_pending_sub_hypotheses(ledger):
+        return False, "仍有待验证的子假设，需继续深化分析", confirmed_ids[0]
 
-    # ── Single-root / legacy: first confirmed hypothesis triggers exit ──
-    # Condition 1: Root cause confirmed — a confirmed hypothesis with p>=80%
-    # that either has no sub-hypotheses (leaf) or has confirmed sub-hypotheses.
-    for node in hypotheses.values():
-        if node["status"] != "confirmed" or node["probability"] < 80:
-            continue
-        if not node["sub_hypothesis_ids"]:
-            return True, f"根因确认: {node['id']} {node['statement']} (p={node['probability']}%)", node["id"]
-        # Has sub-hypotheses — check if any sub is confirmed
-        for sid in node["sub_hypothesis_ids"]:
-            sub = hypotheses[sid]
-            if sub["status"] == "confirmed" and not sub["sub_hypothesis_ids"]:
-                return True, f"根因确认: {sub['id']} {sub['statement']} (p={sub['probability']}%)", sub["id"]
+    # ── S2: expected information gain < cost ──
+    best_v, best_d = max_action_value(ledger)
+    if best_v >= KAPPA_STOP:
+        return False, (
+            f"已有确认根因 {confirmed_ids[0]}，但最高动作价值 "
+            f"{best_v:.3f} ≥ κ={KAPPA_STOP}（{best_d}），"
+            "继续验证仍有正收益"
+        ), confirmed_ids[0]
 
-    # Condition 2: All hypotheses exhausted
-    all_terminal = all(
-        h["status"] in ("refuted", "dead_end", "confirmed", "inconclusive", "deprioritized")
-        for h in hypotheses.values()
-    )
-    if all_terminal and not _can_backtrack(ledger):
-        confirmed = [h for h in hypotheses.values() if h["status"] == "confirmed"]
-        if not confirmed:
-            if can_commit_root_hypotheses(ledger):
-                return False, (
-                    "全部假设已证伪，批次预算未用尽"
-                    f"（已用 {ledger.get('_root_commit_count', 0)}"
-                    f"/{MAX_ROOT_COMMIT_BATCHES} 批），可提交新一批假设"
-                ), None
-            return True, "假设穷尽: 所有假设已验证但未确认根因", None
-        # All hypotheses reached terminal states and at least one is
-        # confirmed (even if p<80%).  Continuing to verify won't yield
-        # new data — exit to REPORT so the LLM can synthesize findings.
-        best = max(confirmed, key=lambda h: h["probability"])
-        return True, (
-            f"假设穷尽: 所有假设已验证完毕，最佳根因 "
-            f"{best['id']} {best['statement']} (p={best['probability']}%)"
-        ), best["id"]
-
-    # (Condition 3 — evidence saturation — is handled at the top of this
-    # function so it takes precedence over both the multi-root and the
-    # single-root branches.)
-
-    # Remaining: some hypotheses still non-terminal, no saturation yet.
-    unfinished = [
-        f"{h['id']}({h['status']})"
-        for h in hypotheses.values()
-        if h["status"] in ("pending", "verifying")
-    ]
-    return False, (
-        "假设尚未全部终结"
-        + (f": {', '.join(unfinished)}" if unfinished else "")
-        + "。请先调用 record_finding 完成所有假设的验证"
-    ), None
+    best = hypotheses[confirmed_ids[0]]
+    return True, (
+        f"根因确认: {best['id']} {best['statement']} "
+        f"(p={best['probability']}%) | 退出判据满足: 把握足够 "
+        f"(R={r:.2f}<{R_THRESHOLD}) 且继续验证增益<成本 "
+        f"(最高动作价值 {best_v:.3f}<κ={KAPPA_STOP}，{best_d})"
+    ), confirmed_ids[0]

@@ -35,8 +35,8 @@ PHASE_SPEC: dict[str, dict] = {
         "actions": [
             "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
             "深化：commit_hypotheses(parent_hypothesis_id=...) 提交子假设，不消耗批次预算",
-            "换批：根假设最多 2 批，第 2 批仅在前批全部 refuted/dead_end 后开放，"
-            "必须基于已排除证据换方向，禁止重复或仅换措辞",
+            "换批：根假设最多 2 批，第 2 批在前批无 confirmed 且无活跃 pending 后开放"
+            "（搁置/inconclusive 不阻塞），必须基于已排除证据换方向，禁止重复或仅换措辞",
         ],
         "exit": "commit_hypotheses 成功后进入 VERIFY。",
     },
@@ -62,12 +62,14 @@ PHASE_SPEC: dict[str, dict] = {
         "actions": [
             "有待验证假设 → select_path 切换到最可能的继续验证",
             "confirmed 假设需更具体 → commit_hypotheses(parent_hypothesis_id=...) 深化",
-            "本层全部 refuted/dead_end 且有可回溯假设 → backtrack",
-            "本层全部 refuted/dead_end 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向",
+            "本层全部 refuted 且有可回溯（搁置/inconclusive）假设 → backtrack",
+            "本层全部 refuted 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向",
             "多根因场景：证据支持的假设即使非主根因也应标记 confirmed；"
             "refuted 仅用于证据明确证伪的假设",
         ],
-        "exit": "退出条件（根因确认 / 假设穷尽 / 证据饱和）满足时系统自动进入 REPORT。",
+        "exit": "退出条件满足时系统自动进入 REPORT：把握足够（已确认根因 p≥80 且残余不确定性低）"
+                "且继续验证的期望信息增益低于成本（重复委派价值衰减）；"
+                "假设穷尽或证据饱和（连续3次 inconclusive）走快速通道。",
     },
     "report": {
         "title": "阶段 5: REPORT（生成报告）",
