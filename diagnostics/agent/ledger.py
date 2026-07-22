@@ -1257,6 +1257,28 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # and forbid text output — contradicting the final user-facing
         # summary the LLM is expected to produce in that last call.
         if ledger.get("report"):
+            # ── Auto-generated stub: invite rewrite via write_file (G10) ──
+            # A stub (system-generated after timeout/safety-valve fallback)
+            # is a floor, not the deliverable.  Guide the LLM to author the
+            # full report via write_file; if it declines (stub sufficient),
+            # a short summary is acceptable, and the REPORT-stall handler
+            # salvages any substantial report text it emits instead.
+            if ledger.get("_report_auto_generated"):
+                _overwrite_hint = (
+                    f"覆盖写入 {report_path}" if report_path else "写入报告文件"
+                )
+                return (
+                    "你当前处于 REPORT 阶段。\n"
+                    "⚠ 当前报告是系统自动生成的简版占位（信息有限）。\n"
+                    f"⛔ 优先动作：调用 write_file，基于 <diagnosis_ledger> 中的"
+                    f"证据链撰写完整诊断报告并{_overwrite_hint}。\n"
+                    "⛔ 报告内容只能通过 write_file 写入文件——"
+                    "禁止在对话里输出完整报告正文。\n"
+                    "- 若确认简版已足够，可跳过 write_file\n"
+                    "- 最后用 3~5 句话向用户总结：根因（多根因分别列出）、"
+                    "关键证据、最重要的修复建议\n"
+                    "- 总结面向运维工程师——禁止提及台账、报告文件路径等内部实现细节"
+                )
             return (
                 "你当前处于 REPORT 阶段（诊断报告已写入）。\n"
                 "- 报告已保存，无需再调用 write_file / record_finding / commit_hypotheses\n"

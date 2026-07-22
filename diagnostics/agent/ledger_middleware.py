@@ -181,8 +181,19 @@ _STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding 
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _VERIFY_STUCK_GAP = 3               # Rounds without verdict/evidence progress → verify-stuck
 _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interventions
-_MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "240"))  # seconds per LLM call
-_REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "480"))  # report phase needs longer timeout
+_MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
+_REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
+
+# ── G7' model-call retry (state-machine-v2.md §8) ──
+# A transient failure (timeout / connection break / 5xx / 429) is retried
+# with exponential backoff BEFORE the G7 fallback fires, so a single
+# network blip no longer terminates the whole diagnosis.  Retries run
+# inside awrap_model_call — before_model has already executed — so round
+# and safety counters are untouched; model calls are side-effect-free
+# (tools have not executed), which makes retrying safe.
+_MODEL_MAX_ATTEMPTS = max(1, int(os.getenv("DIAGNOSTICS_MODEL_MAX_ATTEMPTS", "3")))  # total attempts (1 initial + retries); floor 1
+_MODEL_RETRY_BACKOFF_BASE = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BASE", "2"))  # backoff base seconds (doubles per attempt)
+_MODEL_RETRY_BACKOFF_MAX = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BACKOFF_MAX", "30"))  # backoff cap seconds
 
 # ── Expert verdict text-signal patterns ───────────────────────────────────
 # Used by verify-stall detection to infer verdict from expert subagent
@@ -605,6 +616,76 @@ def _inject_tool_calls(response, tool_calls: list[dict],
     msg.tool_calls = list(normalized)
     response.result = [msg]
     return True
+
+
+# ── G7' retry helpers ──
+
+# Transport-level exception class names indicating a transient connection
+# failure.  Matched by NAME (not isinstance) to stay robust across
+# openai/httpx version bumps; HTTP status codes are checked separately.
+_RETRYABLE_EXC_NAMES = frozenset({
+    "APIConnectionError", "APITimeoutError",
+    "ConnectError", "ReadError", "WriteError",
+    "ConnectTimeout", "ReadTimeout", "PoolTimeout",
+    "RemoteProtocolError", "ServiceUnavailableError",
+})
+
+
+def _is_retryable_model_error(exc: BaseException) -> bool:
+    """True only for transient model-call failures worth retrying.
+
+    Retryable: asyncio.TimeoutError, HTTP 408/429/5xx, connection and
+    transport errors (connection refused/reset, read/write breaks).
+    NOT retryable: CancelledError (user disconnect — must propagate),
+    4xx client errors (bad params/auth/context-length — retrying cannot
+    help), and unknown errors (surface bugs instead of masking them).
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    if isinstance(exc, asyncio.CancelledError):
+        return False
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status in (408, 429) or status >= 500
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    return type(exc).__name__ in _RETRYABLE_EXC_NAMES
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff for retry *attempt* (1-based): base * 2^(n-1),
+    capped, with ±50% jitter to avoid thundering-herd on a shared backend."""
+    import random as _rnd
+    base = _MODEL_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+    return min(base, _MODEL_RETRY_BACKOFF_MAX) * _rnd.uniform(0.5, 1.5)
+
+
+def _extract_response_text(response) -> str:
+    """Concatenate the string content of all messages in a ModelResponse."""
+    result_list = (response.result
+                   if isinstance(response.result, list)
+                   else [response.result])
+    parts: list[str] = []
+    for m in result_list:
+        content = getattr(m, "content", None)
+        if isinstance(content, str) and content.strip():
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.extend(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("text")
+            )
+    return "\n".join(parts)
+
+
+def _is_substantial_report_text(text: str) -> bool:
+    """Heuristic: the text is an actual report, not a 3-5 sentence user
+    summary (which REPORT-phase guidance explicitly asks the LLM for).
+    Requires both length and report structure markers."""
+    if not text or len(text) < 800:
+        return False
+    _REPORT_MARKERS = ("# 故障", "## ", "**根因", "根因分析", "证据链", "修复建议")
+    return any(marker in text for marker in _REPORT_MARKERS)
 
 
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
@@ -1192,11 +1273,51 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if _phase(ledger) == "report"
             else _MODEL_CALL_TIMEOUT
         )
-        try:
-            response = await asyncio.wait_for(
-                handler(_call_request),
-                timeout=_effective_timeout,
-            )
+        # ── G7' transient-failure retry (state-machine-v2.md §8) ──
+        # Each attempt gets its own full timeout.  Retryable failures
+        # (timeout / connection break / 5xx / 429) back off exponentially
+        # and retry within the SAME round — before_model has already run,
+        # so round and safety counters are untouched.  Only when every
+        # attempt fails does the G7 fallback (else-branch) fire.
+        response = None
+        _call_error: BaseException | None = None
+        for _attempt in range(1, _MODEL_MAX_ATTEMPTS + 1):
+            try:
+                response = await asyncio.wait_for(
+                    handler(_call_request),
+                    timeout=_effective_timeout,
+                )
+                _call_error = None
+                break
+            except asyncio.CancelledError:
+                raise  # user disconnect / server shutdown — never retry
+            except BaseException as _exc:  # noqa: BLE001 — retryability classified by _is_retryable_model_error
+                if not _is_retryable_model_error(_exc):
+                    raise  # 4xx / programming errors — retrying cannot help
+                _call_error = _exc
+                _err_label = (
+                    f"timeout after {_effective_timeout}s"
+                    if isinstance(_exc, asyncio.TimeoutError)
+                    else f"{type(_exc).__name__}: {_exc}"
+                )
+                if _attempt < _MODEL_MAX_ATTEMPTS:
+                    _backoff = _retry_backoff_seconds(_attempt)
+                    logger.warning(
+                        "Model call failed (attempt %d/%d, round %d, "
+                        "phase=%s): %s — retrying in %.1fs",
+                        _attempt, _MODEL_MAX_ATTEMPTS,
+                        self._model_call_count, _phase(ledger),
+                        _err_label, _backoff,
+                    )
+                    await asyncio.sleep(_backoff)
+                    continue
+                logger.error(
+                    "Model call failed after %d attempts (round %d, "
+                    "phase=%s): %s. Auto-generating report from ledger.",
+                    _MODEL_MAX_ATTEMPTS, self._model_call_count,
+                    _phase(ledger), _err_label,
+                )
+        if _call_error is None:
             # ── Per-round inference metrics ──
             import time as _time2
             _duration = round(_time2.monotonic() - self._inference_start, 1)
@@ -1258,14 +1379,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_call_count, _duration,
                     _tokens_in, _tokens_out, _tokens_reason,
                 )
-        except asyncio.TimeoutError:
-            logger.error(
-                "Model call timed out after %ds (round %d, phase=%s). "
-                "Auto-generating report from ledger.",
-                _effective_timeout,
-                self._model_call_count,
-                _phase(ledger),
-            )
+        else:
+            # ── G7 fallback: every attempt failed ──
             # NOTE: this recovery path must never crash the stream —
             # a safety valve must not become a failure source itself.
             # Any exception here degrades to a plain-text response that
@@ -2103,6 +2218,36 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # Check if write_file was already called (via tool call)
                 # or report is already present (from record_finding auto-gen)
                 report_exists = bool(ledger.get("report"))
+                # ── G10 salvage: prefer LLM-authored report text ──
+                # The LLM ended REPORT without write_file but produced a
+                # substantial report-structured text (e.g. it rewrote the
+                # auto-generated stub but emitted the rewrite as content).
+                # Use that text as the report when none exists yet, or
+                # when the on-disk one is an auto-generated stub — richer
+                # LLM-authored content always wins over the stub.  Never
+                # overwrite an LLM-authored report (the new text might be
+                # the short user summary).  No extra model call, avoiding
+                # the hang risk noted in the level-1 comment below.
+                _salvage_text = _extract_response_text(response)
+                if _is_substantial_report_text(_salvage_text) and (
+                        not report_exists
+                        or ledger.get("_report_auto_generated")):
+                    ledger["report"] = _salvage_text
+                    ledger["_report_auto_generated"] = False
+                    ledger["_forced_terminal"] = True
+                    _write_report_file(
+                        self.report_path, _salvage_text,
+                        self._AGENT_DATA_REAL,
+                    )
+                    self._persist_ledger(ledger)
+                    logger.warning(
+                        "Safety: REPORT salvage (round %d) — LLM text "
+                        "report (%d chars) replaces %s",
+                        self._model_call_count, len(_salvage_text),
+                        "auto-generated stub" if report_exists
+                        else "missing report",
+                    )
+                    report_exists = True
                 if not report_exists:
                     rounds_in_report = (
                         self._model_call_count
@@ -2283,6 +2428,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "请重新发起诊断。"
                     )
                     ledger["report"] = report_md
+                    ledger["_report_auto_generated"] = True
                     if self.report_path:
                         import pathlib as _pathlib
                         real_path = self.report_path.replace(
@@ -2741,9 +2887,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if content:
                     # Backfill report content into the ledger so that
                     # result.json carries the full report text alongside
-                    # the structured hypothesis data.
+                    # the structured hypothesis data.  This write_file is
+                    # LLM-authored — clear the auto-generated stub mark (G10).
                     if ledger:
                         ledger["report"] = content
+                        ledger["_report_auto_generated"] = False
 
                     try:
                         sw = getattr(request.runtime, "stream_writer", None)
@@ -3804,6 +3952,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         report comparable in structure to an LLM-written one.
         """
         import datetime as _dt
+
+        # Mark the report as system-generated (not LLM-authored) so the
+        # REPORT-phase guidance can invite the LLM to overwrite it via
+        # write_file, and the REPORT-stall handler can salvage a
+        # substantial LLM text response in its place (G10).
+        ledger["_report_auto_generated"] = True
 
         hypotheses: dict = ledger.get("hypotheses", {})
         rounds_data: list = ledger.get("rounds", [])
