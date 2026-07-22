@@ -125,9 +125,8 @@ def _is_tool_failure(content: str) -> bool:
 class ToolDedupMiddleware(AgentMiddleware):
     """Tool-level deduplication with cross-agent cache sharing.
 
-    Must be placed BEFORE DiagnosisLedgerMiddleware and
-    ToolOffloadMiddleware in the pipeline so that cache hits bypass
-    unnecessary downstream processing.
+    Must be placed BEFORE DiagnosisLedgerMiddleware in the pipeline so
+    that cache hits bypass unnecessary downstream processing.
 
     Attributes:
         _tool_call_cache: In-memory cache, keyed by tool_name + sorted

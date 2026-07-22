@@ -6,8 +6,8 @@ the underlying host node name.  However, ``host-argus-expert`` needs a
 concrete hostname to call ``query_argus_cpu`` / ``query_argus_memory`` etc.
 
 This module resolves the hostname **before** the diagnosis starts and
-injects it into ``param_overrides`` so that ``ToolParamOverrideMiddleware``
-can unconditionally overwrite ``hostname`` in host-level Argus tool calls.
+injects it into ``param_overrides`` so that host-level Argus tool calls
+receive the concrete ``hostname``.
 
 Mock mode uses the same static mapping as ``ScopeLimit``.
 Production mode would query the K8s API to resolve pod → node mappings.

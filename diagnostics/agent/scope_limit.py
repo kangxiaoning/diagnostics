@@ -136,10 +136,11 @@ def _augment_scenario_pods(scope: "ScopeLimit", namespace: str) -> None:
 
 @dataclass
 class ScopeLimit:
-    """Pre-discovered diagnostic scope — enforced by ScopeGuardMiddleware.
+    """Pre-discovered diagnostic scope for a single diagnosis session.
 
-    Defines the safe resource boundary for a single diagnosis session.
-    Tool calls targeting resources outside this boundary are blocked.
+    Defines the safe resource boundary.  In production, scope is naturally
+    constrained by the tool results themselves (e.g. K8s API queries), so no
+    middleware-level enforcement is applied.
     """
 
     cluster_name: str

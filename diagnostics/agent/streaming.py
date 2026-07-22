@@ -657,8 +657,8 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 # Precise tool timing from awrap_tool_call
                 events.append(AgentEvent(data["type"], data))
             elif data.get("type") == "tool_args_corrected":
-                # Emitted by param_override_middleware after correcting
-                # LLM-invented args.  Re-emit tool_args_available so
+                # Emitted after correcting LLM-invented args.
+                # Re-emit tool_args_available so
                 # frontend tree nodes show correct (post-middleware) args.
                 tc_id = data.get("id")
                 tc_name = data.get("name", "")
