@@ -44,6 +44,7 @@ from diagnostics.agent.ledger import (
     backtrack,
     can_commit_root_hypotheses,
     check_exit_conditions,
+    delegation_value,
     derive_phase,
     finalize_pending_for_report,
     ledger_to_json,
@@ -544,6 +545,24 @@ def _emit_synthetic_write_file_event(report_path: str, report_md: str,
         pass  # stream_writer unavailable outside ToolNode context
 
 
+def _response_ends_loop(response) -> bool:
+    """True when this response would let the agent loop terminate.
+
+    The graph router continues the loop only while the latest AIMessage
+    carries tool calls; a plain-text answer or an empty result both end
+    it.  Guardrails use this single predicate (state-machine-v2.md §8)
+    instead of re-implementing the check per phase.
+    """
+    result_list = (response.result
+                   if isinstance(response.result, list)
+                   else [response.result])
+    return not any(
+        getattr(m, "tool_calls", None)
+        for m in result_list
+        if hasattr(m, "tool_calls")
+    )
+
+
 def _inject_tool_calls(response, tool_calls: list[dict],
                         content_override: str = "") -> bool:
     """Inject synthetic tool calls into the first AIMessage of the response.
@@ -563,7 +582,11 @@ def _inject_tool_calls(response, tool_calls: list[dict],
     ``ValueError: No AIMessage found in input`` (observed 2026-07-19,
     session f119ac84).
 
-    Returns True on success, False if no suitable AIMessage was found.
+    Returns True on success.  When the response carries no usable
+    AIMessage (e.g. the model returned an empty result as the loop was
+    about to end), a fresh AIMessage is synthesized so the injection can
+    never silently fail — guardrails must not become a failure source
+    themselves (state-machine-v2.md §8 工程约束).
     """
     result_list = (response.result
                    if isinstance(response.result, list)
@@ -578,7 +601,10 @@ def _inject_tool_calls(response, tool_calls: list[dict],
             if content_override and hasattr(m, "content"):
                 m.content = content_override
             return True
-    return False
+    msg = AIMessage(content=content_override or "")
+    msg.tool_calls = list(normalized)
+    response.result = [msg]
+    return True
 
 
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
@@ -1335,12 +1361,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if (self._model_call_count == 1
                 and not self._is_subagent
                 and self._current_ledger):
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls:
+            if _response_ends_loop(response):
                 # Extract text content from the first message
                 text = ""
                 result_list = response.result if isinstance(response.result, list) else [response.result]
@@ -1389,14 +1410,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # text instead of calling record_finding or write_file.
         ledger = self._current_ledger
         if ledger and _phase(ledger) == "verify":
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if has_tool_calls:
+            loop_ends = _response_ends_loop(response)
+            if not loop_ends:
                 self._verify_stall_count = 0  # progress made, reset stall counter
-            elif not has_tool_calls and ledger.get("hypotheses"):
+            elif loop_ends and ledger.get("hypotheses"):
                 active_path = ledger.get("active_path", [])
                 active_id = active_path[-1] if active_path else None
                 if active_id and active_id in ledger.get("hypotheses", {}):
@@ -1722,12 +1739,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and not ledger.get("hypotheses")
                 and self._model_call_count >= 2
                 and _phase(ledger) == "understand"):
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls:
+            if _response_ends_loop(response):
                 data_collected = any(
                     "task" in r.get("tools_called", [])
                     for r in ledger.get("rounds", [])
@@ -1784,115 +1796,181 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )])
                         _inject_tool_calls(response, synthetic)
 
-        # ── Post-response: detect EVALUATE-phase stall ──
-        # When the LLM outputs plain text instead of calling select_path
-        # or commit_hypotheses in EVALUATE phase, force continuation.
-        # Without this, the agent loop exits with hypotheses stuck in
-        # an unresolved state (e.g. H1 inconclusive, H2 still pending).
+        # ── Post-response: EVALUATE-phase loop abandonment (guardrail G9) ──
+        # Trigger: the LLM ends its EVALUATE turn without tool calls
+        # (plain-text "conclusion" or empty response), which would exit
+        # the agent loop while derive_phase still demands a direction
+        # (i.e. check_exit_conditions said NO — there is no confirmed
+        # root cause, so exiting here would be the premature closure the
+        # exit model explicitly forbids, state-machine-v2.md §6.3).
+        #
+        # Intervention follows the §8 three-level pattern:
+        #   1st offence — 降级: walk the code-decided direction on the
+        #     LLM's behalf, using only legal transitions from §5 and the
+        #     priority order of the EVALUATE direction menu shown to the
+        #     LLM (ledger.py _phase_guidance):
+        #     (a) actionable pending root → synthetic select_path (T5);
+        #     (b) only shelved (deferred) roots → synthetic select_path
+        #         reviving one (T5 explicitly allows deferred revival);
+        #     (c) layer fully hard-failed + batch budget open → harmless
+        #         nudge reminding the LLM to commit_hypotheses (T8; no
+        #         placeholder commit — that would consume batch budget
+        #         and pollute the tree).
+        #   2nd consecutive offence, or no legal direction at all — 兜底
+        #     (G7 pattern): finalize undecided hypotheses via
+        #     finalize_pending_for_report (deferred marking, NOT status
+        #     mutation — §10) and force REPORT.  The REPORT-phase handler
+        #     further down runs in this same post-response pass and takes
+        #     care of report generation + persistence.
         ledger = self._current_ledger
         if (ledger
                 and ledger.get("hypotheses")
                 and self._model_call_count >= _MIN_ROUND_FOR_SAFETY
                 and _phase(ledger) == "evaluate"):
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls:
-                # Check if any root hypotheses are still actionable
-                root_ids = ledger.get("root_hypothesis_ids", [])
+            if _response_ends_loop(response):
                 all_h = ledger.get("hypotheses", {})
-                pending = [
+                root_ids = ledger.get("root_hypothesis_ids", [])
+                # Actionable roots (§6.3 R-set): pending/inconclusive and
+                # not shelved; low-probability pending (p<=15) is exempt,
+                # inconclusive always stays actionable.
+                actionable = [
                     hid for hid in root_ids
                     if (node := all_h.get(hid))
                     and node.get("status") in ("pending", "inconclusive")
                     and not node.get("deferred")
-                    and node.get("probability", 0) > 15
+                    and (node.get("status") == "inconclusive"
+                         or node.get("probability", 0) > 15)
                 ]
-                if pending:
-                    self._evaluate_stall_count += 1
+                # Revivable roots: explicitly shelved (deferred) but still
+                # undecided — select_path clears the shelved mark.
+                revivable = [
+                    hid for hid in root_ids
+                    if (node := all_h.get(hid))
+                    and node.get("status") in ("pending", "inconclusive")
+                    and node.get("deferred")
+                ]
+                batch_open = can_commit_root_hypotheses(ledger)
+
+                if (self._evaluate_stall_count >= 1
+                        or (not actionable and not revivable
+                            and not batch_open)):
+                    # ── Terminal: repeated abandonment, or nothing legal
+                    # left to do.  Hand over to REPORT (report generation
+                    # happens in the REPORT-phase handler below).
+                    finalize_pending_for_report(ledger)
+                    _force_report(ledger)
+                    self._report_phase_start_round = self._model_call_count
+                    self._persist_ledger(ledger)
                     logger.warning(
-                        "Safety: evaluate stall (round %d, %d pending "
-                        "roots: %s, count=%d) — forcing continuation",
-                        self._model_call_count, len(pending),
-                        ", ".join(pending),
+                        "Safety: evaluate stall terminal (round %d, "
+                        "stall_count=%d, actionable=%s, revivable=%s, "
+                        "batch_open=%s) — finalized undecided hypotheses, "
+                        "forced REPORT",
+                        self._model_call_count,
                         self._evaluate_stall_count,
+                        actionable, revivable, batch_open,
                     )
-                    if self._evaluate_stall_count == 1:
-                        # First stall — inject synthetic record_finding
-                        # for the first pending hypothesis.  Command(goto)
-                        # is not supported by langchain wrap_model_call.
-                        hid = pending[0]
-                        node = all_h.get(hid, {})
-                        import uuid as _uuid
+                    self._evaluate_stall_count = 0
+                else:
+                    self._evaluate_stall_count += 1
+                    import uuid as _uuid
+                    if actionable:
+                        # (a) T5 — select the highest-value actionable
+                        # root (§6.2 delegation-value ordering).
+                        hid = max(actionable,
+                                  key=lambda h: delegation_value(all_h[h]))
                         synthetic = [{
-                            "name": "record_finding",
+                            "name": "select_path",
                             "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
                             "args": {
-                                "hypothesis_id": hid,
-                                "verdict": "inconclusive",
-                                "evidence_summary": (
-                                    "[系统自动] LLM 在 EVALUATE 阶段未调用工具，"
-                                    "系统自动标记。"
+                                "selected_hypothesis_id": hid,
+                                "rationale": (
+                                    "[系统强制] EVALUATE 阶段未调用工具，"
+                                    "系统按状态机方向选定验证焦点"
                                 ),
-                                "probability_update": node.get("probability", 50),
                             },
                         }]
-                        response = ModelResponse(result=[AIMessage(
-                            content=(
-                                f"[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
-                                f"系统已自动记录假设 {hid} 为 inconclusive。"
-                            ),
-                        )])
-                        _inject_tool_calls(response, synthetic)
-                    else:
-                        # Second+ consecutive stall — auto-resolve
-                        # undecided hypotheses as inconclusive, then
-                        # force REPORT with synthetic write_file.
-                        for hid in pending:
-                            node = all_h.get(hid)
-                            if node:
-                                node["status"] = "inconclusive"
-                                node["selected"] = False
-                                node["_inconclusive_count"] = (
-                                    node.get("_inconclusive_count", 0) + 1)
-                                node["rationale"] = (
-                                    ((node.get("rationale", "") or "")
-                                     + " | [系统自动] LLM 连续 "
-                                     f"{self._evaluate_stall_count} 轮"
-                                     "未处理此假设，系统标记为 inconclusive")
-                                )
-                        _force_report(ledger)
-                        self._report_phase_start_round = self._model_call_count
-                        self._persist_ledger(ledger)
-                        self._evaluate_stall_count = 0
-                        logger.warning(
-                            "Safety: evaluate stall resolved — "
-                            "auto-inconclusive %s, forced REPORT",
-                            ", ".join(pending),
+                        content = (
+                            "[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
+                            f"系统已自动选择假设 {hid} 进入验证（select_path）。"
                         )
-                        report_md = self._generate_report_from_ledger(ledger)
-                        ledger["report"] = report_md
-                        ledger["_forced_terminal"] = True
-                        _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
-                        self._persist_ledger(ledger)
-                        import uuid as _uuid
+                        logger.warning(
+                            "Safety: evaluate stall (round %d) — injecting "
+                            "select_path(%s), forcing continuation",
+                            self._model_call_count, hid,
+                        )
+                    elif revivable:
+                        # (b) T5 revival — re-activate the shelved root
+                        # with the highest probability.  Revival outranks
+                        # batch retry: the EVALUATE direction menu shown
+                        # to the LLM (ledger.py _phase_guidance) and the
+                        # T8 guard in derive_phase both require the whole
+                        # layer to be refuted before a retry batch becomes
+                        # the designated direction; a shelved-but-undecided
+                        # node is a resumable direction, not an exhausted
+                        # one.  If the revived node is later refuted, the
+                        # layer is then fully refuted and T8 opens the
+                        # batch naturally.
+                        hid = max(
+                            revivable,
+                            key=lambda h: all_h[h].get("probability", 0))
                         synthetic = [{
-                            "name": "write_file",
+                            "name": "select_path",
                             "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {"file_path": self.report_path, "content": report_md},
+                            "args": {
+                                "selected_hypothesis_id": hid,
+                                "rationale": (
+                                    "[系统强制] EVALUATE 阶段未调用工具，"
+                                    "系统复活已搁置假设继续验证"
+                                ),
+                            },
                         }]
-                        response = ModelResponse(result=[AIMessage(
-                            content=(
-                                f"[系统自动] 以下假设已被标记为 inconclusive："
-                                f"{', '.join(pending)}。系统已自动生成诊断报告。"
-                            ),
-                        )])
-                        _inject_tool_calls(response, synthetic)
-                else:
-                    # Tool call made (not a stall) — reset counter
-                    self._evaluate_stall_count = 0
+                        content = (
+                            "[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
+                            f"系统已复活被搁置的假设 {hid} 继续验证"
+                            "（select_path）。"
+                        )
+                        logger.warning(
+                            "Safety: evaluate stall (round %d) — reviving "
+                            "deferred %s via select_path",
+                            self._model_call_count, hid,
+                        )
+                    else:
+                        # (c) T8 direction — nothing undecided remains on
+                        # this layer (all roots hard-failed) and the batch
+                        # budget is open.  Nudge via a harmless call; do
+                        # NOT inject commit_hypotheses itself — a
+                        # placeholder hypothesis would consume batch
+                        # budget and pollute the tree.
+                        synthetic = [{
+                            "name": "ls",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {"path": "/agent_data"},
+                        }]
+                        content = (
+                            "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具，"
+                            "本层假设已全部证伪。\n"
+                            f"根假设批次预算仍开放（已用 "
+                            f"{ledger.get('_root_commit_count', 0)}"
+                            f"/{MAX_ROOT_COMMIT_BATCHES}）。请立即调用 "
+                            "commit_hypotheses 提交新一批根假设"
+                            "（必须基于已排除证据换方向，禁止重复或仅换措辞）。"
+                        )
+                        logger.warning(
+                            "Safety: evaluate stall (round %d, batch %d/%d "
+                            "open) — nudging commit_hypotheses via "
+                            "synthetic call",
+                            self._model_call_count,
+                            ledger.get("_root_commit_count", 0),
+                            MAX_ROOT_COMMIT_BATCHES,
+                        )
+                    response = ModelResponse(result=[AIMessage(
+                        content=content,
+                    )])
+                    _inject_tool_calls(response, synthetic)
+            else:
+                # Real tool call made — the loop advances on its own.
+                self._evaluate_stall_count = 0
 
         # ── Post-response: detect HYPOTHESIZE-phase stall (retry batch) ──
         # When all root hypotheses are hard-failed and the retry budget
@@ -1907,12 +1985,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and ledger.get("hypotheses")
                 and _phase(ledger) == "hypothesize"
                 and self._model_call_count >= _MIN_ROUND_FOR_SAFETY):
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls:
+            if _response_ends_loop(response):
                 logger.warning(
                     "Safety: hypothesize-phase stall (round %d, batch "
                     "%d/%d) — nudging commit_hypotheses via synthetic call",
@@ -1976,10 +2049,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             m for m in (response.result if isinstance(response.result, list) else [response.result])
                             if hasattr(m, "tool_calls")
                         ]
-                        has_tool_calls = any(
-                            getattr(m, "tool_calls", None) for m in ai_msgs
-                        )
-                        if has_tool_calls:
+                        if not _response_ends_loop(response):
                             # Check whether ALL tool calls in this
                             # response are ledger-management tools
                             all_ledger = True
@@ -2029,12 +2099,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #     write_file events so the frontend sees a visible node.
         ledger = self._current_ledger
         if ledger and _phase(ledger) == "report":
-            ai_msgs = [
-                m for m in (response.result if isinstance(response.result, list) else [response.result])
-                if hasattr(m, "tool_calls")
-            ]
-            has_tool_calls = any(getattr(m, "tool_calls", None) for m in ai_msgs)
-            if not has_tool_calls:
+            if _response_ends_loop(response):
                 # Check if write_file was already called (via tool call)
                 # or report is already present (from record_finding auto-gen)
                 report_exists = bool(ledger.get("report"))
@@ -2128,16 +2193,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and _phase(ledger) == "understand"
                 and not ledger.get("hypotheses")
             ):
-                ai_msgs = [
-                    m for m in (response.result
-                                if isinstance(response.result, list)
-                                else [response.result])
-                    if hasattr(m, "tool_calls")
-                ]
-                has_tool_calls = any(
-                    getattr(m, "tool_calls", None) for m in ai_msgs
-                )
-                if not has_tool_calls:
+                if _response_ends_loop(response):
                     # Extract context from ledger or environment for
                     # subagent delegation parameters used in the
                     # SystemMessage reminder below.
