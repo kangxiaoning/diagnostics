@@ -2494,6 +2494,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if not should_exit and not (
                     ledger.get("_forced_terminal") or ledger.get("report")
                 ):
+                    logger.warning(
+                        "write_file blocked by exit-condition gate: %s "
+                        "(phase=%s, round=%d, path=%s)",
+                        reason or "退出条件未满足",
+                        _phase(ledger),
+                        self._model_call_count,
+                        tool_args.get("file_path")
+                        or tool_args.get("path") or "",
+                    )
                     return ToolMessage(
                         content=(
                             f"⛔ 暂时无法生成诊断报告: {reason}\n"
@@ -2517,6 +2526,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 cids = ledger.get("root_cause_hypothesis_ids", [])
                 if cids:
                     # At least one confirmed root cause — no restart
+                    logger.warning(
+                        "%s blocked in REPORT phase (root cause "
+                        "confirmed, round=%d)",
+                        tool_name, self._model_call_count,
+                    )
                     return ToolMessage(
                         content=(
                             f"⛔ 当前处于 REPORT 阶段，根因已确认。"
@@ -2537,6 +2551,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 _phase_now = _phase(ledger)
                 _gate = _PHASE_TOOL_GATE.get(_phase_now)
                 if _gate is not None and tool_name in _gate:
+                    logger.warning(
+                        "%s blocked by phase gate in %s (round=%d)",
+                        tool_name, _phase_now, self._model_call_count,
+                    )
                     return ToolMessage(
                         content=(
                             f"⛔ {tool_name} 在 {_phase_now.upper()} 阶段不可用"

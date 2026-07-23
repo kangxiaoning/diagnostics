@@ -1493,7 +1493,12 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     if not confirmed_ids:
         # No confident root cause yet — never exit on the gain<cost
         # rule alone; the LLM still owes a direction (retry / backtrack).
-        return False, "", None
+        # Non-empty reason: consumed by the write_file gate rejection
+        # message (ledger_middleware.awrap_tool_call).
+        return False, (
+            "尚无确认根因（无 p≥80 的 confirmed 根假设），"
+            "需先完成假设验证并 record_finding"
+        ), None
     r = residual_uncertainty(ledger)
     if r >= R_THRESHOLD:
         return False, (
