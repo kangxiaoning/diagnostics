@@ -38,6 +38,8 @@ from diagnostics.agent.ledger import (
     MAX_ROOT_COMMIT_BATCHES,
     DiagnosisLedger,
     DiagnosisLedgerState,
+    _coverage_ready,
+    _has_confirmed_ancestor,
     activate_hypothesis,
     add_evidence_to_active,
     add_hypotheses,
@@ -1002,6 +1004,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         start_time: str = "",
         end_time: str = "",
         param_overrides: dict | None = None,
+        valid_subagents: list[str] | None = None,
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
@@ -1014,6 +1017,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._start_time = start_time
         self._end_time = end_time
         self._param_overrides = param_overrides or {}
+        # Valid subagent names for task() validation (Coordinator only).
+        # None/empty disables the check (tests, subagent instances).
+        self._valid_subagents = tuple(valid_subagents or ())
         # Agent memory (AGENTS.md), loaded once and injected before the
         # ledger block so the current diagnosis state stays at the
         # prompt tail.  Subagents skip injection.
@@ -1890,26 +1896,140 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )])
                         _inject_tool_calls(response, synthetic)
                     else:
-                        logger.warning(
-                            "Safety: understand stall (round %d) — LLM "
-                            "output text without commit_hypotheses, "
-                            "forcing continuation via SystemMessage",
-                            self._model_call_count,
-                        )
-                        import uuid as _uuid
-                        synthetic = [{
-                            "name": "commit_hypotheses",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {
-                                "hypotheses": [
-                                    {"statement": "诊断假设待补充", "probability": 50, "rationale": "系统自动创建"},
-                                ],
-                            },
-                        }]
-                        response = ModelResponse(result=[AIMessage(
-                            content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
-                        )])
-                        _inject_tool_calls(response, synthetic)
+                        # ── Coverage-aware stall handling ──
+                        # If Argus coverage is incomplete (e.g. only
+                        # k8s-argus-expert delegated, host-argus-expert
+                        # missing), injecting commit_hypotheses is
+                        # guaranteed to be blocked by the phase gate
+                        # (understand phase tool whitelist, §7).
+                        # Instead, force delegation of the missing expert
+                        # so coverage becomes complete and the normal
+                        # UNDERSTAND→HYPOTHESIZE transition (T1) can fire.
+                        if not _coverage_ready(ledger):
+                            # Identify which expert(s) are missing.
+                            experts_delegated: set[str] = set()
+                            for r in ledger.get("rounds", []):
+                                experts_delegated.update(
+                                    r.get("delegated_experts", []))
+                            has_host = "host-argus-expert" in experts_delegated
+                            has_k8s = "k8s-argus-expert" in experts_delegated
+                            is_host_only = (
+                                ledger.get("entity_type") == "host")
+
+                            missing: list[str] = []
+                            if not is_host_only and not has_k8s:
+                                missing.append("k8s-argus-expert")
+                            if not has_host:
+                                missing.append("host-argus-expert")
+                            # Host-only: only host-argus-expert matters.
+                            if is_host_only:
+                                missing = (
+                                    ["host-argus-expert"]
+                                    if not has_host else [])
+
+                            if missing:
+                                logger.warning(
+                                    "Safety: understand stall with "
+                                    "incomplete coverage (round %d, "
+                                    "missing: %s) — forcing expert "
+                                    "delegation instead of "
+                                    "commit_hypotheses",
+                                    self._model_call_count,
+                                    ", ".join(missing),
+                                )
+                                _cluster = ledger.get("entity_name", "")
+                                _st = self._start_time
+                                _et = self._end_time
+                                _time_hint = (
+                                    f"时间窗口: {_st} ～ {_et}"
+                                    if _st and _et else
+                                    f"时间窗口: {_st}"
+                                    if _st else
+                                    "时间窗口: 最近 6 小时"
+                                )
+                                import uuid as _uuid2
+                                synthetic = []
+                                for expert in missing:
+                                    desc = (
+                                        f"查询并分析 {_cluster} 集群 "
+                                        f"Argus 指标时序。{_time_hint}。"
+                                        if expert == "k8s-argus-expert"
+                                        else f"查询并分析主机 Argus "
+                                        f"指标时序（CPU/内存/磁盘/网络"
+                                        f" 1min 粒度）。{_time_hint}。"
+                                    )
+                                    synthetic.append({
+                                        "name": "task",
+                                        "id": f"call_safety_{_uuid2.uuid4().hex[:12]}",
+                                        "args": {
+                                            "subagent_type": expert,
+                                            "description": desc,
+                                        },
+                                    })
+                                response = ModelResponse(result=[AIMessage(
+                                    content=(
+                                        f"[系统强制] Argus数据采集不完整"
+                                        f"（缺少{'、'.join(missing)}），"
+                                        f"已自动委派缺失的专家完成故障"
+                                        f"理解阶段。"
+                                    ),
+                                )])
+                                _inject_tool_calls(response, synthetic)
+                            else:
+                                # Coverage gate reports not-ready but
+                                # all expected experts already delegated
+                                # (should not normally happen).  Fall
+                                # through to the original commit injection
+                                # as a last resort.
+                                logger.warning(
+                                    "Safety: understand stall (round %d)"
+                                    " — LLM output text without "
+                                    "commit_hypotheses, forcing "
+                                    "continuation via SystemMessage",
+                                    self._model_call_count,
+                                )
+                                import uuid as _uuid3
+                                synthetic = [{
+                                    "name": "commit_hypotheses",
+                                    "id": f"call_safety_{_uuid3.uuid4().hex[:12]}",
+                                    "args": {
+                                        "hypotheses": [
+                                            {"statement": "诊断假设待补充",
+                                             "probability": 50,
+                                             "rationale": "系统自动创建"},
+                                        ],
+                                    },
+                                }]
+                                response = ModelResponse(result=[AIMessage(
+                                    content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
+                                )])
+                                _inject_tool_calls(response, synthetic)
+                        else:
+                            # Coverage is ready — original behaviour:
+                            # force commit_hypotheses.
+                            logger.warning(
+                                "Safety: understand stall (round %d) — "
+                                "LLM output text without "
+                                "commit_hypotheses, forcing continuation "
+                                "via SystemMessage",
+                                self._model_call_count,
+                            )
+                            import uuid as _uuid4
+                            synthetic = [{
+                                "name": "commit_hypotheses",
+                                "id": f"call_safety_{_uuid4.uuid4().hex[:12]}",
+                                "args": {
+                                    "hypotheses": [
+                                        {"statement": "诊断假设待补充",
+                                         "probability": 50,
+                                         "rationale": "系统自动创建"},
+                                    ],
+                                },
+                            }]
+                            response = ModelResponse(result=[AIMessage(
+                                content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
+                            )])
+                            _inject_tool_calls(response, synthetic)
 
         # ── Post-response: EVALUATE-phase loop abandonment (guardrail G9) ──
         # Trigger: the LLM ends its EVALUATE turn without tool calls
@@ -2615,6 +2735,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if ledger:
                 subagent_type = tool_args.get("subagent_type", "")
                 desc = tool_args.get("description", "")
+
+                # ── Unknown subagent fast-fail (Coordinator only) ──
+                # A missing/unresolvable subagent_type otherwise falls
+                # through to the task tool and wastes a round on an
+                # opaque failure (observed 2026-07-23 session 7805961b:
+                # round-1 two delegations to subagent '?').  Reject
+                # upfront with the valid expert list so the LLM can
+                # correct the call in the same round.
+                if (not self._is_subagent and self._valid_subagents
+                        and subagent_type not in self._valid_subagents):
+                    logger.warning(
+                        "task() blocked: unknown subagent_type=%r "
+                        "(valid: %s, round=%d)",
+                        subagent_type or "<missing>",
+                        ", ".join(self._valid_subagents),
+                        self._model_call_count,
+                    )
+                    _experts = "\n".join(
+                        f"- {name}" for name in self._valid_subagents
+                    )
+                    return ToolMessage(
+                        content=(
+                            f"⛔ 未知的专家类型 subagent_type={subagent_type!r}。\n"
+                            "可用专家（必须从中选择一个作为 subagent_type）：\n"
+                            f"{_experts}\n"
+                            "请修正 subagent_type 后重新调用 task()。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
 
                 # ── S2 gain<cost delegation gate (state-machine-v2.md §6) ──
                 # A delegation whose expected information gain per unit cost
@@ -3406,8 +3555,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     e.get("source", "").startswith("expert:")
                     for e in node.get("evidence", [])
                 )
+                # A fresh select_path/backtrack restarts the verification
+                # clock — the LLM just committed to a recovery plan for
+                # this hypothesis and must get the full gap window to
+                # execute it (aligned with the P1 max-rounds valve, which
+                # already counts _last_select_round as progress; observed
+                # 2026-07-23 session 7805961b: valve fired 1 round after
+                # select_path(H2), preempting the confirmation attempt).
                 stall_ref = max(self._last_finding_round,
-                                self._last_evidence_round)
+                                self._last_evidence_round,
+                                self._last_select_round)
                 # ── Delegation-in-flight exclusion (G4 tightening) ──
                 # A task() issued THIS round or last round means the
                 # expert result may not have come back yet — the "stuck"
@@ -3707,45 +3864,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Check exit conditions
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)
 
-            # ── Multi-root: accumulate ALL confirmed root causes ──
-            # Iterate over every root hypothesis — not just the single
-            # confirmed_id returned by check_exit_conditions (which is
-            # always the first confirmed hypothesis).  This ensures that
-            # in multi-root scenarios (e.g. memory_leak_and_disk_full),
-            # each confirmed root cause is tracked independently.
+            # ── Root-cause tracking: topmost confirmed nodes ──
+            # A confirmed node anywhere in the tree is a located root
+            # cause — including a DEEP node whose ancestor is not
+            # confirmed (verification narrowed the cause below the
+            # original root statement; e.g. H2.1 "Docker Hub rate limit"
+            # confirmed while parent H2 stays inconclusive, observed
+            # 2026-07-23 session 7805961b).  The previous implementation
+            # registered the unconfirmed root ANCESTOR id instead, which
+            # the cleanup below then purged (status != confirmed) —
+            # root_causes stayed empty and REPORT was never reachable.
+            # When both an ancestor and its descendant are confirmed,
+            # the topmost node represents the cause line; the descendant
+            # is a refinement and is dropped by the cleanup below.
             cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
             causes: list[str] = ledger.setdefault("root_causes", [])
-            for rid in ledger.get("root_hypothesis_ids", []):
-                node = ledger["hypotheses"].get(rid)
-                if node and node["status"] == "confirmed" and rid not in cids:
-                    cids.append(rid)
-                    stmt = node["statement"]
-                    # Deduplicate: different hypotheses may converge on
-                    # the same root cause statement after statement_update.
-                    if stmt not in causes:
-                        causes.append(stmt)
-            # ── Propagate: deep confirmed hypotheses count as root causes ──
-            # When a non-root hypothesis (depth > 0) is confirmed, its
-            # evidence also supports the root ancestor's overall conclusion.
-            # Without this, a diagnosis with confirmed evidence at depth 2
-            # but a root hypothesis still in "verifying" state would never
-            # enter the REPORT phase.
             hypotheses = ledger.get("hypotheses", {})
             for hid, node in hypotheses.items():
                 if node.get("status") != "confirmed":
                     continue
                 if hid in cids:
-                    continue  # already tracked as a root
-                # Trace up to find the root ancestor
-                root_id = hid
-                while (parent_id := hypotheses.get(root_id, {}).get("parent_id")):
-                    root_id = parent_id
-                if root_id and root_id in ledger.get("root_hypothesis_ids", []):
-                    if root_id not in cids:
-                        cids.append(root_id)
-                    stmt = node["statement"]
-                    if stmt not in causes:
-                        causes.append(stmt)
+                    continue  # already tracked
+                if _has_confirmed_ancestor(hypotheses, hid):
+                    continue  # refinement of an already-tracked line
+                cids.append(hid)
+                stmt = node["statement"]
+                # Deduplicate: different hypotheses may converge on
+                # the same root cause statement after statement_update.
+                if stmt not in causes:
+                    causes.append(stmt)
             # Keep backward-compat fields in sync with first entry
             if cids:
                 ledger["root_cause"] = causes[0]
@@ -3763,13 +3910,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if ledger.get("root_cause") == old_statement:
                     ledger["root_cause"] = statement_update
 
-            # ── Cleanup: remove non-confirmed hypotheses from
-            # root_cause_hypothesis_ids.  Ensures that refuted or
-            # deprioritized hypotheses do not appear as root causes.
+            # ── Cleanup: drop non-confirmed entries and refinements ──
+            # Ensures refuted/deprioritized hypotheses never appear as
+            # root causes, and that a confirmed descendant yields to its
+            # ancestor once the ancestor itself is confirmed (topmost
+            # confirmed node represents the cause line).
             hypotheses_dict = ledger.get("hypotheses", {})
             cids[:] = [
                 cid for cid in cids
                 if hypotheses_dict.get(cid, {}).get("status") == "confirmed"
+                and not _has_confirmed_ancestor(hypotheses_dict, cid)
             ]
             # Rebuild root_causes to match cleaned cids
             causes[:] = [

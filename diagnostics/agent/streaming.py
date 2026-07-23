@@ -263,13 +263,13 @@ async def stream_agent_events(
                     "[session=%s] Waiting for response... "
                     "(round=%d, tools_active=%d, tools_done=%d)",
                     session_id, state.round_number,
-                    len(state.active_tools) - len(state.done_tools),
+                    len(state.active_tools),
                     len(state.done_tools),
                 )
                 yield AgentEvent("heartbeat", {
                     "session_id": session_id,
                     "round": state.round_number,
-                    "tools_active": len(state.active_tools) - len(state.done_tools),
+                    "tools_active": len(state.active_tools),
                     "tools_done": len(state.done_tools),
                 })
                 # Fall through to wait for get_task without timeout

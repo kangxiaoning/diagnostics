@@ -463,6 +463,7 @@ def build_agent(
         start_time=start_time,
         end_time=end_time,
         param_overrides=param_overrides,
+        valid_subagents=[sa["name"] for sa in subagent_configs],
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)

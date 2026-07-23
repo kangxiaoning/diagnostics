@@ -834,9 +834,19 @@ def _has_pending_sub_hypotheses(ledger: DiagnosisLedger) -> bool:
     that still needs verification (not terminal, not low-probability pending).
     Prevents premature REPORT entry when root causes are confirmed but
     sub-hypotheses (deepening analysis) remain unverified.
+
+    v2.4: confirmed nodes are discovered directly from the tree (topmost
+    confirmed = independent cause lines) instead of relying on
+    ``root_cause_hypothesis_ids``, which is only refreshed by the
+    record_finding tool handler AFTER check_exit_conditions runs — the
+    stale snapshot could miss sub-hypotheses under a just-confirmed node.
     """
     hypotheses = ledger.get("hypotheses", {})
-    confirmed_ids = set(ledger.get("root_cause_hypothesis_ids", []))
+    confirmed_ids = [
+        hid for hid, node in hypotheses.items()
+        if node.get("status") == "confirmed"
+        and not _has_confirmed_ancestor(hypotheses, hid)
+    ]
     for cid in confirmed_ids:
         node = hypotheses.get(cid)
         if not node:
@@ -1228,6 +1238,30 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                    and ledger["hypotheses"].get(h, {}).get("status") != "refuted"]
         if root_cause_hyp_ids and pending:
             pending_hint = f"\n- ⚠ 仍有待验证的假设: {', '.join(pending)}，使用 select_path 切换验证"
+        # ── Consolidation hint (v2.4): confirmed deep node whose parent
+        # is still unconfirmed — the cause line is located but not closed
+        # at the root level.  Guide the LLM to close the parent via
+        # select_path + record_finding (confirmed + statement_update)
+        # instead of opening new directions or new sub-hypotheses
+        # (observed 2026-07-23 session 7805961b: the LLM wandered 6
+        # rounds before discovering this path on its own).
+        consolidation_hint = ""
+        _hyps = ledger.get("hypotheses", {})
+        for _hid, _node in _hyps.items():
+            if _node.get("status") != "confirmed":
+                continue
+            _pid = _norm_parent_id(_node.get("parent_id"))
+            if not _pid:
+                continue
+            if _hyps.get(_pid, {}).get("status") in ("pending", "inconclusive"):
+                consolidation_hint = (
+                    f"\n- ⚠ 子假设 {_hid} 已确认但父假设 {_pid} 尚未收口："
+                    f"优先 select_path({_pid}) 后用 record_finding 终结父假设——"
+                    "证据已覆盖核心机制时 confirmed + statement_update 修正表述，"
+                    "核心机制不成立时 refuted/inconclusive。"
+                    "禁止在未收口的父假设下继续开新子假设。"
+                )
+                break
         return (
             "你当前处于 EVALUATE 阶段。\n"
             "- 评估本层所有假设的验证结果，选择下一步路径：\n"
@@ -1244,6 +1278,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "应保持高概率(≥80%)。"
             "不要因为次要信息缺失而过度降低根因概率。"
             + pending_hint
+            + consolidation_hint
         )
     if phase == "report":
         n_causes = len(ledger.get("root_causes", []))
@@ -1379,6 +1414,47 @@ def _uncertainty(node: HypothesisNode) -> float:
     return 4.0 * p * (1.0 - p)
 
 
+def _has_confirmed_ancestor(hypotheses: dict, hid: str) -> bool:
+    """True if any ancestor of ``hid`` (walking parent_id up) is confirmed.
+
+    Used to distinguish an independent root cause (topmost confirmed
+    node) from a refinement under an already-confirmed line.
+    """
+    cursor = _norm_parent_id(hypotheses.get(hid, {}).get("parent_id"))
+    while cursor:
+        node = hypotheses.get(cursor)
+        if node is None:
+            break
+        if node.get("status") == "confirmed":
+            return True
+        cursor = _norm_parent_id(node.get("parent_id"))
+    return False
+
+
+def _confirmed_ancestor_shield(hypotheses: dict) -> set[str]:
+    """IDs of nodes that are ancestors of at least one confirmed node.
+
+    A confirmed descendant resolves the ancestor's question — the root
+    cause was narrowed below the ancestor's broader statement (e.g.
+    H2.1 confirmed while H2 stays inconclusive), so the ancestor's
+    residual uncertainty / delegation value no longer counts against
+    exit.  Without this, a deep confirmation would be forever shadowed
+    by its unconfirmed parent (observed 2026-07-23 session 7805961b:
+    H2.1 confirmed p=95 at round 20, but H2's U=0.84 kept R≥0.8 and
+    blocked REPORT for 7 more rounds).
+    """
+    shielded: set[str] = set()
+    for hid, node in hypotheses.items():
+        if node.get("status") != "confirmed":
+            continue
+        cursor = _norm_parent_id(node.get("parent_id"))
+        while cursor and cursor not in shielded:
+            shielded.add(cursor)
+            cursor = _norm_parent_id(
+                hypotheses.get(cursor, {}).get("parent_id"))
+    return shielded
+
+
 def residual_uncertainty(ledger: DiagnosisLedger) -> float:
     """R = Σ U(h) over undecided hypotheses.
 
@@ -1388,9 +1464,15 @@ def residual_uncertainty(ledger: DiagnosisLedger) -> float:
     re-enter R when re-activated (deferred cleared by select_path /
     activate_hypothesis / backtrack).  Low-probability pending nodes
     (p ≤ 15) are excluded on the same grounds as the legacy E1 rule.
+    Ancestors of confirmed nodes are excluded (v2.4 ancestor shield —
+    see ``_confirmed_ancestor_shield``).
     """
+    hypotheses = ledger.get("hypotheses", {})
+    shielded = _confirmed_ancestor_shield(hypotheses)
     total = 0.0
-    for node in ledger.get("hypotheses", {}).values():
+    for hid, node in hypotheses.items():
+        if hid in shielded:
+            continue
         if node.get("status") not in ("pending", "inconclusive"):
             continue
         if node.get("deferred"):
@@ -1418,12 +1500,24 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
 
     Actions considered (deterministic, ledger-derived):
     - delegation on each pending (non-deferred) / inconclusive hypothesis
-    - batch retry (if budget open): fresh hypotheses carry U≈1, D=1, F=1
+      (ancestors of confirmed nodes excluded — the confirmed descendant
+      already resolved that line)
+    - batch retry (if budget open): fresh hypotheses carry U≈1, D=1, F=1;
+      NOT offered once any hypothesis is confirmed — batch retry exists
+      for a failed direction, keeping it as an "executable action" would
+      block S2 forever while the budget is open even though a root cause
+      (possibly deep) is already located
     Returns (value, detail) — detail names the best action for logging.
     """
     hypotheses = ledger.get("hypotheses", {})
+    shielded = _confirmed_ancestor_shield(hypotheses)
+    has_confirmed = any(
+        n.get("status") == "confirmed" for n in hypotheses.values()
+    )
     best_v, best_d = 0.0, "(无可执行验证动作)"
     for hid, node in hypotheses.items():
+        if hid in shielded:
+            continue
         if node.get("status") not in ("pending", "inconclusive"):
             continue
         if node.get("deferred"):
@@ -1438,7 +1532,8 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
                 f"已委派{node.get('_delegate_count', 0)}次/"
                 f"inconclusive {node.get('_inconclusive_count', 0)}次)"
             )
-    if ledger.get("root_hypothesis_ids") and can_commit_root_hypotheses(ledger):
+    if (ledger.get("root_hypothesis_ids") and can_commit_root_hypotheses(ledger)
+            and not has_confirmed):
         v = 1.0 / COST_BATCH_COMMIT  # fresh batch: U=1, D=1, F=1
         if v > best_v:
             best_v = v
@@ -1460,6 +1555,8 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
       - E4 quick path (confirmed leaf, nothing pending below)
     S1: ≥1 confirmed root with p≥80 AND residual uncertainty R < 0.8
         (deferred / low-p nodes excluded — they were explicitly shelved).
+        v2.4: a confirmed node at ANY depth counts (topmost only) — a
+        deep confirmation resolves its ancestor line (E4 semantics).
     S2: max action value EIG/c < κ=0.15, or no executable actions left.
     """
     hypotheses: dict = ledger["hypotheses"]
@@ -1476,6 +1573,23 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         if hypotheses.get(hid, {}).get("status") == "confirmed"
         and hypotheses[hid].get("probability", 0) >= 80
     ]
+    # ── Deep confirmation fallback (v2.4) ──
+    # A confirmed node (p≥80) below the root layer also resolves the
+    # root question: verification narrowed the root cause under a
+    # broader root statement (e.g. H2.1 "Docker Hub rate limit"
+    # confirmed while parent H2 stays inconclusive).  Only topmost
+    # confirmed nodes count — a confirmed node under an already-
+    # confirmed ancestor is a refinement, not an independent cause.
+    # Without this, S1 is blind to deep confirmations: the write_file
+    # gate rejects the report and diagnosis wanders (observed
+    # 2026-07-23 session 7805961b: 7 wasted rounds after H2.1 p=95).
+    if not confirmed_ids:
+        confirmed_ids = [
+            hid for hid, node in hypotheses.items()
+            if node.get("status") == "confirmed"
+            and node.get("probability", 0) >= 80
+            and not _has_confirmed_ancestor(hypotheses, hid)
+        ]
 
     # ── E2 exhaustion (fast lane): all roots refuted, budget spent ──
     if root_ids and not confirmed_ids:
