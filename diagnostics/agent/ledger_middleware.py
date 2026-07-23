@@ -289,24 +289,39 @@ def _build_evidence_audit(ledger: dict) -> str:
 # distinguish "collected rich data" from "collected nothing useful"
 # and trigger early REPORT instead of forcing commit_hypotheses.
 
-_EMPTY_DATA_PATTERNS = (
-    "无监控数据返回",
-    "无数据返回",
+# Argus outcome classification patterns (state-machine-v2.md §8 G2, v2.5).
+# Three semantically distinct outcomes must NOT be conflated:
+_ARGUS_PARAM_MISSING_PATTERNS = (
     "需要补充",            # expert asking for missing params
     "需要更具体的信息",     # expert asking for clarification
-    "全部指标无异常波动",   # all metrics normal (no anomaly to diagnose)
-    "需要补充两个关键参数",  # expert needs hostname/time window
+)
+_ARGUS_FAILURE_PATTERNS = (
+    "无监控数据返回",
+    "无数据返回",
+    "查询失败",
+    "执行失败",
+    "调用失败",
+    "报错",
+)
+_ARGUS_ALL_NORMAL_PATTERNS = (
+    "全部指标无异常波动",   # all metrics normal (data IS available)
 )
 
 
-def _is_data_empty(ledger: dict) -> bool:
-    """Check if ALL delegated expert responses indicate empty/normal data.
+def _classify_argus_data(ledger: dict) -> str:
+    """Classify Argus expert outcomes when every expert round is "empty".
 
-    Returns True when every expert round shows no meaningful diagnostic
-    data — either tools returned empty (wrong hostname/cluster) or all
-    metrics were normal (nothing to diagnose).  In this case the system
-    should short-circuit to REPORT instead of forcing commit_hypotheses
-    on data that cannot support any hypothesis.
+    Returns one of:
+      ""              — at least one expert returned real diagnostic data
+                        (or no expert delegated yet): normal flow;
+      "param_missing" — experts asked for missing params (hostname/time
+                        window).  The delegation itself was malformed,
+                        NOT an argus outage → re-delegate with full params;
+      "failure"       — argus returned empty data or errored.  The argus
+                        monitoring platform is considered unavailable →
+                        degrade to user-input hypotheses (T1 bypass);
+      "all_normal"    — data collected, all metrics normal.  Record
+                        faithfully and continue the normal flow.
     """
     rounds = ledger.get("rounds", [])
     expert_rounds = [
@@ -315,15 +330,30 @@ def _is_data_empty(ledger: dict) -> bool:
         and r.get("delegated_experts")
     ]
     if not expert_rounds:
-        return False  # no experts delegated yet — not "empty", just "not yet"
+        return ""  # no experts delegated yet — not "empty", just "not yet"
 
+    saw_param_missing = False
+    saw_failure = False
+    saw_all_normal = False
     for r in expert_rounds:
         kf = r.get("key_findings", "")
-        if not any(p in kf for p in _EMPTY_DATA_PATTERNS):
-            return False  # at least one expert returned real data
+        if any(p in kf for p in _ARGUS_PARAM_MISSING_PATTERNS):
+            saw_param_missing = True
+        elif any(p in kf for p in _ARGUS_FAILURE_PATTERNS):
+            saw_failure = True
+        elif any(p in kf for p in _ARGUS_ALL_NORMAL_PATTERNS):
+            saw_all_normal = True
+        else:
+            return ""  # at least one expert returned real data
 
-    # All expert responses matched empty/normal patterns
-    return True
+    # param_missing wins: re-delegation with correct params may fix all.
+    if saw_param_missing:
+        return "param_missing"
+    if saw_failure:
+        return "failure"
+    if saw_all_normal:
+        return "all_normal"
+    return ""
 
 
 def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
@@ -681,10 +711,15 @@ def _extract_response_text(response) -> str:
 
 
 def _is_substantial_report_text(text: str) -> bool:
-    """Heuristic: the text is an actual report, not a 3-5 sentence user
-    summary (which REPORT-phase guidance explicitly asks the LLM for).
-    Requires both length and report structure markers."""
-    if not text or len(text) < 800:
+    """Heuristic: the text is an actual report, not bare chatter
+    ("好的，我将生成报告").  Requires report structure markers — no
+    length requirement (v2.5): a legitimate report can be short
+    (scenario 29 produced a valid 615-char conclusion that the old
+    800-char floor wrongly rejected).  Overwrite safety is already
+    guaranteed by the caller's conditions (salvage only fires when no
+    report exists or the on-disk one is an auto-generated stub; an
+    LLM-authored report is never overwritten)."""
+    if not text:
         return False
     _REPORT_MARKERS = ("# 故障", "## ", "**根因", "根因分析", "证据链", "修复建议")
     return any(marker in text for marker in _REPORT_MARKERS)
@@ -1866,36 +1901,90 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     for r in ledger.get("rounds", [])
                 )
                 if data_collected:
-                    if _is_data_empty(ledger):
-                        # All expert data is empty — forcing continuation
-                        # to commit_hypotheses would be useless.  Instead,
-                        # set REPORT phase and let the REPORT guard take
-                        # over in the next round with a "no data" directive.
-                        _force_report(ledger)
-                        self._report_phase_start_round = self._model_call_count
+                    _argus_state = _classify_argus_data(ledger)
+                    if (_argus_state == "param_missing"
+                            and not ledger.get("_argus_redelegated")):
+                        # ── Argus params missing → re-delegate ONCE ──
+                        # The expert asked for params (hostname/time
+                        # window) — the delegation was malformed, NOT an
+                        # argus outage.  Re-delegate the required argus
+                        # experts with full entity/time-window params.
+                        # One-shot: if the retry also comes back
+                        # param-missing, the next stall degrades (below).
+                        ledger["_argus_redelegated"] = True
                         self._persist_ledger(ledger)
                         logger.warning(
-                            "Safety: understand stall with EMPTY data "
-                            "(round %d) — forcing REPORT instead of "
-                            "commit_hypotheses",
+                            "Safety: understand stall — argus experts "
+                            "missing params (round %d), re-delegating "
+                            "with full entity/time-window",
                             self._model_call_count,
                         )
-                        import uuid as _uuid
-                        report_md = self._generate_report_from_ledger(ledger)
-                        ledger["report"] = report_md
-                        ledger["_forced_terminal"] = True
-                        _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
-                        self._persist_ledger(ledger)
-                        synthetic = [{
-                            "name": "write_file",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {"file_path": self.report_path, "content": report_md},
-                        }]
+                        _entity = (ledger.get("entity_name")
+                                   or ledger.get("hostname") or "")
+                        _st = self._start_time
+                        _et = self._end_time
+                        _time_hint = (
+                            f"时间窗口: {_st} ～ {_et}"
+                            if _st and _et else
+                            f"时间窗口: {_st}"
+                            if _st else
+                            "时间窗口: 最近 6 小时"
+                        )
+                        _required = ["host-argus-expert"]
+                        if ledger.get("entity_type") != "host":
+                            _required.append("k8s-argus-expert")
+                        import uuid as _uuid_re
+                        synthetic = []
+                        for expert in _required:
+                            desc = (
+                                f"查询并分析 {_entity} 集群 Argus K8s "
+                                f"指标时序（NotReady/Pod重启/API延迟/"
+                                f"etcd/DNS）。{_time_hint}。"
+                                if expert == "k8s-argus-expert"
+                                else f"查询并分析主机 {_entity} 的 Argus "
+                                f"指标时序（CPU/内存/磁盘/网络 1min 粒度"
+                                f"）。{_time_hint}。"
+                            )
+                            synthetic.append({
+                                "name": "task",
+                                "id": f"call_safety_{_uuid_re.uuid4().hex[:12]}",
+                                "args": {
+                                    "subagent_type": expert,
+                                    "description": desc,
+                                },
+                            })
                         response = ModelResponse(result=[AIMessage(
-                            content="[系统强制] 所有已采集的监控数据均为空。系统已生成诊断报告。",
+                            content=(
+                                "[系统提醒] Argus 专家反馈参数不全，已按"
+                                "完整实体名与时间窗口自动重新委派。"
+                            ),
                         )])
                         _inject_tool_calls(response, synthetic)
                     else:
+                        if _argus_state == "failure" or (
+                                _argus_state == "param_missing"
+                                and ledger.get("_argus_redelegated")):
+                            # ── Argus platform failure → degrade ──
+                            # Argus returned empty data / errors (or the
+                            # one-shot re-delegation also failed): the
+                            # monitoring platform is considered
+                            # unavailable.  Degrade to hypotheses from
+                            # user input — T1 coverage gate is bypassed
+                            # via _argus_unavailable, the normal
+                            # VERIFY→EVALUATE→REPORT flow continues, and
+                            # domain experts can still collect evidence.
+                            ledger["_argus_unavailable"] = True
+                            self._persist_ledger(ledger)
+                            logger.warning(
+                                "Safety: argus platform failure "
+                                "(round %d, state=%s) — degrading to "
+                                "user-input hypotheses (T1 bypass)",
+                                self._model_call_count, _argus_state,
+                            )
+                        # "all_normal" needs no special handling: the
+                        # findings are recorded in the ledger and the
+                        # normal coverage/commit flow continues (如实
+                        # 记录，继续推进).
                         # ── Coverage-aware stall handling ──
                         # If Argus coverage is incomplete (e.g. only
                         # k8s-argus-expert delegated, host-argus-expert
@@ -2005,8 +2094,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 )])
                                 _inject_tool_calls(response, synthetic)
                         else:
-                            # Coverage is ready — original behaviour:
-                            # force commit_hypotheses.
+                            # Coverage is ready (or the argus-failure
+                            # degrade bypassed T1) — force commit.
                             logger.warning(
                                 "Safety: understand stall (round %d) — "
                                 "LLM output text without "
@@ -2027,7 +2116,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 },
                             }]
                             response = ModelResponse(result=[AIMessage(
-                                content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
+                                content=(
+                                    "[系统强制] Argus 监控平台故障（空数据"
+                                    "/报错），监控数据不可用。系统已自动"
+                                    "提交占位假设——请基于用户描述的故障"
+                                    "现象修正假设，后续专家诊断将继续验证。"
+                                    if ledger.get("_argus_unavailable")
+                                    else
+                                    "[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。"
+                                ),
                             )])
                             _inject_tool_calls(response, synthetic)
 
@@ -2374,32 +2471,40 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         - max(self._report_phase_start_round, 1)
                     )
                     if rounds_in_report < 2:
-                        # ── Level 1: Auto-generate report, then END ──
-                        # Do NOT inject synthetic write_file tool calls.
-                        # Injected tool_calls route through tools → model
-                        # is called again → model call can hang (ollama
-                        # GPU drops to 0 / token limit reached), creating
-                        # an unrecoverable stall.  The auto-generated
-                        # report is sufficient — just write it to disk,
-                        # emit frontend events, and let the graph END.
-                        report_md = self._generate_report_from_ledger(ledger)
-                        ledger["report"] = report_md
-                        ledger["_forced_terminal"] = True
-                        _write_report_file(
-                            self.report_path, report_md,
-                            self._AGENT_DATA_REAL,
-                        )
-                        self._persist_ledger(ledger)
-                        _emit_synthetic_write_file_event(
-                            self.report_path, report_md,
+                        # ── Level 1: nudge — the LLM writes the report ──
+                        # Design principle (v2.5): the fault report is
+                        # LLM-authored whenever the LLM can still respond;
+                        # the ledger stub is reserved for "LLM unable to
+                        # call".  A first REPORT stall means the LLM ended
+                        # its turn without write_file — not that it cannot
+                        # write.  Inject a harmless read-only ls call to
+                        # keep the loop alive (Command(goto) unsupported)
+                        # plus a directive demanding write_file next turn.
+                        # If that model call hangs/fails, the G7'
+                        # retry/fallback produces the stub — the same
+                        # worst case as the old stub-first design, so the
+                        # historical hang concern is fully absorbed.
+                        logger.warning(
+                            "Safety: REPORT stall level-1 (round %d) — "
+                            "nudging LLM to call write_file (loop kept "
+                            "alive, no stub yet)",
                             self._model_call_count,
                         )
-                        logger.warning(
-                            "Safety: REPORT stall level-1 (round %d) "
-                            "— auto-generated report (%d chars), "
-                            "letting loop end naturally",
-                            self._model_call_count, len(report_md),
-                        )
+                        import uuid as _uuid_r1
+                        synthetic = [{
+                            "name": "ls",
+                            "id": f"call_safety_{_uuid_r1.uuid4().hex[:12]}",
+                            "args": {"path": "/agent_data"},
+                        }]
+                        response = ModelResponse(result=[AIMessage(
+                            content=(
+                                "⛔ [系统提醒] REPORT 阶段禁止纯文本收尾。\n"
+                                "你必须在下一轮调用 write_file 将完整诊断"
+                                f"报告写入 {self.report_path}。\n"
+                                "禁止调用任何诊断工具，禁止输出纯文本分析。"
+                            ),
+                        )])
+                        _inject_tool_calls(response, synthetic)
                     else:
                         # ── Level 2: Auto-generate as last resort ──
                         report_md = self._generate_report_from_ledger(ledger)
@@ -2630,6 +2735,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         ),
                         tool_call_id=tool_call_id,
                     )
+                # ── Canonicalize the report path (v2.5) ──
+                # The report path is system-generated and handed to the
+                # LLM, which merely carries it back — LLM path
+                # reproduction is unreliable (scenario 29: hash-suffix
+                # typo `bda8640e`→`bda860e` silently discarded a complete
+                # LLM-authored report, system shipped the stub instead).
+                # Any write_file passing the gate above IS the report
+                # write, so coerce its target unconditionally; the LLM
+                # only supplies content.  Downstream capture
+                # (_paths_match backfill, report_content SSE event, stub
+                # suppression) then works unchanged.
+                if self.report_path:
+                    _provided = (tool_args.get("file_path")
+                                 or tool_args.get("path") or "")
+                    if _provided and not _paths_match(
+                            _provided, self.report_path):
+                        logger.warning(
+                            "write_file path coerced to canonical report "
+                            "path: %s -> %s (round=%d)",
+                            _provided, self.report_path,
+                            self._model_call_count,
+                        )
+                    for _k in ("file_path", "path"):
+                        if _k in tool_args:
+                            tool_args[_k] = self.report_path
 
         # ── REPORT-phase gate: prevent restarting diagnosis after
         # a root cause has been confirmed.  Creating new hypotheses
@@ -3333,11 +3463,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 has_k8s = "k8s-argus-expert" in experts_delegated
                 is_host_only = ledger.get("entity_type") == "host"
 
+                if ledger.get("_argus_unavailable"):
+                    # Argus platform failure (v2.5 degrade): coverage and
+                    # delegation interventions are pointless — argus is
+                    # unavailable.  Just keep nudging commit from user
+                    # input; the normal flow continues with domain
+                    # experts collecting evidence in VERIFY.
+                    if round_num >= 3 and _phase(ledger) == "hypothesize":
+                        warnings.append(
+                            "⚠ [系统提示] Argus 监控平台故障，监控数据不"
+                            "可用。\n请基于用户描述的故障现象调用 "
+                            "commit_hypotheses 提出假设，"
+                            "后续专家诊断将继续验证并修正假设。"
+                        )
                 # Only intervene when an expert WAS delegated but one
                 # domain is still uncovered — this indicates a container
                 # scenario where both experts are expected.
                 # Host-only scenarios skip this check entirely.
-                if has_delegated and not is_host_only and has_host and not has_k8s:
+                elif has_delegated and not is_host_only and has_host and not has_k8s:
                     warnings.append(
                         "⚠ [系统强制] 已采集主机 Argus 数据但缺少集群级 "
                         "K8s Argus 数据（query_argus_nodes + "
@@ -3368,32 +3511,44 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     )
                 else:
                     # Data collected but no hypotheses
-                    if _is_data_empty(ledger):
-                        # All expert responses indicate empty/normal data.
-                        # Forcing commit_hypotheses is counterproductive —
-                        # the LLM has nothing to base hypotheses on.
-                        # Short-circuit to REPORT with an explanation.
-                        _force_report(ledger)
-                        self._report_phase_start_round = round_num
-                        self._persist_ledger(ledger)
+                    _argus_state = _classify_argus_data(ledger)
+                    if _argus_state == "failure" or (
+                            _argus_state == "param_missing"
+                            and ledger.get("_argus_redelegated")):
+                        # Argus platform failure (v2.5): argus returned
+                        # empty data / errors — degrade to hypotheses
+                        # from user input.  T1 coverage gate is bypassed
+                        # via _argus_unavailable; the normal
+                        # VERIFY→EVALUATE→REPORT flow continues and
+                        # domain experts can still collect evidence.
+                        if not ledger.get("_argus_unavailable"):
+                            ledger["_argus_unavailable"] = True
+                            self._persist_ledger(ledger)
+                            logger.warning(
+                                "Safety: argus platform failure "
+                                "(round %d, state=%s) — degrading to "
+                                "user-input hypotheses (T1 bypass)",
+                                round_num, _argus_state,
+                            )
                         warnings.append(
-                            "⛔ [系统强制] 已完成数据采集，但所有专家均返回"
-                            "空数据或无异常指标。\n"
-                            "无法形成有意义的诊断假设。\n"
-                            "禁止再调用任何诊断工具或委派专家。\n"
-                            f"必须立即调用 write_file 生成诊断报告"
-                            f"（写入 {self.report_path}），\n"
-                            "报告中说明：当前主机/集群无可用监控数据，"
-                            "建议检查以下可能原因：\n"
-                            "1. 主机名或集群名是否正确\n"
-                            "2. Argus 数据源是否可用\n"
-                            "3. 时间窗口范围内是否有有效数据"
+                            "⚠ [系统提示] Argus 监控平台故障（返回空数据"
+                            "或报错），监控数据不可用。\n"
+                            "请基于用户描述的故障现象调用 "
+                            "commit_hypotheses 提出假设，"
+                            "后续专家诊断将继续验证并修正假设。"
                         )
-                        logger.warning(
-                            "Safety: understand stagnation with EMPTY "
-                            "data (round %d) — forcing REPORT",
-                            round_num,
-                        )
+                    elif _argus_state == "all_normal":
+                        # Metrics genuinely normal — record faithfully
+                        # and continue the normal flow: the user still
+                        # reported a fault, so hypotheses are built from
+                        # user input + the recorded normal baseline.
+                        if round_num >= 3 and _phase(ledger) == "hypothesize":
+                            warnings.append(
+                                "ℹ [系统提示] Argus 指标全部正常（已如实"
+                                "记录）。\n用户仍报告了故障现象——请结合"
+                                "用户输入与已记录的正常基线调用 "
+                                "commit_hypotheses 提出假设。"
+                            )
                     elif round_num >= 3 and _phase(ledger) == "hypothesize":
                         # Coverage gate already opened (phase derives to
                         # hypothesize) but the LLM still hasn't committed —
@@ -4119,6 +4274,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         delegation summary, and excluded hypotheses — producing a
         report comparable in structure to an LLM-written one.
         """
+        # Never clobber an LLM-authored report (v2.5): when the ledger
+        # already carries a non-stub report, return it unchanged.  The
+        # stub is strictly a last-resort fallback for "LLM unable to
+        # call" — LLM-authored content always wins.
+        _existing = ledger.get("report")
+        if _existing and not ledger.get("_report_auto_generated"):
+            return _existing
+
         import datetime as _dt
 
         # Mark the report as system-generated (not LLM-authored) so the

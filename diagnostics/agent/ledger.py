@@ -761,6 +761,13 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     """
     if ledger.get("current_round", 0) < 2:
         return False
+    # v2.5 argus-failure degrade: when the argus monitoring platform
+    # returned empty data / errors (and any one-shot param re-delegation
+    # was exhausted), the coverage gate is bypassed — the LLM commits
+    # hypotheses from user input and the normal VERIFY→EVALUATE→REPORT
+    # flow continues with domain experts collecting evidence.
+    if ledger.get("_argus_unavailable"):
+        return True
     experts_delegated: set[str] = set()
     has_delegated = False
     for rd in ledger.get("rounds", []):
