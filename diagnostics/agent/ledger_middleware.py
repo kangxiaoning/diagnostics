@@ -166,7 +166,7 @@ _LEDGER_TOOLS = frozenset({
 })
 
 # ── Safety mechanism thresholds ──
-_MAX_ROUNDS = 40                    # Hard limit (simple scenario): force REPORT after this many LLM rounds
+_MAX_ROUNDS = 40                    # G1 轮次上限（简单场景，state-machine-v2.md §8）：超过此轮次强制 REPORT
 _MAX_ROUNDS_COMPLEX = 24            # Hard limit when diagnosis went deep (retry batch / depth ≥ 1):
                                     # a diagnosis that needed a second batch or sub-hypotheses is
                                     # already past the healthy budget — further rounds show
@@ -179,7 +179,7 @@ _MAX_ROUNDS_COMPLEX_GRACE = 5       # Smaller grace for the complex-scenario cap
                                     # grace means this only fires on true stagnation)
 _MAX_ROUNDS_GRACE = 10              # Extra rounds granted when diagnosis is progressing
 _PROGRESS_WINDOW = 5                # Recent-round window used to detect progress
-_STAGNATION_THRESHOLD = 3           # Consecutive task() without record_finding → stagnation
+_STAGNATION_THRESHOLD = 3           # G3 停滞阈值（state-machine-v2.md §8）：连续 task() 无 record_finding 判定为 VERIFY 委派无结论
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _VERIFY_STUCK_GAP = 3               # Rounds without verdict/evidence progress → verify-stuck
 _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interventions
@@ -1507,7 +1507,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "部分结果可能已写入报告文件。",
                 )])
 
-        # ── Post-response: detect round-1 text simulation ──
+        # ── G8 首轮文本模拟（state-machine-v2.md §8）：round-1 text simulation ──
         # The LLM may output the entire diagnostic flow as a single
         # simulated text block — complete with fake delegation results,
         # fake hypothesis submissions, and references to past report
@@ -3366,6 +3366,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         cap = _MAX_ROUNDS_COMPLEX if is_complex else _MAX_ROUNDS
         grace = _MAX_ROUNDS_COMPLEX_GRACE if is_complex else _MAX_ROUNDS_GRACE
 
+        # ── G1 最大轮次安全阀（state-machine-v2.md §8）：进展感知停滞兜底 ──
         if round_num >= cap and not ledger.get("_forced_terminal"):
             last_progress = max(
                 self._last_finding_round,
@@ -3592,7 +3593,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     round_num,
                 )
 
-        # ── Delegation saturation — prevent redundant re-delegation ──
+        # ── G5 委派饱和（state-machine-v2.md §8）：防止重复委派相同专家验证相同假设 ──
         # Detects the pattern: task(expert, Hn) → record_finding →
         # task(same expert, same Hn) repeated.  Uses per-key tracking
         # (_same_delegate_count) so that delegating to different experts
@@ -3631,6 +3632,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             current_phase = _phase(ledger)
             has_hypotheses = bool(ledger.get("hypotheses"))
 
+            # ── G3 VERIFY 委派无结论（state-machine-v2.md §8）：连续 3 次 task 无 record_finding ──
             if self._consecutive_task_count >= _STAGNATION_THRESHOLD:
                 if current_phase == "verify" and has_hypotheses:
                     # ── P3: Auto-record inconclusive for active hypothesis ──
