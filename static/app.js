@@ -176,6 +176,13 @@ historyBack.addEventListener("click", () => {
       hypothesisBadge.classList.add("hidden");
     }
   }
+  // Restore tab-button highlight to match the live panel that is actually
+  // active. openHistory may have switched the highlight to 诊断过程 for the
+  // history default view, but the live tab-panel `.active` state is the
+  // source of truth for what the user sees after leaving history.
+  const liveHypActive = !!document.querySelector('[data-panel="hypothesis"]')?.classList.contains("active");
+  if (tabExecution) tabExecution.classList.toggle("active", !liveHypActive);
+  if (tabHypothesis) tabHypothesis.classList.toggle("active", liveHypActive);
   // Refresh main graph edges after layout
   if (GRAPH.hasContent) {
     requestAnimationFrame(() => {
@@ -222,6 +229,13 @@ async function openHistory(item) {
   // Reset inline display styles so CSS class rules take effect
   if (historyViewerBody) { historyViewerBody.style.display = ""; }
   if (historyHypothesisCanvas) { historyHypothesisCanvas.style.display = ""; }
+  // Sync the tab-button highlight to the content actually shown by default
+  // (execution/诊断过程). Removing `history-tab-active` makes the history
+  // viewer display the execution body, but the tab-button `.active` state was
+  // left as whatever it was before opening history (often 推理过程), so the
+  // highlighted tab disagreed with the visible content. Reset it here.
+  if (tabExecution) tabExecution.classList.add("active");
+  if (tabHypothesis) tabHypothesis.classList.remove("active");
   historyBack.classList.remove("hidden");
   historyViewerTitle.classList.remove("hidden");
   const durText = item.duration_secs ? ` · ${Math.round(item.duration_secs)}s` : "";
@@ -1803,8 +1817,30 @@ function renderMarkdown(text) {
   // Links
   out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
     '<a href="$2" target="_blank">$1</a>');
-  // Blockquote
-  out = out.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
+  // Blockquote — note `>` was already escaped to `&gt;` by escNoBr in
+  // Phase 0, so match the escaped form. Consecutive ">" lines are merged
+  // into a single <blockquote> (standard markdown semantics) instead of
+  // emitting one <blockquote> per line.
+  {
+    const blines = out.split('\n');
+    const bres = [];
+    let buf = null;
+    for (const ln of blines) {
+      const m = ln.match(/^&gt; (.+)$/);
+      if (m) {
+        if (buf === null) buf = [];
+        buf.push(m[1]);
+      } else {
+        if (buf !== null) {
+          bres.push('<blockquote>' + buf.join('<br>') + '</blockquote>');
+          buf = null;
+        }
+        bres.push(ln);
+      }
+    }
+    if (buf !== null) bres.push('<blockquote>' + buf.join('<br>') + '</blockquote>');
+    out = bres.join('\n');
+  }
 
   // ── Phase 2: tables ──
   {
@@ -1834,48 +1870,73 @@ function renderMarkdown(text) {
     out = result.join('\n');
   }
 
-  // ── Phase 3: nested lists (up to 2 levels) ──
+  // ── Phase 3: nested lists (stack-based, correct nesting) ──
+  // Replaces the previous buggy version that injected <ul>/<ol> *inside*
+  // each <li> and left the "- " / "N. " marker unstripped (because the
+  // marker was no longer at line start after the list tag prefix was
+  // prepended), producing malformed "<li><ul>- text</li>" output. The new
+  // version builds properly nested lists: a sublist is emitted *inside* its
+  // parent <li>, and the list marker is stripped from `content` *before* any
+  // tag is prepended, so no raw "- " leaks into the rendered HTML. Each
+  // stack entry tracks `liOpen` so sibling <li>s are closed before a new one
+  // opens, keeping the emitted HTML tag-balanced.
   {
     const lines = out.split('\n');
-    let inUl = 0, inOl = 0;  // depth counter
+    const out3 = [];
+    const stack = [];  // entries: { depth:int, type:'ul'|'ol', liOpen:bool }
+    const openTag = (t) => (t === 'ul' ? '<ul>' : '<ol>');
+    const closeTag = (t) => (t === 'ul' ? '</ul>' : '</ol>');
+
+    const closeDeeper = (depth) => {
+      while (stack.length && stack[stack.length - 1].depth > depth) {
+        const g = stack.pop();
+        if (g.liOpen) out3.push('</li>');  // close the last <li> of this list
+        out3.push(closeTag(g.type));
+      }
+    };
+
     for (let i = 0; i < lines.length; i++) {
-      if (/^\x00CB\d+\x00$/.test(lines[i].trim())) {
-        while (inUl > 0) { lines[i] = '</ul>' + lines[i]; inUl--; }
-        while (inOl > 0) { lines[i] = '</ol>' + lines[i]; inOl--; }
+      const raw = lines[i];
+      const trimmed = raw.trim();
+      if (/^\x00CB\d+\x00$/.test(trimmed)) {
+        closeDeeper(-1);  // close all open lists around a code block
+        out3.push(raw);
         continue;
       }
-      let m;
-      // Nested unordered (indented - or *)
-      if ((m = lines[i].match(/^(\s*)[-*] (.+)$/))) {
-        const depth = Math.min(Math.floor(m[1].length / 2), 1);
-        while (inUl > depth) { lines[i] = '</ul>' + lines[i]; inUl--; }
-        while (inOl > 0) { lines[i] = '</ol>' + lines[i]; inOl--; }
-        if (inUl < depth || inUl === 0) {
-          lines[i] = '<ul>' + lines[i]; inUl = depth || 1;
+      const um = raw.match(/^(\s*)[-*]\s+(.+)$/);
+      const om = raw.match(/^(\s*)(\d+)\.\s+(.+)$/);
+      if (um || om) {
+        const indent = (um ? um[1] : om[1]).length;
+        const depth = Math.min(Math.floor(indent / 2), 2);
+        const type = um ? 'ul' : 'ol';
+        const content = um ? um[2] : om[3];
+        closeDeeper(depth);
+        const top = stack[stack.length - 1];
+        if (!stack.length || top.depth < depth) {
+          out3.push(openTag(type));
+          stack.push({ depth, type, liOpen: false });
+        } else if (top.depth === depth && top.type !== type) {
+          // same level but list kind changed: close & reopen
+          if (top.liOpen) { out3.push('</li>'); top.liOpen = false; }
+          out3.push(closeTag(top.type));
+          top.type = type;
+          out3.push(openTag(type));
         }
-        lines[i] = lines[i].replace(/^\s*[-*] /, '');
-        lines[i] = `<li>${lines[i]}</li>`;
-        continue;
-      }
-      // Nested ordered (indented N.)
-      if ((m = lines[i].match(/^(\s*)(\d+)\. (.+)$/))) {
-        const depth = Math.min(Math.floor(m[1].length / 2), 1);
-        while (inOl > depth) { lines[i] = '</ol>' + lines[i]; inOl--; }
-        while (inUl > 0) { lines[i] = '</ul>' + lines[i]; inUl--; }
-        if (inOl < depth || inOl === 0) {
-          lines[i] = '<ol>' + lines[i]; inOl = depth || 1;
+        // close the previous sibling <li> at this level if still open
+        if (stack[stack.length - 1].liOpen) {
+          out3.push('</li>');
+          stack[stack.length - 1].liOpen = false;
         }
-        lines[i] = lines[i].replace(/^\s*\d+\. /, '');
-        lines[i] = `<li>${lines[i]}</li>`;
+        out3.push('<li>' + content);  // <li> left open to host nested sublist
+        stack[stack.length - 1].liOpen = true;
         continue;
       }
-      // Non-list line: close open lists
-      if (inUl > 0) { lines[i] = '</ul>'.repeat(inUl) + lines[i]; inUl = 0; }
-      if (inOl > 0) { lines[i] = '</ol>'.repeat(inOl) + lines[i]; inOl = 0; }
+      // Non-list line: close all open lists
+      closeDeeper(-1);
+      out3.push(raw);
     }
-    while (inUl-- > 0) lines[lines.length - 1] += '</ul>';
-    while (inOl-- > 0) lines[lines.length - 1] += '</ol>';
-    out = lines.join('\n');
+    closeDeeper(-1);
+    out = out3.join('\n');
   }
 
   // ── Phase 4: paragraphs & cleanup ──
@@ -2137,11 +2198,45 @@ function _nodeFingerprint(node) {
   ].join("|");
 }
 
+// ── Display root set for the reasoning tree ──
+// `root_hypothesis_ids` intentionally tracks ONLY the current active batch:
+// the backend resets it on a fresh batch commit (ledger.py commit_root_
+// hypotheses), so prior-batch roots that were refuted/buried stay in
+// `hypotheses` but are dropped from that list. Rendering straight from
+// `root_hypothesis_ids` therefore hid those hypotheses while the tab badge
+// (which counts every hypothesis) still included them — the "6 vs 3" gap.
+// Include every hypothesis whose parent_id is null so the full reasoning
+// record (incl. ruled-out prior-batch roots) is shown and matches the badge.
+function _displayRootIds(ledger, hypotheses) {
+  const declared = ledger.root_hypothesis_ids || [];
+  const seen = new Set(declared);
+  const roots = [...declared];
+  for (const hid of Object.keys(hypotheses)) {
+    const pid = hypotheses[hid].parent_id;
+    if ((pid === null || pid === undefined) && !seen.has(hid)) {
+      seen.add(hid);
+      roots.push(hid);
+    }
+  }
+  // Stable sort by hypothesis creation order (numeric suffix of the id) so
+  // earlier-proposed roots (incl. ruled-out prior-batch H1-H3) appear before
+  // later batches (H4-H6), instead of the active-batch-first order produced
+  // by prepending root_hypothesis_ids.  Avoids lexicographic陷阱 (H10 < H2).
+  roots.sort((a, b) => _hypIdNum(a) - _hypIdNum(b));
+  return roots;
+}
+
+// Numeric index of a hypothesis id ("H3" -> 3, "H10" -> 10) for ordering.
+function _hypIdNum(hid) {
+  const m = String(hid).match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
 // ── Render full tree ──
 function renderHypothesisTree(ledger) {
   if (!ledger) return;
   const hypotheses = ledger.hypotheses || {};
-  const rootIds = ledger.root_hypothesis_ids || [];
+  const rootIds = _displayRootIds(ledger, hypotheses);
 
   if (rootIds.length === 0) {
     if (hypothesisEmpty) hypothesisEmpty.style.display = "flex";
@@ -2458,7 +2553,7 @@ function _renderHistoryHypothesis(ledger) {
   if (!historyHypothesisTree || !historyHypothesisCanvas) return;
 
   const hypotheses = ledger.hypotheses || {};
-  const rootIds = ledger.root_hypothesis_ids || [];
+  const rootIds = _displayRootIds(ledger, hypotheses);
 
   if (rootIds.length === 0) {
     if (historyHypothesisEmpty) historyHypothesisEmpty.style.display = "flex";
