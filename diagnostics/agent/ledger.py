@@ -236,7 +236,7 @@ def new_evidence(
     """
     return Evidence(
         source=source,
-        summary=summary[:300],
+        summary=summary[:3000],
         supports=supports,
         tool_call_id=tool_call_id,
         timestamp=datetime.now(UTC).isoformat(),
@@ -924,7 +924,7 @@ def backtrack(ledger: DiagnosisLedger) -> str | None:
     return None
 
 
-def _clean_evidence_text(text: str, max_chars: int = 250) -> str:
+def _clean_evidence_text(text: str, max_chars: int = 3000) -> str:
     """Flatten markdown in evidence/reason text for tree rendering.
 
     Expert outputs contain ``##``/``###`` headings and ``**`` bold
@@ -1034,14 +1034,14 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                 tag = _TERMINAL_REASON_TAG.get(tr, "已证伪")
             lines.append(
                 f"- [{tag}] {h['id']} {h['statement']}: "
-                f"{_clean_evidence_text(reason, 200)}"
+                f"{_clean_evidence_text(reason, 2000)}"
             )
         for h in deferred:
             reason = (h.get("deferred_reason") or h.get("rationale", "")
                       or "(无记录)")
             lines.append(
                 f"- [搁置待回溯 p={h['probability']}%] {h['id']} "
-                f"{h['statement']}: {_clean_evidence_text(reason, 200)}"
+                f"{h['statement']}: {_clean_evidence_text(reason, 2000)}"
             )
         lines.append("")
 
@@ -1161,7 +1161,7 @@ def _render_hypothesis_tree(
         for ev in evidence_entries:
             lines.append(
                 f"{prefix}  证据: "
-                f"{_clean_evidence_text(ev.get('summary', ''))} "
+                f"{_clean_evidence_text(ev.get('summary', ''), 3000)} "
                 f"({_support_tag(ev.get('supports'))})"
             )
         # Verification tools
@@ -1175,7 +1175,7 @@ def _render_hypothesis_tree(
             reason = node.get("verdict_reason") or node.get("rationale", "")
             if reason:
                 lines.append(
-                    f"{prefix}  理由: {_clean_evidence_text(reason, 150)}"
+                    f"{prefix}  理由: {_clean_evidence_text(reason, 2000)}"
                 )
         # Sub-hypotheses
         if node["sub_hypothesis_ids"]:

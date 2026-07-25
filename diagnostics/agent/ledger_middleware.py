@@ -438,7 +438,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
                 lines.append(f"  {node.get('statement', '')}")
                 rationale = node.get("rationale", "")
                 if rationale:
-                    lines.append(f"  依据: {rationale[:200]}")
+                    lines.append(f"  依据: {rationale}")
             lines.append("")
 
         if refuted:
@@ -446,7 +446,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
             for hid, node in refuted:
                 rationale = node.get("rationale", "") or "(无记录)"
                 lines.append(f"- **{hid}**: {node.get('statement', '')}")
-                lines.append(f"  原因: {rationale[:150]}")
+                lines.append(f"  原因: {rationale}")
             lines.append("")
 
         if unfinished:
@@ -726,7 +726,7 @@ def _is_substantial_report_text(text: str) -> bool:
 
 
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
-                             max_chars: int = 1500) -> str:
+                             max_chars: int = 24000) -> str:
     """Extract already-collected evidence from the ledger for subagent injection.
 
     When a subagent is delegated via task(), it normally sees only the
@@ -818,8 +818,7 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
         for e in evidence_entries:
             s = e.get("summary", "").strip()
             if s:
-                # Truncate each evidence entry to keep context compact
-                summaries.append(s[:250])
+                summaries.append(s)
         if summaries:
             status_label = {"confirmed": "✓", "refuted": "✗", "inconclusive": "?"}.get(h["status"], "⟳")
             lines.append(f"\n假设 {hid} [{status_label}] {h.get('statement', '')}:")
@@ -832,7 +831,7 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
         finding = expert.get("finding", "")
         if finding:
             lines.append(f"\n已委派专家: {expert.get('expert', '?')} ({expert.get('skill', '?')})")
-            lines.append(f"  结论: {finding[:300]}")
+            lines.append(f"  结论: {finding}")
 
     context = "\n".join(lines)
     if len(context) > max_chars:
@@ -3092,10 +3091,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             tool_name=tool_name,
                         )
 
-            # Build key_findings from tool output (first 200 chars)
+            # Build key_findings from tool output.
+            # Normal outputs are truncated (kept as a concise "key finding"),
+            # but failing tool calls (LangChain ToolNode errors) keep their
+            # full message so the root cause is traceable in post-hoc review.
             key_findings = ""
             if output:
-                key_findings = output[:200].replace("\n", " ").strip()
+                key_findings = output.replace("\n", " ").strip()
+                is_error = key_findings.startswith("Error invoking tool") or \
+                    "Error:" in key_findings
+                if is_error:
+                    if len(key_findings) > 2000:
+                        key_findings = key_findings[:2000] + " …(truncated)"
+                elif len(key_findings) > 200:
+                    key_findings = key_findings[:200] + " …(truncated)"
 
             # Track delegated experts for coverage detection
             delegated = None
@@ -4338,7 +4347,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if "task" not in r.get("tools_called", []):
                     continue  # skip non-expert rounds
                 # Truncate long findings
-                kf_short = kf[:250] + "..." if len(kf) > 250 else kf
+                kf_short = kf
                 if kf_short:
                     lines.append(
                         f"- **第{r['round']}轮{expert_label}**: {kf_short}"
@@ -4368,7 +4377,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         lines.append(f"- **[{src}]**({supp}): {summary}")
                 rationale = h.get("rationale", "")
                 if rationale:
-                    lines.append(f"\n依据: {rationale[:300]}")
+                    lines.append(f"\n依据: {rationale}")
                 lines.append("")
         else:
             lines.append("（无已确认假设，无可提取证据链。）\n")

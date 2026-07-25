@@ -34,7 +34,7 @@ def _render_trace_hypothesis(
     lines.append(f"{prefix}- `{hid}` [{status} p={prob}%]{star} {stmt}")
     for ev in node.get("evidence", []):
         tag = "支持" if ev.get("supports") else "反驳"
-        lines.append(f"{prefix}  - ({tag}) {ev.get('summary', '')[:100]}")
+        lines.append(f"{prefix}  - ({tag}) {ev.get('summary', '')[:3000]}")
     for sid in node.get("sub_hypothesis_ids", []):
         _render_trace_hypothesis(lines, hypotheses, sid, indent + 1)
 
@@ -125,10 +125,10 @@ class TraceWriter:
         _ = round_num, tool_name
         if not output_full:
             return
-        summary = output_full[:3000].rstrip()
+        summary = output_full[:8000].rstrip()
         suffix = (
             f"\n\n> ... (truncated, {len(output_full)} chars total)"
-            if len(output_full) > 3000 else ""
+            if len(output_full) > 8000 else ""
         )
         indented = "> " + summary.replace("\n", "\n> ") + suffix
         result_lines = ["", indented, ""]
