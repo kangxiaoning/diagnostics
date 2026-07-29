@@ -11,6 +11,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
+from diagnostics.agent.file_tool_governance import ExpertFileToolGovernanceMiddleware
 from diagnostics.agent.ledger import DiagnosisLedgerState
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
@@ -468,10 +469,16 @@ def build_agent(
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)
 
+    # Expert file-tool governance — path whitelist, read-window boost,
+    # exact-repeat dedup, per-delegation read budget (A1-A4).  Expert-only:
+    # the Coordinator's file tools (report writing) stay untouched.
+    governance_subagent = ExpertFileToolGovernanceMiddleware()
+
     # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
-    _subagent_middleware = [dedup_subagent, subagent_ledger]
+    # Governance runs before ledger so denied calls skip ledger bookkeeping.
+    _subagent_middleware = [dedup_subagent, governance_subagent, subagent_ledger]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 

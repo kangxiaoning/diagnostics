@@ -38,6 +38,15 @@ _DEDUP_CACHE_PREFIX = "/_dedup_cache"
 _TOOL_FAILURE_BREAKER = int(os.getenv("DIAGNOSTICS_TOOL_FAILURE_BREAKER", "2"))
 """Consecutive failures of same tool → auto-block retry."""
 
+_FULL_CONTENT_MAX = int(os.getenv("DIAGNOSTICS_DEDUP_FULL_CONTENT_MAX", "30000"))
+"""Subagent dedup hits return full content (not preview) up to this size.
+
+A subagent starts with a fresh context — the original result is NOT in
+its history, so a 300-char preview forces a read_file round-trip (often
+several, paginated).  Returning the full content directly below this
+threshold eliminates that round-trip; deepagents' eviction (~80k chars)
+does not re-trigger.  Larger results keep the preview+path flow."""
+
 # ── Pattern: transport/network-level tool failures ─────────────────────────
 
 _TOOL_FAILURE_PATTERNS = re.compile(
@@ -139,6 +148,9 @@ class ToolDedupMiddleware(AgentMiddleware):
 
     def __init__(self, backend: BackendProtocol | None = None) -> None:
         self._backend = backend
+        # True only on instances created via for_subagent() — enables
+        # full-content dedup hits for fresh-context experts (B1).
+        self._is_subagent = False
         # In-memory cache shared across agents via for_subagent()
         self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
         # In-flight futures shared across agents via for_subagent()
@@ -158,6 +170,7 @@ class ToolDedupMiddleware(AgentMiddleware):
         is deduplicated when a subagent tries the same call, and vice versa.
         """
         instance = cls(backend=coordinator._backend)
+        instance._is_subagent = True
         instance._tool_call_cache = coordinator._tool_call_cache
         instance._in_flight = coordinator._in_flight
         return instance
@@ -213,6 +226,22 @@ class ToolDedupMiddleware(AgentMiddleware):
         if len(full_content) > 300:
             preview += "…"
         backend_path = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+        # B1: subagents start with a fresh context — the original result
+        # is NOT in their message history, so a bare preview forces a
+        # (often paginated) read_file round-trip.  Return the full
+        # content directly when it fits; the expert's fresh context +
+        # summarization absorbs it, eliminating the round-trip.
+        if self._is_subagent and len(full_content) <= _FULL_CONTENT_MAX:
+            return ToolMessage(
+                content=(
+                    f"[系统去重] {tool_name} 与此前一次调用的参数完全相同，"
+                    "本次未重复执行。完整结果（"
+                    f"{len(full_content)} 字符，与此前一致）如下：\n"
+                    f"---\n{full_content}\n---"
+                ),
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
         return ToolMessage(
             content=(
                 f"[系统去重] {tool_name} 与此前一次调用的参数完全相同，"
@@ -220,7 +249,8 @@ class ToolDedupMiddleware(AgentMiddleware):
                 f"---\n{preview}\n---\n"
                 f"完整结果（{len(full_content)} 字符）与此前一致"
                 "（若上方历史消息中已有该结果，直接引用即可）；"
-                f"如需全文可 read_file \"{backend_path}\"。"
+                f"如需全文：read_file \"{backend_path}\" 一次性大窗口读取"
+                "（limit≥500，按 offset 顺推），避免逐页翻读。"
             ),
             tool_call_id=tool_call_id,
             name=tool_name,
