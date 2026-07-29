@@ -31,10 +31,10 @@ PHASE_SPEC: dict[str, dict] = {
         "title": "阶段 2: HYPOTHESIZE（形成假设）",
         "duty": "基于已收集证据，一次性提出最多 3 个可能性最大的假设（按概率降序），"
                 "每个标注概率(0-100)和依据。适用于三种场景：首批、深化（confirmed 假设下"
-                "更具体的子假设）、换批（前批全部证伪后换方向）。",
+                "更具体的假设）、换批（前批全部证伪后换方向）。",
         "actions": [
             "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
-            "深化：commit_hypotheses(parent_hypothesis_id=...) 提交子假设，不消耗批次预算",
+            "深化：commit_hypotheses(parent_hypothesis_id=...) 提交假设，不消耗批次预算",
             "换批：根假设最多 2 批，第 2 批在前批无 confirmed 且无活跃 pending 后开放"
             "（搁置/inconclusive 不阻塞），必须基于已排除证据换方向，禁止重复或仅换措辞",
         ],
