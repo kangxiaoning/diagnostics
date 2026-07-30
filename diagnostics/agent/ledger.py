@@ -413,8 +413,11 @@ def add_hypotheses(
         if not can_commit_root_hypotheses(ledger):
             if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
                 raise ValueError(
-                    f"根假设批次预算已用尽（{MAX_ROOT_COMMIT_BATCHES} 批）。"
-                    "请基于已有假设的验证结果生成报告。"
+                    f"根假设批次预算已用尽（{MAX_ROOT_COMMIT_BATCHES} 批），"
+                    "不可再开新批。请基于现有假设继续：select_path 切换验证"
+                    "焦点 / backtrack 恢复搁置假设 / record_finding 终结活跃"
+                    "假设；全部根假设证伪时系统会自动进入 REPORT（T9），"
+                    "无需手动提交。"
                 )
             raise ValueError(
                 "当前批仍有活跃 pending 或已 confirmed 的根假设，不可换批。"
@@ -690,8 +693,16 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
          exit; only genuinely terminal states fall through to REPORT.
       5. Exit conditions E1-E4 → report; otherwise evaluate.
     """
-    # 1. REPORT terminal lock.
-    if ledger.get("report"):
+    # 1. REPORT terminal lock: report already written, OR a guardrail
+    #    forced the terminal entry (§8: G1 max-rounds / G7 fallback / G9 /
+    #    verify-stall).  The forced marker is ledger data, so P1 (phase
+    #    derived purely from the ledger) still holds; honouring it here
+    #    keeps the rendered phase guidance consistent with the tool gate
+    #    and the middleware's effective phase (both already treat
+    #    _forced_terminal as REPORT) — otherwise a forced entry with no
+    #    confirmed root cause would keep rendering the EVALUATE/
+    #    HYPOTHESIZE menu while the gate rejects those tools.
+    if ledger.get("report") or ledger.get("_forced_terminal"):
         return "report"
 
     hypotheses = ledger.get("hypotheses", {})
@@ -1609,6 +1620,33 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
                 f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批根假设全部证伪，"
                 "未确认根因"
             ), None
+        # ── E2′ economic exhaustion (fast lane) ──
+        # Batch budget strictly spent AND every surviving root is
+        # economically dead (delegation_value < κ — G5 would reject any
+        # further delegation anyway): E2's "无可执行动作" semantics
+        # completed for the terminal mix the refuted-only check misses
+        # (e.g. H1–H5 refuted + H6 inconclusive whose value decayed below
+        # κ after one delegation + one inconclusive verdict; observed
+        # 2026-07-30 production: write_file gate-rejected, LLM detoured
+        # through backtrack for three rounds).  Deferred survivors still
+        # block — explicitly shelved = revivable direction (G9 handles).
+        # The budget test uses the raw commit count, NOT the can_commit
+        # proxy (an active pending node would poison that proxy).
+        if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
+            survivors = [
+                node for hid in root_ids
+                if (node := hypotheses.get(hid)) is not None
+                and node.get("status") not in _HARD_FAILED_STATUSES
+            ]
+            if survivors and all(
+                    node.get("status") in ("pending", "inconclusive")
+                    and not node.get("deferred")
+                    and delegation_value(node) < KAPPA_STOP
+                    for node in survivors):
+                return True, (
+                    f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批根假设预算用尽，"
+                    "残余未决假设的验证增益均低于成本（κ），未确认根因"
+                ), None
 
     # ── S1: confidence sufficient ──
     if not confirmed_ids:

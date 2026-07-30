@@ -39,6 +39,17 @@ _TOOL_FAILURE_BREAKER = int(os.getenv("DIAGNOSTICS_TOOL_FAILURE_BREAKER", "2"))
 """Consecutive failures of same tool → auto-block retry."""
 
 _FULL_CONTENT_MAX = int(os.getenv("DIAGNOSTICS_DEDUP_FULL_CONTENT_MAX", "30000"))
+
+# Subagent repeat-invocation escalation (2026-07-30 production: an expert
+# issued dozens of duplicate calls — cache hits are FREE, so nothing
+# stopped the repetition).  Identical (tool, args) hits are counted per
+# cache key on subagent instances: hits < WARN behave as before (full
+# content returned, fresh-context recovery), hits >= WARN prepend an
+# escalating warning, hits >= BLOCK are refused with a corrective
+# message pointing at the cache file (data stays reachable via
+# read_file — the block denies only the invocation, not the data).
+_SUBAGENT_REPEAT_WARN = int(os.getenv("DIAGNOSTICS_SUBAGENT_REPEAT_WARN", "3"))
+_SUBAGENT_REPEAT_BLOCK = int(os.getenv("DIAGNOSTICS_SUBAGENT_REPEAT_BLOCK", "5"))
 """Subagent dedup hits return full content (not preview) up to this size.
 
 A subagent starts with a fresh context — the original result is NOT in
@@ -155,6 +166,8 @@ class ToolDedupMiddleware(AgentMiddleware):
         self._tool_call_cache: dict[str, tuple[ToolMessage, int]] = {}
         # In-flight futures shared across agents via for_subagent()
         self._in_flight: dict[str, asyncio.Future] = {}
+        # Subagent repeat-hit counter per cache key (escalation F2).
+        self._subagent_hit_counts: dict[str, int] = {}
         logger.info(
             "ToolDedupMiddleware: backend=%s, breaker=%d",
             "enabled" if backend else "disabled",
@@ -211,6 +224,7 @@ class ToolDedupMiddleware(AgentMiddleware):
         tool_call_id: str,
         tool_name: str,
         full_content: str,
+        repeat_count: int = 0,
     ) -> ToolMessage:
         """Build the dedup-hit ToolMessage: short preview + retrieval path.
 
@@ -226,6 +240,17 @@ class ToolDedupMiddleware(AgentMiddleware):
         if len(full_content) > 300:
             preview += "…"
         backend_path = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
+        # F2 escalation: repeated identical invocations are no longer
+        # silent free hits — past WARN the message carries an explicit
+        # repetition count and the BLOCK threshold announcement.
+        warning = ""
+        if repeat_count >= _SUBAGENT_REPEAT_WARN:
+            warning = (
+                f"⚠ 这是第 {repeat_count} 次以相同参数重复调用该工具"
+                "（结果与前几次完全一致）。重复调用浪费诊断轮次——"
+                "直接引用本结果，禁止再次调用；"
+                f"第 {_SUBAGENT_REPEAT_BLOCK} 次起将被系统拦截。\n"
+            )
         # B1: subagents start with a fresh context — the original result
         # is NOT in their message history, so a bare preview forces a
         # (often paginated) read_file round-trip.  Return the full
@@ -234,7 +259,8 @@ class ToolDedupMiddleware(AgentMiddleware):
         if self._is_subagent and len(full_content) <= _FULL_CONTENT_MAX:
             return ToolMessage(
                 content=(
-                    f"[系统去重] {tool_name} 与此前一次调用的参数完全相同，"
+                    warning
+                    + f"[系统去重] {tool_name} 与此前一次调用的参数完全相同，"
                     "本次未重复执行。完整结果（"
                     f"{len(full_content)} 字符，与此前一致）如下：\n"
                     f"---\n{full_content}\n---"
@@ -294,9 +320,33 @@ class ToolDedupMiddleware(AgentMiddleware):
                 self._emit_dedup_event(tool_call_id)
                 full = cached_msg.content if isinstance(
                     cached_msg.content, str) else str(cached_msg.content)
+                repeat_count = 0
+                if self._is_subagent:
+                    repeat_count = (
+                        self._subagent_hit_counts.get(cache_key, 0) + 1)
+                    self._subagent_hit_counts[cache_key] = repeat_count
+                    if repeat_count >= _SUBAGENT_REPEAT_BLOCK:
+                        logger.warning(
+                            "去重拦截(重复%d次): %s",
+                            repeat_count, cache_key,
+                        )
+                        return ToolMessage(
+                            content=(
+                                f"⛔ [系统去重] 这是第 {repeat_count} 次以完全"
+                                f"相同参数调用 {tool_name}——结果与前几次一致，"
+                                "重复调用不会获得新数据。\n"
+                                "完整结果在上方历史消息中；若已被压缩，可 "
+                                f'read_file "{_DEDUP_CACHE_PREFIX}/{cache_key}"'
+                                "（limit≥500）一次性查看。\n"
+                                "请立即基于已有数据产出结论并返回；"
+                                "如证据不足，在返回中明确说明还缺什么数据。"
+                            ),
+                            tool_call_id=tool_call_id,
+                            name=cached_msg.name or tool_name,
+                        )
                 return self._dedup_hit_result(
                     cache_key, tool_call_id, cached_msg.name or tool_name,
-                    full,
+                    full, repeat_count=repeat_count,
                 )
             # Previous call(s) failed → this is a retry
             if fail_count >= _TOOL_FAILURE_BREAKER:

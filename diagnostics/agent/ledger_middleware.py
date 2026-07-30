@@ -113,9 +113,12 @@ _PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
     "understand": frozenset({
         "commit_hypotheses", "record_finding", "select_path", "backtrack",
     }),
-    # HYPOTHESIZE only commits; no findings/paths yet.
+    # HYPOTHESIZE only commits; no findings/paths/delegations yet
+    # (§7 whitelist: commit_hypotheses + read_file).  Letting task()
+    # through here would pull VERIFY behaviour forward and expose the
+    # G5 delegation-value gate outside its designed phase.
     "hypothesize": frozenset({
-        "record_finding", "select_path", "backtrack",
+        "record_finding", "select_path", "backtrack", "task",
     }),
     # VERIFY delegates + records findings; no commits/paths.
     "verify": frozenset({
@@ -1247,7 +1250,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         context_block = render_ledger_context(ledger, report_path=self.report_path,
                                                start_time=self._start_time,
                                                end_time=self._end_time)
-        safety_block = self._build_safety_warnings(ledger)
+        safety_block, safety_mutated = self._build_safety_warnings(ledger)
+        if safety_mutated:
+            # A valve mutated the ledger during prompt assembly (auto
+            # verdict / forced REPORT / argus degrade) — re-render the
+            # context so the phase guidance describes the post-mutation
+            # state instead of contradicting the valve's own directive
+            # (same pattern as the Phase-guard re-render below).
+            context_block = render_ledger_context(ledger, report_path=self.report_path,
+                                                   start_time=self._start_time,
+                                                   end_time=self._end_time)
 
         # ── Phase guard: finalize pending hypotheses on REPORT entry ──
         # Only fires on LEGITIMATE report entries:
@@ -1621,35 +1633,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "round %d) — auto-confirmed %s, forced REPORT",
                                 self._model_call_count, active_id,
                             )
-                            # Auto-generate report as backup, then
-                            # inject synthetic write_file to keep the
-                            # graph loop alive (Command(goto) is not
-                            # supported by langchain wrap_model_call).
-                            report_md = self._generate_report_from_ledger(ledger)
-                            ledger["report"] = report_md
-                            ledger["_forced_terminal"] = True
-                            _write_report_file(
-                                self.report_path, report_md,
-                                self._AGENT_DATA_REAL,
-                            )
-                            self._persist_ledger(ledger)
-                            import uuid as _uuid
-                            synthetic = [{
-                                "name": "write_file",
-                                "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                                "args": {
-                                    "file_path": self.report_path,
-                                    "content": report_md,
-                                },
-                            }]
-                            response = ModelResponse(result=[AIMessage(
-                                content=(
-                                    "[系统安全阀] verify 阶段已结束，"
-                                    f"假设 {active_id} 已自动确认。"
-                                    "系统已自动生成诊断报告。"
-                                ),
-                            )])
-                            _inject_tool_calls(response, synthetic)
+                            # Do NOT generate/write the report here —
+                            # verify only records the verdict and hands
+                            # over to the state machine (same pattern as
+                            # branch C below and the G9 evaluate valve).
+                            # The REPORT-phase post-response handler runs
+                            # later in this same pass: it nudges the LLM
+                            # to author the report via write_file
+                            # (level-1), with the ledger stub (level-2) or
+                            # the G7 fallback reserved for "LLM unable".
+
                         elif has_expert:
                             # Expert evidence exists but no coordinator
                             # assessment yet — LLM likely received expert
@@ -1804,35 +1797,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     self._model_call_count, auto_verdict,
                                     active_id,
                                 )
-                                # Auto-generate report as backup, then
-                                # inject synthetic write_file to keep loop
-                                # alive (Command(goto) not supported by
-                                # langchain wrap_model_call).
-                                report_md = self._generate_report_from_ledger(ledger)
-                                ledger["report"] = report_md
-                                ledger["_forced_terminal"] = True
-                                _write_report_file(
-                                    self.report_path, report_md,
-                                    self._AGENT_DATA_REAL,
-                                )
-                                self._persist_ledger(ledger)
-                                import uuid as _uuid
-                                synthetic = [{
-                                    "name": "write_file",
-                                    "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                                    "args": {
-                                        "file_path": self.report_path,
-                                        "content": report_md,
-                                    },
-                                }]
-                                response = ModelResponse(result=[AIMessage(
-                                    content=(
-                                        "[系统安全阀] verify 阶段已结束，"
-                                        f"假设 {active_id} 已自动{auto_verdict}。"
-                                        "系统已自动生成诊断报告。"
-                                    ),
-                                )])
-                                _inject_tool_calls(response, synthetic)
+                                # Do NOT generate/write the report here —
+                                # verify only records the verdict and hands
+                                # over to the state machine (same pattern as
+                                # branch C below and the G9 evaluate valve).
+                                # The REPORT-phase post-response handler runs
+                                # later in this same pass: it nudges the LLM
+                                # to author the report via write_file
+                                # (level-1), with the ledger stub (level-2)
+                                # or the G7 fallback reserved for "LLM
+                                # unable".
 
                         else:
                             # —— 分支 C（新增）：verifying 但无任何已记录证据 ——
@@ -2066,63 +2040,65 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             else:
                                 # Coverage gate reports not-ready but
                                 # all expected experts already delegated
-                                # (should not normally happen).  Fall
-                                # through to the original commit injection
-                                # as a last resort.
+                                # (should not normally happen).  Nudge the
+                                # loop alive with a harmless read-only call
+                                # — do NOT inject a placeholder commit: it
+                                # would be rejected by the UNDERSTAND phase
+                                # gate, consume root-batch budget, and
+                                # pollute the hypothesis tree (same
+                                # principle as the G9 evaluate valve, §8).
                                 logger.warning(
-                                    "Safety: understand stall (round %d)"
-                                    " — LLM output text without "
-                                    "commit_hypotheses, forcing "
-                                    "continuation via SystemMessage",
+                                    "Safety: understand stall (round %d) — "
+                                    "coverage anomaly (experts delegated, "
+                                    "gate not ready), nudging continuation",
                                     self._model_call_count,
                                 )
                                 import uuid as _uuid3
                                 synthetic = [{
-                                    "name": "commit_hypotheses",
+                                    "name": "ls",
                                     "id": f"call_safety_{_uuid3.uuid4().hex[:12]}",
-                                    "args": {
-                                        "hypotheses": [
-                                            {"statement": "诊断假设待补充",
-                                             "probability": 50,
-                                             "rationale": "系统自动创建"},
-                                        ],
-                                    },
+                                    "args": {"path": "/agent_data"},
                                 }]
                                 response = ModelResponse(result=[AIMessage(
-                                    content="[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。",
+                                    content=(
+                                        "[系统提醒] 监控数据采集状态异常"
+                                        "（专家已委派但覆盖门控未就绪）。"
+                                        "请查看已有工具调用结果：若数据已返回，"
+                                        "请基于数据继续诊断流程。"
+                                    ),
                                 )])
                                 _inject_tool_calls(response, synthetic)
                         else:
                             # Coverage is ready (or the argus-failure
-                            # degrade bypassed T1) — force commit.
+                            # degrade bypassed T1) — nudge commit via a
+                            # harmless read-only call.  Do NOT inject a
+                            # placeholder commit_hypotheses: a placeholder
+                            # root batch consumes batch budget and pollutes
+                            # the tree (same principle as the G9 evaluate
+                            # valve, state-machine-v2.md §8).
                             logger.warning(
                                 "Safety: understand stall (round %d) — "
-                                "LLM output text without "
-                                "commit_hypotheses, forcing continuation "
-                                "via SystemMessage",
+                                "LLM output text without commit_hypotheses, "
+                                "nudging commit via synthetic call",
                                 self._model_call_count,
                             )
                             import uuid as _uuid4
                             synthetic = [{
-                                "name": "commit_hypotheses",
+                                "name": "ls",
                                 "id": f"call_safety_{_uuid4.uuid4().hex[:12]}",
-                                "args": {
-                                    "hypotheses": [
-                                        {"statement": "诊断假设待补充",
-                                         "probability": 50,
-                                         "rationale": "系统自动创建"},
-                                    ],
-                                },
+                                "args": {"path": "/agent_data"},
                             }]
                             response = ModelResponse(result=[AIMessage(
                                 content=(
                                     "[系统强制] Argus 监控平台故障（空数据"
-                                    "/报错），监控数据不可用。系统已自动"
-                                    "提交占位假设——请基于用户描述的故障"
-                                    "现象修正假设，后续专家诊断将继续验证。"
+                                    "/报错），监控数据不可用。请基于用户描述"
+                                    "的故障现象立即调用 commit_hypotheses "
+                                    "提交假设，后续专家诊断将继续验证并修正。"
                                     if ledger.get("_argus_unavailable")
                                     else
-                                    "[系统强制] 已连续输出纯文本而未提交假设。系统已自动提交占位假设，请基于监控数据修正。"
+                                    "[系统强制] 你已连续输出纯文本而未提交假设。"
+                                    "请立即基于已有数据调用 commit_hypotheses "
+                                    "提交假设（最多3个，按概率降序，各附依据）。"
                                 ),
                             )])
                             _inject_tool_calls(response, synthetic)
@@ -2160,24 +2136,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and _phase(ledger) == "evaluate"):
             if _response_ends_loop(response):
                 all_h = ledger.get("hypotheses", {})
-                root_ids = ledger.get("root_hypothesis_ids", [])
-                # Actionable roots (§6.3 R-set): pending/inconclusive and
-                # not shelved; low-probability pending (p<=15) is exempt,
-                # inconclusive always stays actionable.
+                # Actionable nodes (§6.3 R-set semantics), scanned
+                # TREE-WIDE — not just the root layer: pending /
+                # inconclusive and not shelved; low-probability pending
+                # (p<=15) is exempt, inconclusive always stays actionable.
+                # A confirmed root with an unverified sub-hypothesis
+                # (deepening in progress) is a legal direction via T5
+                # select_path; a roots-only scan is blind to it and would
+                # force-REPORT over an open deepening line.
                 actionable = [
-                    hid for hid in root_ids
-                    if (node := all_h.get(hid))
-                    and node.get("status") in ("pending", "inconclusive")
+                    hid for hid, node in all_h.items()
+                    if node.get("status") in ("pending", "inconclusive")
                     and not node.get("deferred")
                     and (node.get("status") == "inconclusive"
                          or node.get("probability", 0) > 15)
                 ]
-                # Revivable roots: explicitly shelved (deferred) but still
+                # Revivable nodes: explicitly shelved (deferred) but still
                 # undecided — select_path clears the shelved mark.
                 revivable = [
-                    hid for hid in root_ids
-                    if (node := all_h.get(hid))
-                    and node.get("status") in ("pending", "inconclusive")
+                    hid for hid, node in all_h.items()
+                    if node.get("status") in ("pending", "inconclusive")
                     and node.get("deferred")
                 ]
                 batch_open = can_commit_root_hypotheses(ledger)
@@ -2713,15 +2691,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #      system, so a rewrite is idempotent and harmless.
         if tool_name == "write_file":
             ledger = self._current_ledger
-            if ledger and ledger.get("hypotheses"):
+            # Gate ALWAYS applies — including the zero-hypothesis state:
+            # check_exit_conditions returns False there, so an UNDERSTAND-
+            # phase write_file can no longer short-circuit the whole
+            # state machine into the REPORT terminal lock (§7 T12).
+            # Guardrail paths stay open: _forced_terminal is set before
+            # any synthetic write_file injection (G7), and system-side
+            # stub writers never go through this tool.
+            if ledger:
                 should_exit, reason, _ = check_exit_conditions(ledger)
                 if not should_exit and not (
                     ledger.get("_forced_terminal") or ledger.get("report")
                 ):
+                    if not reason:
+                        reason = "诊断尚未建立任何假设"
                     logger.warning(
                         "write_file blocked by exit-condition gate: %s "
                         "(phase=%s, round=%d, path=%s)",
-                        reason or "退出条件未满足",
+                        reason,
                         _phase(ledger),
                         self._model_call_count,
                         tool_args.get("file_path")
@@ -3193,11 +3180,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if content:
                     # Backfill report content into the ledger so that
                     # result.json carries the full report text alongside
-                    # the structured hypothesis data.  This write_file is
-                    # LLM-authored — clear the auto-generated stub mark (G10).
+                    # the structured hypothesis data.  Clear the
+                    # auto-generated stub mark (G10) only when the content
+                    # is NOT the stub itself: guardrail-injected synthetic
+                    # write_file calls (G7 timeout / verify-stall fallback)
+                    # carry the auto-generated stub verbatim — clearing the
+                    # mark on such an echo would disguise the stub as
+                    # LLM-authored, permanently disabling the G10
+                    # overwrite invitation and the REPORT-stall salvage.
                     if ledger:
+                        _is_stub_echo = (
+                            ledger.get("_report_auto_generated")
+                            and content == ledger.get("report")
+                        )
                         ledger["report"] = content
-                        ledger["_report_auto_generated"] = False
+                        if not _is_stub_echo:
+                            ledger["_report_auto_generated"] = False
 
                     try:
                         sw = getattr(request.runtime, "stream_writer", None)
@@ -3333,8 +3331,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     # ── Safety mechanisms: max-round, loop detection, stagnation fallback ──
 
-    def _build_safety_warnings(self, ledger: DiagnosisLedger) -> str:
+    def _build_safety_warnings(self, ledger: DiagnosisLedger) -> tuple[str, bool]:
         """Build safety directive messages injected into the system prompt.
+
+        Returns ``(warnings_text, mutated)``.  ``mutated`` is True when a
+        valve changed ledger state during this pass (auto-verdict via
+        record_finding / forced REPORT / argus degrade) — the caller then
+        re-renders the ledger context, which was rendered BEFORE these
+        mutations and would otherwise contradict the valve directives.
 
         Safety mechanisms prevent infinite loops and premature termination:
 
@@ -3354,6 +3358,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         """
         round_num = self._model_call_count
         warnings: list[str] = []
+        mutated = False  # set when a valve changes ledger state below
 
         # ── P1: Maximum round limit — progress-aware, then synthesis + REPORT ──
         # The round cap is a stagnation backstop, not a blunt cutoff: when
@@ -3408,6 +3413,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 _force_report(ledger)
                 ledger["_forced_terminal"] = True
                 self._report_phase_start_round = round_num
+                mutated = True
                 # Replace the blunt "STOP NOW" directive with a comprehensive
                 # diagnostic synthesis that helps the LLM produce a quality
                 # report from everything learned so far.
@@ -3534,6 +3540,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         if not ledger.get("_argus_unavailable"):
                             ledger["_argus_unavailable"] = True
                             self._persist_ledger(ledger)
+                            mutated = True
                             logger.warning(
                                 "Safety: argus platform failure "
                                 "(round %d, state=%s) — degrading to "
@@ -3583,24 +3590,40 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             round_num,
                         )
             else:
-                # No data collected — force diagnostic data collection
-                warnings.append(
-                    "⚠ [系统强制] 当前是第"
-                    f"{round_num}轮，你尚未提交任何假设，"
-                    "且未调用任何诊断工具采集数据。\n"
-                    "禁止输出纯文本分析，禁止调用 commit_hypotheses。\n"
-                    "你必须在本轮调用 task() 委派 Argus 专家"
-                    "（task(\"host-argus-expert\", ...) + "
-                    "task(\"k8s-argus-expert\", ...)）"
-                    "采集主机和集群的监控指标数据。\n"
-                    "这是诊断的第一步——没有数据就无法形成假设。"
-                )
-                logger.warning(
-                    "Safety: understand stagnation without data (round %d, "
-                    "no hypotheses, no diagnostic tools) — forcing "
-                    "data collection",
-                    round_num,
-                )
+                # No data collected.  _coverage_ready treats "never
+                # delegated" as ready (ledger.py), so at round>=2 the
+                # derived phase is already hypothesize — the old text
+                # ("禁止调用 commit_hypotheses，必须委派 Argus") ALWAYS
+                # contradicted the phase guidance.  Only demand
+                # delegation while genuinely in UNDERSTAND; otherwise
+                # nudge committing from user input (same semantics as
+                # the argus-degrade path).
+                if _phase(ledger) == "understand":
+                    warnings.append(
+                        "⚠ [系统强制] 当前是第"
+                        f"{round_num}轮，你尚未提交任何假设，"
+                        "且未调用任何诊断工具采集数据。\n"
+                        "禁止输出纯文本分析，禁止调用 commit_hypotheses。\n"
+                        "你必须在本轮调用 task() 委派 Argus 专家"
+                        "（task(\"host-argus-expert\", ...) + "
+                        "task(\"k8s-argus-expert\", ...)）"
+                        "采集主机和集群的监控指标数据。\n"
+                        "这是诊断的第一步——没有数据就无法形成假设。"
+                    )
+                    logger.warning(
+                        "Safety: understand stagnation without data (round %d, "
+                        "no hypotheses, no diagnostic tools) — forcing "
+                        "data collection",
+                        round_num,
+                    )
+                elif round_num >= 3:
+                    warnings.append(
+                        "⚠ [系统提示] 当前已是第"
+                        f"{round_num}轮，尚未委派专家采集监控数据。\n"
+                        "可调用 task() 委派 Argus 专家采集数据，或直接基于"
+                        "用户描述的故障现象调用 commit_hypotheses 提出假设，"
+                        "后续专家诊断将继续验证并修正假设。"
+                    )
 
         # ── G5 委派饱和（state-machine-v2.md §8）：防止重复委派相同专家验证相同假设 ──
         # Detects the pattern: task(expert, Hn) → record_finding →
@@ -3678,6 +3701,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         self._same_delegate_count = 0
                         self._last_delegate_key = ""
                         self._last_finding_round = round_num
+                        mutated = True
                         logger.warning(
                             "Safety: auto-inconclusive for %s (round %d, "
                             "consecutive_task=%d)",
@@ -3686,12 +3710,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )
                 else:
                     # ── P2: Loop warning without auto-recording ──
+                    # Suggest only phase-legal actions (§7): record_finding
+                    # is gated outside VERIFY and write_file is gated until
+                    # exit — the previous text ("调用 record_finding …或
+                    # 直接生成报告") recommended actions the phase gate
+                    # rejects in every phase this branch can fire in.
+                    _p2_actions = {
+                        "understand": "继续委派 Argus 专家完成数据采集",
+                        "hypothesize": "调用 commit_hypotheses 提交假设",
+                        "evaluate": "调用 select_path 选择下一步验证方向",
+                        "report": "调用 write_file 生成诊断报告",
+                    }
+                    _p2_hint = _p2_actions.get(
+                        current_phase, "按当前阶段指引推进诊断")
                     warnings.append(
                         f"⚠ [系统警告] 已连续{self._consecutive_task_count}次"
                         "委派专家但未记录验证结论。\n"
-                        "工具已返回足够数据，请分析已有证据并调用"
-                        " record_finding 记录结论，或直接生成报告。\n"
-                        "避免重复委派专家查询相同数据。"
+                        "避免重复委派专家查询相同数据。\n"
+                        f"当前处于 {current_phase.upper()} 阶段：{_p2_hint}。"
                     )
                     logger.warning(
                         "Safety: %d consecutive task() calls without "
@@ -3809,6 +3845,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._last_delegate_key = ""
                     self._last_finding_round = round_num
                     self._verify_stuck_last_fired = round_num
+                    mutated = True
                     logger.warning(
                         "Safety: verify-phase stuck for %s (round %d, no "
                         "progress since round %d) — auto-%s, phase→%s",
@@ -3850,7 +3887,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Reset trackers when leaving REPORT phase (e.g. backtrack)
             self._report_phase_start_round = 0
 
-        return "\n\n".join(warnings) if warnings else ""
+        return ("\n\n".join(warnings) if warnings else ""), mutated
 
     # ── Tool: commit_hypotheses ──
 
@@ -4117,21 +4154,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 ledger["root_cause"] = causes[0] if causes else ""
                 ledger["root_cause_hypothesis_id"] = cids[0]
 
-            # ── Propagation-aware exit: deep confirmed → force REPORT ──
-            # When a non-root hypothesis is confirmed and its root ancestor
-            # was added to cids via the propagation block above, force exit
-            # even though check_exit_conditions (which runs before propagation)
-            # may have returned False.
-            # IMPORTANT: do NOT override when check_exit_conditions returned
-            # False because there are still pending root hypotheses with
-            # significant probability (>15%).  The multi-root exit logic
-            # intentionally keeps the diagnosis alive for remaining symptoms.
-            if not should_exit and cids and "部分根因" not in reason:
-                should_exit = True
-                reason = ("深层假设已确认，根因已定位"
-                          if len(cids) == 1
-                          else f"{len(cids)} 个根因已确认")
-
+            # ── Exit is decided SOLELY by check_exit_conditions (§6.3) ──
+            # Removed the legacy "propagation-aware" override: its
+            # suppression string ("部分根因") has not appeared in any
+            # check_exit_conditions reason since the v2.1 quantified exit
+            # model, so the guard was dead and the override fired on EVERY
+            # record_finding while any confirmed node existed in the tree
+            # (cids registration has no p≥80 threshold) — forcing REPORT
+            # over significant residual uncertainty (multi-root
+            # truncation), pending sub-hypotheses (deepening truncation),
+            # and even sub-80 confirmations.  The v2.4 deep-confirmation
+            # fallback inside check_exit_conditions covers the override's
+            # intended case through the legitimate S1/S2 path.
             if should_exit:
                 _force_report(ledger)
             # else: phase is derived — partial-root / normal cases land on

@@ -129,6 +129,18 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
         # Per-delegation state, keyed by delegation description hash.
         self._seen: OrderedDict[str, set[str]] = OrderedDict()
         self._budget: OrderedDict[str, int] = OrderedDict()
+        # Per-delegation read intervals per file path (A3' interval
+        # dedup).  Keyed by delegation like A3/A4: a covered re-read
+        # WITHIN one delegation is zero-gain (the original result is in
+        # that delegation's own history).  Cross-delegation re-reads stay
+        # ALLOWED — a fresh delegation's context does not contain the
+        # earlier read, so blocking it would deny legitimate data access
+        # (Case 5.1 semantics preserved).
+        self._read_intervals: OrderedDict[
+            str, dict[str, list[tuple[int, int]]]] = OrderedDict()
+        # Per-delegation grep counts per path (F4 merge-keywords
+        # escalation: 2nd same-path grep → hint; 3rd+ → double budget).
+        self._grep_paths: OrderedDict[str, dict[str, int]] = OrderedDict()
         logger.info(
             "ExpertFileToolGovernance: window=%d, soft=%d, hard=%d",
             _read_window(), _soft_budget(), _hard_budget(),
@@ -186,6 +198,66 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
             return True
         return False
 
+    # ── A3': read-interval tracking (session-wide) ─────────────────────
+
+    @staticmethod
+    def _read_succeeded(result) -> bool:
+        """Only successful reads get their interval recorded — a failed
+        read obtained no bytes and must not block a later retry (e.g.
+        read-before-create of an offload file)."""
+        if not isinstance(result, ToolMessage):
+            return False
+        if getattr(result, "status", "success") == "error":
+            return False
+        content = result.content if isinstance(result.content, str) else str(result.content)
+        return not content.startswith("Error")
+
+    def _effective_read_interval(self, args: dict, path: str) -> tuple[int, int] | None:
+        """Effective [start, end) line range of a read_file call AFTER the
+        A2 window boost (mirrors the boost condition below — the boosted
+        limit is what actually executes and what gets recorded)."""
+        try:
+            offset = int(args.get("offset") or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        limit = args.get("limit")
+        if (limit is None
+                or (isinstance(limit, int) and limit <= _DEFAULT_PAGE_LIMIT)):
+            if any(path.startswith(p) for p in _READBACK_PREFIXES):
+                limit = _read_window()
+        if limit is None:
+            limit = _DEFAULT_PAGE_LIMIT  # deepagents default (non-boosted)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = _DEFAULT_PAGE_LIMIT
+        if limit <= 0:
+            return None
+        return (offset, offset + limit)
+
+    def _interval_covered(self, dkey: str, path: str,
+                          iv: tuple[int, int]) -> bool:
+        """True iff iv is fully covered by this delegation's prior reads."""
+        spans = self._read_intervals.get(dkey, {}).get(path, [])
+        for s, e in spans:
+            if s <= iv[0] and iv[1] <= e:
+                return True
+        return False
+
+    def _record_interval(self, dkey: str, path: str,
+                         iv: tuple[int, int]) -> None:
+        per_file = self._bucket(self._read_intervals, dkey, {})
+        spans = per_file.setdefault(path, [])
+        spans.append(iv)
+        spans.sort()
+        merged: list[list[int]] = []
+        for s, e in spans:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        per_file[path] = [(s, e) for s, e in merged]
+
     # ── Tool call interception ─────────────────────────────────────────
 
     async def awrap_tool_call(
@@ -202,6 +274,23 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
         tool_args = tool_call.get("args") or {}
         path = self._extract_path(tool_name, tool_args)
         dkey = self._delegation_key(request)
+
+        # ── A1': grep on the skills DIRECTORY root is denied ──
+        # The delegation already names the expert's skill — navigate with
+        # ls/glob and read_file the specific file instead of content-
+        # searching the whole skill tree (zero-gain wandering, observed
+        # in production 2026-07-30).
+        if tool_name == "grep" and path.rstrip("/") == "/agent_data/skills":
+            logger.warning("治理拦截(skills目录grep): delegation=%s", dkey)
+            return ToolMessage(
+                content=(
+                    "⛔ [文件工具治理] 禁止对 /agent_data/skills/ 目录做内容搜索。\n"
+                    "你的技能已在委派时指定——请用 ls /agent_data/skills/ 定位"
+                    "技能文件后直接 read_file 读取；grep 仅允许针对具体文件。"
+                ),
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
 
         # ── A1: path whitelist hard gate ──
         if not self._path_allowed(tool_name, path):
@@ -256,6 +345,45 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
                     name=tool_name,
                 )
 
+        # ── A3': interval-containment dedup for read_file (per-delegation) ──
+        # A fully-covered re-read WITHIN one delegation yields zero new
+        # bytes (the original result is in that delegation's own history;
+        # whitelisted targets are static or append-only in-session).
+        # Partially-new ranges pass (A2's widened window keeps genuine
+        # pagination rare).  Cross-delegation re-reads are NOT blocked —
+        # a fresh delegation has no access to the earlier read's content.
+        _iv: tuple[int, int] | None = None
+        if tool_name == "read_file":
+            _iv = self._effective_read_interval(tool_args, path)
+            if _iv is not None and self._interval_covered(dkey, path, _iv):
+                logger.info(
+                    "治理拦截(重复读): %s [%d,%d) delegation=%s",
+                    path, _iv[0], _iv[1], dkey,
+                )
+                return ToolMessage(
+                    content=(
+                        f"⛔ [文件工具治理] 重复读取：{path} 的 "
+                        f"[{_iv[0]},{_iv[1]}) 区间已被本次委派先前的读取完全"
+                        "覆盖（结果就在上方消息历史中，直接引用即可——"
+                        "重复读取信息增益为 0）。\n"
+                        "如需该文件其他部分，请调整 offset 读取未覆盖区间；"
+                        "如需定位内容，请用 grep 正则一次定位。"
+                    ),
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+
+        # ── F4: same-path grep escalation (merge-keywords guidance) ──
+        # Regex alternation has identical recall to separate searches, so
+        # repeated greps on one path are pure overhead.  2nd: merge hint
+        # appended to the result; 3rd+: double A4 budget consumption
+        # (never hard-blocked — the A4 cap still terminates cleanly).
+        _grep_path_count = 0
+        if tool_name == "grep":
+            _gp = self._bucket(self._grep_paths, dkey, {})
+            _grep_path_count = _gp.get(path, 0) + 1
+            _gp[path] = _grep_path_count
+
         # ── A4: hard budget ──
         used = 0
         if tool_name in _COUNTED_TOOLS:
@@ -302,10 +430,29 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
         if tool_name in _READ_CLASS:
             seen.add(sig)
         if tool_name in _COUNTED_TOOLS:
-            used += 1
+            # F4: 3rd+ same-path grep costs double budget.
+            used += 2 if _grep_path_count >= 3 else 1
             self._budget[dkey] = used
 
         result = await handler(request)
+
+        # A3': record the interval only after a successful read (see
+        # _read_succeeded — failed reads must not poison coverage).
+        if _iv is not None and self._read_succeeded(result):
+            self._record_interval(dkey, path, _iv)
+
+        # F4: merge hint appended to 2nd+ same-path grep results.
+        if (tool_name == "grep" and _grep_path_count >= 2
+                and isinstance(result, ToolMessage)):
+            note = (
+                f"\n\n[系统提示] 这是本次委派中对同一路径的第 "
+                f"{_grep_path_count} 次 grep——检索多个关键字请用一条正则"
+                "一次完成（如 kw1|kw2|kw3），召回相同、调用更少"
+                + ("；同路径 grep 此后将双倍计入读取预算。"
+                   if _grep_path_count >= 3 else "。")
+            )
+            content = result.content if isinstance(result.content, str) else str(result.content)
+            result = result.model_copy(update={"content": content + note})
 
         # ── A4: soft budget hint appended to the result ──
         if (
