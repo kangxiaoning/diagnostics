@@ -35,7 +35,7 @@ from pydantic import AliasChoices, BaseModel, Field
 from deepagents.backends.protocol import BackendProtocol
 
 from diagnostics.agent.ledger import (
-    MAX_ROOT_COMMIT_BATCHES,
+    MAX_COMMIT_CALLS,
     DiagnosisLedger,
     DiagnosisLedgerState,
     _coverage_ready,
@@ -275,7 +275,7 @@ def _build_evidence_audit(ledger: dict) -> str:
             label = "基本"
         else:
             label = "不足"
-        priority = "根因" if hid in root_ids else "子假设"
+        priority = "根因假设" if hid in root_ids else "深化假设"
         lines.append(
             f"  {hid}({priority}): 证据{label} "
             f"({len(supporting)}条支持/{len(refuting)}条反对, "
@@ -863,7 +863,8 @@ def _make_cache_key(tool_name: str, args: dict) -> str:
 
 def _sanitize_ledger(ledger: dict) -> dict:
     """Strip internal fields from ledger before sending to frontend/streaming."""
-    internal_keys = {"_inconclusive_streak", "_backtrack_count", "_root_commit_count"}
+    internal_keys = {"_inconclusive_streak", "_backtrack_count",
+                     "_root_commit_count", "_commit_count"}
     return {k: v for k, v in ledger.items() if k not in internal_keys}
 
 
@@ -979,7 +980,7 @@ class CommitHypothesesInput(BaseModel):
     )
     parent_hypothesis_id: str | None = Field(
         default=None,
-        description="父假设ID。None=顶层假设，否则在该假设下深化",
+        description="父假设ID。None=顶层假设，否则在该假设下深化（同样占用提交预算）",
     )
     focus_summary: str = Field(
         default="",
@@ -2259,19 +2260,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         content = (
                             "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具，"
                             "本层假设已全部证伪。\n"
-                            f"根假设批次预算仍开放（已用 "
-                            f"{ledger.get('_root_commit_count', 0)}"
-                            f"/{MAX_ROOT_COMMIT_BATCHES}）。请立即调用 "
+                            f"假设提交预算仍开放（已用 "
+                            f"{ledger.get('_commit_count', 0)}"
+                            f"/{MAX_COMMIT_CALLS} 次）。请立即调用 "
                             "commit_hypotheses 提交新一批根假设"
                             "（必须基于已排除证据换方向，禁止重复或仅换措辞）。"
                         )
                         logger.warning(
-                            "Safety: evaluate stall (round %d, batch %d/%d "
+                            "Safety: evaluate stall (round %d, commit %d/%d "
                             "open) — nudging commit_hypotheses via "
                             "synthetic call",
                             self._model_call_count,
-                            ledger.get("_root_commit_count", 0),
-                            MAX_ROOT_COMMIT_BATCHES,
+                            ledger.get("_commit_count", 0),
+                            MAX_COMMIT_CALLS,
                         )
                     response = ModelResponse(result=[AIMessage(
                         content=content,
@@ -2296,11 +2297,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and self._model_call_count >= _MIN_ROUND_FOR_SAFETY):
             if _response_ends_loop(response):
                 logger.warning(
-                    "Safety: hypothesize-phase stall (round %d, batch "
+                    "Safety: hypothesize-phase stall (round %d, commit "
                     "%d/%d) — nudging commit_hypotheses via synthetic call",
                     self._model_call_count,
-                    ledger.get("_root_commit_count", 0),
-                    MAX_ROOT_COMMIT_BATCHES,
+                    ledger.get("_commit_count", 0),
+                    MAX_COMMIT_CALLS,
                 )
                 import uuid as _uuid
                 synthetic = [{
@@ -2311,9 +2312,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 response = ModelResponse(result=[AIMessage(
                     content=(
                         "[系统提醒] 当前处于 HYPOTHESIZE 阶段"
-                        f"（根假设批次预算已用 "
-                        f"{ledger.get('_root_commit_count', 0)}"
-                        f"/{MAX_ROOT_COMMIT_BATCHES}）。\n"
+                        f"（假设提交预算已用 "
+                        f"{ledger.get('_commit_count', 0)}"
+                        f"/{MAX_COMMIT_CALLS} 次）。\n"
                         "请立即调用 commit_hypotheses 提交新一批根假设——"
                         "必须基于已排除证据换方向推断，"
                         "禁止与已排除假设重复或仅换措辞。"
@@ -2834,9 +2835,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         f"⚠️ {tool_name} 是专家专用工具，Coordinator 不能直接调用。\n"
                         "请通过 task() 委派对应专家：\n"
                         "- 主机指标(CPU/内存/磁盘/网络) → "
-                        "task('host-argus-expert', '查询主机Argus指标时序')\n"
+                        "task(subagent_type='host-argus-expert', description='查询主机Argus指标时序')\n"
                         "- K8s集群指标(节点/Pod/API/DNS) → "
-                        "task('k8s-argus-expert', '查询K8s Argus指标时序')"
+                        "task(subagent_type='k8s-argus-expert', description='查询K8s Argus指标时序')"
                     ),
                     tool_call_id=tool_call_id,
                 )
@@ -3502,7 +3503,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "K8s Argus 数据（query_argus_nodes + "
                         "query_argus_services）。\n"
                         "禁止在本轮调用 commit_hypotheses。\n"
-                        "你必须先调用 task(\"k8s-argus-expert\", ...) "
+                        "你必须先调用 task(subagent_type=\"k8s-argus-expert\", description=...) "
                         "委派 K8s Argus 专家采集集群指标。\n"
                         "收到 K8s Argus 专家的分析摘要后再提交假设。"
                     )
@@ -3516,7 +3517,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "⚠ [系统强制] 已采集 K8s Argus 数据但缺少主机级 "
                         "Argus 数据（CPU/内存/磁盘/网络）。\n"
                         "禁止在本轮调用 commit_hypotheses。\n"
-                        "你必须先调用 task(\"host-argus-expert\", ...) "
+                        "你必须先调用 task(subagent_type=\"host-argus-expert\", description=...) "
                         "委派主机 Argus 专家采集主机指标。\n"
                         "收到主机 Argus 专家的分析摘要后再提交假设。"
                     )
@@ -3605,8 +3606,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "且未调用任何诊断工具采集数据。\n"
                         "禁止输出纯文本分析，禁止调用 commit_hypotheses。\n"
                         "你必须在本轮调用 task() 委派 Argus 专家"
-                        "（task(\"host-argus-expert\", ...) + "
-                        "task(\"k8s-argus-expert\", ...)）"
+                        "（task(subagent_type=\"host-argus-expert\", description=...) + "
+                        "task(subagent_type=\"k8s-argus-expert\", description=...)）"
                         "采集主机和集群的监控指标数据。\n"
                         "这是诊断的第一步——没有数据就无法形成假设。"
                     )
@@ -3815,8 +3816,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         ),
                         "hypothesize": (
                             "请调用 commit_hypotheses 提交新一批根假设"
-                            f"（第 {ledger.get('_root_commit_count', 0) + 1}"
-                            f"/{MAX_ROOT_COMMIT_BATCHES} 批）——"
+                            f"（第 {ledger.get('_commit_count', 0) + 1}"
+                            f"/{MAX_COMMIT_CALLS} 次）——"
                             "必须基于已排除证据换方向推断，"
                             "禁止与已排除假设重复或仅换措辞。"
                         ),
@@ -3917,6 +3918,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             for h in created:
                 sel = " ★" if h["selected"] else ""
                 lines.append(f"  {h['id']} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
+            _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
+            if _budget_left > 0:
+                lines.append(
+                    f"（提交预算剩余 {_budget_left}/{MAX_COMMIT_CALLS} 次）"
+                )
+            else:
+                lines.append(
+                    f"（提交预算已用尽 {MAX_COMMIT_CALLS}/{MAX_COMMIT_CALLS} 次；"
+                    "后续如需细化假设，请用 record_finding(statement_update=...)）"
+                )
 
             mw._persist_ledger(ledger)
             mw._current_ledger = ledger
@@ -3926,8 +3937,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         return StructuredTool.from_function(
             name="commit_hypotheses",
             description=(
-                "提交诊断假设（HYPOTHESIZE阶段必须调用）。每层最多3个假设，按概率降序。"
-                "若在已确认假设下深化，传入parent_hypothesis_id。"
+                "提交诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
+                "整个诊断最多提交2次（首批、深化、换批共用此预算），总计不超过6个假设。"
+                "若在已确认假设下深化，传入parent_hypothesis_id（同样占用1次预算）。"
+                "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述。"
                 "提交后系统自动选择概率最高的假设进入验证。"
             ),
             coroutine=_run,
@@ -4206,7 +4219,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # fresh batch in a new direction.
                 exit_hint = (
                     f"\n⚠ {reason}\n"
-                    "⛔ 请调用 commit_hypotheses 提交新一批根假设——"
+                    "⛔ 请调用 commit_hypotheses 提交新一批根假设"
+                    f"（第 {ledger.get('_commit_count', 0) + 1}"
+                    f"/{MAX_COMMIT_CALLS} 次，最后一次）——"
                     "必须基于已排除证据换方向推断，"
                     "禁止与已排除假设重复或仅换措辞。"
                 )
@@ -4231,6 +4246,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "应调用 confirmed + statement_update=剔除不成立环节后的表述，"
                 "而非整体 refuted——整体 refuted 会把已确认的真实机制从根因列表中丢弃，"
                 "导致台账根因与报告结论不一致。"
+                "假设提交预算用尽后，细化假设只能通过本工具的 statement_update 完成，"
+                "不能再调用 commit_hypotheses。"
                 "所有root假设均到达终态且至少1个confirmed时自动进入REPORT阶段。"
             ),
             coroutine=_run,
@@ -4258,9 +4275,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     mw._persist_ledger(ledger)
                     mw._current_ledger = ledger
                     return (
-                        "没有可回溯的假设，但根假设批次预算未用尽"
-                        f"（已用 {ledger.get('_root_commit_count', 0)}"
-                        f"/{MAX_ROOT_COMMIT_BATCHES} 批）。\n"
+                        "没有可回溯的假设，但假设提交预算未用尽"
+                        f"（已用 {ledger.get('_commit_count', 0)}"
+                        f"/{MAX_COMMIT_CALLS} 次）。\n"
                         "已进入 HYPOTHESIZE 阶段。\n"
                         "⛔ 请调用 commit_hypotheses 提交新一批根假设——"
                         "必须基于已排除证据换方向推断，"
@@ -4274,8 +4291,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # pre-set — G6 timestamps the first derived REPORT round
                 # itself (see record_finding for rationale).
                 return (
-                    "回溯失败: 没有可回溯的假设，且根假设批次预算已用尽"
-                    f"（{MAX_ROOT_COMMIT_BATCHES} 批）。\n"
+                    "回溯失败: 没有可回溯的假设，且假设提交预算已用尽"
+                    f"（{MAX_COMMIT_CALLS} 次）。\n"
                     "已进入 REPORT 阶段（标注假设穷尽）。\n"
                     "⛔ 你必须在下一轮调用 write_file 将诊断报告写入"
                     f" {mw.report_path}。\n"

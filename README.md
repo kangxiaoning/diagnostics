@@ -90,7 +90,7 @@ flowchart LR
 | 概念 | 说明 |
 |------|------|
 | **DiagnosisLedger** | 诊断台账 — 持久化在 LangGraph State 中的结构化诊断记忆 |
-| **Hypothesis Tree** | 假设树 — 最多 3 个/层，支持多级子假设深化 |
+| **Hypothesis Tree** | 假设树 — 最多 3 个/层；整个诊断最多提交 2 次假设（共不超过 6 个），深化/换批共用预算 |
 | **Active Path** | 活动路径 — 当前探索路径栈，支持回溯 |
 | **Phase** | 诊断阶段 — `understand` → `hypothesize` → `verify` → `evaluate` → `report` → `backtrack` |
 | **Exit Conditions** | 退出条件 — 根因确认(p≥80%) / 假设穷尽 / 证据饱和(3×inconclusive) |

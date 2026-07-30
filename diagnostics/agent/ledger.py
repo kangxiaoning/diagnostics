@@ -46,10 +46,21 @@ TerminalReason = Literal["evidence_saturated", "timeout_unreached", "auto_finali
 
 Verdict = Literal["confirmed", "refuted", "inconclusive"]
 
-# ── Root-hypothesis batch budget ──
-# The LLM may submit at most this many batches of ROOT hypotheses
-# (parent_id=None).  A new batch is only allowed after ALL root
-# hypotheses from prior batches are hard-failed (refuted/dead_end).
+# ── Hypothesis commit budget (GLOBAL, hard-coded) ──
+# At most this many commit_hypotheses CALLS per diagnosis — first batch,
+# deepening (parent_hypothesis_id given) and retry batch (换批) ALL
+# consume from this single budget.  With the per-call limit of
+# MAX_LAYER_SIZE, a diagnosis can never exceed
+# MAX_COMMIT_CALLS × MAX_LAYER_SIZE = 6 hypotheses in total.
+# Deepening used to be budget-free, which invited unbounded
+# sub-hypothesis proliferation; making every commit count is the fix.
+MAX_COMMIT_CALLS = 2
+
+# ── Root-hypothesis batch gate ──
+# A retry batch of ROOT hypotheses (parent_id=None) is only allowed
+# after ALL root hypotheses from prior batches are hard-failed
+# (refuted/dead_end) — and only while the global commit budget above
+# is not exhausted.
 MAX_ROOT_COMMIT_BATCHES = 2
 
 # ── Hypothesis-tree hard invariants (deterministic, code-enforced) ──
@@ -57,18 +68,16 @@ MAX_ROOT_COMMIT_BATCHES = 2
 # schemas (Pydantic validates a single call, not cumulative tree state),
 # so they are enforced here at the data-structure layer.  Rationale and
 # evidence: private/design/state-machine-v2.md §11; the 2026-07-20
-# 32-round session (root layer grew to 6 via batch accumulation, depth
-# reached 2 with unproductive H1.1.x exploration).
+# 32-round session (root layer grew to 6 via batch accumulation,
+# deepened with unproductive H1.1.x exploration).
 MAX_LAYER_SIZE = 3
 """Max sibling hypotheses sharing the same parent (cumulative, not per
 commit call).  Root layer obeys the same limit per CURRENT batch —
-a retry batch REPLACES the current root layer instead of appending."""
-
-import os as _os
-MAX_DEPTH = int(_os.getenv("DIAGNOSTICS_MAX_DEPTH", "2"))
-"""Max hypothesis-tree depth.  0=root, 1=sub, 2=grandchild.  Depth-2
-nodes are leaves by construction; deeper refinement must go through
-record_finding (sharpen the statement) instead of a new sub-hypothesis."""
+a retry batch REPLACES the current root layer instead of appending.
+With MAX_COMMIT_CALLS = 2 the tree depth is structurally bounded to 1
+(the first call must be roots; at most one deepening call remains), so
+no explicit depth limit is needed; this per-layer cap stays as the
+defensive invariant should the call budget ever be raised."""
 
 # Statuses that permanently close a hypothesis with a negative verdict.
 # (dead_end merged into refuted in the 5-state model.)
@@ -186,6 +195,7 @@ def new_ledger(entity_type: str = "", hostname: str = "",
         _inconclusive_streak=0,
         _backtrack_count=0,
         _root_commit_count=0,
+        _commit_count=0,
         entity_type=entity_type,
         hostname=hostname,
         entity_name=entity_name,
@@ -298,7 +308,13 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
       "bury" them one by one before changing direction (observed
       2026-07-21 session: round-8 batch rejection + 4 wasted rounds of
       ritual verification on a deprioritized H3).
+    - Any batch additionally requires the GLOBAL commit budget
+      (``MAX_COMMIT_CALLS``) to still be open — derive_phase (T8) and the
+      backtrack tool both route through this predicate, so folding the
+      global check in here keeps every caller coherent.
     """
+    if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+        return False
     if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
         return False
     root_ids = ledger.get("root_hypothesis_ids", [])
@@ -314,6 +330,18 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
         if node.get("status") == "pending" and not node.get("deferred"):
             return False
     return True
+
+
+def _commit_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
+    """Shared rejection text when the global commit budget is spent."""
+    return (
+        f"假设提交预算已用尽（全程最多 {MAX_COMMIT_CALLS} 次，"
+        f"已提交 {ledger.get('_commit_count', 0)} 次）。不可再提交新假设。"
+        "如需细化已有假设，请用 record_finding(statement_update=...) "
+        "修正其表述；如需调整验证方向，用 select_path 切换焦点 / "
+        "backtrack 恢复搁置假设；全部假设证伪时系统会自动进入 "
+        "REPORT（T9），无需手动提交。"
+    )
 
 
 def add_hypotheses(
@@ -352,32 +380,35 @@ def add_hypotheses(
     if not parent_id:
         parent_id = None
 
-    parent_depth = hypotheses[parent_id]["depth"] if parent_id else -1
-
-    # ── Hard invariant: depth limit ──
-    # Reject ANY commit (first batch, retry, or deepening) that would
-    # exceed MAX_DEPTH.  Checked before dedup/budget so a rejected call
-    # consumes nothing.
-    if parent_depth + 1 > MAX_DEPTH:
+    # ── Parent existence validation ──
+    # An unknown parent id used to raise a bare KeyError; return a clear
+    # Chinese error instead so the LLM can recover.
+    if parent_id is not None and parent_id not in hypotheses:
         raise ValueError(
-            f"假设树已达最大深化层级（{MAX_DEPTH} 层），禁止继续细化。"
-            "请调用 record_finding 用 statement_update 修正当前假设表述，"
-            "或评估是否满足退出条件进入 REPORT。"
+            f"父假设 {parent_id} 不存在。请检查假设 ID，"
+            "或改为提交顶层假设（不传 parent_hypothesis_id）。"
         )
+
+    parent_depth = hypotheses[parent_id]["depth"] if parent_id else -1
 
     # ── Hard invariant: cumulative layer-size limit (non-root) ──
     # Root layer is handled separately below (retry batch REPLACES the
-    # current root layer).  For sub-hypotheses, the TOTAL sibling count
-    # under one parent must not exceed MAX_LAYER_SIZE — the per-call
-    # check above alone would allow 3+3+… commits under one parent.
+    # current root layer).  For deepening commits, the TOTAL sibling
+    # count under one parent must not exceed MAX_LAYER_SIZE — the
+    # per-call check above alone would allow 3+3+… commits under one
+    # parent if the global call budget were ever raised.
+    # Deepening commits CONSUME the same global commit budget
+    # (MAX_COMMIT_CALLS) as root batches — no free refinement path.
     if parent_id is not None:
+        if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+            raise ValueError(_commit_budget_exhausted_message(ledger))
         current_siblings = len(hypotheses[parent_id]["sub_hypothesis_ids"])
         if current_siblings + len(hypothesis_specs) > MAX_LAYER_SIZE:
             raise ValueError(
-                f"父假设 {parent_id} 下已有 {current_siblings} 个子假设，"
+                f"父假设 {parent_id} 下已有 {current_siblings} 个假设，"
                 f"本次提交 {len(hypothesis_specs)} 个将超过每层上限"
-                f"（{MAX_LAYER_SIZE} 个）。请只提交可能性最高的子假设，"
-                "或先用 record_finding 终结已有的低价值子假设。"
+                f"（{MAX_LAYER_SIZE} 个）。请只提交可能性最高的假设，"
+                "或先用 record_finding 终结已有的低价值假设。"
             )
 
     # Detect duplicate statements — only scan root-level hypotheses
@@ -407,18 +438,17 @@ def add_hypotheses(
                     f"而非 commit_hypotheses 重复提交。"
                 )
 
-        # ── Root-batch budget ──
+        # ── Commit budget (global) + retry-batch gate ──
         # Checked AFTER dedup so a rejected duplicate does not consume
-        # budget.  Deepening commits (parent_id given) never consume it.
+        # budget.  can_commit_root_hypotheses folds in the global
+        # MAX_COMMIT_CALLS check, so budget exhaustion surfaces first;
+        # the remaining False case is the retry-batch gate (confirmed or
+        # active-pending root still standing).
         if not can_commit_root_hypotheses(ledger):
-            if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
-                raise ValueError(
-                    f"根假设批次预算已用尽（{MAX_ROOT_COMMIT_BATCHES} 批），"
-                    "不可再开新批。请基于现有假设继续：select_path 切换验证"
-                    "焦点 / backtrack 恢复搁置假设 / record_finding 终结活跃"
-                    "假设；全部根假设证伪时系统会自动进入 REPORT（T9），"
-                    "无需手动提交。"
-                )
+            if (ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS
+                    or ledger.get("_root_commit_count", 0)
+                    >= MAX_ROOT_COMMIT_BATCHES):
+                raise ValueError(_commit_budget_exhausted_message(ledger))
             raise ValueError(
                 "当前批仍有活跃 pending 或已 confirmed 的根假设，不可换批。"
                 "请先用 record_finding 终结活跃假设，或用 select_path "
@@ -436,6 +466,13 @@ def add_hypotheses(
         # First batch (no existing roots or all stale) keeps append
         # semantics via a fresh list.
         ledger["root_hypothesis_ids"] = []
+
+    # ── Global commit budget consumption ──
+    # Every successful commit — first batch, retry batch, or deepening —
+    # consumes exactly one unit.  With the per-call limit above, total
+    # hypotheses per diagnosis are bounded by
+    # MAX_COMMIT_CALLS × MAX_LAYER_SIZE = 6.
+    ledger["_commit_count"] = ledger.get("_commit_count", 0) + 1
 
     for spec in hypothesis_specs:
         hid = _next_hypothesis_id(parent_id, hypotheses)
@@ -999,10 +1036,12 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
     phase = derive_phase(ledger)
     active_path_str = " → ".join(ledger["active_path"]) if ledger["active_path"] else "(无)"
     batch_info = ""
-    if ledger.get("_root_commit_count"):
+    if ledger.get("_commit_count"):
         batch_info = (
-            f" | 根假设批次: {ledger['_root_commit_count']}"
-            f"/{MAX_ROOT_COMMIT_BATCHES}"
+            f" | 假设提交: {ledger['_commit_count']}"
+            f"/{MAX_COMMIT_CALLS} 次"
+            f"（共 {len(ledger.get('hypotheses', {}))}"
+            f"/{MAX_COMMIT_CALLS * MAX_LAYER_SIZE} 个）"
         )
     lines.append(f"## 当前诊断状态")
     lines.append(f"- 阶段: {phase} | 步骤: {ledger['current_round']}{batch_info} | 活动路径: {active_path_str}")
@@ -1202,8 +1241,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "- 从用户输入提取故障画像（实体、症状、时间线、变更、已尝试操作）\n"
             "- 委派 Argus 专家时使用上方「诊断会话参数」中的时间范围（禁止自行推断）\n"
             "- 委派 Argus 专家采集监控指标（通过 task() 调用）：\n"
-            "  主机相关（CPU/内存/磁盘/网络症状）→ task(\"host-argus-expert\", ...)\n"
-            "  K8s 相关（节点/Pod/集群症状）→ task(\"k8s-argus-expert\", ...)\n"
+            "  主机相关（CPU/内存/磁盘/网络症状）→ task(subagent_type=\"host-argus-expert\", description=...)\n"
+            "  K8s 相关（节点/Pod/集群症状）→ task(subagent_type=\"k8s-argus-expert\", description=...)\n"
             "  复合场景 → 同时委派两个专家（并行 task），分别负责主机级和集群级指标\n"
             "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
             "- ⚠ 查看上方「已有工具调用结果」，禁止重复调用已执行过的工具\n"
@@ -1214,8 +1253,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         retry_hint = ""
         if ledger.get("_root_commit_count", 0) > 0 and ledger.get("hypotheses"):
             retry_hint = (
-                f"\n- ⚠ 这是第 {ledger['_root_commit_count'] + 1}"
-                f"/{MAX_ROOT_COMMIT_BATCHES} 批根假设。"
+                f"\n- ⚠ 这是第 {ledger.get('_commit_count', 0) + 1}"
+                f"/{MAX_COMMIT_CALLS} 次假设提交（最后一次）。"
                 "前一批已全部证伪（见上方「已排除/降级假设」）。\n"
                 "  新假设必须基于排除证据换方向推断，"
                 "禁止与已排除假设重复或仅换措辞。"
@@ -1224,6 +1263,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "你当前处于 HYPOTHESIZE 阶段。\n"
             "- 基于当前证据，提出最多3个可能性最大的假设（按概率降序）\n"
             "- 每个假设标注概率(0-100)和依据\n"
+            f"- 提交预算：全程最多 {MAX_COMMIT_CALLS} 次"
+            f"（本次为第 {ledger.get('_commit_count', 0) + 1} 次）；"
+            "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
             "- 完成后必须调用 commit_hypotheses 提交假设"
             + retry_hint
         )
@@ -1233,9 +1275,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         stmt = active.get("statement", "?")
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {active_id}: {stmt}\n"
-            "- 主机假设 → task(\"host-expert\", ...) 委派验证\n"
-            "- K8s 假设 → task(\"k8s-expert\", ...) 委派验证\n"
-            "- GPU 假设 → task(\"gpu-expert\", ...) 委派验证\n"
+            "- 主机假设 → task(subagent_type=\"host-expert\", description=...) 委派验证\n"
+            "- K8s 假设 → task(subagent_type=\"k8s-expert\", description=...) 委派验证\n"
+            "- GPU 假设 → task(subagent_type=\"gpu-expert\", description=...) 委派验证\n"
             "- 委派时明确\"验证假设{active_id}\"并传入假设上下文\n"
             "- 收到结果后必须调用 record_finding 记录结论\n"
             "- ⚠ 若假设仅部分不成立（某环节被证伪但核心机制已确认），用"
@@ -1273,20 +1315,34 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 continue
             if _hyps.get(_pid, {}).get("status") in ("pending", "inconclusive"):
                 consolidation_hint = (
-                    f"\n- ⚠ 子假设 {_hid} 已确认但父假设 {_pid} 尚未收口："
+                    f"\n- ⚠ 假设 {_hid}（{_pid} 的深化假设）已确认但 {_pid} 尚未收口："
                     f"优先 select_path({_pid}) 后用 record_finding 终结父假设——"
                     "证据已覆盖核心机制时 confirmed + statement_update 修正表述，"
                     "核心机制不成立时 refuted/inconclusive。"
-                    "禁止在未收口的父假设下继续开新子假设。"
+                    "禁止在未收口的父假设下继续提交新假设。"
                 )
                 break
+        _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
+        _deepen_option = (
+            "  · confirmed 假设需更具体 → "
+            "commit_hypotheses(parent_hypothesis_id=...) 提交深化假设"
+            f"（占用 1 次提交预算，剩余 {_budget_left} 次）\n"
+            if _budget_left > 0 else
+            "  · confirmed 假设需更具体 → 提交预算已用尽，"
+            "用 record_finding(statement_update=...) 修正其表述\n"
+        )
+        _retry_option = (
+            "  · 本层全部 refuted 且不可回溯、提交预算未用尽 → "
+            "commit_hypotheses 换方向提交新一批根假设\n"
+            if _budget_left > 0 else ""
+        )
         return (
             "你当前处于 EVALUATE 阶段。\n"
             "- 评估本层所有假设的验证结果，选择下一步路径：\n"
             "  · 有待验证假设 → select_path 切换到最可能的继续验证\n"
-            "  · confirmed 假设需更具体 → commit_hypotheses(parent_hypothesis_id=...) 提交子假设深化\n"
+            + _deepen_option +
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
-            "  · 本层全部 refuted 且不可回溯、批次预算未用尽 → commit_hypotheses 换方向提交新一批根假设\n"
+            + _retry_option +
             "  · 退出条件满足时系统已自动进入 REPORT（无需你判断）\n"
             "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
             "refuted 仅用于证据明确证伪的假设。多个假设可同时为 confirmed。\n"
@@ -1617,8 +1673,8 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         )
         if all_refuted and not can_commit_root_hypotheses(ledger):
             return True, (
-                f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批根假设全部证伪，"
-                "未确认根因"
+                f"假设穷尽: 提交预算已用尽（{MAX_COMMIT_CALLS} 次），"
+                "根假设全部证伪，未确认根因"
             ), None
         # ── E2′ economic exhaustion (fast lane) ──
         # Batch budget strictly spent AND every surviving root is
@@ -1630,9 +1686,11 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         # 2026-07-30 production: write_file gate-rejected, LLM detoured
         # through backtrack for three rounds).  Deferred survivors still
         # block — explicitly shelved = revivable direction (G9 handles).
-        # The budget test uses the raw commit count, NOT the can_commit
-        # proxy (an active pending node would poison that proxy).
-        if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
+        # The budget test uses the raw GLOBAL commit count, NOT the
+        # can_commit proxy (an active pending node would poison that
+        # proxy); deepening commits count too — 1 root batch + 1
+        # deepening means the budget is just as spent.
+        if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
             survivors = [
                 node for hid in root_ids
                 if (node := hypotheses.get(hid)) is not None
@@ -1665,7 +1723,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             f"R={r:.2f} ≥ {R_THRESHOLD}，仍有值得验证的未决假设"
         ), confirmed_ids[0]
     if _has_pending_sub_hypotheses(ledger):
-        return False, "仍有待验证的子假设，需继续深化分析", confirmed_ids[0]
+        return False, "仍有待验证的假设（深化方向），需继续验证", confirmed_ids[0]
 
     # ── S2: expected information gain < cost ──
     best_v, best_d = max_action_value(ledger)
