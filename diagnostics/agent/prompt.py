@@ -67,11 +67,13 @@ PHASE_SPEC: dict[str, dict] = {
         "title": "阶段 4: EVALUATE（评估结果）",
         "duty": "评估本层所有假设的验证结果，选择下一步路径。退出条件由系统判定——"
                 "满足时系统自动进入 REPORT，无需你判断；"
-                "未满足时（已有 confirmed 根因但仍有可行动验证的未决假设）"
-                "禁止主动调用 write_file，必须先 select_path 验证/证伪；"
+                "未满足时禁止主动调用 write_file，必须先处理未决假设"
+                "（现有证据足够 → 直接 record_finding 判定；不足 → select_path 验证/证伪）；"
                 "已委派仍无法定论的假设可 defer 搁置，不必反复重试。",
         "actions": [
-            "有待验证假设 → select_path 切换到最可能的继续验证"
+            "现有证据已足以判定某未决假设（跨假设证据复用）→ 直接 record_finding "
+            "记录结论，无需重复委派——比 select_path 更省轮次",
+            "有待验证假设但证据不足以判定 → select_path 切换到最可能的继续验证"
             "（可用 deprioritized 参数同时搁置反复无法定论的假设）",
             "confirmed 假设需更具体 → record_finding(statement_update=...) 修正表述"
             "（假设为扁平结构，无层级深化）",
@@ -239,6 +241,23 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 - 写入例外：`write_file` 可将最终报告写入系统指定的 `reports/` 路径，但不要读取该目录已有文件。
 - 诊断报告与台账文件创建后为只读：禁止修改、清空或删除已有内容；如需补充，创建新文件。
 </file_rules>
+
+<output_format>
+## 输出格式（每轮必遵）
+
+每轮回复必须以一个 diagnosis_status 代码块开头，然后再给出分析或工具调用：
+
+```diagnosis_status
+phase: 当前阶段（understand/hypothesize/verify/evaluate/report，与注入台账的阶段一致）
+beliefs: 各假设你的当前判断，格式 H序号=状态@概率，状态∈pending/inconclusive/refuted/confirmed，如 H1=refuted@5, H3=pending@20
+root_cause_candidate: 你当前认定的根因与置信度（如 DockerHub限速@95）；尚无则填 none
+menu_choice: 本轮动作对应的相位菜单选项及一句话理由
+```
+
+- 该块是认知校准信号：系统会将你的自报认知与诊断台账做一致性比对，不一致时在下一轮提示纠偏（例如你认定的根因尚未经 record_finding 正式确认、或你自报的阶段与台账不符）。
+- 状态块**不改变台账**——结论仍须经 commit_hypotheses / record_finding 正式提交才生效；文本陈述不产生任何结论。
+- 保持紧凑（≤6 行），禁止在块内粘贴证据全文；write_file 的报告正文中不要包含该块。
+</output_format>
 
 <examples>
 以下是两个完整的诊断示例（工具参数名为真实签名）。

@@ -958,6 +958,120 @@ def _clean_evidence_text(text: str, max_chars: int = 3000) -> str:
     return cleaned
 
 
+# ── Diagnosis status block (SBR) parsing ──
+# state-machine-v2.md §12: every Coordinator round must open with a
+# fenced ```diagnosis_status block self-reporting the model's belief
+# state (phase / per-hypothesis beliefs / root-cause candidate / menu
+# choice).  The middleware parses it and runs deterministic
+# belief-ledger consistency checks; these helpers are the shared,
+# dependency-free parsing primitives (also used by app.py to strip the
+# blocks out of persisted reports).
+
+_SBR_FENCED_RE = re.compile(
+    r"```\s*diagnosis_status[^\n`*]*\n(.*?)(?:```|\Z)", re.S | re.I,
+)
+_SBR_XML_RE = re.compile(
+    r"<diagnosis_status>(.*?)(?:</diagnosis_status>|\Z)", re.S | re.I,
+)
+
+# Status aliases → canonical ledger status.  English tokens pass through
+# lowercased; common Chinese renderings are accepted (lenient parsing —
+# a local model's wording varies, and a missed alias must degrade to
+# "no opinion" rather than a parse failure).
+_SBR_STATUS_ALIASES = {
+    "pending": "pending", "待验证": "pending", "未决": "pending", "待定": "pending",
+    "inconclusive": "inconclusive", "不确定": "inconclusive", "无法定论": "inconclusive",
+    "refuted": "refuted", "证伪": "refuted", "已证伪": "refuted",
+    "排除": "refuted", "已排除": "refuted",
+    "confirmed": "confirmed", "确认": "confirmed", "已确认": "confirmed",
+    "已证实": "confirmed", "证实": "confirmed",
+}
+
+# H3=pending@20 / 3=证伪@5 / H1=confirmed@95（附注） — the trailing
+# parenthetical note is simply not consumed.
+_SBR_BELIEF_ITEM_RE = re.compile(
+    r"[Hh]?(\d+)\s*[=＝:：]\s*([A-Za-z一-鿿]+?)\s*[@＠]\s*(\d{1,3})\s*%?"
+)
+
+_SBR_FIELD_RE = re.compile(r"^\s*([A-Za-z_一-鿿]+)\s*[:：]\s*(.*?)\s*$")
+
+_SBR_KNOWN_PHASES = frozenset({
+    "understand", "hypothesize", "verify", "evaluate", "report",
+})
+
+
+def _sbr_block_text(text: str) -> str | None:
+    """Return the raw inner text of the first diagnosis_status block."""
+    if not text:
+        return None
+    m = _SBR_FENCED_RE.search(text) or _SBR_XML_RE.search(text)
+    return m.group(1) if m else None
+
+
+def parse_diagnosis_status(text: str) -> dict | None:
+    """Leniently parse a diagnosis_status block from an LLM response.
+
+    Returns ``None`` when no block exists or nothing usable was parsed
+    (callers treat that as "no self-report this round", never as an
+    error).  On success returns a dict with optional keys:
+
+    - ``phase``: canonical phase string (only when recognized)
+    - ``beliefs``: ``{hid: (status, prob)}`` — canonical status, int prob
+    - ``root_cause``: ``(description, prob | None)``
+    - ``menu_choice``: raw free-text menu justification
+    """
+    block = _sbr_block_text(text)
+    if block is None:
+        return None
+    parsed: dict = {}
+    for line in block.splitlines():
+        fm = _SBR_FIELD_RE.match(line)
+        if not fm:
+            continue
+        key, value = fm.group(1).lower(), fm.group(2)
+        if not value:
+            continue
+        if key in ("phase", "阶段"):
+            v = value.strip().lower()
+            if v in _SBR_KNOWN_PHASES:
+                parsed["phase"] = v
+        elif key in ("beliefs", "belief", "假设信念", "假设判断"):
+            beliefs: dict = {}
+            for bm in _SBR_BELIEF_ITEM_RE.finditer(value):
+                hid, raw_status, prob = bm.group(1), bm.group(2), int(bm.group(3))
+                status = _SBR_STATUS_ALIASES.get(raw_status.lower())
+                if status:
+                    beliefs[hid] = (status, min(prob, 100))
+            if beliefs:
+                parsed["beliefs"] = beliefs
+        elif key in ("root_cause_candidate", "root_cause", "根因候选", "根因"):
+            v = value.strip()
+            if v.lower() not in ("none", "无", "暂无", "(无)", "n/a", "-"):
+                pm = re.search(r"[@＠]\s*(\d{1,3})\s*%?", v)
+                desc = v[:pm.start()].rstrip(" ，,、") if pm else v
+                prob = min(int(pm.group(1)), 100) if pm else None
+                if desc:
+                    parsed["root_cause"] = (desc, prob)
+        elif key in ("menu_choice", "menu", "菜单选择", "动作依据"):
+            parsed["menu_choice"] = value.strip()
+    return parsed or None
+
+
+def strip_diagnosis_status_blocks(text: str) -> str:
+    """Remove all diagnosis_status blocks (fenced and XML forms).
+
+    Used when persisting LLM text as the fault report — the status block
+    is process metadata for the consistency guard, not report content.
+    """
+    if not text:
+        return text
+    out = _SBR_FENCED_RE.sub("", text)
+    out = _SBR_XML_RE.sub("", out)
+    # Collapse the blank line run a stripped block typically leaves at
+    # the document head.
+    return out.lstrip("\n") if out != text else text
+
+
 def _support_tag(supports: bool | None) -> str:
     """Render the tri-state support flag of an evidence entry."""
     if supports is True:
@@ -1319,7 +1433,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "你当前处于 EVALUATE 阶段。\n"
             f"- {duty}\n"
             "- 下一步路径菜单：\n"
-            "  · 有待验证假设 → select_path 切换到最可能的继续验证\n"
+            "  · 现有证据已可判定某未决假设 → 直接 record_finding 记录结论"
+            "（跨假设证据复用，无需重复委派——比 select_path 更省轮次）\n"
+            "  · 证据不足、需继续验证 → select_path 切换到最可能的假设\n"
             "  · confirmed 假设需更具体 → record_finding(statement_update=...) "
             "修正其表述（假设为扁平结构，无层级深化）\n"
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"

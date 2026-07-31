@@ -55,11 +55,13 @@ from diagnostics.agent.ledger import (
     ledger_to_json,
     new_evidence,
     new_ledger,
+    parse_diagnosis_status,
     record_finding,
     record_round,
     render_ledger_context,
     resolve_hypothesis_id,
     select_path,
+    strip_diagnosis_status_blocks,
 )
 from deepagents.middleware._utils import append_to_system_message
 
@@ -748,6 +750,160 @@ def _is_substantial_report_text(text: str) -> bool:
         return False
     _REPORT_MARKERS = ("# 故障", "## ", "**根因", "根因分析", "证据链", "修复建议")
     return any(marker in text for marker in _REPORT_MARKERS)
+
+
+# ── SBR belief-ledger consistency guard (state-machine-v2.md §12) ──
+# Every Coordinator round should open with a diagnosis_status block
+# (prompt.py <output_format>).  After each model response we parse the
+# block and compare the model's SELF-REPORTED beliefs against the ledger
+# — the system's only window into the model's mind before it ACTS.
+# Divergence found here fires one round EARLIER than the action gates
+# (write_file exit gate / phase gate): e.g. a self-reported root cause
+# @95% with no confirmed hypothesis in the ledger means the model is
+# about to either write_file (blocked, wasting a full report-generation
+# call) or wander into ritual verification.  Corrections are injected
+# into the NEXT round's safety block — informational, never commands;
+# the hard gates remain the backstop.
+#
+# Rule design constraints (P1): every rule is a deterministic predicate
+# over (parsed block, ledger, same-round tool calls); conservative by
+# construction — a rule only fires on UNAMBIGUOUS divergence, anything
+# parseable as "already being resolved this round" suppresses it.
+
+def _response_tool_calls(response) -> list[tuple[str, dict]]:
+    """Extract (name, args) pairs for every tool call in a ModelResponse."""
+    result_list = (response.result
+                   if isinstance(response.result, list)
+                   else [response.result])
+    calls: list[tuple[str, dict]] = []
+    for m in result_list:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if isinstance(tc, dict):
+                calls.append((tc.get("name", ""), tc.get("args") or {}))
+    return calls
+
+
+def _sbr_norm_hid(raw: object) -> str | None:
+    """Normalize a hypothesis id to the ledger's numeric-string key."""
+    n = _parse_hypothesis_num(raw)
+    return str(n) if n is not None else None
+
+
+# Kill-intent toward a hypothesis in the menu_choice free text, both
+# orders: "终结 H3" / "H3 可证伪".  Used by C3 only.
+_SBR_KILL_INTENT_RES = (
+    re.compile(r"(?:终结|证伪|埋葬|排除|record_finding)\s*[，,、]?\s*[Hh]?(\d+)"),
+    re.compile(r"[Hh]?(\d+)\s*(?:终结|证伪|埋葬|排除|可证伪|已证伪)"),
+)
+
+
+def _check_belief_consistency(
+    sbr: dict,
+    ledger: DiagnosisLedger,
+    tool_calls: list[tuple[str, dict]],
+) -> list[tuple[str, str]]:
+    """Deterministic belief-ledger divergence checks (C0-C3).
+
+    Returns a list of ``(rule_id, message)`` pairs, at most one per
+    rule, total capped at 3 (context budget).  Messages are phrased as
+    calibration information, never imperatives.
+    """
+    corrections: list[tuple[str, str]] = []
+    hypotheses = ledger.get("hypotheses", {})
+
+    # Same-round tool calls that already resolve a divergence suppress
+    # the corresponding rule (the model is formalizing RIGHT NOW).
+    rf_verdicts: dict[str, str] = {}
+    select_targets: list[str] = []
+    commit_called = False
+    for name, args in tool_calls:
+        if name == "record_finding":
+            hid = _sbr_norm_hid(args.get("hypothesis_id", ""))
+            if hid:
+                rf_verdicts[hid] = str(args.get("verdict", "")).lower()
+        elif name == "commit_hypotheses":
+            commit_called = True
+        elif name == "select_path":
+            sid = _sbr_norm_hid(args.get("selected_hypothesis_id", ""))
+            if sid:
+                select_targets.append(sid)
+
+    # ── C0: self-reported phase contradicts the derived phase ──
+    sp = sbr.get("phase")
+    derived = derive_phase(ledger)
+    if sp and sp != derived:
+        corrections.append((
+            "C0",
+            f"⚠ [认知校准] 状态块自报阶段={sp}，但台账推导当前阶段为 "
+            f"{derived}——以台账为准，请按 {derived} 阶段的「本步要求」行动。",
+        ))
+
+    # ── C1: root cause claimed (≥80%) but nothing confirmed formally ──
+    rc = sbr.get("root_cause")
+    if rc and rc[1] is not None and rc[1] >= 80:
+        has_confirmed = any(
+            h.get("status") == "confirmed" for h in hypotheses.values()
+        )
+        formalizing = commit_called or any(
+            v == "confirmed" for v in rf_verdicts.values()
+        )
+        if not has_confirmed and not formalizing:
+            corrections.append((
+                "C1",
+                f"⚠ [认知校准] 你在状态块中认定根因（{rc[0][:40]}@{rc[1]}%），"
+                "但台账尚无任何 confirmed 假设——文本陈述不产生结论。合法路径："
+                "① 现有证据已可判定的未决假设 → 直接 record_finding 终结"
+                "（跨假设证据复用，无需重复委派）；"
+                "② 全部判定后 commit_hypotheses 提交该根因假设；"
+                "③ record_finding(verdict=confirmed, p≥80) 正式确认。"
+                "出口判据满足后系统自动进入 REPORT，提前 write_file 会被门控拦截。",
+            ))
+
+    # ── C2: belief claims a terminal verdict the ledger doesn't have ──
+    diverged: list[str] = []
+    for hid, (st, _prob) in (sbr.get("beliefs") or {}).items():
+        node = hypotheses.get(hid)
+        if node is None:
+            continue  # id not in ledger (stale/hallucinated) — no opinion
+        ledger_status = node.get("status")
+        if st in ("refuted", "confirmed") and ledger_status in (
+                "pending", "inconclusive"):
+            if rf_verdicts.get(hid) == st:
+                continue  # record_finding this round is resolving it
+            diverged.append(
+                f"{fmt_hid(hid)}=已{'证伪' if st == 'refuted' else '确认'}"
+                f"(台账仍为 {ledger_status})"
+            )
+    if diverged:
+        corrections.append((
+            "C2",
+            "⚠ [认知校准] 状态块认为 "
+            + "、".join(diverged[:3])
+            + "——若证据足够，请用 record_finding 正式记录对应结论；"
+            "文本陈述不改变台账。",
+        ))
+
+    # ── C3: declared kill-intent on Hx but the action reactivates it ──
+    menu = sbr.get("menu_choice") or ""
+    if menu and select_targets:
+        kill_ids: set[str] = set()
+        for kre in _SBR_KILL_INTENT_RES:
+            for km in kre.finditer(menu):
+                hid = _sbr_norm_hid(km.group(1))
+                if hid:
+                    kill_ids.add(hid)
+        for sid in select_targets:
+            if sid in kill_ids:
+                corrections.append((
+                    "C3",
+                    f"⚠ [认知校准] 状态块声明「{menu[:50]}」，但本轮动作是 "
+                    f"select_path 选择 {fmt_hid(sid)} 继续验证——两者矛盾。"
+                    f"若证据已可判定 {fmt_hid(sid)}，直接 record_finding "
+                    "终结更省轮次；若确需验证，请在下轮状态块如实更新判断。",
+                ))
+                break
+
+    return corrections[:3]
 
 
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
@@ -1460,6 +1616,51 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_call_count, _duration,
                     _tokens_in, _tokens_out, _tokens_reason,
                 )
+            # ── SBR belief-ledger consistency guard (§12) ──
+            # Parse the round's diagnosis_status block and compare the
+            # self-reported beliefs against the ledger.  Corrections are
+            # stored on the ledger and rendered by _build_safety_warnings
+            # into the NEXT round's context (one-shot, then popped).
+            # Everything here is best-effort: a parse/check failure must
+            # never break the loop (the guard is advisory by design).
+            try:
+                _sbr = parse_diagnosis_status(_extract_response_text(response))
+                _sbr_corrections: list[tuple[str, str]] = []
+                if _sbr is None:
+                    _streak = ledger.get("_sbr_missing_streak", 0) + 1
+                    if _streak >= 3:
+                        _sbr_corrections.append((
+                            "C4",
+                            "⚠ [认知校准] 已连续 "
+                            f"{_streak} 轮缺少 diagnosis_status 状态块。"
+                            "每轮回复必须以该块开头（见系统指令「输出格式」）"
+                            "——它用于校准你的认知与台账，缺失会降低系统的"
+                            "引导精度。",
+                        ))
+                        _streak = 0
+                    ledger["_sbr_missing_streak"] = _streak
+                else:
+                    ledger["_sbr_missing_streak"] = 0
+                    _sbr_corrections = _check_belief_consistency(
+                        _sbr, ledger, _response_tool_calls(response),
+                    )
+                if _sbr_corrections:
+                    ledger["_sbr_corrections"] = [
+                        msg for _, msg in _sbr_corrections
+                    ]
+                    _sbr_log = ledger.setdefault("_sbr_log", [])
+                    _sbr_log.append({
+                        "round": self._model_call_count,
+                        "rules": [rid for rid, _ in _sbr_corrections],
+                    })
+                    del _sbr_log[:-50]  # bounded audit trail
+                    logger.warning(
+                        "SBR guard: %s (round=%d, phase=%s)",
+                        ",".join(rid for rid, _ in _sbr_corrections),
+                        self._model_call_count, _phase(ledger),
+                    )
+            except Exception as _sbr_exc:  # noqa: BLE001 — advisory only
+                logger.debug("SBR guard skipped on error: %s", _sbr_exc)
         else:
             # ── G7 fallback: every attempt failed ──
             # NOTE: this recovery path must never crash the stream —
@@ -2533,7 +2734,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # overwrite an LLM-authored report (the new text might be
                 # the short user summary).  No extra model call, avoiding
                 # the hang risk noted in the level-1 comment below.
-                _salvage_text = _extract_response_text(response)
+                _salvage_text = strip_diagnosis_status_blocks(
+                    _extract_response_text(response)
+                )
                 if _is_substantial_report_text(_salvage_text) and (
                         not report_exists
                         or ledger.get("_report_auto_generated")):
@@ -3490,6 +3693,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         round_num = self._model_call_count
         warnings: list[str] = []
         mutated = False  # set when a valve changes ledger state below
+
+        # ── SBR belief-ledger consistency corrections (one-shot) ──
+        # Stored by the post-response SBR guard (§12); rendered here so
+        # the correction sits in the safety block at the prompt tail.
+        # Popping makes them one-shot — they describe a divergence the
+        # LLM is expected to act on THIS round; the guard re-fires next
+        # round if it persists.  Not a ledger mutation that affects the
+        # context block (the key is never rendered there), so the
+        # caller's re-render trigger (`mutated`) stays untouched.
+        _sbr_pending = ledger.pop("_sbr_corrections", None)
+        if _sbr_pending:
+            warnings.extend(_sbr_pending)
 
         # ── P1: Maximum round limit — progress-aware, then synthesis + REPORT ──
         # The round cap is a stagnation backstop, not a blunt cutoff: when
