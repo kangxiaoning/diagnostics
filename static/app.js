@@ -2423,7 +2423,7 @@ function renderHypothesisNode(node, allHypotheses, depth) {
   if (childCount > 0) {
     html += `<div class="hyp-children${chCollapsed ? " collapsed" : ""}" data-ch-for="${esc(node.id)}">`;
     html += `<button class="hyp-collapse-btn" data-action="toggle-children" data-hid="${esc(node.id)}">`;
-    html += `深化假设 (${childCount})</button>`;
+    html += `细化 (${childCount})</button>`;
     html += `<div class="hyp-children-list${chCollapsed ? " hidden" : ""}">`;
     for (const sid of node.sub_hypothesis_ids) {
       html += renderHypothesisNode(allHypotheses[sid], allHypotheses, depth + 1);

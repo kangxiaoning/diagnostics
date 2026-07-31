@@ -9,9 +9,11 @@ would re-introduce the prompt/code drift this refactor removed.
 from __future__ import annotations
 
 # ── PHASE_SPEC: single source of truth for phase semantics ──
-# Rendered into <diagnostic_flow> below AND consumed (indirectly, via
-# ledger._phase_guidance) for the per-round "本步要求" injection.  Keep
-# the two consumers consistent by editing only this table.
+# Rendered into <diagnostic_flow> below AND consumed by
+# ledger._phase_guidance for the per-round "本步要求" injection
+# (v2.8.2: duty/exit/summary 语句经 PHASE_SPEC 单源引用，轮次指引不再
+# 手写重复——此前两份手写文案靠人肉同步，历次设计迭代均需双处修改).
+# Keep the two consumers consistent by editing only this table.
 
 PHASE_SPEC: dict[str, dict] = {
     "understand": {
@@ -19,10 +21,14 @@ PHASE_SPEC: dict[str, dict] = {
         "duty": "从用户输入提取故障画像（实体、症状、时间线、最近变更、已尝试操作），"
                 "委派 Argus 专家采集监控指标时序，识别突变点与跨域关联。",
         "actions": [
-            "主机症状（CPU/内存/磁盘/网络）→ task(subagent_type=\"host-argus-expert\", description=...)",
-            "K8s 症状（节点/Pod/集群）→ task(subagent_type=\"k8s-argus-expert\", description=...)",
-            "K8s 集群场景（含容器/Pod/DNS/集群症状）→ 单轮并行委派两个 Argus 专家",
-            "可按需 read_file 加载 SKILL.md / AGENTS.md 指导方向",
+            "委派几个 Argus 专家由实体类型决定（与覆盖门控一致，非按症状逐个映射）",
+            "纯主机场景（entity_type=host）→ 仅 task(subagent_type=\"host-argus-expert\", description=...)",
+            "K8s/容器集群场景 → 单轮并行委派两个：task(subagent_type=\"host-argus-expert\") "
+            "+ task(subagent_type=\"k8s-argus-expert\")",
+            "即使症状仅点名集群/Pod/DNS/节点也必须双委派——主机节点资源（CPU/内存/磁盘 IO）"
+            "是集群故障的底层排查维度，缺一则覆盖门控判数据不齐、无法进入 HYPOTHESIZE",
+            "先委派、后读技能：Argus 委派已发出后，才可按需 read_file 加载 "
+            "SKILL.md / AGENTS.md 深化理解（首轮先读技能会延误数据采集）",
         ],
         "exit": "必需 Argus 专家数据齐备后，系统自动进入 HYPOTHESIZE。"
                 "本阶段不提交假设。",
@@ -30,13 +36,12 @@ PHASE_SPEC: dict[str, dict] = {
     "hypothesize": {
         "title": "阶段 2: HYPOTHESIZE（形成假设）",
         "duty": "基于已收集证据，一次性提出最多 3 个可能性最大的假设（按概率降序），"
-                "每个标注概率(0-100)和依据。适用于三种场景：首批、深化（confirmed 假设下"
-                "更具体的假设）、换批（前批全部证伪后换方向）。",
+                "每个标注概率(0-100)和依据。适用于两种场景：首批、换批（前批全部证伪后"
+                "换方向）。假设为扁平结构（ID 为整数编号如 H1、H2），不支持子假设。",
         "actions": [
             "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
-            "预算硬约束：整个诊断最多提交 2 次（首批/深化/换批共用），每次最多 3 个，"
+            "预算硬约束：整个诊断最多提交 2 次（首批/换批共用），每次最多 3 个，"
             "总计不超过 6 个假设；预算用尽后只能用 record_finding(statement_update=...) 修正已有假设",
-            "深化：commit_hypotheses(parent_hypothesis_id=...) 提交假设，占用 1 次提交预算",
             "换批：第 2 次提交在前批无 confirmed 且无活跃 pending 后开放"
             "（搁置/inconclusive 不阻塞），必须基于已排除证据换方向，禁止重复或仅换措辞",
         ],
@@ -61,24 +66,31 @@ PHASE_SPEC: dict[str, dict] = {
     "evaluate": {
         "title": "阶段 4: EVALUATE（评估结果）",
         "duty": "评估本层所有假设的验证结果，选择下一步路径。退出条件由系统判定——"
-                "满足时系统自动进入 REPORT，无需你判断。",
+                "满足时系统自动进入 REPORT，无需你判断；"
+                "未满足时（已有 confirmed 根因但仍有可行动验证的未决假设）"
+                "禁止主动调用 write_file，必须先 select_path 验证/证伪；"
+                "已委派仍无法定论的假设可 defer 搁置，不必反复重试。",
         "actions": [
-            "有待验证假设 → select_path 切换到最可能的继续验证",
-            "confirmed 假设需更具体且提交预算未用尽 → commit_hypotheses(parent_hypothesis_id=...) 深化；"
-            "预算已用尽 → record_finding(statement_update=...) 修正表述",
+            "有待验证假设 → select_path 切换到最可能的继续验证"
+            "（可用 deprioritized 参数同时搁置反复无法定论的假设）",
+            "confirmed 假设需更具体 → record_finding(statement_update=...) 修正表述"
+            "（假设为扁平结构，无层级深化）",
             "本层全部 refuted 且有可回溯（搁置/inconclusive）假设 → backtrack",
-            "本层全部 refuted 且不可回溯、提交预算未用尽 → commit_hypotheses 换方向",
+            "本层全部 refuted 或验证增益已低于成本（经济死亡）、提交预算未用尽 → "
+            "commit_hypotheses 换方向（搁置/经济死亡假设不阻塞换批）",
             "多根因场景：证据支持的假设即使非主根因也应标记 confirmed；"
             "refuted 仅用于证据明确证伪的假设",
         ],
-        "exit": "退出条件满足时系统自动进入 REPORT：把握足够（已确认根因 p≥80 且残余不确定性低）"
-                "且继续验证的期望信息增益低于成本（重复委派价值衰减）；"
+        "exit": "退出条件满足时系统自动进入 REPORT：把握足够（已确认根因 p≥80）"
+                "且无可行动验证（全部未决假设的验证增益均低于成本，重复委派价值衰减）；"
                 "假设穷尽或证据饱和（连续3次 inconclusive）走快速通道。",
     },
     "report": {
         "title": "阶段 5: REPORT（生成报告）",
         "duty": "基于诊断台账（证据链）生成报告并交付。系统已自动终结所有挂起假设，"
                 "你无需再调用 record_finding / commit_hypotheses。",
+        "summary": "用 3~5 句话向用户总结：根因（多根因分别列出）、关键证据、"
+                   "最重要的修复建议",
         "actions": [
             "立即调用 write_file 将报告写入系统指定路径（见下），禁止输出文本分析",
             "报告写盘后用 3~5 句话向用户总结：根因（多根因分别列出）、关键证据、"
@@ -173,6 +185,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 {report_path}
 ```
 
+⏳ 使用时机：诊断完成、系统进入 REPORT 阶段后，你会收到写入报告的明确指令（并复述此路径）——届时再调用 write_file。提前调用将被系统门控拒绝，内容不会保存。
+
 ⚠ 该路径是系统分配的唯一标识符，其中的时间戳与随机串不可预测。**禁止**根据故障现象/时间/实体自行拼接描述性文件名（如 `...-java-app-oomkilled-disk-full.md`）——任何非此路径的写法都会被系统强制改写，且可能导致报告内容丢失。直接复制上方路径即可。
 
 诊断台账（ledger JSON）已由系统自动持久化到 `{ledger_path}`，**无需手动写入**。
@@ -246,25 +260,15 @@ HYPOTHESIZE:
   (系统自动聚焦 H1 进入 VERIFY)
 
 VERIFY (聚焦 H1, 委派 K8s 专家):
-  → task(subagent_type="k8s-expert", description="验证假设H1: Pod内存超限OOMKilled。cluster_name=prod-cluster。检查 java-backend 的 Pod 状态、重启原因、资源限制。")
+  → task(subagent_type="k8s-expert", description="验证假设H1: Pod内存超限OOMKilled。cluster_name=prod-cluster。检查 java-backend 的 Pod 状态、重启原因、资源限制、JVM 启动参数(-Xmx)与容器 memory limit 的关系。")
   → record_finding(hypothesis_id="H1", verdict="confirmed",
-      evidence_summary="java-backend OOMKilled 5次, RSS 1.2Gi > limit 1Gi",
-      probability_update=80)
+      evidence_summary="java-backend OOMKilled 5次, RSS 1.2Gi > limit 1Gi；JVM -Xmx 1536m 超过容器 limit",
+      probability_update=90,
+      statement_update="JVM堆配置(-Xmx 1536m)超过容器 memory limit(1Gi)导致 OOMKilled")
+  （验证中发现更具体的根因表述时，用 statement_update 一步到位修正——
+    假设为扁平结构，不需要也不能提交子假设）
 
-EVALUATE: H1 confirmed p=80%，但需深化（limit 过低还是内存泄漏）
-  → commit_hypotheses(parent_hypothesis_id="H1", hypotheses=[  （占用第 2 次、即最后一次提交预算）
-      {{statement: "JVM堆配置超过limit", probability: 60, rationale: "-Xmx 可能超限"}},
-      {{statement: "应用内存泄漏", probability: 30, rationale: "RSS 持续增长"}},
-      {{statement: "cgroup统计包含页缓存导致误杀", probability: 10, rationale: "统计口径"}}
-    ])
-
-VERIFY (聚焦 H1.1):
-  → task(subagent_type="k8s-expert", description="验证假设H1.1: JVM堆配置超过limit。cluster_name=prod-cluster。检查 JVM 启动参数(-Xmx)与容器 memory limit 的关系。")
-  → record_finding(hypothesis_id="H1.1", verdict="confirmed",
-      evidence_summary="-Xmx 1536m > limit 1Gi(1024Mi)",
-      probability_update=90)
-
-EVALUATE → 退出条件满足（根因确认，系统自动进入 REPORT）
+EVALUATE → 退出条件满足（根因确认 p≥80，系统自动进入 REPORT）
 REPORT:
   → write_file(file_path="{report_path}", content=诊断报告)
   （台账已由系统自动持久化；随后用 3~5 句话向用户总结）

@@ -35,11 +35,13 @@ from pydantic import AliasChoices, BaseModel, Field
 from deepagents.backends.protocol import BackendProtocol
 
 from diagnostics.agent.ledger import (
+    KAPPA_STOP,
     MAX_COMMIT_CALLS,
     DiagnosisLedger,
     DiagnosisLedgerState,
     _coverage_ready,
-    _has_confirmed_ancestor,
+    _economically_dead,
+    _parse_hypothesis_num,
     activate_hypothesis,
     add_evidence_to_active,
     add_hypotheses,
@@ -49,12 +51,14 @@ from diagnostics.agent.ledger import (
     delegation_value,
     derive_phase,
     finalize_pending_for_report,
+    fmt_hid,
     ledger_to_json,
     new_evidence,
     new_ledger,
     record_finding,
     record_round,
     render_ledger_context,
+    resolve_hypothesis_id,
     select_path,
 )
 from deepagents.middleware._utils import append_to_system_message
@@ -90,10 +94,11 @@ def _phase(ledger: dict) -> str:
 def _force_report(ledger: dict) -> None:
     """Guardrail entry into REPORT.
 
-    Sets the terminal marker consumed by the write_file gate and the
-    finalize guard, and clears the active hypothesis selection so the
-    derived phase can no longer land on "verify" for a stale active
-    node.  The phase itself is NOT stored (derived on demand).
+    Sets the terminal marker consumed by the write_file gate, the
+    finalize guard, and derive_phase's step-1 REPORT lock — once the
+    marker is set, a stale selected/active hypothesis can no longer
+    pull the derived phase back to "verify".  The phase itself is NOT
+    stored (derived on demand, P1).
     """
     ledger["_forced_terminal"] = True
 
@@ -107,6 +112,16 @@ def _force_report(ledger: dict) -> None:
 # by the dedicated write_file gate in awrap_tool_call (exit conditions
 # based), so a legitimate report write from any phase is never killed by
 # phase bookkeeping lag (see the evaluate comment below).
+# Required args of the deepagents file tools — used ONLY for an
+# observability warning when the model emits a malformed (empty-args)
+# tool call.  Not a gate: schema validation produces the actual error
+# returned to the LLM.
+_FILE_TOOL_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
+    "write_file": ("file_path", "content"),
+    "read_file": ("file_path",),
+    "edit_file": ("file_path", "old_string", "new_string"),
+}
+
 _PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
     # UNDERSTAND collects data only — committing hypotheses before the
     # coverage gate opens would skip HYPOTHESIZE entirely.
@@ -124,18 +139,27 @@ _PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
     "verify": frozenset({
         "commit_hypotheses", "select_path", "backtrack",
     }),
-    # EVALUATE picks direction; findings belong to VERIFY.  write_file is
-    # deliberately NOT gated here — the dedicated write_file gate above
-    # (check_exit_conditions / _forced_terminal / report) is the correct
-    # guard for "may I write the report now".  Gating write_file by phase
-    # would kill the legitimate escape hatch where exit conditions are
-    # met while the derived phase still reads "evaluate" (observed
-    # 2026-07-20 32-round session: round-14/18 write_file from evaluate
-    # was rejected by the phase gate, the report content was lost twice,
-    # and diagnosis wandered for 18 more rounds).
-    "evaluate": frozenset({
-        "record_finding",
-    }),
+    # EVALUATE picks direction; recording a finding is ALSO legal here
+    # (v2.8.1: record_finding is an evidence-ledgering EVENT, not a phase
+    # milestone — Statecharts shared-event semantics, valid in VERIFY as
+    # the T3 transition and in EVALUATE as an internal self-transition).
+    # Gating it in evaluate contradicted the evaluate guidance itself
+    # ("confirmed 假设需更具体 → record_finding(statement_update=...)";
+    # multi-root secondary confirmations) and the v2.7.1 confirmed→confirmed
+    # strengthening channel, which has no legal path back to verify
+    # (select_path/backtrack/auto-heal all target pending/inconclusive
+    # only).  Production evidence: 2026-07-25 "record_finding blocked by
+    # phase gate in evaluate" ×5 (round 5 retries).  Semantic guards stay
+    # in the tool handler (Defect D anti-flip, refuted frozen, ID
+    # validation), so allowing it here opens no abuse surface.
+    # write_file is deliberately NOT gated here — the dedicated write_file
+    # gate above (check_exit_conditions / _forced_terminal / report) is
+    # the correct guard for "may I write the report now".  Gating
+    # write_file by phase would kill the legitimate escape hatch where
+    # exit conditions are met while the derived phase still reads
+    # "evaluate" (observed 2026-07-20 32-round session: round-14/18
+    # write_file from evaluate was rejected by the phase gate, the report
+    # content was lost twice, and diagnosis wandered for 18 more rounds).
     # REPORT only writes the report; diagnosis tools are locked out.
     "report": frozenset({
         "commit_hypotheses", "record_finding", "select_path", "backtrack",
@@ -147,7 +171,7 @@ _PHASE_ALLOWED_HINT: dict[str, str] = {
     "understand": "task(*-argus-expert), read_file",
     "hypothesize": "commit_hypotheses",
     "verify": "task(*-expert), record_finding",
-    "evaluate": "select_path / commit_hypotheses / backtrack",
+    "evaluate": "select_path / commit_hypotheses / backtrack / record_finding",
     "report": "write_file",
 }
 
@@ -170,7 +194,7 @@ _LEDGER_TOOLS = frozenset({
 
 # ── Safety mechanism thresholds ──
 _MAX_ROUNDS = 40                    # G1 轮次上限（简单场景，state-machine-v2.md §8）：超过此轮次强制 REPORT
-_MAX_ROUNDS_COMPLEX = 24            # Hard limit when diagnosis went deep (retry batch / depth ≥ 1):
+_MAX_ROUNDS_COMPLEX = 24            # Hard limit when diagnosis needed a retry batch:
                                     # a diagnosis that needed a second batch or sub-hypotheses is
                                     # already past the healthy budget — further rounds show
                                     # diminishing returns (observed 2026-07-20 32-round session:
@@ -249,7 +273,6 @@ def _build_evidence_audit(ledger: dict) -> str:
     if not hypotheses:
         return ""
 
-    root_ids = ledger.get("root_hypothesis_ids", [])
     confirmed = [(hid, h) for hid, h in hypotheses.items()
                  if h.get("status") == "confirmed"]
 
@@ -275,9 +298,8 @@ def _build_evidence_audit(ledger: dict) -> str:
             label = "基本"
         else:
             label = "不足"
-        priority = "根因假设" if hid in root_ids else "深化假设"
         lines.append(
-            f"  {hid}({priority}): 证据{label} "
+            f"  {fmt_hid(hid)}: 证据{label} "
             f"({len(supporting)}条支持/{len(refuting)}条反对, "
             f"{len(expert_sources)}个专家来源, "
             f"{'多源交叉验证' if multi_source else '单一来源'})"
@@ -432,7 +454,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
                          and any(e.get("source") == "coordinator" for e in evidence))
                 conf = "高" if prob >= 80 and multi else "中" if prob >= 60 else "低"
                 lines.append(
-                    f"- **{hid}**{' [根因]' if is_root else ''} "
+                    f"- **{fmt_hid(hid)}**{' [根因]' if is_root else ''} "
                     f"置信度:{conf} 概率:{prob}% "
                     f"证据:{len(supporting)}支持/{len(refuting_ev)}反对 "
                     f"来源:{len(expert_srcs)}专家 "
@@ -448,7 +470,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
             lines.append("### ❌ 已排除假设")
             for hid, node in refuted:
                 rationale = node.get("rationale", "") or "(无记录)"
-                lines.append(f"- **{hid}**: {node.get('statement', '')}")
+                lines.append(f"- **{fmt_hid(hid)}**: {node.get('statement', '')}")
                 lines.append(f"  原因: {rationale}")
             lines.append("")
 
@@ -460,7 +482,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
                 evidence = node.get("evidence", [])
                 supporting = [e for e in evidence if e.get("supports") is True]
                 lines.append(
-                    f"- **{hid}**: {node.get('statement', '')} "
+                    f"- **{fmt_hid(hid)}**: {node.get('statement', '')} "
                     f"(概率:{prob}%, 已收集{len(supporting)}条证据)"
                 )
             lines.append("")
@@ -824,7 +846,7 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
                 summaries.append(s)
         if summaries:
             status_label = {"confirmed": "✓", "refuted": "✗", "inconclusive": "?"}.get(h["status"], "⟳")
-            lines.append(f"\n假设 {hid} [{status_label}] {h.get('statement', '')}:")
+            lines.append(f"\n假设 {fmt_hid(hid)} [{status_label}] {h.get('statement', '')}:")
             for s in summaries:
                 lines.append(f"  - {s}")
 
@@ -944,6 +966,16 @@ def _parse_hypothesis_id_from_description(
     """
     if not description or not hypotheses:
         return None
+
+    def _canon(raw: str) -> str | None:
+        # v2.7: ledger keys are canonical numeric strings ("2"); the
+        # regex captures display form ("H2") — normalize before lookup.
+        n = _parse_hypothesis_num(raw)
+        if n is None:
+            return None
+        hid = str(n)
+        return hid if hid in hypotheses else None
+
     marker = "[Coordinator 委派指令]"
     idx = description.rfind(marker)
     if idx >= 0:
@@ -952,12 +984,12 @@ def _parse_hypothesis_id_from_description(
         # routing — a full-text match here would more likely hit a
         # hypothesis snapshot in the wrapped context than the target.
         match = _HYPOTHESIS_ID_PATTERN.search(description[idx + len(marker):])
-        if match and match.group(1) in hypotheses:
-            return match.group(1)
+        if match:
+            return _canon(match.group(1))
         return None
     match = _HYPOTHESIS_ID_PATTERN.search(description)
-    if match and match.group(1) in hypotheses:
-        return match.group(1)
+    if match:
+        return _canon(match.group(1))
     return None
 
 
@@ -977,10 +1009,6 @@ class DeprioritizedSpec(BaseModel):
 class CommitHypothesesInput(BaseModel):
     hypotheses: list[HypothesisSpec] = Field(
         description="假设列表（最多3个，按概率降序）",
-    )
-    parent_hypothesis_id: str | None = Field(
-        default=None,
-        description="父假设ID。None=顶层假设，否则在该假设下深化（同样占用提交预算）",
     )
     focus_summary: str = Field(
         default="",
@@ -1663,48 +1691,60 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     break
 
                             if self._verify_stall_count == 1:
-                                # First stall — inject reminder via
-                                # ExtendedModelResponse to FORCE loop
-                                # continuation.  Appending text to AIMessage
-                                # is insufficient because the deepagents
-                                # graph router checks tool_calls for loop
+                                # First stall — REMINDER only (G13 level-1,
+                                # §8 three-level pattern).  Nudge with a
+                                # harmless ls call + a record_finding
+                                # directive; the VERDICT decision stays
+                                # with the LLM.  (v2.8.4: the previous
+                                # level-1 auto-injected verdict="confirmed"
+                                # even with NO coordinator support —
+                                # contradicting G4's same-situation rule
+                                # (coordinator support → confirmed, else
+                                # inconclusive) and fabricating a positive
+                                # verdict from unassessed expert output.)
+                                # Appending text to AIMessage is
+                                # insufficient because the deepagents graph
+                                # router checks tool_calls for loop
                                 # decisions — a text-only AIMessage with no
-                                # tool_calls terminates the loop immediately,
-                                # and the appended reminder text never
-                                # reaches the LLM.
+                                # tool_calls terminates the loop
+                                # immediately, and the appended reminder
+                                # text never reaches the LLM.
                                 logger.info(
                                     "Verify-phase gentle reminder: expert "
                                     "evidence exists for %s but no "
-                                    "record_finding (round %d)",
+                                    "record_finding (round %d) — nudging",
                                     active_id, self._model_call_count,
                                 )
                                 import uuid as _uuid
                                 synthetic = [{
-                                    "name": "record_finding",
+                                    "name": "ls",
                                     "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                                    "args": {
-                                        "hypothesis_id": active_id,
-                                        "verdict": "confirmed",
-                                        "evidence_summary": (
-                                            "[系统自动] LLM 未调用 record_finding，"
-                                            "系统基于已有专家证据自动确认。"
-                                        ),
-                                        "probability_update": node["probability"],
-                                    },
+                                    "args": {"path": "/agent_data"},
                                 }]
                                 response = ModelResponse(result=[AIMessage(
                                     content=(
-                                        "[系统提醒] 你已收到专家验证结果但未调用 "
-                                        "record_finding。系统已自动记录验证结论，"
-                                        "请在下一轮基于台账继续诊断。"
+                                        "⛔ [系统提醒] 你已收到专家验证结果但"
+                                        "未调用 record_finding 记录结论。\n"
+                                        f"请立即对假设 {fmt_hid(active_id)} "
+                                        "调用 record_finding（confirmed / "
+                                        "refuted / inconclusive 由你根据证据"
+                                        "判定；证据不足就给 inconclusive）。"
+                                        "禁止以纯文本结束本阶段。"
                                     ),
                                 )])
                                 _inject_tool_calls(response, synthetic)
-                                self._verify_stall_count = 0  # reset after auto-action
+                                # No count reset: escalation must be
+                                # monotonic (reminder → degrade → terminal)
+                                # across CONSECUTIVE stalls.  Any real tool
+                                # call resets the counter at the top of the
+                                # verify-stall handler.
 
                             elif self._verify_stall_count == 2:
-                                # Second stall — inject strong reminder with
-                                # inferred verdict hint.  Also uses
+                                # Second stall — DEGRADE (G13 level-2):
+                                # record the verdict inferred from the
+                                # expert's explicit verdict text (no
+                                # fabrication: inferred=None → inconclusive,
+                                # never a blind confirmed).  Also uses
                                 # ExtendedModelResponse to force loop
                                 # continuation (same reason as stall 1).
                                 inferred = _infer_verdict_from_text(expert_text)
@@ -1741,14 +1781,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 response = ModelResponse(result=[AIMessage(
                                     content=(
                                         f"[系统强制] 已连续 2 轮未调用 record_finding。"
-                                        f"系统已自动处理假设 {active_id}。"
+                                        f"系统已自动处理假设 {fmt_hid(active_id)}。"
                                     ),
                                 )])
                                 _inject_tool_calls(response, synthetic)
-                                self._verify_stall_count = 0
+                                # No count reset — next consecutive stall
+                                # escalates to the terminal auto-decision.
 
                             else:
-                                # Third consecutive stall → auto-decision
+                                # Third consecutive stall → TERMINAL
+                                # auto-decision (G13 level-3)
                                 inferred = _infer_verdict_from_text(expert_text)
                                 if inferred == "confirmed":
                                     record_finding(
@@ -2120,10 +2162,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #     (a) actionable pending root → synthetic select_path (T5);
         #     (b) only shelved (deferred) roots → synthetic select_path
         #         reviving one (T5 explicitly allows deferred revival);
-        #     (c) layer fully hard-failed + batch budget open → harmless
-        #         nudge reminding the LLM to commit_hypotheses (T8; no
-        #         placeholder commit — that would consume batch budget
-        #         and pollute the tree).
+        #     (b′) weak-confirmed (p<80) present → nudge the v2.7.1
+        #         strengthening channel (record_finding, verdict stays
+        #         with the LLM);
+        #     (c) layer fully hard-failed/economically dead + batch
+        #         budget open → harmless nudge reminding the LLM to
+        #         commit_hypotheses (T8; no placeholder commit — that
+        #         would consume batch budget and pollute the tree).
         #   2nd consecutive offence, or no legal direction at all — 兜底
         #     (G7 pattern): finalize undecided hypotheses via
         #     finalize_pending_for_report (deferred marking, NOT status
@@ -2137,20 +2182,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 and _phase(ledger) == "evaluate"):
             if _response_ends_loop(response):
                 all_h = ledger.get("hypotheses", {})
-                # Actionable nodes (§6.3 R-set semantics), scanned
-                # TREE-WIDE — not just the root layer: pending /
+                # Actionable nodes (§6.3 S2 actionability semantics),
+                # scanned TREE-WIDE — not just the root layer: pending /
                 # inconclusive and not shelved; low-probability pending
-                # (p<=15) is exempt, inconclusive always stays actionable.
-                # A confirmed root with an unverified sub-hypothesis
-                # (deepening in progress) is a legal direction via T5
-                # select_path; a roots-only scan is blind to it and would
-                # force-REPORT over an open deepening line.
+                # (p<=15) is exempt.  v2.9: the value filter (≥κ) aligns
+                # this direction choice with the G5 delegation gate —
+                # selecting an economically dead node was self-
+                # contradictory: the very next delegation it implies is
+                # hard-blocked by G5 (reproduced 2026-07-31: G9 picked a
+                # value=0.125<κ node, G5 blocked the follow-up task()).
+                # Dead nodes fall through to the revivable/batch/terminal
+                # branches instead — a fresh batch (budget open) or a
+                # REPORT boundary is the legal way out of a dead layer.
                 actionable = [
                     hid for hid, node in all_h.items()
                     if node.get("status") in ("pending", "inconclusive")
                     and not node.get("deferred")
                     and (node.get("status") == "inconclusive"
                          or node.get("probability", 0) > 15)
+                    and delegation_value(node) >= KAPPA_STOP
                 ]
                 # Revivable nodes: explicitly shelved (deferred) but still
                 # undecided — select_path clears the shelved mark.
@@ -2159,11 +2209,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if node.get("status") in ("pending", "inconclusive")
                     and node.get("deferred")
                 ]
+                # Strengthenable nodes: weak confirmations below the S1
+                # bar (p<80).  The v2.7.1 confirmed→confirmed channel is
+                # a LEGAL direction here — without this branch, a weak
+                # confirmation surrounded by economically dead siblings
+                # (nothing actionable, batch gate closed by the confirmed
+                # node) hit the terminal branch on the FIRST abandonment
+                # and the strengthening channel was lost.
+                strengthenable = [
+                    hid for hid, node in all_h.items()
+                    if node.get("status") == "confirmed"
+                    and node.get("probability", 0) < 80
+                ]
                 batch_open = can_commit_root_hypotheses(ledger)
 
                 if (self._evaluate_stall_count >= 1
                         or (not actionable and not revivable
-                            and not batch_open)):
+                            and not strengthenable and not batch_open)):
                     # ── Terminal: repeated abandonment, or nothing legal
                     # left to do.  Hand over to REPORT (report generation
                     # happens in the REPORT-phase handler below).
@@ -2202,7 +2264,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         }]
                         content = (
                             "[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
-                            f"系统已自动选择假设 {hid} 进入验证（select_path）。"
+                            f"系统已自动选择假设 {fmt_hid(hid)} 进入验证（select_path）。"
                         )
                         logger.warning(
                             "Safety: evaluate stall (round %d) — injecting "
@@ -2237,7 +2299,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         }]
                         content = (
                             "[系统强制] 当前处于 EVALUATE 阶段但未调用工具。"
-                            f"系统已复活被搁置的假设 {hid} 继续验证"
+                            f"系统已复活被搁置的假设 {fmt_hid(hid)} 继续验证"
                             "（select_path）。"
                         )
                         logger.warning(
@@ -2245,13 +2307,45 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "deferred %s via select_path",
                             self._model_call_count, hid,
                         )
+                    elif strengthenable:
+                        # (b′) Strengthen direction — a weak-confirmed
+                        # node (p<80) is the best remaining direction:
+                        # the v2.7.1 confirmed→confirmed channel can lift
+                        # it over the S1 bar.  Nudge only — the verdict
+                        # and probability are the LLM's judgement call,
+                        # never system-fabricated.
+                        hid = max(
+                            strengthenable,
+                            key=lambda h: all_h[h].get("probability", 0))
+                        synthetic = [{
+                            "name": "ls",
+                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+                            "args": {"path": "/agent_data"},
+                        }]
+                        content = (
+                            "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具。\n"
+                            f"已确认假设 {fmt_hid(hid)} 概率 "
+                            f"{all_h[hid].get('probability')}% 低于根因确认门槛"
+                            "（80%）。请基于已有证据调用 "
+                            f"record_finding(hypothesis_id=\"{fmt_hid(hid)}\", "
+                            "verdict=\"confirmed\", probability_update=...) "
+                            "强化置信度/补充证据/修正表述；"
+                            "若证据不足维持现状，请按指引选择其他方向。"
+                        )
+                        logger.warning(
+                            "Safety: evaluate stall (round %d) — nudging "
+                            "strengthening of weak-confirmed %s (p=%d)",
+                            self._model_call_count, hid,
+                            all_h[hid].get("probability", 0),
+                        )
                     else:
-                        # (c) T8 direction — nothing undecided remains on
-                        # this layer (all roots hard-failed) and the batch
-                        # budget is open.  Nudge via a harmless call; do
-                        # NOT inject commit_hypotheses itself — a
-                        # placeholder hypothesis would consume batch
-                        # budget and pollute the tree.
+                        # (c) T8 direction — nothing actionable remains on
+                        # this layer (all roots hard-failed or economically
+                        # dead, v2.9) and the batch budget is open.  Nudge
+                        # via a harmless call; do NOT inject
+                        # commit_hypotheses itself — a placeholder
+                        # hypothesis would consume batch budget and pollute
+                        # the tree.
                         synthetic = [{
                             "name": "ls",
                             "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
@@ -2259,11 +2353,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         }]
                         content = (
                             "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具，"
-                            "本层假设已全部证伪。\n"
+                            "本层假设已全部证伪或验证增益已低于成本"
+                            "（经济死亡，禁止再委派验证）。\n"
                             f"假设提交预算仍开放（已用 "
                             f"{ledger.get('_commit_count', 0)}"
                             f"/{MAX_COMMIT_CALLS} 次）。请立即调用 "
-                            "commit_hypotheses 提交新一批根假设"
+                            "commit_hypotheses 提交新一批假设"
                             "（必须基于已排除证据换方向，禁止重复或仅换措辞）。"
                         )
                         logger.warning(
@@ -2282,26 +2377,34 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # Real tool call made — the loop advances on its own.
                 self._evaluate_stall_count = 0
 
-        # ── Post-response: detect HYPOTHESIZE-phase stall (retry batch) ──
-        # When all root hypotheses are hard-failed and the retry budget
-        # is still open, derive_phase returns "hypothesize".  If the LLM
-        # outputs plain text instead of calling commit_hypotheses, the
-        # loop would exit silently without a report.  Nudge via a
-        # harmless synthetic call — do NOT inject commit_hypotheses
-        # itself: a placeholder hypothesis would consume batch budget
-        # and pollute the tree.
+        # ── Post-response: detect HYPOTHESIZE-phase stall (G12) ──
+        # HYPOTHESIZE has two entry paths (state-machine-v2.md §4/§5): T1
+        # (first batch — coverage just became ready, the ledger has NO
+        # hypotheses yet) and T8 (retry batch — the current batch is all
+        # hard-failed and budget remains).  In BOTH, if the LLM outputs
+        # plain text instead of calling commit_hypotheses, the agent loop
+        # would exit silently with no report (2026-07-31 scenario-24
+        # swap_thrashing: 2 rounds, zero hypotheses, no report, no ledger
+        # persisted).  Nudge via a harmless synthetic call — do NOT inject
+        # commit_hypotheses itself: a placeholder hypothesis would consume
+        # batch budget and pollute the tree (same principle as the G9
+        # evaluate valve, §8).  No round gate: the phase cannot occur
+        # before round 2 (s₀=UNDERSTAND, T1 coverage needs ≥2 rounds), and
+        # plain text always means the loop is about to END — so a nudge is
+        # always correct.  This mirrors the sibling verify-stall valve
+        # (which also fires with no round gate).
         ledger = self._current_ledger
-        if (ledger
-                and ledger.get("hypotheses")
-                and _phase(ledger) == "hypothesize"
-                and self._model_call_count >= _MIN_ROUND_FOR_SAFETY):
+        if ledger and _phase(ledger) == "hypothesize":
             if _response_ends_loop(response):
+                _has_prior = bool(ledger.get("hypotheses"))
                 logger.warning(
                     "Safety: hypothesize-phase stall (round %d, commit "
-                    "%d/%d) — nudging commit_hypotheses via synthetic call",
+                    "%d/%d, %s) — nudging commit_hypotheses via "
+                    "synthetic call",
                     self._model_call_count,
                     ledger.get("_commit_count", 0),
                     MAX_COMMIT_CALLS,
+                    "retry-batch" if _has_prior else "first-batch",
                 )
                 import uuid as _uuid
                 synthetic = [{
@@ -2309,15 +2412,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
                     "args": {"path": "/agent_data"},
                 }]
+                _directive = (
+                    "请立即调用 commit_hypotheses 提交新一批假设——"
+                    "必须基于已排除证据换方向推断，"
+                    "禁止与已排除假设重复或仅换措辞。"
+                    if _has_prior else
+                    "你尚未提交任何假设。请立即调用 commit_hypotheses "
+                    "提交首批竞争性假设（≤3 个，按概率降序，各附依据）——"
+                    "禁止以纯文本结束本阶段。"
+                )
                 response = ModelResponse(result=[AIMessage(
                     content=(
                         "[系统提醒] 当前处于 HYPOTHESIZE 阶段"
                         f"（假设提交预算已用 "
                         f"{ledger.get('_commit_count', 0)}"
                         f"/{MAX_COMMIT_CALLS} 次）。\n"
-                        "请立即调用 commit_hypotheses 提交新一批根假设——"
-                        "必须基于已排除证据换方向推断，"
-                        "禁止与已排除假设重复或仅换措辞。"
+                        f"{_directive}"
                     ),
                 )])
                 _inject_tool_calls(response, synthetic)
@@ -2394,7 +2504,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     if hasattr(m, "content") and isinstance(m.content, str):
                                         m.content = m.content.rstrip() + (
                                             "\n\n⛔ [系统提醒] 当前活跃假设 "
-                                            f"{active_id} 尚无专家验证证据。"
+                                            f"{fmt_hid(active_id)} 尚无专家验证证据。"
                                             "请在本轮委派 host-expert "
                                             "（task, subagent_type=host-expert）"
                                             "验证此假设后，再调用 "
@@ -2676,6 +2786,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
 
+        # ── Malformed file-tool call observability ──
+        # The streaming layer cannot warn on empty args (they may arrive
+        # in later chunks).  Here args are final: a file tool missing
+        # required params means the model emitted a malformed tool call
+        # (observed 2026-07-30 session: write_file({}) in REPORT phase,
+        # wasting a full round).  Warn only — the normal schema
+        # validation error is what the LLM recovers from.
+        if tool_name in _FILE_TOOL_REQUIRED_ARGS:
+            _missing = [
+                k for k in _FILE_TOOL_REQUIRED_ARGS[tool_name]
+                if not (tool_args or {}).get(k)
+            ]
+            if _missing:
+                logger.warning(
+                    "%s called with missing/empty args %s (round=%d) — "
+                    "model emitted malformed tool call; schema validation "
+                    "error will be returned to the LLM",
+                    tool_name, _missing, self._model_call_count,
+                )
+
         # ── write_file gate: enforce "verify before report" ──
         # The state machine requires the quantified exit criteria
         # (S1 confidence ∧ S2 gain<cost, or a fast lane) before entering
@@ -2911,7 +3041,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                             return ToolMessage(
                                 content=(
-                                    f"⛔ 委派被信息增益门控拦截：假设 {_gate_hid} "
+                                    f"⛔ 委派被信息增益门控拦截：假设 {fmt_hid(_gate_hid)} "
                                     f"当前验证动作价值 {_v:.3f} < κ={KAPPA_STOP}"
                                     f"（已委派 {_gate_node.get('_delegate_count', 0)} 次、"
                                     f"inconclusive {_gate_node.get('_inconclusive_count', 0)} 次，"
@@ -3369,15 +3499,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # fire when the process has gone quiet — no ledger progress in the
         # last _PROGRESS_WINDOW rounds — or after the grace was consumed.
         # ── Scenario-aware round cap ──
-        # "Complex" = the diagnosis already needed a retry root batch OR
-        # sub-hypotheses (depth ≥ 1) — signals the straightforward path
-        # failed.  Such sessions get a tighter cap: history shows rounds
-        # beyond ~24 in this state are unproductive wandering.
-        is_complex = bool(
-            ledger.get("_root_commit_count", 0) > 1
-            or any(h.get("depth", 0) >= 1
-                   for h in ledger.get("hypotheses", {}).values())
-        )
+        # "Complex" = the diagnosis already needed a retry root batch —
+        # signals the straightforward path failed.  Such sessions get a
+        # tighter cap: history shows rounds beyond ~24 in this state are
+        # unproductive wandering.  (v2.7 flat model: the depth≥1 clause
+        # was removed with sub-hypotheses.)
+        is_complex = bool(ledger.get("_root_commit_count", 0) > 1)
         cap = _MAX_ROUNDS_COMPLEX if is_complex else _MAX_ROUNDS
         grace = _MAX_ROUNDS_COMPLEX_GRACE if is_complex else _MAX_ROUNDS_GRACE
 
@@ -3815,7 +3942,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "commit_hypotheses。"
                         ),
                         "hypothesize": (
-                            "请调用 commit_hypotheses 提交新一批根假设"
+                            "请调用 commit_hypotheses 提交新一批假设"
                             f"（第 {ledger.get('_commit_count', 0) + 1}"
                             f"/{MAX_COMMIT_CALLS} 次）——"
                             "必须基于已排除证据换方向推断，"
@@ -3835,7 +3962,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "record_finding。",
                     )
                     warnings.append(
-                        f"⛔ [系统安全阀] 假设 {active_id} 已获得专家数据但 "
+                        f"⛔ [系统安全阀] 假设 {fmt_hid(active_id)} 已获得专家数据但 "
                         f"{round_num - stall_ref} 轮无验证进展"
                         f"（第{round_num}轮），系统已自动标记为 "
                         f"{auto_verdict}。\n{guidance}"
@@ -3881,7 +4008,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if round_num - self._report_phase_start_round >= 1:
                 logger.warning(
                     "Safety: REPORT phase round %d without write_file "
-                    "(started round %d) — forcing write_file",
+                    "(started round %d) — re-injecting mandatory "
+                    "write_file directive (no auto-write)",
                     round_num, self._report_phase_start_round,
                 )
         elif current_phase != "report":
@@ -3897,7 +4025,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         async def _run(
             hypotheses: list[HypothesisSpec],
-            parent_hypothesis_id: str | None = None,
             focus_summary: str = "",
         ) -> str:
             ledger = mw._current_ledger or new_ledger()
@@ -3906,7 +4033,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             specs = [h.model_dump() if hasattr(h, "model_dump") else dict(h) for h in hypotheses]
 
             try:
-                created = add_hypotheses(ledger, specs, parent_hypothesis_id)
+                created = add_hypotheses(ledger, specs)
             except ValueError as e:
                 return f"假设提交失败: {e}"
 
@@ -3917,7 +4044,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             lines = [f"已提交 {len(created)} 个假设:"]
             for h in created:
                 sel = " ★" if h["selected"] else ""
-                lines.append(f"  {h['id']} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
+                lines.append(f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
             _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
             if _budget_left > 0:
                 lines.append(
@@ -3938,8 +4065,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="commit_hypotheses",
             description=(
                 "提交诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
-                "整个诊断最多提交2次（首批、深化、换批共用此预算），总计不超过6个假设。"
-                "若在已确认假设下深化，传入parent_hypothesis_id（同样占用1次预算）。"
+                "本工具只创建待验证假设，不产生任何结论；确认或证伪已有假设必须调用 "
+                "record_finding，重复提交不会确认任何假设。"
+                "假设为扁平结构（ID 为整数编号如 H1、H2），不支持在某假设下提交子假设；"
+                "如需更具体的表述，用 record_finding(statement_update=...) 修正。"
+                "整个诊断最多提交2次（首批、换批共用此预算），总计不超过6个假设。"
                 "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述。"
                 "提交后系统自动选择概率最高的假设进入验证。"
             ),
@@ -3961,6 +4091,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if ledger is None:
                 return "错误: 诊断台账不存在"
 
+            # Normalize the LLM-supplied ID first (v2.7 flat-model
+            # validation) so all checks below compare canonical IDs.
+            try:
+                selected_hypothesis_id = resolve_hypothesis_id(
+                    ledger, selected_hypothesis_id)
+            except ValueError as e:
+                return f"路径选择失败: {e}"
+
             # Convert Pydantic objects to plain dicts
             dep_dicts = [d.model_dump() if hasattr(d, "model_dump") else dict(d)
                          for d in (deprioritized or [])]
@@ -3979,7 +4117,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     and target.get("status") in ("pending", "inconclusive")
                     and target.get("selected")):
                 for dep in dep_dicts:
-                    dep_id = dep.get("id", "")
+                    _n = _parse_hypothesis_num(dep.get("id", ""))
+                    dep_id = str(_n) if _n is not None else ""
                     if dep_id in hypotheses and dep_id != selected_hypothesis_id:
                         hypotheses[dep_id]["deferred"] = True
                         hypotheses[dep_id]["selected"] = False
@@ -3987,7 +4126,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 mw._persist_ledger(ledger)
                 mw._current_ledger = ledger
                 return (
-                    f"{selected_hypothesis_id} 已是当前验证焦点"
+                    f"{fmt_hid(selected_hypothesis_id)} 已是当前验证焦点"
                     "（commit 时已自动选中最高概率假设），无需重复 select_path。\n"
                     "请直接调用 task() 委派专家验证该假设。"
                 )
@@ -4003,9 +4142,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             mw._current_ledger = ledger
 
             return (
-                f"已选择路径: {selected_hypothesis_id} {selected['statement']}\n"
+                f"已选择路径: {fmt_hid(selected_hypothesis_id)} {selected['statement']}\n"
                 f"理由: {rationale}\n"
-                f"活动路径: {' → '.join(ledger['active_path'])}"
+                f"活动路径: {' → '.join(fmt_hid(h) for h in ledger['active_path'])}"
             )
 
         return StructuredTool.from_function(
@@ -4035,6 +4174,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if ledger is None:
                 return "错误: 诊断台账不存在"
 
+            # Normalize the LLM-supplied ID first (v2.7 flat-model
+            # validation) so all guards below compare canonical IDs.
+            try:
+                hypothesis_id = resolve_hypothesis_id(ledger, hypothesis_id)
+            except ValueError as e:
+                return f"记录失败: {e}"
+
             # Capture old statement for root_causes sync
             old_statement = ""
             if statement_update and hypothesis_id in ledger.get("hypotheses", {}):
@@ -4044,28 +4190,46 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # preserved for historical accuracy.
                 if hnode.get("status") == "refuted":
                     return (
-                        f"⚠️ 假设 {hypothesis_id} 已被证伪(status=refuted)，"
+                        f"⚠️ 假设 {fmt_hid(hypothesis_id)} 已被证伪(status=refuted)，"
                         "禁止修改假设表述(statement_update)。"
                         "请使用新的证据描述发现，不要修改已排除假设的原始表述。"
                     )
                 old_statement = hnode.get("statement", "")
 
-            # Defect D: Terminal-state guard — hypotheses already in
-            # confirmed/refuted must not be re-recorded.  This prevents
-            # the LLM from accidentally overwriting a correct verdict
-            # (e.g. calling record_finding(H1, refuted) after already
-            # calling record_finding(H1, confirmed)).
+            # Defect D: Terminal-state guard (v2.7.1 relaxed).
+            # Verdict FLIPS remain forbidden — they prevent the LLM from
+            # overwriting a correct verdict (e.g. record_finding(H1,
+            # refuted) after record_finding(H1, confirmed)).  But a
+            # confirmed node MAY be re-recorded with verdict=confirmed
+            # to strengthen probability / refine the statement / attach
+            # new evidence: the flat model has no deepening path, so
+            # this is the only channel to rescue a weak confirmation
+            # (confirmed@p<80 never satisfies S1's p≥80 bar — observed
+            # 2026-07-30 session e7fa8b74 exit lockout).  refuted nodes
+            # stay fully closed.
             if hypothesis_id in ledger.get("hypotheses", {}):
                 _hnode = ledger["hypotheses"][hypothesis_id]
                 _terminal = _hnode.get("status")
-                if _terminal in ("confirmed", "refuted"):
+                if _terminal == "confirmed" and verdict != "confirmed":
                     return (
-                        f"⚠️ 假设 {hypothesis_id} 已处于终态"
-                        f"(status={_terminal}, "
+                        f"⚠️ 假设 {fmt_hid(hypothesis_id)} 已处于终态"
+                        f"(status=confirmed, "
+                        f"p={_hnode.get('probability')}%)，"
+                        f"禁止翻转为 {verdict}。"
+                        "若证据强化或表述需修正，可再次调用 "
+                        "record_finding(verdict='confirmed', "
+                        "probability_update=..., statement_update=...)；"
+                        "若确需推翻已确认结论，请用 backtrack 恢复其他假设"
+                        "继续验证（confirmed 结论不可直接翻转）。"
+                    )
+                if _terminal == "refuted":
+                    return (
+                        f"⚠️ 假设 {fmt_hid(hypothesis_id)} 已处于终态"
+                        f"(status=refuted, "
                         f"p={_hnode.get('probability')}%)，"
                         "不允许重复记录验证结论。"
-                        "如需修正，请使用新假设(commit_hypotheses)"
-                        "或回溯(backtrack)。"
+                        "该假设的验证已关闭，请基于其他未决假设继续诊断；"
+                        "全部假设终态后系统会自动进入 REPORT。"
                     )
 
             try:
@@ -4080,19 +4244,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Check exit conditions
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)
 
-            # ── Root-cause tracking: topmost confirmed nodes ──
-            # A confirmed node anywhere in the tree is a located root
-            # cause — including a DEEP node whose ancestor is not
-            # confirmed (verification narrowed the cause below the
-            # original root statement; e.g. H2.1 "Docker Hub rate limit"
-            # confirmed while parent H2 stays inconclusive, observed
-            # 2026-07-23 session 7805961b).  The previous implementation
-            # registered the unconfirmed root ANCESTOR id instead, which
-            # the cleanup below then purged (status != confirmed) —
-            # root_causes stayed empty and REPORT was never reachable.
-            # When both an ancestor and its descendant are confirmed,
-            # the topmost node represents the cause line; the descendant
-            # is a refinement and is dropped by the cleanup below.
+            # ── Root-cause tracking (v2.7 flat model) ──
+            # Every confirmed hypothesis IS a root cause — there are no
+            # sub-hypotheses, so no topmost/refinement disambiguation is
+            # needed.  Multi-root scenarios simply accumulate confirmed
+            # nodes.
             cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
             causes: list[str] = ledger.setdefault("root_causes", [])
             hypotheses = ledger.get("hypotheses", {})
@@ -4101,8 +4257,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     continue
                 if hid in cids:
                     continue  # already tracked
-                if _has_confirmed_ancestor(hypotheses, hid):
-                    continue  # refinement of an already-tracked line
                 cids.append(hid)
                 stmt = node["statement"]
                 # Deduplicate: different hypotheses may converge on
@@ -4126,16 +4280,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if ledger.get("root_cause") == old_statement:
                     ledger["root_cause"] = statement_update
 
-            # ── Cleanup: drop non-confirmed entries and refinements ──
+            # ── Cleanup: drop non-confirmed entries ──
             # Ensures refuted/deprioritized hypotheses never appear as
-            # root causes, and that a confirmed descendant yields to its
-            # ancestor once the ancestor itself is confirmed (topmost
-            # confirmed node represents the cause line).
+            # root causes.
             hypotheses_dict = ledger.get("hypotheses", {})
             cids[:] = [
                 cid for cid in cids
                 if hypotheses_dict.get(cid, {}).get("status") == "confirmed"
-                and not _has_confirmed_ancestor(hypotheses_dict, cid)
             ]
             # Rebuild root_causes to match cleaned cids
             causes[:] = [
@@ -4219,7 +4370,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # fresh batch in a new direction.
                 exit_hint = (
                     f"\n⚠ {reason}\n"
-                    "⛔ 请调用 commit_hypotheses 提交新一批根假设"
+                    "⛔ 请调用 commit_hypotheses 提交新一批假设"
                     f"（第 {ledger.get('_commit_count', 0) + 1}"
                     f"/{MAX_COMMIT_CALLS} 次，最后一次）——"
                     "必须基于已排除证据换方向推断，"
@@ -4229,14 +4380,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 exit_hint = ""
             stmt_hint = f"\nℹ 假设表述已修正为: {statement_update}" if statement_update else ""
             return (
-                f"已记录验证结果: {hypothesis_id} → {verdict} (p={probability_update}%)\n"
+                f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
                 f"{evidence_summary}{stmt_hint}{exit_hint}"
             )
 
         return StructuredTool.from_function(
             name="record_finding",
             description=(
-                "记录假设验证结论（VERIFY阶段后必须调用）。"
+                "记录假设验证结论（VERIFY 阶段验证后必须调用；EVALUATE 阶段亦可调用——"
+                "confirmed 强化、次要根因确认、statement_update 精化）。"
                 "verdict: confirmed(已证实，可同时存在多个确认的根因/加剧因素)"
                 " | refuted(证据明确证伪，该假设不成立)"
                 " | inconclusive(证据不足)。"
@@ -4246,9 +4398,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "应调用 confirmed + statement_update=剔除不成立环节后的表述，"
                 "而非整体 refuted——整体 refuted 会把已确认的真实机制从根因列表中丢弃，"
                 "导致台账根因与报告结论不一致。"
-                "假设提交预算用尽后，细化假设只能通过本工具的 statement_update 完成，"
-                "不能再调用 commit_hypotheses。"
-                "所有root假设均到达终态且至少1个confirmed时自动进入REPORT阶段。"
+                "假设为扁平结构（无子假设），细化假设只能通过本工具的 statement_update 完成。"
+                "⚠ 确认根因时 probability_update 建议≥80：退出判据要求至少1个 p≥80 的 "
+                "confirmed 假设，低于 80 的 confirmed 不被视为已确认根因。"
+                "已 confirmed 的假设允许再次调用本工具强化置信度/修正表述/补充证据"
+                "（verdict 必须仍为 confirmed，禁止翻转；这是已确认假设唯一的精化通道）；"
+                "refuted 假设不可再记录。"
+                "所有root假设均到达终态且满足退出判据时自动进入REPORT阶段。"
             ),
             coroutine=_run,
             args_schema=RecordFindingInput,
@@ -4279,7 +4435,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         f"（已用 {ledger.get('_commit_count', 0)}"
                         f"/{MAX_COMMIT_CALLS} 次）。\n"
                         "已进入 HYPOTHESIZE 阶段。\n"
-                        "⛔ 请调用 commit_hypotheses 提交新一批根假设——"
+                        "⛔ 请调用 commit_hypotheses 提交新一批假设——"
                         "必须基于已排除证据换方向推断，"
                         "禁止与已排除假设重复或仅换措辞。"
                     )
@@ -4415,7 +4571,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 hid = h.get("id", "?")
                 prob = h.get("probability", 0)
                 is_root = hid in set(ledger.get("root_hypothesis_ids", []))
-                lines.append(f"### {hid}{' [根因]' if is_root else ''}"
+                lines.append(f"### {fmt_hid(hid)}{' [根因]' if is_root else ''}"
                              f" — 置信度 {prob}%\n")
                 lines.append(f"{h.get('statement', '')}\n")
                 for e in h.get("evidence", []):
