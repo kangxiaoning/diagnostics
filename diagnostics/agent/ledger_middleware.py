@@ -4794,7 +4794,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "menu_choice": menu_choice.strip(),
             }
 
-            lines = ["已记录认知状态。"]
+            lines = [
+                "已记录认知状态。"
+                "（每轮行动前都请先调用 report_beliefs 自报——"
+                "它让系统能在你偏离台账时当场提示。）"
+            ]
             # Deterministic belief-ledger consistency checks (C0-C3).
             # Sibling tool calls of the same round (stashed post-response
             # in awrap_model_call) suppress rules the model is already

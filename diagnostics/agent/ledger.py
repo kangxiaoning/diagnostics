@@ -1223,22 +1223,41 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                 lines.append(f"- 已委派专家: {', '.join(sorted(delegated))}")
             lines.append("")
 
-    # Current step guidance
+    # Current step guidance.  Step 0 is always the belief self-report
+    # (SBR v2, §12): folded INTO the phase-duty menu because that menu is
+    # the one instruction block the model demonstrably follows every
+    # round — a standalone reminder section gets classified as optional
+    # metadata and dropped under task load (production: tail-reminder
+    # sections ignored in rounds 2+ after a compliant round 1).
     guidance = _phase_guidance(phase, ledger, report_path)
     if guidance:
         lines.append("## 本步要求")
+        lines.append(
+            "0. 调用 report_beliefs 自报当前认知"
+            "（phase / beliefs / root_cause_candidate / menu_choice）"
+            "——每轮例行，先于下列动作；可与其他工具同轮并行；"
+            "自报不改变台账，结论仍须经 commit_hypotheses / record_finding "
+            "正式提交。"
+        )
         lines.append(guidance)
 
-    # ── Belief self-report mirror + standing reminder (SBR v2, §12) ──
+    # ── Belief self-report mirror (SBR v2, §12) ──
     # Reflect the model's latest report_beliefs self-report next to the
-    # ledger truth, at the prompt tail (highest-salience position —
-    # lost-in-the-middle mitigation).  Deterministic ⚠ flags mark
-    # self-report/ledger divergences; the standing reminder doubles as
-    # the per-round report_beliefs instruction.
+    # ledger truth, at the prompt tail.  Deterministic ⚠ flags mark
+    # self-report/ledger divergences and STALENESS — an outdated
+    # self-report is itself a nudge to re-report.
     latest = ledger.get("_sbr_latest")
     if latest:
+        staleness = ledger.get("current_round", 0) - (latest.get("round") or 0)
         lines.append("")
-        lines.append("## 你上一轮的自报认知（report_beliefs 镜像）")
+        if staleness >= 1:
+            lines.append("## 你最近一次的自报认知（report_beliefs 镜像）")
+            lines.append(
+                f"- ⚠ 该自报来自第 {latest.get('round')} 轮，"
+                f"已 {staleness} 轮未更新——本轮请先调用 report_beliefs 更新"
+            )
+        else:
+            lines.append("## 你上一轮的自报认知（report_beliefs 镜像）")
         sp = latest.get("phase") or "?"
         phase_flag = "" if sp == phase else f" ⚠ 台账当前为 {phase}"
         lines.append(f"- 自报相位: {sp}{phase_flag}")
@@ -1254,14 +1273,6 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             lines.append(f"- 根因候选: {rc}{rc_flag}")
         if latest.get("menu_choice"):
             lines.append(f"- 动作依据: {latest['menu_choice']}")
-    lines.append("")
-    lines.append("## 每轮例行（先于一切动作）")
-    lines.append(
-        "调用 report_beliefs 自报当前认知"
-        "（phase / beliefs / root_cause_candidate / menu_choice），"
-        "然后执行「本步要求」。自报不改变台账，结论仍须经 "
-        "commit_hypotheses / record_finding 正式提交。"
-    )
 
     lines.append("</diagnosis_ledger>")
     return "\n".join(lines)
