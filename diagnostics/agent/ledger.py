@@ -118,6 +118,18 @@ COST_STATE_OP = 0.5
 COST_BATCH_COMMIT = 1.0
 COST_QUERY = 0.3
 
+_EPISTEMIC_BONUS = 2.0
+"""First-delegation epistemic bonus for unverified hypotheses.
+
+LLM self-reported probabilities suffer from systematic overconfidence
+(Chhikara 2025, TMLR, arXiv:2502.11028 — 9 LLMs tested, all miscalibrated).
+U(h)=4·p·(1-p) captures only aleatoric uncertainty; an unverified hypothesis
+(_delegate_count=0, pending/inconclusive) also carries epistemic uncertainty
+that the first delegation resolves.  The 2x bonus ensures delegation_value
+>= kappa for p <= 0.96, preventing premature exit in multi-root-cause
+scenarios where the second root cause is created with high prior probability
+but never delegated (cf. scenario 25: H5 p=95, value 0.095 < kappa -> S2 exits)."""
+
 # LLMs sometimes prefix hypothesis statements with the ledger ID they
 # expect (e.g. "H1: 磁盘故障"), producing doubled prefixes in rendering
 # ("H1 [refuted] H1: 磁盘故障") and guidance ("聚焦验证 H1: H1: ...").
@@ -1495,12 +1507,18 @@ def residual_uncertainty(ledger: DiagnosisLedger) -> float:
 def delegation_value(node: HypothesisNode) -> float:
     """value(a) = EIG(a)/c(a) for a targeted expert delegation on *node*.
 
-    EIG = U(h) × D × F, D=1.0 (targeted), F = 0.5^(n_deleg + n_inc)
-    (D6: inconclusive verdicts add freshness decay — the same evidence
-    re-examined rarely flips the outcome).  Cost = COST_DELEGATION.
+    EIG = U(h) x D x F x B, D=1.0 (targeted), F = 0.5^(n_deleg + n_inc)
+    (D6: inconclusive verdicts add freshness decay -- the same evidence
+    re-examined rarely flips the outcome).  B = _EPISTEMIC_BONUS (2.0) for
+    first-ever delegation to an unverified hypothesis (_delegate_count=0,
+    pending/inconclusive): U(h) captures only aleatoric uncertainty, but an
+    unverified prior also carries epistemic uncertainty that the first
+    delegation resolves.  Cost = COST_DELEGATION.
     """
     n = node.get("_delegate_count", 0) + node.get("_inconclusive_count", 0)
     eig = _uncertainty(node) * (0.5 ** n)
+    if node.get("_delegate_count", 0) == 0 and node.get("status") in ("pending", "inconclusive"):
+        eig *= _EPISTEMIC_BONUS
     return eig / COST_DELEGATION
 
 
