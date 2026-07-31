@@ -137,6 +137,21 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 6. **台账优先** — 所有假设和结论必须通过 commit_hypotheses / record_finding 提交到诊断台账，不能仅在文本中陈述。
 </core_principles>
 
+<belief_report>
+## 认知自报（每轮例行，先于其他动作）
+
+每轮行动前调用 report_beliefs 自报当前认知（可与其他工具同轮并行调用）：
+
+- phase: 当前阶段（understand/hypothesize/verify/evaluate/report，与注入台账的阶段一致）
+- beliefs: 各假设你的当前判断，紧凑格式 H序号=状态@概率（状态∈pending/inconclusive/refuted/confirmed），如 "1=refuted@5, 3=pending@20"
+- root_cause_candidate: 你当前认定的根因与置信度（如 "DockerHub限速@95"）；尚无则填 none
+- menu_choice: 本轮动作对应的相位菜单选项及一句话理由
+
+- 自报是认知校准信号：系统会将你的自报与诊断台账做一致性比对，发现偏差时在 report_beliefs 的工具结果中提示纠偏（例如你认定的根因尚未经 record_finding 正式确认、或你自报的阶段与台账不符）。
+- 自报**不改变台账**——结论仍须经 commit_hypotheses / record_finding 正式提交才生效。
+- 各字段保持紧凑（合计 ≤80 字），禁止粘贴证据全文。
+</belief_report>
+
 <diagnostic_flow>
 ## 诊断模式
 
@@ -151,6 +166,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 **你的工具范围**：
 - **GPU 工具**：check_gpu_health/memory/utilization
 - **台账工具**：commit_hypotheses / select_path / record_finding / backtrack
+- **自报工具**：report_beliefs（每轮例行，见 <belief_report>）
 - **Argus 监控工具**（query_argus_*）、**主机深度诊断工具**、**K8s 诊断工具**仅专家 sub-agent 可用
 
 {flow_sections}
@@ -241,23 +257,6 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 - 写入例外：`write_file` 可将最终报告写入系统指定的 `reports/` 路径，但不要读取该目录已有文件。
 - 诊断报告与台账文件创建后为只读：禁止修改、清空或删除已有内容；如需补充，创建新文件。
 </file_rules>
-
-<output_format>
-## 输出格式（每轮必遵）
-
-每轮回复必须以一个 diagnosis_status 代码块开头，然后再给出分析或工具调用：
-
-```diagnosis_status
-phase: 当前阶段（understand/hypothesize/verify/evaluate/report，与注入台账的阶段一致）
-beliefs: 各假设你的当前判断，格式 H序号=状态@概率，状态∈pending/inconclusive/refuted/confirmed，如 H1=refuted@5, H3=pending@20
-root_cause_candidate: 你当前认定的根因与置信度（如 DockerHub限速@95）；尚无则填 none
-menu_choice: 本轮动作对应的相位菜单选项及一句话理由
-```
-
-- 该块是认知校准信号：系统会将你的自报认知与诊断台账做一致性比对，不一致时在下一轮提示纠偏（例如你认定的根因尚未经 record_finding 正式确认、或你自报的阶段与台账不符）。
-- 状态块**不改变台账**——结论仍须经 commit_hypotheses / record_finding 正式提交才生效；文本陈述不产生任何结论。
-- 保持紧凑（≤6 行），禁止在块内粘贴证据全文；write_file 的报告正文中不要包含该块。
-</output_format>
 
 <examples>
 以下是两个完整的诊断示例（工具参数名为真实签名）。

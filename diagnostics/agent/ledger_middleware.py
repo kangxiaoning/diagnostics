@@ -39,6 +39,7 @@ from diagnostics.agent.ledger import (
     MAX_COMMIT_CALLS,
     DiagnosisLedger,
     DiagnosisLedgerState,
+    _SBR_KNOWN_PHASES,
     _coverage_ready,
     _economically_dead,
     _parse_hypothesis_num,
@@ -55,7 +56,8 @@ from diagnostics.agent.ledger import (
     ledger_to_json,
     new_evidence,
     new_ledger,
-    parse_diagnosis_status,
+    parse_beliefs_field,
+    parse_root_cause_field,
     record_finding,
     record_round,
     render_ledger_context,
@@ -168,6 +170,9 @@ _PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
         "task",
     }),
 }
+# NOTE: report_beliefs (SBR v2 self-report) is intentionally absent from
+# every denylist entry above — it is phase-agnostic process metadata and
+# must be callable in ALL phases, including REPORT.
 
 _PHASE_ALLOWED_HINT: dict[str, str] = {
     "understand": "task(*-argus-expert), read_file",
@@ -183,16 +188,27 @@ def _gate_hint(phase: str) -> str:
 
 # Tools that are scaffolding (not diagnostic). "task" is included because
 # expert delegation results are recorded by the Coordinator via record_finding.
+# report_beliefs is process metadata (SBR v2 self-report) — it never
+# advances the diagnosis itself, so it is scaffolding for round-recording
+# classification, and non-substantive for every stall predicate.
 _SCAFFOLDING_TOOLS = frozenset({
     "write_file", "read_file", "edit_file",
     "write_todos", "read_todos",
     "ls", "glob", "grep",
+    "report_beliefs",
 })
 
 # Ledger management tools (handled by this middleware)
 _LEDGER_TOOLS = frozenset({
     "commit_hypotheses", "select_path", "record_finding", "backtrack",
 })
+
+# Self-report tools (SBR v2) — excluded from every "substantive activity"
+# predicate: a response containing ONLY report_beliefs calls must still
+# count as loop-ending (G9/G12 stall handlers) and as a ledger-idle round
+# (G14), because reporting beliefs produces no evidence and no ledger
+# progress.  Not in _LEDGER_TOOLS: it doesn't manage hypotheses.
+_BELIEF_TOOLS = frozenset({"report_beliefs"})
 
 # ── Safety mechanism thresholds ──
 _MAX_ROUNDS = 40                    # G1 轮次上限（简单场景，state-machine-v2.md §8）：超过此轮次强制 REPORT
@@ -622,15 +638,25 @@ def _response_ends_loop(response) -> bool:
     carries tool calls; a plain-text answer or an empty result both end
     it.  Guardrails use this single predicate (state-machine-v2.md §8)
     instead of re-implementing the check per phase.
+
+    A response whose tool calls are ALL report_beliefs (SBR v2
+    self-report, _BELIEF_TOOLS) also counts as loop-ending: the
+    self-report is process metadata that produces no evidence and no
+    ledger progress, so it must not mask a genuine stall from the
+    guardrails that key on this predicate.
     """
     result_list = (response.result
                    if isinstance(response.result, list)
                    else [response.result])
-    return not any(
-        getattr(m, "tool_calls", None)
-        for m in result_list
-        if hasattr(m, "tool_calls")
-    )
+    for m in result_list:
+        for tc in (getattr(m, "tool_calls", None) or []):
+            if isinstance(tc, dict):
+                name = tc.get("name", "")
+            else:
+                name = getattr(tc, "name", "")
+            if name and name not in _BELIEF_TOOLS:
+                return False
+    return True
 
 
 def _inject_tool_calls(response, tool_calls: list[dict],
@@ -753,20 +779,26 @@ def _is_substantial_report_text(text: str) -> bool:
 
 
 # ── SBR belief-ledger consistency guard (state-machine-v2.md §12) ──
-# Every Coordinator round should open with a diagnosis_status block
-# (prompt.py <output_format>).  After each model response we parse the
-# block and compare the model's SELF-REPORTED beliefs against the ledger
-# — the system's only window into the model's mind before it ACTS.
-# Divergence found here fires one round EARLIER than the action gates
-# (write_file exit gate / phase gate): e.g. a self-reported root cause
-# @95% with no confirmed hypothesis in the ledger means the model is
-# about to either write_file (blocked, wasting a full report-generation
-# call) or wander into ritual verification.  Corrections are injected
-# into the NEXT round's safety block — informational, never commands;
-# the hard gates remain the backstop.
+# Every Coordinator round should call report_beliefs, self-reporting its
+# belief state as flat tool args (phase/beliefs/root_cause_candidate/
+# menu_choice).  The tool handler parses the args and compares the
+# SELF-REPORTED beliefs against the ledger — the system's only window
+# into the model's mind before it ACTS.  Divergence found here fires
+# one round EARLIER than the action gates (write_file exit gate / phase
+# gate): e.g. a self-reported root cause @95% with no confirmed
+# hypothesis in the ledger means the model is about to either write_file
+# (blocked, wasting a full report-generation call) or wander into
+# ritual verification.  Corrections are returned IN THE TOOL RESULT —
+# the channel the model demonstrably reads and acts on — informational,
+# never commands; the hard gates remain the backstop.
+#
+# (v1 parsed a diagnosis_status text block from the response — the
+# local model emitted it 0/14 rounds.  Tool args are its reliable
+# structured channel, and tool-result feedback is its strongest
+# behavioral signal.)
 #
 # Rule design constraints (P1): every rule is a deterministic predicate
-# over (parsed block, ledger, same-round tool calls); conservative by
+# over (parsed args, ledger, same-round tool calls); conservative by
 # construction — a rule only fires on UNAMBIGUOUS divergence, anything
 # parseable as "already being resolved this round" suppresses it.
 
@@ -834,7 +866,7 @@ def _check_belief_consistency(
     if sp and sp != derived:
         corrections.append((
             "C0",
-            f"⚠ [认知校准] 状态块自报阶段={sp}，但台账推导当前阶段为 "
+            f"⚠ [认知校准] 你自报阶段={sp}，但台账推导当前阶段为 "
             f"{derived}——以台账为准，请按 {derived} 阶段的「本步要求」行动。",
         ))
 
@@ -850,8 +882,8 @@ def _check_belief_consistency(
         if not has_confirmed and not formalizing:
             corrections.append((
                 "C1",
-                f"⚠ [认知校准] 你在状态块中认定根因（{rc[0][:40]}@{rc[1]}%），"
-                "但台账尚无任何 confirmed 假设——文本陈述不产生结论。合法路径："
+                f"⚠ [认知校准] 你自报认定根因（{rc[0][:40]}@{rc[1]}%），"
+                "但台账尚无任何 confirmed 假设——自报不产生结论。合法路径："
                 "① 现有证据已可判定的未决假设 → 直接 record_finding 终结"
                 "（跨假设证据复用，无需重复委派）；"
                 "② 全部判定后 commit_hypotheses 提交该根因假设；"
@@ -877,10 +909,10 @@ def _check_belief_consistency(
     if diverged:
         corrections.append((
             "C2",
-            "⚠ [认知校准] 状态块认为 "
+            "⚠ [认知校准] 你自报认为 "
             + "、".join(diverged[:3])
             + "——若证据足够，请用 record_finding 正式记录对应结论；"
-            "文本陈述不改变台账。",
+            "自报不改变台账。",
         ))
 
     # ── C3: declared kill-intent on Hx but the action reactivates it ──
@@ -896,10 +928,11 @@ def _check_belief_consistency(
             if sid in kill_ids:
                 corrections.append((
                     "C3",
-                    f"⚠ [认知校准] 状态块声明「{menu[:50]}」，但本轮动作是 "
+                    f"⚠ [认知校准] 你自报「{menu[:50]}」，但本轮动作是 "
                     f"select_path 选择 {fmt_hid(sid)} 继续验证——两者矛盾。"
                     f"若证据已可判定 {fmt_hid(sid)}，直接 record_finding "
-                    "终结更省轮次；若确需验证，请在下轮状态块如实更新判断。",
+                    "终结更省轮次；若确需验证，请在下轮 report_beliefs "
+                    "如实更新判断。",
                 ))
                 break
 
@@ -1206,6 +1239,31 @@ class RecordFindingInput(BaseModel):
     )
 
 
+class ReportBeliefsInput(BaseModel):
+    # All fields are optional flat strings (SBR v2, §12): nested schemas
+    # are the known tool-serialization failure mode on local models
+    # (write_file({}) incident); a flat string arg is the simplest
+    # possible shape and is parsed leniently by the handler.
+    phase: str = Field(
+        default="",
+        description="自报当前阶段: understand/hypothesize/verify/evaluate/report",
+    )
+    beliefs: str = Field(
+        default="",
+        description="各假设的当前判断，紧凑格式 'H序号=状态@概率'，"
+                    "状态∈pending/inconclusive/refuted/confirmed，"
+                    "如 '1=refuted@5, 3=pending@20'",
+    )
+    root_cause_candidate: str = Field(
+        default="",
+        description="当前认定的根因与置信度，如 'DockerHub限速@95'；尚无则填 none",
+    )
+    menu_choice: str = Field(
+        default="",
+        description="本轮动作对应的相位菜单选项及一句话理由",
+    )
+
+
 # ── Middleware ──
 
 class DiagnosisLedgerMiddleware(AgentMiddleware):
@@ -1273,6 +1331,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # order within the same LLM round (LangGraph executes tool calls
         # concurrently, so completion order ≠ invocation order).
         self._round_record_seq: int = 0
+        # This round's (name, args) tool calls, stashed post-response so
+        # the report_beliefs handler can suppress consistency rules that
+        # a same-round sibling call is already resolving (SBR v2 §12).
+        self._round_tool_calls: list[tuple[str, dict]] = []
         # Filesystem path prefix for offloaded tool results.
         self._tool_results_prefix = "/tool_results"
         # Ledger management tools — only needed by Coordinator; subagents
@@ -1285,6 +1347,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._make_select_path_tool(),
                 self._make_record_finding_tool(),
                 self._make_backtrack_tool(),
+                self._make_report_beliefs_tool(),
             ]
         )
 
@@ -1616,51 +1679,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_call_count, _duration,
                     _tokens_in, _tokens_out, _tokens_reason,
                 )
-            # ── SBR belief-ledger consistency guard (§12) ──
-            # Parse the round's diagnosis_status block and compare the
-            # self-reported beliefs against the ledger.  Corrections are
-            # stored on the ledger and rendered by _build_safety_warnings
-            # into the NEXT round's context (one-shot, then popped).
-            # Everything here is best-effort: a parse/check failure must
-            # never break the loop (the guard is advisory by design).
+            # ── SBR belief self-report tracking (§12, v2 tool-based) ──
+            # Stash this round's tool calls for the report_beliefs tool
+            # handler (same-round sibling suppression in C1/C2/C3), and
+            # track whether the model self-reported at all.  Consistency
+            # corrections themselves are computed in the tool handler and
+            # returned in the tool result — the channel the model
+            # demonstrably reads.  Here we only detect ABSENCE: 3 rounds
+            # without a report_beliefs call earns one actionable reminder
+            # via the safety block.  Everything is best-effort — a
+            # failure here must never break the loop.
             try:
-                _sbr = parse_diagnosis_status(_extract_response_text(response))
-                _sbr_corrections: list[tuple[str, str]] = []
-                if _sbr is None:
-                    _streak = ledger.get("_sbr_missing_streak", 0) + 1
-                    if _streak >= 3:
-                        _sbr_corrections.append((
-                            "C4",
-                            "⚠ [认知校准] 已连续 "
-                            f"{_streak} 轮缺少 diagnosis_status 状态块。"
-                            "每轮回复必须以该块开头（见系统指令「输出格式」）"
-                            "——它用于校准你的认知与台账，缺失会降低系统的"
-                            "引导精度。",
-                        ))
-                        _streak = 0
-                    ledger["_sbr_missing_streak"] = _streak
-                else:
+                self._round_tool_calls = _response_tool_calls(response)
+                _reported = any(
+                    n == "report_beliefs" for n, _ in self._round_tool_calls
+                )
+                if _reported:
                     ledger["_sbr_missing_streak"] = 0
-                    _sbr_corrections = _check_belief_consistency(
-                        _sbr, ledger, _response_tool_calls(response),
-                    )
-                if _sbr_corrections:
-                    ledger["_sbr_corrections"] = [
-                        msg for _, msg in _sbr_corrections
-                    ]
-                    _sbr_log = ledger.setdefault("_sbr_log", [])
-                    _sbr_log.append({
-                        "round": self._model_call_count,
-                        "rules": [rid for rid, _ in _sbr_corrections],
-                    })
-                    del _sbr_log[:-50]  # bounded audit trail
-                    logger.warning(
-                        "SBR guard: %s (round=%d, phase=%s)",
-                        ",".join(rid for rid, _ in _sbr_corrections),
-                        self._model_call_count, _phase(ledger),
-                    )
+                else:
+                    _streak = ledger.get("_sbr_missing_streak", 0) + 1
+                    ledger["_sbr_missing_streak"] = _streak
+                    if _streak >= 3:
+                        ledger["_sbr_corrections"] = [
+                            "⚠ [认知校准] 已连续 "
+                            f"{_streak} 轮未调用 report_beliefs 自报认知状态。"
+                            "每轮请先调用 report_beliefs"
+                            "（phase / beliefs / root_cause_candidate / "
+                            "menu_choice）再进行其他动作——它用于校准你的"
+                            "认知与台账，缺失会降低系统的引导精度。",
+                        ]
+                        ledger["_sbr_missing_streak"] = 0
+                        logger.warning(
+                            "SBR: beliefs not reported for %d consecutive "
+                            "rounds (round=%d, phase=%s)",
+                            _streak, self._model_call_count, _phase(ledger),
+                        )
             except Exception as _sbr_exc:  # noqa: BLE001 — advisory only
-                logger.debug("SBR guard skipped on error: %s", _sbr_exc)
+                logger.debug("SBR tracking skipped on error: %s", _sbr_exc)
         else:
             # ── G7 fallback: every attempt failed ──
             # NOTE: this recovery path must never crash the stream —
@@ -2672,12 +2727,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         ]
                         if not _response_ends_loop(response):
                             # Check whether ALL tool calls in this
-                            # response are ledger-management tools
+                            # response are ledger-management tools.
+                            # report_beliefs (SBR v2) counts as
+                            # non-substantive here too: a self-report
+                            # produces no expert evidence, so a
+                            # beliefs+select_path round is still a
+                            # ledger-idle stall.
                             all_ledger = True
                             for m in ai_msgs:
                                 for tc in (m.tool_calls or []):
                                     name = getattr(tc, "name", "") if hasattr(tc, "name") else tc.get("name", "")
-                                    if name not in _LEDGER_TOOLS:
+                                    if (name not in _LEDGER_TOOLS
+                                            and name not in _BELIEF_TOOLS):
                                         all_ledger = False
                                         break
                                 if not all_ledger:
@@ -4689,6 +4750,97 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "如果没有可回溯的假设，自动进入 REPORT 阶段。"
             ),
             coroutine=_run,
+        )
+
+    # ── Tool: report_beliefs (SBR v2, state-machine-v2.md §12) ──
+
+    def _make_report_beliefs_tool(self) -> StructuredTool:
+        mw = self
+
+        async def _run(
+            phase: str = "",
+            beliefs: str = "",
+            root_cause_candidate: str = "",
+            menu_choice: str = "",
+        ) -> str:
+            ledger = mw._current_ledger
+            if ledger is None:
+                return "错误: 诊断台账不存在"
+
+            # Parse the flat string args into the sbr dict consumed by
+            # the consistency guard.  All parsing is lenient — an
+            # unparseable field simply means "no opinion".
+            sbr: dict = {}
+            p = phase.strip().lower()
+            if p in _SBR_KNOWN_PHASES:
+                sbr["phase"] = p
+            b = parse_beliefs_field(beliefs)
+            if b:
+                sbr["beliefs"] = b
+            rc = parse_root_cause_field(root_cause_candidate)
+            if rc:
+                sbr["root_cause"] = rc
+            if menu_choice.strip():
+                sbr["menu_choice"] = menu_choice.strip()
+
+            # Persist the raw self-report for the ledger-context mirror
+            # (rendered into the NEXT round's prompt tail by
+            # render_ledger_context — highest-salience position).
+            ledger["_sbr_latest"] = {
+                "round": mw._model_call_count,
+                "phase": p or phase.strip(),
+                "beliefs": beliefs.strip(),
+                "root_cause_candidate": root_cause_candidate.strip(),
+                "menu_choice": menu_choice.strip(),
+            }
+
+            lines = ["已记录认知状态。"]
+            # Deterministic belief-ledger consistency checks (C0-C3).
+            # Sibling tool calls of the same round (stashed post-response
+            # in awrap_model_call) suppress rules the model is already
+            # resolving right now.  Corrections ride the tool result —
+            # the channel the model demonstrably reads and acts on.
+            # Advisory by design: a checker failure degrades to "no
+            # opinion", never to a tool error.
+            try:
+                corrections = _check_belief_consistency(
+                    sbr, ledger, mw._round_tool_calls or [],
+                )
+            except Exception as _chk_exc:  # noqa: BLE001 — advisory only
+                logger.debug("SBR consistency check skipped on error: %s",
+                             _chk_exc)
+                corrections = []
+            if corrections:
+                lines.extend(msg for _rid, msg in corrections)
+                _sbr_log = ledger.setdefault("_sbr_log", [])
+                _sbr_log.append({
+                    "round": mw._model_call_count,
+                    "rules": [rid for rid, _ in corrections],
+                })
+                del _sbr_log[:-50]  # bounded audit trail
+                logger.warning(
+                    "SBR guard: %s (round=%d, phase=%s)",
+                    ",".join(rid for rid, _ in corrections),
+                    mw._model_call_count, _phase(ledger),
+                )
+
+            mw._persist_ledger(ledger)
+            mw._current_ledger = ledger
+            return "\n".join(lines)
+
+        return StructuredTool.from_function(
+            name="report_beliefs",
+            description=(
+                "自报当前认知状态（每轮例行，先于其他动作；可与其他工具同轮并行调用）。"
+                "四个扁平字符串字段：phase（当前阶段 understand/hypothesize/verify/"
+                "evaluate/report）；beliefs（各假设判断，如 '1=refuted@5, 3=pending@20'）；"
+                "root_cause_candidate（根因@置信度，如 'DockerHub限速@95'，尚无填 none）；"
+                "menu_choice（本轮动作对应的相位菜单选项及一句话理由）。"
+                "自报不改变台账——确认/证伪仍须经 record_finding 正式提交。"
+                "系统会将自报与台账做一致性校准，发现偏差时在本工具结果中提示纠偏。"
+            ),
+            coroutine=_run,
+            args_schema=ReportBeliefsInput,
         )
 
     # ── Auto-report generation (P11 safety net) ──

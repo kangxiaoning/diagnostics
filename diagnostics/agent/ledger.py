@@ -958,14 +958,19 @@ def _clean_evidence_text(text: str, max_chars: int = 3000) -> str:
     return cleaned
 
 
-# ── Diagnosis status block (SBR) parsing ──
-# state-machine-v2.md §12: every Coordinator round must open with a
-# fenced ```diagnosis_status block self-reporting the model's belief
-# state (phase / per-hypothesis beliefs / root-cause candidate / menu
-# choice).  The middleware parses it and runs deterministic
+# ── Belief self-report (SBR v2, tool-based) parsing ──
+# state-machine-v2.md §12: every Coordinator round should call the
+# report_beliefs tool, self-reporting the model's belief state (phase /
+# per-hypothesis beliefs / root-cause candidate / menu choice) as flat
+# string args.  The middleware parses the args and runs deterministic
 # belief-ledger consistency checks; these helpers are the shared,
-# dependency-free parsing primitives (also used by app.py to strip the
-# blocks out of persisted reports).
+# dependency-free parsing primitives.
+#
+# v1 parsed a fenced ```diagnosis_status text block from the response —
+# abandoned: the local model emitted it 0/14 rounds (its reliable
+# structured channel is tool calls, not persistent text formats).
+# strip_diagnosis_status_blocks stays as protection for legacy blocks
+# that may still appear in multi-turn history / reports.
 
 _SBR_FENCED_RE = re.compile(
     r"```\s*diagnosis_status[^\n`*]*\n(.*?)(?:```|\Z)", re.S | re.I,
@@ -993,75 +998,48 @@ _SBR_BELIEF_ITEM_RE = re.compile(
     r"[Hh]?(\d+)\s*[=＝:：]\s*([A-Za-z一-鿿]+?)\s*[@＠]\s*(\d{1,3})\s*%?"
 )
 
-_SBR_FIELD_RE = re.compile(r"^\s*([A-Za-z_一-鿿]+)\s*[:：]\s*(.*?)\s*$")
-
 _SBR_KNOWN_PHASES = frozenset({
     "understand", "hypothesize", "verify", "evaluate", "report",
 })
 
 
-def _sbr_block_text(text: str) -> str | None:
-    """Return the raw inner text of the first diagnosis_status block."""
-    if not text:
+def parse_beliefs_field(value: str) -> dict:
+    """Parse a report_beliefs ``beliefs`` arg like
+    ``"1=refuted@5, H3=pending@20（附注）"`` into
+    ``{hid: (canonical_status, prob)}``.  Unparseable items are skipped
+    (never an error — a malformed item means "no opinion")."""
+    beliefs: dict = {}
+    if not value:
+        return beliefs
+    for bm in _SBR_BELIEF_ITEM_RE.finditer(value):
+        hid, raw_status, prob = bm.group(1), bm.group(2), int(bm.group(3))
+        status = _SBR_STATUS_ALIASES.get(raw_status.lower())
+        if status:
+            beliefs[hid] = (status, min(prob, 100))
+    return beliefs
+
+
+def parse_root_cause_field(value: str) -> tuple[str, int | None] | None:
+    """Parse a report_beliefs ``root_cause_candidate`` arg like
+    ``"DockerHub限速@95"`` into ``(description, prob | None)``.
+    Returns ``None`` for empty/none-like values."""
+    if not value:
         return None
-    m = _SBR_FENCED_RE.search(text) or _SBR_XML_RE.search(text)
-    return m.group(1) if m else None
-
-
-def parse_diagnosis_status(text: str) -> dict | None:
-    """Leniently parse a diagnosis_status block from an LLM response.
-
-    Returns ``None`` when no block exists or nothing usable was parsed
-    (callers treat that as "no self-report this round", never as an
-    error).  On success returns a dict with optional keys:
-
-    - ``phase``: canonical phase string (only when recognized)
-    - ``beliefs``: ``{hid: (status, prob)}`` — canonical status, int prob
-    - ``root_cause``: ``(description, prob | None)``
-    - ``menu_choice``: raw free-text menu justification
-    """
-    block = _sbr_block_text(text)
-    if block is None:
+    v = value.strip()
+    if not v or v.lower() in ("none", "无", "暂无", "(无)", "n/a", "-"):
         return None
-    parsed: dict = {}
-    for line in block.splitlines():
-        fm = _SBR_FIELD_RE.match(line)
-        if not fm:
-            continue
-        key, value = fm.group(1).lower(), fm.group(2)
-        if not value:
-            continue
-        if key in ("phase", "阶段"):
-            v = value.strip().lower()
-            if v in _SBR_KNOWN_PHASES:
-                parsed["phase"] = v
-        elif key in ("beliefs", "belief", "假设信念", "假设判断"):
-            beliefs: dict = {}
-            for bm in _SBR_BELIEF_ITEM_RE.finditer(value):
-                hid, raw_status, prob = bm.group(1), bm.group(2), int(bm.group(3))
-                status = _SBR_STATUS_ALIASES.get(raw_status.lower())
-                if status:
-                    beliefs[hid] = (status, min(prob, 100))
-            if beliefs:
-                parsed["beliefs"] = beliefs
-        elif key in ("root_cause_candidate", "root_cause", "根因候选", "根因"):
-            v = value.strip()
-            if v.lower() not in ("none", "无", "暂无", "(无)", "n/a", "-"):
-                pm = re.search(r"[@＠]\s*(\d{1,3})\s*%?", v)
-                desc = v[:pm.start()].rstrip(" ，,、") if pm else v
-                prob = min(int(pm.group(1)), 100) if pm else None
-                if desc:
-                    parsed["root_cause"] = (desc, prob)
-        elif key in ("menu_choice", "menu", "菜单选择", "动作依据"):
-            parsed["menu_choice"] = value.strip()
-    return parsed or None
+    pm = re.search(r"[@＠]\s*(\d{1,3})\s*%?", v)
+    desc = v[:pm.start()].rstrip(" ，,、") if pm else v
+    prob = min(int(pm.group(1)), 100) if pm else None
+    return (desc, prob) if desc else None
 
 
 def strip_diagnosis_status_blocks(text: str) -> str:
     """Remove all diagnosis_status blocks (fenced and XML forms).
 
-    Used when persisting LLM text as the fault report — the status block
-    is process metadata for the consistency guard, not report content.
+    Used when persisting LLM text as the fault report — legacy v1 blocks
+    may still appear in multi-turn history and must not leak into
+    reports (they are process metadata, not report content).
     """
     if not text:
         return text
@@ -1250,6 +1228,40 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
     if guidance:
         lines.append("## 本步要求")
         lines.append(guidance)
+
+    # ── Belief self-report mirror + standing reminder (SBR v2, §12) ──
+    # Reflect the model's latest report_beliefs self-report next to the
+    # ledger truth, at the prompt tail (highest-salience position —
+    # lost-in-the-middle mitigation).  Deterministic ⚠ flags mark
+    # self-report/ledger divergences; the standing reminder doubles as
+    # the per-round report_beliefs instruction.
+    latest = ledger.get("_sbr_latest")
+    if latest:
+        lines.append("")
+        lines.append("## 你上一轮的自报认知（report_beliefs 镜像）")
+        sp = latest.get("phase") or "?"
+        phase_flag = "" if sp == phase else f" ⚠ 台账当前为 {phase}"
+        lines.append(f"- 自报相位: {sp}{phase_flag}")
+        if latest.get("beliefs"):
+            lines.append(f"- 假设判断: {latest['beliefs']}")
+        rc = (latest.get("root_cause_candidate") or "").strip()
+        if rc and rc.lower() not in ("none", "无", "暂无", "n/a", "-"):
+            has_confirmed = any(
+                h.get("status") == "confirmed"
+                for h in ledger.get("hypotheses", {}).values()
+            )
+            rc_flag = "" if has_confirmed else " ⚠ 台账尚无 confirmed 假设——需经 record_finding 正式确认"
+            lines.append(f"- 根因候选: {rc}{rc_flag}")
+        if latest.get("menu_choice"):
+            lines.append(f"- 动作依据: {latest['menu_choice']}")
+    lines.append("")
+    lines.append("## 每轮例行（先于一切动作）")
+    lines.append(
+        "调用 report_beliefs 自报当前认知"
+        "（phase / beliefs / root_cause_candidate / menu_choice），"
+        "然后执行「本步要求」。自报不改变台账，结论仍须经 "
+        "commit_hypotheses / record_finding 正式提交。"
+    )
 
     lines.append("</diagnosis_ledger>")
     return "\n".join(lines)
