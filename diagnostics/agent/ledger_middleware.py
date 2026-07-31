@@ -833,8 +833,14 @@ def _check_belief_consistency(
     sbr: dict,
     ledger: DiagnosisLedger,
     tool_calls: list[tuple[str, dict]],
+    expected_phase: str | None = None,
 ) -> list[tuple[str, str]]:
     """Deterministic belief-ledger divergence checks (C0-C3).
+
+    ``expected_phase`` is the DECISION-TIME phase (what the model saw in
+    「本步要求」 when planning this round) — C0's comparison baseline.
+    When None, C0 falls back to the current derived phase (correct for
+    direct/unit-test calls where no same-round action has run).
 
     Returns a list of ``(rule_id, message)`` pairs, at most one per
     rule, total capped at 3 (context budget).  Messages are phrased as
@@ -860,14 +866,20 @@ def _check_belief_consistency(
             if sid:
                 select_targets.append(sid)
 
-    # ── C0: self-reported phase contradicts the derived phase ──
+    # ── C0: self-reported phase contradicts the decision-time phase ──
+    # Baseline is the phase the model SAW when planning this round
+    # (expected_phase, snapshotted post-response before any tool ran).
+    # Comparing against the CURRENT derived phase would false-positive
+    # whenever a same-round action (commit / final refutation) advanced
+    # the phase before report_beliefs executed — the model honestly
+    # reported what it saw (production 2026-07-31, rounds 2/6).
     sp = sbr.get("phase")
-    derived = derive_phase(ledger)
-    if sp and sp != derived:
+    expected = expected_phase or derive_phase(ledger)
+    if sp and sp != expected:
         corrections.append((
             "C0",
-            f"⚠ [认知校准] 你自报阶段={sp}，但台账推导当前阶段为 "
-            f"{derived}——以台账为准，请按 {derived} 阶段的「本步要求」行动。",
+            f"⚠ [认知校准] 你自报阶段={sp}，但本轮决策时台账阶段为 "
+            f"{expected}——以台账为准，请按 {expected} 阶段的「本步要求」行动。",
         ))
 
     # ── C1: root cause claimed (≥80%) but nothing confirmed formally ──
@@ -1335,6 +1347,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # the report_beliefs handler can suppress consistency rules that
         # a same-round sibling call is already resolving (SBR v2 §12).
         self._round_tool_calls: list[tuple[str, dict]] = []
+        # The effective phase at DECISION time (post-response, before any
+        # tool executes) — what the model saw in 「本步要求」 when it
+        # planned this round.  C0 compares the self-reported phase
+        # against THIS, not the post-action phase: same-round actions
+        # (commit / final refutation) advance the derived phase before
+        # report_beliefs executes, and comparing against that advanced
+        # state false-positives on an honest self-report (production
+        # 2026-07-31, rounds 2/6 of session 92842846).
+        self._round_start_phase: str = ""
         # Filesystem path prefix for offloaded tool results.
         self._tool_results_prefix = "/tool_results"
         # Ledger management tools — only needed by Coordinator; subagents
@@ -1691,6 +1712,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # failure here must never break the loop.
             try:
                 self._round_tool_calls = _response_tool_calls(response)
+                # Snapshot the decision-time phase BEFORE any tool runs —
+                # C0's comparison baseline (see __init__ note).
+                self._round_start_phase = _phase(ledger)
                 _reported = any(
                     n == "report_beliefs" for n, _ in self._round_tool_calls
                 )
@@ -4809,6 +4833,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             try:
                 corrections = _check_belief_consistency(
                     sbr, ledger, mw._round_tool_calls or [],
+                    expected_phase=mw._round_start_phase or None,
                 )
             except Exception as _chk_exc:  # noqa: BLE001 — advisory only
                 logger.debug("SBR consistency check skipped on error: %s",
