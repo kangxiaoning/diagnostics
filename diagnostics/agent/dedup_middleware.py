@@ -81,14 +81,11 @@ _EMPTY_PATTERNS = re.compile(
 # ── Tools that should never be deduplicated ────────────────────────────────
 # Scaffolding, ledger-management, and delegation tools are intentionally
 # excluded from dedup — they are not diagnostic data collection tools.
-# report_beliefs (SBR v2 self-report) is likewise exempt: it is process
-# metadata, and identical self-reports across rounds are legitimate.
 
 _SCAFFOLDING_TOOLS = frozenset({
     "write_file", "read_file", "edit_file",
     "write_todos", "read_todos",
     "ls", "glob", "grep",
-    "report_beliefs",
 })
 
 _LEDGER_TOOLS = frozenset({

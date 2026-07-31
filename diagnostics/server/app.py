@@ -16,7 +16,6 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage
 
 from diagnostics.agent import build_agent
-from diagnostics.agent.ledger import strip_diagnosis_status_blocks
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.streaming import stream_agent_events
 from diagnostics.config import ROOT_DIR, STATIC_DIR, Settings
@@ -260,10 +259,7 @@ def _save_result(
     # This ensures the .md is always written at the canonical report_path
     # even when the LLM uses write_file (producing no answering text_delta)
     # or alters the filename (e.g. strips HHMMSS).
-    # Strip diagnosis_status blocks (SBR, state-machine-v2.md §12) — the
-    # block is process metadata for the belief-ledger consistency guard,
-    # never report content.
-    md_content = strip_diagnosis_status_blocks(content)
+    md_content = content
     if not md_content and ledger:
         try:
             md_content = ledger.get("report") or ""
@@ -593,9 +589,7 @@ async def _chat_event_stream(
                     "phase": "answering",
                 })
 
-        # SBR blocks are stripped from the persisted assistant message so
-        # multi-turn follow-ups don't accumulate process metadata (§12).
-        content = strip_diagnosis_status_blocks("".join(assistant_text)).strip()
+        content = "".join(assistant_text).strip()
         if content:
             state.messages.append(AIMessage(content=content))
             state.messages = state.messages[-settings.max_history_messages :]

@@ -137,21 +137,6 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 6. **台账优先** — 所有假设和结论必须通过 commit_hypotheses / record_finding 提交到诊断台账，不能仅在文本中陈述。
 </core_principles>
 
-<belief_report>
-## 认知自报（每轮例行，先于其他动作）
-
-每轮行动前调用 report_beliefs 自报当前认知（可与其他工具同轮并行调用）：
-
-- phase: 当前阶段（understand/hypothesize/verify/evaluate/report，与注入台账的阶段一致）
-- beliefs: 各假设你的当前判断，紧凑格式 H序号=状态@概率（状态∈pending/inconclusive/refuted/confirmed），如 "1=refuted@5, 3=pending@20"
-- root_cause_candidate: 你当前认定的根因与置信度（如 "DockerHub限速@95"）；尚无则填 none
-- menu_choice: 本轮动作对应的相位菜单选项及一句话理由
-
-- 自报是认知校准信号：系统会将你的自报与诊断台账做一致性比对，发现偏差时在 report_beliefs 的工具结果中提示纠偏（例如你认定的根因尚未经 record_finding 正式确认、或你自报的阶段与台账不符）。
-- 自报**不改变台账**——结论仍须经 commit_hypotheses / record_finding 正式提交才生效。
-- 各字段保持紧凑（合计 ≤80 字），禁止粘贴证据全文。
-</belief_report>
-
 <diagnostic_flow>
 ## 诊断模式
 
@@ -166,7 +151,6 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 **你的工具范围**：
 - **GPU 工具**：check_gpu_health/memory/utilization
 - **台账工具**：commit_hypotheses / select_path / record_finding / backtrack
-- **自报工具**：report_beliefs（每轮例行，见 <belief_report>）
 - **Argus 监控工具**（query_argus_*）、**主机深度诊断工具**、**K8s 诊断工具**仅专家 sub-agent 可用
 
 {flow_sections}
