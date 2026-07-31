@@ -7,6 +7,7 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
@@ -58,6 +59,14 @@ except ImportError:
     check_memory = check_network = check_processes = None
     get_system_overview = None
     check_kubernetes_control_plane = check_kubernetes_nodes = check_kubernetes_pods = None
+
+# Hide write_todos from the model's tool list.  Unlike excluded_middleware
+# (which removes TodoListMiddleware entirely and destabilized qwen3.6's
+# tool-call serialization per the 2026-07-19 experiment), _ToolExclusionMiddleware
+# keeps TodoListMiddleware in the stack — only the tool name is filtered from
+# request.tools before the model sees them.  BASE_AGENT_PROMPT never references
+# write_todos, so hiding it introduces no prompt/tool mismatch.
+_WRITE_TODOS_EXCLUSION = _ToolExclusionMiddleware(excluded=frozenset({"write_todos"}))
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 AGENT_DATA_ROOT = PROJECT_ROOT / "agent_data"
@@ -420,15 +429,18 @@ def build_agent(
         model_kwargs={"tool_choice": "auto"},
     )
 
-    # NOTE: write_todos (TodoListMiddleware) must stay ENABLED.  An
-    # experiment on 2026-07-19 showed that removing it (via a harness
-    # profile excluding TodoListMiddleware) destabilizes qwen3.6's
-    # tool-call serialization — malformed XML tool calls / mangled
-    # tool names rose from ~0% to ~75% across three diagnosis sessions
-    # (13:05, 13:53, 14:50), and an A/B replay against ollama confirmed
-    # 25% vs 100% clean rate with/without the tool+prompt block.
-    # Subagents are instead restrained by a prompt-level ban in their
-    # shared return suffixes below.
+    # write_todos is hidden from the model via _ToolExclusionMiddleware
+    # (module-level _WRITE_TODOS_EXCLUSION, appended to both Coordinator
+    # and subagent middleware stacks).  This filters the tool from
+    # request.tools while keeping TodoListMiddleware in the stack.
+    # The 2026-07-19 experiment showed that *removing* TodoListMiddleware
+    # (via excluded_middleware) destabilizes qwen3.6's tool-call
+    # serialization — malformed XML / mangled names rose from ~0% to ~75%.
+    # The tool-exclusion approach avoids this: the middleware stays (its
+    # state management / serialization stabilization is preserved), only
+    # the write_todos tool is hidden.  BASE_AGENT_PROMPT never references
+    # write_todos, so there is no prompt/tool mismatch.  Subagents get
+    # the same filter plus a prompt-level ban in their return suffixes.
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
     mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
@@ -484,7 +496,7 @@ def build_agent(
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     # Governance runs before ledger so denied calls skip ledger bookkeeping.
-    _subagent_middleware = [dedup_subagent, governance_subagent, subagent_ledger]
+    _subagent_middleware = [dedup_subagent, governance_subagent, subagent_ledger, _WRITE_TODOS_EXCLUSION]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 
@@ -500,6 +512,6 @@ def build_agent(
         # diagnosis state stays at the prompt tail.
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[dedup_middleware, ledger_middleware],
+        middleware=[dedup_middleware, ledger_middleware, _WRITE_TODOS_EXCLUSION],
         state_schema=DiagnosisLedgerState,
     )

@@ -233,7 +233,6 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 ## 文件与工具边界
 
 - `execute` — **禁止使用**。诊断过程只读优先，不执行任意 Shell 命令。
-- `write_todos` — 同一步骤内只调用一次；结果已知时直接用最终状态一次性提交。
 - 本地文件工具（read_file/write_file/edit_file/grep/glob/ls）操作**诊断系统本地文件系统**，不能用于访问被诊断目标的远程路径。
   - 合法读取：`/agent_data/skills/**`、`/agent_data/AGENTS.md`
   - 禁止读取：`/agent_data/reports/**`、`/agent_data/traces/**`（与当前诊断无关）
