@@ -92,8 +92,6 @@ _EXPERT_RETURN_SUFFIX = (
     "- 禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
     "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
-    "- 禁止调用 `write_todos`——你的任务边界明确（查询→分析→返回结论），"
-    "直接执行无需计划跟踪，调用 write_todos 只会浪费诊断轮次。\n"
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个资源异常则需全部核查），不对正常的节点/Pod/资源逐一调用同名查询工具。"
     "若多个工具返回同一资源的数据且结论一致，取最早返回的结果即可，无需重复验证。\n"
@@ -124,8 +122,6 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "\n\n**工具使用边界（严格遵守）**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
-    "- 禁止调用 `write_todos`——你的任务边界明确（查询→分析→返回结论），"
-    "直接执行无需计划跟踪，调用 write_todos 只会浪费诊断轮次。\n"
     "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
     "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
     "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
@@ -439,8 +435,7 @@ def build_agent(
     # The tool-exclusion approach avoids this: the middleware stays (its
     # state management / serialization stabilization is preserved), only
     # the write_todos tool is hidden.  BASE_AGENT_PROMPT never references
-    # write_todos, so there is no prompt/tool mismatch.  Subagents get
-    # the same filter plus a prompt-level ban in their return suffixes.
+    # write_todos, so there is no prompt/tool mismatch.
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
     mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
