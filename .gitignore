@@ -10,11 +10,13 @@ agent_data/skills.db
 agent_data/reports/
 agent_data/traces/
 
-# Design docs & test cases — not version controlled
-private/
 test_cases/
 
 # Mock tools — local-only, not pushed to GitHub
 diagnostics/tools/mock/
-scripts/
-capture/
+
+# Local private assets (spec/scripts/capture/history) — not pushed to GitHub
+.local/
+
+# IDE/agent project data (skills, teams, automations) — not pushed to GitHub
+.codebuddy/

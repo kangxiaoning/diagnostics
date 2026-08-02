@@ -708,7 +708,7 @@ def _sanitize_ledger_for_event(ledger: dict[str, Any]) -> dict[str, Any]:
     """Strip internal fields from the ledger before sending to frontend.
 
     Also injects the derived ``current_phase`` — the ledger itself no
-    longer persists it (state-machine-v2 §3), but the frontend banner
+    longer persists it (design document §3), but the frontend banner
     still consumes this key, so we compute it on the way out.
     """
     internal_keys = {"_inconclusive_streak", "_backtrack_count"}

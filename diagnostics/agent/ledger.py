@@ -3,7 +3,6 @@
 The ledger is a structured diagnosis memory persisted in LangGraph state.
 It holds the hypothesis tree, evidence chain, and diagnosis round history.
 
-See: private/HYPOTHESIS_LEDGER_DESIGN.md
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from diagnostics.agent.prompt import PHASE_SPEC  # P6/§9: duty/exit 单源（�
 # ── Phase & status types ──
 
 # ── Phase & status types ──
-# 5-phase state machine (private/design/state-machine-v2.md):
+# 5-phase state machine (design document):
 # understand → hypothesize → verify → evaluate → report.
 # backtrack/skill_verify are NOT phases: backtrack is an EVALUATE action,
 # skill mode is delegation guidance inside VERIFY.
@@ -30,7 +29,7 @@ DiagnosisPhase = Literal[
     "understand", "hypothesize", "verify", "evaluate", "report",
 ]
 
-# 5-state model (state-machine-v2.md §5, v2.1 精简):
+# 5-state model (design document §5, v2.1 simplified):
 # - verifying   → removed: the verification focus is active_path[-1]
 # - deprioritized → demoted to the ``deferred`` boolean field on the node
 # - dead_end    → merged into ``refuted`` with ``terminal_reason`` set
@@ -67,7 +66,7 @@ MAX_ROOT_COMMIT_BATCHES = 2
 # These are BUSINESS invariants — they cannot be expressed by tool-input
 # schemas (Pydantic validates a single call, not cumulative state),
 # so they are enforced here at the data-structure layer.  Rationale and
-# evidence: private/design/state-machine-v2.md §11; the 2026-07-20
+# evidence: design document §11; the 2026-07-20
 # 32-round session (root layer grew to 6 via batch accumulation).
 MAX_LAYER_SIZE = 3
 """Max hypotheses per commit call AND per current batch.  A retry batch
@@ -78,7 +77,7 @@ is flat (no sub-hypotheses), so this is simply the per-batch cap."""
 # (dead_end merged into refuted in the 5-state model.)
 _HARD_FAILED_STATUSES = frozenset({"refuted"})
 
-# ── Quantified exit model (state-machine-v2.md §6, v2.1) ──
+# ── Quantified exit model (design document §6, v2.1) ──
 # 退出时机 = 继续验证的期望信息增益 < 成本，且当前把握足够。
 # Value of a verification action: value(a) = EIG(a) / c(a), where
 #   EIG(a) = U(h) × D(a,h) × F(a,h)
@@ -544,7 +543,7 @@ def select_path(
     hypotheses = ledger["hypotheses"]
     selected_id = resolve_hypothesis_id(ledger, selected_id)
 
-    # ── T5 guard (state-machine-v2.md §5): the target must be decidable ──
+    # ── T5 guard (design document §5): the target must be decidable ──
     # Selecting a terminal node is never a verification direction: a
     # confirmed node is refined via record_finding (v2.7.1 channel), a
     # refuted node is permanently closed.  Previously the guard existed
@@ -717,7 +716,7 @@ def add_evidence_to_active(
 
 
 # ── Phase derivation ──
-# 5-phase state machine (private/design/state-machine-v2.md §3).
+# 5-phase state machine (design document §3).
 # The phase is NEVER persisted: ``derive_phase`` is the single source of
 # truth, called by rendering, tool gating, and guardrails alike.
 #
@@ -742,7 +741,7 @@ def add_evidence_to_active(
 def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
     """Derive the current diagnosis phase from ledger state (pure function).
 
-    Decision order (fixed, state-machine-v2.md §3):
+    Decision order (fixed, design document §3):
       1. REPORT terminal lock — report already written.
       2. No hypotheses yet → understand (coverage not ready) or
          hypothesize (coverage ready).
@@ -838,7 +837,7 @@ def _argus_target_resolved(ledger: DiagnosisLedger) -> bool:
 def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     """UNDERSTAND→HYPOTHESIZE gate (T1): required Argus data collected.
 
-    Rules (see state-machine-v2.md §4):
+    Rules (see design document §4):
     - At least 2 rounds have passed (delegation needs time to return).
     - If any task() delegation happened: host scenarios require
       host-argus-expert; container scenarios require BOTH host-argus-expert
@@ -1279,7 +1278,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
     if phase == "evaluate":
         # Direction is computed by the state machine and presented as
         # THE action for this step — the LLM does not choose freely.
-        # Mutually exclusive by construction (state-machine-v2.md §5):
+        # Mutually exclusive by construction (design document §5):
         # exit was already ruled out by derive_phase (evaluate reached),
         # so exactly one of select/refine/backtrack/retry applies.
         pending_hint = ""
@@ -1590,7 +1589,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
 
     Returns (should_exit, reason, confirmed_hypothesis_id).
 
-    v2.8 flat model (state-machine-v2.md §6):
+    v2.8 flat model (design document §6):
       exit = S1 (把握足够) AND S2 (无可行动验证), plus fast lanes:
       - E3 evidence saturation (3 consecutive inconclusive)
       - E2 exhaustion (all roots refuted, batch budget spent)

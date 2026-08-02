@@ -246,7 +246,7 @@ def _save_result(
         # payload — streaming._sanitize_ledger_for_event injects a derived
         # "current_phase" for the frontend banner.  The persisted result
         # must store the RAW ledger (phase is derived, not persisted;
-        # state-machine-v2 §10), so strip the injected key.
+        # design document §10), so strip the injected key.
         data["ledger"] = {
             k: v for k, v in ledger.items() if k != "current_phase"
         }

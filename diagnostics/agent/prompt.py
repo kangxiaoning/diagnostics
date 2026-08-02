@@ -2,7 +2,7 @@
 
 The diagnostic flow section is generated from PHASE_SPEC — the single
 source of truth shared with the state machine implementation
-(private/design/state-machine-v2.md §9).  Hand-editing flow text here
+(design document §9).  Hand-editing flow text here
 would re-introduce the prompt/code drift this refactor removed.
 """
 

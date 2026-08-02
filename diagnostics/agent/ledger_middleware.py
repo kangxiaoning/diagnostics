@@ -6,7 +6,6 @@ This middleware:
 3. Auto-records evidence from diagnostic tool calls
 4. Persists the ledger to the filesystem on key changes
 
-See: private/HYPOTHESIS_LEDGER_DESIGN.md
 """
 
 from __future__ import annotations
@@ -66,7 +65,7 @@ from deepagents.middleware._utils import append_to_system_message
 logger = logging.getLogger(__name__)
 
 
-# ── V2 phase helpers (state-machine-v2.md §3) ──
+# ── V2 phase helpers (design document §3) ──
 # The ledger no longer persists ``current_phase``; the phase is derived
 # on demand.  Two flavours are needed inside this middleware:
 #
@@ -103,7 +102,7 @@ def _force_report(ledger: dict) -> None:
     ledger["_forced_terminal"] = True
 
 
-# ── Phase tool gating (state-machine-v2.md §7) ──
+# ── Phase tool gating (design document §7) ──
 # Tools REJECTED per phase for the Coordinator.  Anything not listed is
 # allowed; read-only scaffolding (read_file/grep/glob/ls/write_todos) is
 # never gated.  The gate exists to make illegal phases fail fast with a
@@ -193,7 +192,7 @@ _LEDGER_TOOLS = frozenset({
 })
 
 # ── Safety mechanism thresholds ──
-_MAX_ROUNDS = 40                    # G1 轮次上限（简单场景，state-machine-v2.md §8）：超过此轮次强制 REPORT
+_MAX_ROUNDS = 40                    # G1 轮次上限（简单场景，design document §8）：超过此轮次强制 REPORT
 _MAX_ROUNDS_COMPLEX = 24            # Hard limit when diagnosis needed a retry batch:
                                     # a diagnosis that needed a second batch or sub-hypotheses is
                                     # already past the healthy budget — further rounds show
@@ -206,14 +205,14 @@ _MAX_ROUNDS_COMPLEX_GRACE = 5       # Smaller grace for the complex-scenario cap
                                     # grace means this only fires on true stagnation)
 _MAX_ROUNDS_GRACE = 10              # Extra rounds granted when diagnosis is progressing
 _PROGRESS_WINDOW = 5                # Recent-round window used to detect progress
-_STAGNATION_THRESHOLD = 3           # G3 停滞阈值（state-machine-v2.md §8）：连续 task() 无 record_finding 判定为 VERIFY 委派无结论
+_STAGNATION_THRESHOLD = 3           # G3 停滞阈值（design document §8）：连续 task() 无 record_finding 判定为 VERIFY 委派无结论
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _VERIFY_STUCK_GAP = 3               # Rounds without verdict/evidence progress → verify-stuck
 _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interventions
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
 
-# ── G7' model-call retry (state-machine-v2.md §8) ──
+# ── G7' model-call retry (design document §8) ──
 # A transient failure (timeout / connection break / 5xx / 429) is retried
 # with exponential backoff BEFORE the G7 fallback fires, so a single
 # network blip no longer terminates the whole diagnosis.  Retries run
@@ -314,7 +313,7 @@ def _build_evidence_audit(ledger: dict) -> str:
 # distinguish "collected rich data" from "collected nothing useful"
 # and trigger early REPORT instead of forcing commit_hypotheses.
 
-# Argus outcome classification patterns (state-machine-v2.md §8 G2, v2.5).
+# Argus outcome classification patterns (design document §8 G2, v2.5).
 # Three semantically distinct outcomes must NOT be conflated:
 _ARGUS_PARAM_MISSING_PATTERNS = (
     "需要补充",            # expert asking for missing params
@@ -618,7 +617,7 @@ def _response_ends_loop(response) -> bool:
 
     The graph router continues the loop only while the latest AIMessage
     carries tool calls; a plain-text answer or an empty result both end
-    it.  Guardrails use this single predicate (state-machine-v2.md §8)
+    it.  Guardrails use this single predicate (design document §8)
     instead of re-implementing the check per phase.
     """
     result_list = (response.result
@@ -654,7 +653,7 @@ def _inject_tool_calls(response, tool_calls: list[dict],
     AIMessage (e.g. the model returned an empty result as the loop was
     about to end), a fresh AIMessage is synthesized so the injection can
     never silently fail — guardrails must not become a failure source
-    themselves (state-machine-v2.md §8 工程约束).
+    themselves (design document §8 工程约束).
     """
     result_list = (response.result
                    if isinstance(response.result, list)
@@ -1354,7 +1353,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if _phase(ledger) == "report"
             else _MODEL_CALL_TIMEOUT
         )
-        # ── G7' transient-failure retry (state-machine-v2.md §8) ──
+        # ── G7' transient-failure retry (design document §8) ──
         # Each attempt gets its own full timeout.  Retryable failures
         # (timeout / connection break / 5xx / 429) back off exponentially
         # and retry within the SAME round — before_model has already run,
@@ -1547,7 +1546,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "部分结果可能已写入报告文件。",
                 )])
 
-        # ── G8 首轮文本模拟（state-machine-v2.md §8）：round-1 text simulation ──
+        # ── G8 首轮文本模拟（design document §8）：round-1 text simulation ──
         # The LLM may output the entire diagnostic flow as a single
         # simulated text block — complete with fake delegation results,
         # fake hypothesis submissions, and references to past report
@@ -2118,7 +2117,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             # placeholder commit_hypotheses: a placeholder
                             # root batch consumes batch budget and pollutes
                             # the tree (same principle as the G9 evaluate
-                            # valve, state-machine-v2.md §8).
+                            # valve, design document §8).
                             logger.warning(
                                 "Safety: understand stall (round %d) — "
                                 "LLM output text without commit_hypotheses, "
@@ -2152,7 +2151,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # the agent loop while derive_phase still demands a direction
         # (i.e. check_exit_conditions said NO — there is no confirmed
         # root cause, so exiting here would be the premature closure the
-        # exit model explicitly forbids, state-machine-v2.md §6.3).
+        # exit model explicitly forbids, design document §6.3).
         #
         # Intervention follows the §8 three-level pattern:
         #   1st offence — 降级: walk the code-decided direction on the
@@ -2378,7 +2377,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._evaluate_stall_count = 0
 
         # ── Post-response: detect HYPOTHESIZE-phase stall (G12) ──
-        # HYPOTHESIZE has two entry paths (state-machine-v2.md §4/§5): T1
+        # HYPOTHESIZE has two entry paths (design document §4/§5): T1
         # (first batch — coverage just became ready, the ledger has NO
         # hypotheses yet) and T8 (retry batch — the current batch is all
         # hard-failed and budget remains).  In BOTH, if the LLM outputs
@@ -2907,7 +2906,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         tool_call_id=tool_call_id,
                     )
 
-        # ── Phase tool gating (state-machine-v2.md §7, Q4 硬门控) ──
+        # ── Phase tool gating (design document §7, Q4 硬门控) ──
         # Reject out-of-phase ledger/diagnostic actions with a corrective
         # message.  read_file/write_todos/ls/grep/glob are always allowed
         # (read-only scaffolding).  Only Coordinator is gated — subagents
@@ -3012,7 +3011,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         tool_call_id=tool_call_id,
                     )
 
-                # ── S2 gain<cost delegation gate (state-machine-v2.md §6) ──
+                # ── S2 gain<cost delegation gate (design document §6) ──
                 # A delegation whose expected information gain per unit cost
                 # falls below κ is hard-blocked with a quantified reason.
                 # Only applies to VERIFY-phase delegations targeting a
@@ -3508,7 +3507,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         cap = _MAX_ROUNDS_COMPLEX if is_complex else _MAX_ROUNDS
         grace = _MAX_ROUNDS_COMPLEX_GRACE if is_complex else _MAX_ROUNDS_GRACE
 
-        # ── G1 最大轮次安全阀（state-machine-v2.md §8）：进展感知停滞兜底 ──
+        # ── G1 最大轮次安全阀（design document §8）：进展感知停滞兜底 ──
         if round_num >= cap and not ledger.get("_forced_terminal"):
             last_progress = max(
                 self._last_finding_round,
@@ -3753,7 +3752,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "后续专家诊断将继续验证并修正假设。"
                     )
 
-        # ── G5 委派饱和（state-machine-v2.md §8）：防止重复委派相同专家验证相同假设 ──
+        # ── G5 委派饱和（design document §8）：防止重复委派相同专家验证相同假设 ──
         # Detects the pattern: task(expert, Hn) → record_finding →
         # task(same expert, same Hn) repeated.  Uses per-key tracking
         # (_same_delegate_count) so that delegating to different experts
@@ -3792,7 +3791,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             current_phase = _phase(ledger)
             has_hypotheses = bool(ledger.get("hypotheses"))
 
-            # ── G3 VERIFY 委派无结论（state-machine-v2.md §8）：连续 3 次 task 无 record_finding ──
+            # ── G3 VERIFY 委派无结论（design document §8）：连续 3 次 task 无 record_finding ──
             if self._consecutive_task_count >= _STAGNATION_THRESHOLD:
                 if current_phase == "verify" and has_hypotheses:
                     # ── P3: Auto-record inconclusive for active hypothesis ──
