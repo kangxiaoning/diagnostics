@@ -15,21 +15,25 @@ def _ensure_log_dir() -> pathlib.Path:
 
 
 def get_log_path(suffix: str = "") -> pathlib.Path:
-    """Return a log file path for today, optionally with a suffix.
+    """Return the active log file path, optionally with a suffix.
+
+    The filename carries NO date; per-day rotation is handled by
+    TimedRotatingFileHandler (archives become <name>.log.<YYYY-MM-DD>),
+    so file names always match content dates.
 
     Examples:
-        get_log_path()           → log/diagnostics_2026-06-06.log
-        get_log_path("access")   → log/access_2026-06-06.log
+        get_log_path()           → log/diagnostics.log
+        get_log_path("access")   → log/access.log
     """
-    today = datetime.now().strftime("%Y-%m-%d")
-    name = f"diagnostics_{today}.log" if not suffix else f"{suffix}_{today}.log"
+    name = "diagnostics.log" if not suffix else f"{suffix}.log"
     return _ensure_log_dir() / name
 
 
 def setup_logging(*, level: int = logging.DEBUG) -> None:
     """Configure project-wide logging to both file and console.
 
-    File log:  log/diagnostics_YYYY-MM-DD.log  (DEBUG and above)
+    File log:  log/diagnostics.log (DEBUG and above; rotates daily →
+           archives log/diagnostics.log.<YYYY-MM-DD>)
     Console:   stderr  (INFO and above)
 
     Call once at startup (e.g. in main.py).
