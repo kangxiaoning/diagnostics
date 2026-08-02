@@ -995,7 +995,12 @@ def _parse_hypothesis_id_from_description(
 # ── Pydantic schemas for tool inputs ──
 
 class HypothesisSpec(BaseModel):
-    statement: str = Field(description="假设陈述")
+    # statement 必填——实证：模型曾漏填第 2 个假设的 statement 触发
+    # Field required 错误浪费轮次（场景25 换批提交）。
+    statement: str = Field(
+        description="假设陈述（必填，每个假设都必须提供，勿遗漏；"
+                    "简洁陈述因果链，如『X 导致 Y』）",
+    )
     probability: int = Field(description="可能性 0-100", ge=0, le=100)
     rationale: str = Field(default="", description="假设依据")
 
@@ -1016,8 +1021,13 @@ class CommitHypothesesInput(BaseModel):
 
 
 class SelectPathInput(BaseModel):
-    selected_hypothesis_id: str = Field(description="选择的假设ID")
-    rationale: str = Field(description="选择理由")
+    # 字段名固定为 selected_hypothesis_id（勿用 path/name 等别名）——
+    # 实证：模型曾只传 {"path": "H2"} 触发 Field required 错误浪费轮次。
+    selected_hypothesis_id: str = Field(
+        description="选择的假设ID（必填；字段名固定为 selected_hypothesis_id，"
+                    "不要用 path/name 等别名）",
+    )
+    rationale: str = Field(description="选择理由（必填）")
     deprioritized: list[DeprioritizedSpec] = Field(
         default_factory=list,
         description="未选中假设的降级原因",
@@ -1027,7 +1037,10 @@ class SelectPathInput(BaseModel):
 class RecordFindingInput(BaseModel):
     hypothesis_id: str = Field(description="验证的假设ID")
     verdict: str = Field(
-        description="验证结论: confirmed(已证实) | refuted(已排除) | inconclusive(证据不足)",
+        description="验证结论，只能取三者之一: confirmed(已证实) | "
+                    "refuted(已排除) | inconclusive(证据不足)。"
+                    "禁止使用变体（如 partially confirmed）；"
+                    "若仅部分成立，用 confirmed + statement_update 修正表述",
         pattern="^(confirmed|refuted|inconclusive)$",
     )
     evidence_summary: str = Field(description="验证证据摘要")

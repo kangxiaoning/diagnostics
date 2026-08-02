@@ -1254,6 +1254,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- 提交预算：全程最多 {MAX_COMMIT_CALLS} 次"
             f"（本次为第 {ledger.get('_commit_count', 0) + 1} 次）；"
             "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
+            "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
+            "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
+            "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
+            "导致漏判独立故障源。\n"
             f"- 完成后必须调用 commit_hypotheses 提交假设（{exit_txt}）"
             + retry_hint
         )
@@ -1272,7 +1276,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
             "- ⚠ 若假设仅部分不成立（某环节被证伪但核心机制已确认），用"
             " confirmed + statement_update 修正表述，禁止整体 refuted\n"
-            "- ⚠ 查看上方「已有工具调用结果」和假设的「证据」字段，禁止重复调用已有结果的工具\n"
+            "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
+            "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
+            "委派时明确要求专家「复用已有证据，仅补查缺失项」，禁止重跑相同检查"
+            "（重复调用会被去重拦截并浪费轮次）\n"
             "- 禁止调用与当前假设无关的工具"
         )
     if phase == "evaluate":
@@ -1339,6 +1346,11 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + _retry_option +
             "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
             "refuted 仅用于证据明确证伪的假设。多个假设可同为 confirmed。\n"
+            "- ⚠ 独立故障源识别：当证据显示多个独立故障源同时存在"
+            "（如多个进程/配置异常各自被观测到），即使某故障源非主症状的"
+            "直接因果原因，也应作为独立根因 confirmed 或在报告中明确列为"
+            "次要根因——不得仅因『非主症状直接原因』而 refuted 一个客观"
+            "存在的独立故障（refuted 仅用于因果链被证据明确证伪）。\n"
             "- ⚠ 概率判断原则：若核心因果关系已由证据确认"
             "（如「异常进程占满资源→服务响应超时」），"
             "仅次要细节未知（如触发者、启动源），"
