@@ -36,6 +36,32 @@ def _make_tool_label(name: str) -> str:
     return _TOOL_LABELS.get(name, name)
 
 
+def _format_args_summary(tc_name: str, tc_args: dict) -> str:
+    """Build a compact parameter summary for the think-stream tool line.
+
+    Same-named calls on different entities (e.g. query_argus_cpu on
+    master-1 vs worker-3) must be distinguishable in the text stream,
+    which otherwise shows only the tool label.  Long values (delegation
+    descriptions, file contents, etc.) are truncated to keep the line
+    readable.
+    """
+    if not tc_args:
+        return ""
+    if tc_name == "task":
+        sub = (tc_args.get("subagent_type") or tc_args.get("subagent_name")
+               or tc_args.get("name") or "")
+        return f" → {sub}" if sub else ""
+    parts = []
+    for k, v in tc_args.items():
+        sv = str(v).strip()
+        if not sv or sv == "{}":
+            continue
+        if len(sv) > 40:
+            sv = sv[:37] + "…"
+        parts.append(f"{k}={sv}")
+    return ": " + ", ".join(parts) if parts else ""
+
+
 def _parse_file_path(text: str) -> str:
     """Extract file path from LLM text.
 
@@ -456,11 +482,12 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     tc_id = _extract_tool_id(tc)
                     tc_name = _extract_tool_name(tc)
                     tc_args = _extract_tool_args(tc)
-                    # Log file tools and task for args inspection
-                    if tc_name in ("read_file", "write_file", "edit_file",
-                                   "write_todos", "task", "glob", "grep", "ls"):
-                        logger.debug("[round=%d] %s args: %s",
-                                     state.round_number, tc_name, tc_args)
+                    # Log every tool call with its args for traceability
+                    # (previously only a small whitelist had it, so expert
+                    # queries like query_argus_cpu were indistinguishable).
+                    logger.debug("[round=%d] %s args: %s",
+                                 state.round_number, tc_name,
+                                 json.dumps(tc_args, ensure_ascii=False)[:300])
                     if tc_id and tc_name:
                         label = _make_tool_label(tc_name)
                         if tc_id in state.active_tools:
@@ -493,9 +520,13 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                 "round": state.round_number,
                                 "description": "",
                             }))
-                            # Emit tool call to the current round's think section
+                            # Emit tool call to the current round's think
+                            # section, with a compact args summary so
+                            # same-named calls on different entities are
+                            # distinguishable in the text stream.
                             events.append(AgentEvent("text_delta", {
-                                "text": f"\n\n🔧 {label}",
+                                "text": f"\n\n🔧 {label}"
+                                        f"{_format_args_summary(tc_name, tc_args)}",
                                 "path": path,
                                 "round": state.round_number,
                                 "phase": "thinking",
@@ -530,11 +561,16 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     if info.get("_deduped"):
                         end_evt.payload["_deduped"] = True
                     events.append(end_evt)
-                    # Emit tool result summary to the current round's think section
+                    # Emit tool result summary to the current round's think
+                    # section — keep the args summary so the result line
+                    # matches its start line for same-named calls.
                     label = info["label"]
+                    name = info.get("name", "")
+                    args = info.get("args") or {}
                     summary = _summarize_output(output)
                     events.append(AgentEvent("text_delta", {
-                        "text": f"\n📊 **{label}**: {summary}",
+                        "text": f"\n📊 **{label}"
+                                f"{_format_args_summary(name, args)}**: {summary}",
                         "path": path,
                         "round": state.round_number,
                         "phase": "thinking",
