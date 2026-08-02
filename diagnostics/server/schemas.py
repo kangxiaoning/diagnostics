@@ -8,7 +8,7 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     entity_type: str = Field(
         default="",
-        description="Entity category: 'hosts' or 'kubernetes'. Empty means auto-detect.",
+        description="Entity category: 'host' or 'kubernetes'. Empty means auto-detect.",
     )
     entity_name: str = Field(
         default="",

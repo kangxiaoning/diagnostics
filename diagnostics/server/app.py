@@ -159,7 +159,7 @@ def _build_augmented_message(
 
     if entity_name and entity_type == "kubernetes":
         lines.append(f"- 集群: {entity_name}")
-    elif entity_name and entity_type == "hosts" and not hostname:
+    elif entity_name and entity_type == "host" and not hostname:
         lines.append(f"- 主机名: {entity_name}")
     if hostname:
         lines.append(f"- 主机名: {hostname}")

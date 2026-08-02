@@ -73,7 +73,7 @@ AGENT_DATA_ROOT = PROJECT_ROOT / "agent_data"
 
 # Ensure report directory structure exists for hierarchical archiving
 _REPORT_DIRS = [
-    AGENT_DATA_ROOT / "reports" / "hosts",
+    AGENT_DATA_ROOT / "reports" / "host",
     AGENT_DATA_ROOT / "reports" / "kubernetes",
 ]
 for _d in _REPORT_DIRS:
