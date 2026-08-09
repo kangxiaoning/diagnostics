@@ -62,6 +62,43 @@ def _format_args_summary(tc_name: str, tc_args: dict) -> str:
     return ": " + ", ".join(parts) if parts else ""
 
 
+_ARG_NOISE_KEYS = ("start_time", "end_time")
+
+
+def _brief_args_summary(tc_name: str, tc_args: dict) -> str:
+    """Compact args summary for INFO log lines.
+
+    Wraps `_format_args_summary`, filtering out start/end time — those
+    are session-constant (identical across every call), pure noise when
+    the goal is distinguishing same-named calls on different entities.
+    """
+    return _format_args_summary(
+        tc_name, {k: v for k, v in (tc_args or {}).items()
+                  if k not in _ARG_NOISE_KEYS})
+
+
+def _tool_done_suffix(info: dict) -> str:
+    """Build the discriminative suffix for "Tool done" log lines.
+
+    Parallel experts and multi-entity collection issue same-named calls
+    that complete in the same second; bare "Tool done: query_argus_cpu"
+    lines then read as duplicate executions (2026-08-05 scenario-39
+    round-1: 12 legitimate host-argus calls across 3 SCI nodes + 2 pod
+    IPs looked like 3x duplication at INFO level).  Suffix carries the
+    delegating expert and the entity-discriminating args.
+    """
+    bits: list[str] = []
+    for elem in reversed(info.get("path") or []):
+        if elem not in ("coordinator", "task"):
+            bits.append(str(elem))
+            break
+    summary = _brief_args_summary(info.get("name", ""), info.get("args"))
+    if summary:
+        bits.append(summary.lstrip(": ") if not summary.startswith(" →")
+                    else summary[3:])
+    return f" [{'; '.join(bits)}]" if bits else ""
+
+
 def _parse_file_path(text: str) -> str:
     """Extract file path from LLM text.
 
@@ -429,10 +466,27 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     if _extract_tool_id(tc) and _extract_tool_name(tc)
                 )
                 if has_new_calls:
-                    tool_names = [_extract_tool_name(tc) for tc in tc_list
-                                  if _extract_tool_name(tc)]
-                    logger.info("[round=%d] LLM issued %d tool calls: %s",
-                                state.round_number, len(tool_names), tool_names)
+                    # Inline a compact args summary per call so same-named
+                    # calls on different entities are distinguishable at
+                    # INFO level (pairs with the "Tool done" suffix).
+                    # Args may be empty on incremental-streaming backends —
+                    # the summary then degrades to the bare name, same as
+                    # the previous behavior.
+                    tool_descs: list[str] = []
+                    for tc in tc_list:
+                        _n = _extract_tool_name(tc)
+                        if not _n:
+                            continue
+                        _s = _brief_args_summary(_n, _extract_tool_args(tc))
+                        if not _s:
+                            tool_descs.append(_n)
+                        elif _s.startswith(" →"):
+                            tool_descs.append(f"{_n}{_s}")
+                        else:
+                            tool_descs.append(f"{_n}({_s.lstrip(': ')})")
+                    logger.info("[round=%d] LLM issued %d tool calls: [%s]",
+                                state.round_number, len(tool_descs),
+                                ", ".join(tool_descs))
                     # Log subagent delegation details
                     for tc in tc_list:
                         tc_name = _extract_tool_name(tc)
@@ -546,7 +600,8 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                  state.round_number, tc_id)
                 else:
                     state.done_tools.add(tc_id)
-                    logger.info("[round=%d] Tool done: %s", state.round_number, info["label"])
+                    logger.info("[round=%d] Tool done: %s%s", state.round_number,
+                                info["label"], _tool_done_suffix(info))
                     # Deduped nodes should be removed from the frontend tree
                     # so users don't see duplicated identical calls.
                     end_evt = AgentEvent("tool_end", {
@@ -596,8 +651,9 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                                  state.round_number, tc_id)
                                 else:
                                     state.done_tools.add(tc_id)
-                                    logger.info("[round=%d] Tool done (updates): %s",
-                                                state.round_number, info["label"])
+                                    logger.info("[round=%d] Tool done (updates): %s%s",
+                                                state.round_number, info["label"],
+                                                _tool_done_suffix(info))
                                     end_evt = AgentEvent("tool_end", {
                                         "id": tc_id,
                                         "name": info["name"],
@@ -692,6 +748,12 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
             elif data.get("type") in ("tool_executing", "tool_completed"):
                 # Precise tool timing from awrap_tool_call
                 events.append(AgentEvent(data["type"], data))
+            elif data.get("type") == "prompt_injection":
+                # Prompt-side injection delta (phase guidance / safety
+                # warnings / evidence audit) from awrap_model_call —
+                # recorded into the trace file by the server, not
+                # forwarded to the frontend.
+                events.append(AgentEvent("prompt_injection", data))
             elif data.get("type") == "tool_args_corrected":
                 # Emitted after correcting LLM-invented args.
                 # Re-emit tool_args_available so

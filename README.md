@@ -899,12 +899,13 @@ awrap_tool_call 被调用
 **P1 专家工具阻塞**：
 
 ```
-Coordinator 尝试调用 query_argus_nodes(...)
-  → ⛔ 拦截: "query_argus_nodes 是专家专用工具，请通过 task() 委派"
+Coordinator 尝试调用 query_argus_k8s_cluster(...)
+  → ⛔ 拦截: "query_argus_k8s_cluster 是专家专用工具，请通过 task() 委派"
   → Subagent 调用同样工具 → ✅ 放行（_is_subagent=True）
 ```
 
-受拦截工具：`query_argus_cpu/memory/disk/network/nodes/services/gpu`
+受拦截工具：`query_argus_cpu/memory/disk/network/nodes/services/`
+`query_argus_k8s_cluster/node/workload/pod/etcd/gpu`
 
 **自动证据采集**：
 - 每次诊断工具执行后，结果自动写入当前活跃假设的 evidence
@@ -1111,7 +1112,7 @@ diagnostics/
 │   │   ├── ledger_middleware.py      # 台账中间件：假设管理、P1阻塞、安全机制、offload
 │   │   ├── param_override_middleware.py  # ⚠ 已移除（0 bytes）— 原参数覆写，改用 system prompt 注入
 │   │   ├── offload_middleware.py     # ⚠ 已移除（0 bytes）— 原 offload，已合并入 ledger
-│   │   ├── scope_limit.py            # 诊断范围限制：K8s API发现 + 控制面健康检查
+│   │   ├── scope_limit.py            # ⚠ 已移除 — 原诊断范围限制（ScopeGuard 已废弃），静态 pod→node 映射迁入 hostname_resolver.py
 │   │   ├── offload_middleware.py      # 结果卸载中间件：超大结果→文件系统
 │   │   └── consolidation.py         # 学习记忆整理
 │   ├── server/
@@ -1179,8 +1180,8 @@ diagnostics/
 | 3 | `tools/live/argus.py`（新建） | 6 个 `query_argus_*` 监控查询工具，函数名和参数签名必须与 mock 版**完全一致** | **P0** |
 | 4 | `tools/live/kubernetes.py` | `check_certificate_expiry` 从占位文本改为真实实现 | **P2** |
 | 5 | `agent/factory.py` | `mode=="production"` 时从 `diagnostics.tools.live` 导入 host/GPU 工具（当前全部硬编码 import from mock）；增加 `get_host_argus_live_tools` / `get_k8s_argus_live_tools` | **P0** |
-| 6 | `agent/scope_limit.py:discover()` | 通过 K8s client 查询 Pod → Node → Host 映射，实现 scope 自动发现 | **P1** |
-| 7 | `agent/scope_limit.py:get_control_plane_metrics()` | 查询监控 API 获取控制面内存指标，实现集群过载保护 | **P1** |
+| 6 | `agent/hostname_resolver.py:_resolve_production()` | 通过 K8s client 查询 Pod → Node 映射，实现生产模式 hostname 预解析（原 scope_limit.discover 职责迁移至此） | **P1** |
+| 7 | ~~控制面过载保护~~ | 已废弃 — 随 ScopeGuardMiddleware 移除（scope 由工具结果自然限制），见上文"已移除"记录 | — |
 
 > **无需改动的文件**：`dedup_middleware.py`、`ledger_middleware.py` — 这两个中间件与工具实现解耦，生产环境下直接复用。`param_override_middleware.py` 和 `offload_middleware.py` 已移除（功能分别由 system prompt 注入和 ledger 内置 offload 替代）。
 
@@ -1218,9 +1219,14 @@ def query_argus_cpu(hostname: str = "", start_time: str = "", end_time: str = ""
 def query_argus_memory(hostname: str = "", start_time: str = "", end_time: str = "") -> str: ...
 def query_argus_disk(hostname: str = "", start_time: str = "", end_time: str = "") -> str: ...
 def query_argus_network(hostname: str = "", start_time: str = "", end_time: str = "") -> str: ...
-def query_argus_nodes(hostname: str = "", start_time: str = "", end_time: str = "") -> str: ...
-def query_argus_services(hostname: str = "", start_time: str = "", end_time: str = "") -> str: ...
+def query_argus_k8s_cluster(monitor_name: str, cluster_name: str, start_time: str = "", end_time: str = "") -> dict: ...
+def query_argus_k8s_node(monitor_name: str, cluster_name: str, node_name: str, start_time: str = "", end_time: str = "") -> dict: ...
+def query_argus_k8s_workload(monitor_name: str, cluster_name: str, namespace: str, workload_type: str, workload_name: str, start_time: str = "", end_time: str = "") -> dict: ...
+def query_argus_k8s_pod(monitor_name: str, cluster_name: str, namespace: str, workload_name: str, pod_name: str, start_time: str = "", end_time: str = "") -> dict: ...
+def query_argus_k8s_etcd(monitor_name: str, host_name: str = "", start_time: str = "", end_time: str = "") -> dict: ...
 ```
+
+k8s Argus 工具为维度分区（参考 serverless-argus-expert），首参 `monitor_name` 必填——实际环境在创建 agent 前根据用户输入查询，单主机/专有集群单 Pod 场景保存在 `param_overrides` 中（mock 由 `monitor_resolver` 按同一时机解析）；Serverless 场景的 monitor_name 来自 RelationGraph 拓扑。
 
 **GPU 工具**（`tools/live/gpu.py`）：
 

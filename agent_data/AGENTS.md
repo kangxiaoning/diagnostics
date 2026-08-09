@@ -10,8 +10,9 @@
 Coordinator **不持有** `query_argus_*` 工具——这些工具仅 Argus 专家 subagent 可用，
 Coordinator 直接调用会被系统拦截。监控时序一律通过 `task()` 委派获取：
 
-- 主机级指标（CPU/内存/磁盘/网络）→ `task("host-argus-expert", ...)`
-- 集群级指标（节点/Pod/API/etcd/DNS）→ `task("k8s-argus-expert", ...)`
+- 主机级指标（CPU/内存/磁盘/网络）→ 委派当前场景的主机 argus 专家
+- 集群级指标（节点/Pod/API/etcd/DNS）→ 委派当前场景的集群 argus 专家
+- 确切的专家名称随诊断场景变化（主机/容器/Serverless），以系统指令列出的当前场景可用专家为准。
 
 专家返回的时序摘要中，各类指标的异常信号参考：
 

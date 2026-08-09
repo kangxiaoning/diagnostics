@@ -160,6 +160,32 @@ class TraceWriter:
             # Rebuild id→slot mapping after index shift
             self._rebuild_id_slot_map(target_idx, 2)
 
+    def prompt_injection(self, round_num: int, content: str) -> None:
+        """Record prompt-side injections for a round (stimulus half).
+
+        The middleware injects phase guidance / safety-valve warnings /
+        evidence audit into the system message on every Coordinator LLM
+        call.  Without recording them the trace shows only responses,
+        making guardrail behavior (e.g. whether the exit banner was
+        actually delivered) unverifiable from the trace alone.
+        The ledger data body and AGENTS.md are excluded — the former is
+        already captured by ledger snapshots, the latter is static.
+        """
+        if not content:
+            return
+        self._ensure_round(round_num)
+        self._flush_llm_buffer()
+        summary = content.rstrip()
+        suffix = ""
+        if len(summary) > 6000:
+            suffix = f"\n> ... (truncated, {len(summary)} chars total)"
+            summary = summary[:6000]
+        indented = "> " + summary.replace("\n", "\n> ") + suffix
+        self._lines.append(
+            "#### 📨 **注入 prompt 增量**（相位指引/安全阀/证据审计）\n"
+        )
+        self._lines.append(indented + "\n")
+
     def ledger_update(self, ledger: dict) -> None:
         """Record a diagnosis ledger snapshot (hypothesis tree evolution).
 

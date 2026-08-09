@@ -27,6 +27,12 @@ try:
         get_host_argus_tools,
         get_k8s_argus_tools,
         get_k8s_mock_tools,
+        get_kmc_argus_tools,
+        get_kmc_tools,
+        get_sci_argus_tools,
+        get_sci_tools,
+        get_serverless_argus_tools,
+        get_serverless_tools,
     )
     from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
     from diagnostics.tools.mock.hosts import (
@@ -54,6 +60,12 @@ except ImportError:
     def get_host_argus_tools(): return []
     def get_k8s_argus_tools(): return []
     def get_k8s_mock_tools(): return []
+    def get_serverless_argus_tools(): return []
+    def get_serverless_tools(): return []
+    def get_kmc_argus_tools(): return []
+    def get_kmc_tools(): return []
+    def get_sci_argus_tools(): return []
+    def get_sci_tools(): return []
     check_gpu_health = check_gpu_memory = check_gpu_utilization = None
     check_conntrack = check_cpu = check_disk = check_dmesg = None
     check_memory = check_network = check_processes = None
@@ -91,7 +103,7 @@ _EXPERT_RETURN_SUFFIX = (
     "禁止访问 `/agent_data/reports/**`、`/agent_data/traces/**`（历史诊断数据，与你的任务无关）。\n"
     "- 禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
     "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
-    "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "- 你只负责取证与分析——假设与结论的台账登记由 Coordinator 统一完成，你只需按下方格式返回结构化结论。\n"
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个资源异常则需全部核查），不对正常的节点/Pod/资源逐一调用同名查询工具。"
     "若多个工具返回同一资源的数据且结论一致，取最早返回的结果即可，无需重复验证。\n"
@@ -110,6 +122,8 @@ _EXPERT_RETURN_SUFFIX = (
     "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
     "- 假设验证: {confirmed|refuted|inconclusive}\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
+    "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
+    "必须如实列出，与阳性证据同等重要，不得省略\n"
     "- 根因判断: 如已定位根因则陈述，否则说明还需什么数据\n"
     "- 置信度: {高|中|低} + 百分比"
 )
@@ -121,11 +135,12 @@ _EXPERT_RETURN_SUFFIX = (
 _ARGUS_EXPERT_RETURN_SUFFIX = (
     "\n\n**工具使用边界（严格遵守）**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
-    "- 禁止调用台账管理工具（`commit_hypotheses`、`select_path`、`record_finding`）——这些工具仅供 Coordinator 使用。\n"
+    "- 你只负责指标采集与关联分析——假设与结论的台账登记由 Coordinator 统一完成。\n"
     "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
     "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
     "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
     "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 / ✅正常，每条标注具体数值\n"
+    "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
     "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
     "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
     "- 初步判断: 基于指标关联的根因推断（一句话）\n"
@@ -133,7 +148,11 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
 )
 
 
-def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str, Any]]:
+def _build_subagents(
+    mode: str = "mock",
+    scene_profile: Any | None = None,
+    entity_type: str = "",
+) -> list[dict[str, Any]]:
     """Define specialized diagnostic subagents with domain-specific skills.
 
     Each subagent has:
@@ -142,9 +161,12 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
     - Domain skills loaded lazily (skills-first diagnosis)
     - Output format with word limit to keep context clean
 
-    When *entity_type* is ``"host"``, Kubernetes-specific experts
-    (k8s-argus-expert, k8s-expert) are excluded — the target has no
-    K8s cluster, so delegating those experts would waste a round.
+    Expert filtering (design document scenario-framework §4.2):
+    - When *scene_profile* is given, only the experts listed in
+      ``scene_profile.experts`` are kept (scene-driven assembly).
+    - Legacy fallback: when *entity_type* is ``"host"``, Kubernetes-specific
+      experts (k8s-argus-expert, k8s-expert) are excluded — the target has no
+      K8s cluster, so delegating those experts would waste a round.
     """
     if mode == "mock" and not _MOCK_AVAILABLE:
         raise RuntimeError(
@@ -175,8 +197,11 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
                 "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 hostname 参数值，优先级最高）\n"
-                "2. Coordinator 的 task 描述\n"
-                "如果两处都未提供足够的参数，回复'需要 hostname 参数'——"
+                "2. 消息开头的「Serverless 拓扑锚点」区块（「可查询主机名」清单；"
+                "query_argus_* 的 hostname 参数必须取其中的主机名）\n"
+                "3. Coordinator 的 task 描述\n"
+                "hostname 参数必须是主机名（host_name），禁止填写节点 IP（node_name）。\n"
+                "如果以上都未提供足够的参数，回复'需要 hostname 参数'——"
                 "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
                 "- 并行查询所有相关 Argus 指标（CPU/内存/磁盘/网络）\n"
@@ -191,16 +216,21 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
         # ── K8s Argus expert (cluster-level time-series analysis) ──
         #
         # Dedicated Argus metrics analyst for Kubernetes cluster indicators.
-        # Has two specialised tools: query_argus_nodes (node health + Pod
-        # stability) and query_argus_services (API Server + etcd + DNS).
+        # Dimension-partitioned tools (refactored following the serverless
+        # argus expert, design document §4 专有集群 Argus 工具契约 / §11 v3.1.0):
+        # cluster/node/workload/pod + etcd — 5 tools, monitor_name as leading
+        # required param (resolved before agent creation, stored in param_overrides).
         # Host-level metrics (CPU/memory/disk/network) are exclusively owned
         # by host-argus-expert to avoid duplicate queries.
         {
             "name": "k8s-argus-expert",
             "description": (
                 "查询并分析 Kubernetes 集群级 Argus 监控指标时序。"
-                "工具 query_argus_nodes: 节点状态(NotReady)/Pod重启/驱逐/Pending。"
-                "工具 query_argus_services: API延迟/etcd leader/etcd存储/DNS延迟/DNS错误。"
+                "工具 query_argus_k8s_cluster: 集群概览(API延迟/etcd/DNS/节点就绪)。"
+                "工具 query_argus_k8s_node: 单节点(Ready/驱逐/kubelet)。"
+                "工具 query_argus_k8s_workload: 工作负载(副本/重启/Pending)。"
+                "工具 query_argus_k8s_pod: 单Pod(重启/OOM/探针)。"
+                "工具 query_argus_k8s_etcd: etcd(leader/raft/存储)。"
                 "适用场景：需要获取K8s集群指标时间线以识别集群异常时序、"
                 "控制面稳定性与工作负载状态时委派。"
             ),
@@ -208,19 +238,23 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "你是 Kubernetes 集群指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度的集群指标时间线，"
                 "识别集群异常时序与控制面稳定性问题。\n\n"
-                "你有两个专用工具：\n"
-                "- query_argus_nodes: 节点健康(NotReady) + Pod稳定性(Restarts/Evictions/Pending)\n"
-                "- query_argus_services: 控制面(API延迟/etcd leader切换/etcd存储) + DNS(延迟/错误数)\n\n"
+                "你有五个按维度分区的专用工具（首参均为 monitor_name，"
+                "已由系统预解析提供）：\n"
+                "- query_argus_k8s_cluster: 集群概览(API Server延迟/错误、etcd Leader/DB用量、DNS延迟/错误、NotReady节点数)\n"
+                "- query_argus_k8s_node: 单节点(Ready状态/驱逐/kubelet心跳/节点CPU/内存)\n"
+                "- query_argus_k8s_workload: 工作负载(期望/就绪副本、Pod重启、Pending)\n"
+                "- query_argus_k8s_pod: 单Pod(容器重启/OOMKilled/探针失败/内存工作集)\n"
+                "- query_argus_k8s_etcd: etcd(Leader/Leader变更/提案失败/WAL fsync/Backend Commit/DB大小)\n\n"
                 "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
-                "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 cluster_name 参数值，优先级最高）\n"
+                "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 monitor_name/cluster_name 参数值，优先级最高）\n"
                 "2. Coordinator 的 task 描述\n"
-                "如果两处都未提供足够的参数，回复'需要 cluster_name 参数'——"
+                "如果两处都未提供足够的参数，回复'需要 monitor_name/cluster_name 参数'——"
                 "不要输出完整诊断报告，不要模拟工具调用。\n\n"
                 "诊断原则：\n"
-                "- 并行调用两个工具，分别获取基础设施层和控制面层的时序数据\n"
-                "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
-                "- 分析跨层时序关联——同一分钟的异常可能共享根因\n"
+                "- 按需并行调用维度工具（先 cluster 概览定位异常层，再 node/workload/pod/etcd 下钻）\n"
+                "- 识别每个维度的突变时间点（指标显著变化的分钟）\n"
+                "- 分析跨维度时序关联——同一分钟的异常可能共享根因\n"
                 "- 区分控制面问题(API/etcd/DNS) vs 节点资源问题(NotReady/Evictions) vs 工作负载问题(Restarts/Pending)\n"
                 "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
                 "- 如需节点级CPU/内存/磁盘/网络时序，告知Coordinator另行委派host-argus-expert\n"
@@ -241,18 +275,19 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
             "description": (
                 "诊断 Linux 主机全栈问题：CPU（利用率/负载/iowait/D状态）、"
                 "内存（泄漏/OOM/Swap）、磁盘（IO饱和/存储延迟）、"
-                "网络（TCP重传/丢包/连接饱和/ARP/conntrack/MTU/软中断/TCP队列/gRPC泄漏）。"
-                "适用场景：主机层面任何异常——高负载、内存不足、IO慢、网络丢包，"
+                "网络（TCP重传/丢包/连接饱和/ARP/conntrack/MTU/软中断/TCP队列/gRPC泄漏）、"
+                "GPU（CUDA OOM/温度限速/利用率异常/ECC 错误）。"
+                "适用场景：主机层面任何异常——高负载、内存不足、IO慢、网络丢包、GPU 异常，"
                 "或复合症状（如CPU高同时磁盘慢）。能跨子系统关联诊断。"
             ),
             "system_prompt": (
-                "你是 Linux 主机全栈诊断专家，覆盖 CPU、内存、磁盘 IO、网络四个子系统。\n\n"
+                "你是 Linux 主机全栈诊断专家，覆盖 CPU、内存、磁盘 IO、网络、GPU 五个子系统。\n\n"
                 "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
                 "你不需要生成完整诊断报告或修复方案——那是 Coordinator 的职责。\n"
                 "你的输出将被 Coordinator 解析为 record_finding 调用的输入。\n\n"
                 "诊断原则：\n"
                 "- 先看全局（system-health-check），再按症状选择对应技能深入\n"
-                "- 注意跨域关联——同一根因常表现跨子系统症状\n\n"
+                "- 注意跨域关联——同一根因常表现跨子系统症状（如 CUDA OOM 致进程被 kill 而主机内存正常）\n\n"
                 "按症状选择技能：\n"
                 "- CPU 高/负载高/iowait → cpu-diagnosis\n"
                 "- 内存不足/OOM/Swap → memory-diagnosis\n"
@@ -266,7 +301,10 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "- gRPC 连接泄漏 → grpc-connection-leak\n"
                 "- 内核参数丢包 → kernel-parameter-drops\n"
                 "- 跨域复合症状 → cross-layer-diagnosis\n"
-                "- 技能工具不足时，使用 check_cpu/check_memory/check_disk/check_network 直接分析\n\n"
+                "- GPU CUDA OOM/温度限速/利用率异常/ECC 错误 → gpu-diagnosis"
+                "（检查顺序：健康状态[温度/限速/ECC/PCIe] → 显存[OOM/泄漏] → 利用率）\n"
+                "- 技能工具不足时，使用 check_cpu/check_memory/check_disk/check_network/"
+                "check_gpu_* 直接分析\n\n"
                 "关键诊断动作：\n"
                 "- iowait 高 + 进程 D 状态 → 锁定磁盘 IO 根因\n"
                 "- RSS 远超 heap limit → 识别堆外内存泄漏\n"
@@ -275,7 +313,13 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据，供 Coordinator 综合判断\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": [t for t in [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg] if t is not None],
+            # GPU tools/skills are part of the unified host expert
+            # (v3.9.0 — the standalone gpu-expert was removed: GPU faults
+            # need cross-domain correlation with memory/processes, e.g.
+            # "CUDA OOM kills the process while host memory stays normal";
+            # container-scene GPU checks go through the host expert too,
+            # since GPUs live on physical nodes).
+            "tools": [t for t in [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg, check_gpu_health, check_gpu_memory, check_gpu_utilization] if t is not None],
             "skills": [
                 "/agent_data/skills/system-health-check/",
                 "/agent_data/skills/cpu-diagnosis/",
@@ -290,32 +334,8 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "/agent_data/skills/tcp-listen-overflow/",
                 "/agent_data/skills/grpc-connection-leak/",
                 "/agent_data/skills/cross-layer-diagnosis/",
+                "/agent_data/skills/gpu-diagnosis/",
             ],
-        },
-        {
-            "name": "gpu-expert",
-            "description": (
-                "诊断 GPU CUDA OOM、温度/功率限速、利用率异常和 ECC 错误。"
-                "适用场景：GPU 密集型工作负载出现异常时。"
-            ),
-            "system_prompt": (
-                "你是 GPU 诊断专家。\n\n"
-                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定 GPU 假设，返回结构化验证结论。\n"
-                "你不需要生成完整诊断报告——那是 Coordinator 的职责。\n"
-                "诊断工作流：\n"
-                "1. 优先使用 gpu-diagnosis 技能执行结构化 GPU 诊断流程。\n"
-                "2. 如技能工具不足，使用 check_gpu_health、check_gpu_memory、check_gpu_utilization 深入分析。\n"
-                "3. 检查顺序：健康状态（温度、限速、ECC、PCIe）→ 显存（OOM、泄漏）→ 利用率（计算 vs 带宽）。\n"
-                + _EXPERT_RETURN_SUFFIX
-            ),
-            "tools": [
-                t for t in [
-                    check_gpu_health,
-                    check_gpu_memory,
-                    check_gpu_utilization,
-                ] if t is not None
-            ],
-            "skills": ["/agent_data/skills/gpu-diagnosis/"],
         },
         # ── Kubernetes expert (unified: cluster infrastructure + workloads) ──
         #
@@ -384,12 +404,195 @@ def _build_subagents(mode: str = "mock", entity_type: str = "") -> list[dict[str
                 "/agent_data/skills/system-health-check/",
             ],
         },
+        # ── Serverless experts (k8s-on-k8s: 逻辑集群 ↔ KMC 控制面 ↔ SCI 数据面) ──
+        #
+        # 场景 single_pod+serverless 的 6 个专属专家 + host 双专家（host-argus-expert/
+        # host-expert 复用）。参数语义（design document §5.2）：argus 专家用 monitor_name
+        # （拓扑 mapping），深度专家用物理集群 cluster_name（拓扑 mapping.kmc_cluster /
+        # sci_cluster / serverless_cluster）；命名规则见 serverless-architecture 技能。
+        {
+            "name": "serverless-argus-expert",
+            "description": (
+                "查询并分析 Serverless 逻辑集群的 Argus 监控指标时序：API 延迟、Pod 稳定计数、节点就绪率。"
+                "适用场景：需要逻辑集群视角指标时间线（虚拟集群 API 健康、Pod 稳定性）时委派。"
+            ),
+            "system_prompt": (
+                "你是 Serverless 逻辑集群指标时序分析专家。\n"
+                "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别逻辑集群异常时序。\n\n"
+                "⚠ 关键约束：你只有 query_argus_serverless_* 与 query_argus_shared_etcd 工具，没有文件工具。\n"
+                "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
+                "pod（单 Pod）/ shared_etcd（共享 etcd）。\n"
+                "所有参数必须从消息开头的「Serverless 拓扑视图（serverless_views）」区块解析（优先级最高）：\n"
+                "- monitor_name / cluster_name ← mapping.serverless_* 字段\n"
+                "- namespace / workload_type / workload_name ← resource(kind/ns/name)\n"
+                "- pod_name / node_name ← physical_pods[].name / node_name\n"
+                "- 共享 etcd 查询：「Serverless 拓扑视图（etcd_views）」区块条目（host_name 可选）\n"
+                "不自造参数；若区块未提供足够参数，回复'需要 <参数名>'，不要模拟工具调用。\n\n"
+                "诊断原则：\n"
+                "- 先查集群概览（_cluster），异常时按维度深入（_node/_workload/_pod）\n"
+                "- 共享 etcd 异常（多集群同时异常优先怀疑）用 query_argus_shared_etcd\n"
+                "- 与 KMC/SCI 物理层时序关联由 Coordinator 跨层综合\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                + _ARGUS_EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_serverless_argus_tools(),
+        },
+        {
+            "name": "serverless-expert",
+            "description": (
+                "诊断 Serverless 逻辑集群资源：Deployment/Pod/Service/ConfigMap 状态与事件、控制器行为、"
+                "Pod 固定 IP 注解。适用场景：逻辑资源协调异常、Pod 状态与物理不符、API 对象错误时委派。"
+            ),
+            "system_prompt": (
+                "你是 Serverless 逻辑集群资源诊断专家（面向用户的虚拟 Kubernetes 集群）。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告——那是 Coordinator 的职责。\n\n"
+                "关键约束：\n"
+                "- cluster_name 用逻辑集群名（拓扑 mapping.serverless_cluster）\n"
+                "- 逻辑 Pod 的物理落点经「环境拓扑」区块的物理 Pod 锚点（burst-<ns>-<pod>）获取\n"
+                "- 对比逻辑状态与 SCI 物理状态（VK 同步链路故障时两视图不一致）\n\n"
+                "诊断原则：\n"
+                "- 查 Deployment 状态/事件、Pod 生命周期（OOMKilled/CrashLoopBackOff）\n"
+                "- 检查 Pod 固定 IP 注解与重建行为（固定 IP 保留）\n"
+                "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
+                + _EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_serverless_tools(),
+            "skills": [
+                "/agent_data/skills/serverless-architecture/",
+                "/agent_data/skills/kubernetes-diagnosis/",
+            ],
+        },
+        {
+            "name": "kmc-argus-expert",
+            "description": (
+                "查询并分析 KMC 物理集群的 Argus 监控指标时序：节点健康、Serverless 控制面组件"
+                "（Deployment Pod）资源、KMC 自身 etcd。适用场景：需要控制面集群指标时间线时委派。"
+            ),
+            "system_prompt": (
+                "你是 KMC 物理集群（控制面承载）指标时序分析专家。\n"
+                "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别控制面集群异常时序。\n\n"
+                "⚠ 关键约束：你只有 query_argus_kmc_* 与 query_argus_kmc_etcd 工具，没有文件工具。\n"
+                "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
+                "pod（单 Pod）/ kmc_etcd（KMC 自身 etcd）。\n"
+                "所有参数必须从消息开头的「Serverless 拓扑视图（kmc_views）」区块解析（优先级最高）：\n"
+                "- monitor_name / cluster_name ← mapping.kmc_* 字段\n"
+                "- namespace / workload_type / workload_name ← kmc_resource(kind/ns/name)\n"
+                "- pod_name / node_name ← kmc_resource.name / node_name\n"
+                "- KMC 自身 etcd 查询：kmc_views 中 kind=EtcdMember 条目（kmc-etcd-*，host_name 可选）\n"
+                "不自造参数；若区块未提供足够参数，回复'需要 <参数名>'，不要模拟工具调用。\n\n"
+                "诊断原则：\n"
+                "- 识别 KMC 节点健康、控制面组件 CPU/内存、etcd 指标突变时间点\n"
+                "- 控制面组件高负载可解释逻辑集群 API 延迟（跨层关联）\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                + _ARGUS_EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_kmc_argus_tools(),
+        },
+        {
+            "name": "kmc-expert",
+            "description": (
+                "诊断 KMC 物理集群：Serverless 控制面 Deployment/Pod（含 vpc-cni-controller、etcd-proxy sidecar）、"
+                "共享 etcd（5 节点）、共享组件（API Gateway kube-system / Group1-xxx kmc-ingress / IPAM kmc-system）、"
+                "KMC 自身控制面与节点。适用场景：逻辑集群 API 超时、多集群同时异常、控制面组件异常时委派。"
+            ),
+            "system_prompt": (
+                "你是 KMC 物理集群诊断专家（承载多个 Serverless 逻辑集群的控制面）。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告——那是 Coordinator 的职责。\n\n"
+                "关键约束：\n"
+                "- cluster_name 用物理集群名（拓扑 mapping.kmc_cluster），非逻辑集群名\n"
+                "- 控制面命名空间 = <k8s_name>-<master_id>（拓扑 mapping 派生），不自造\n"
+                "- 共享组件命名空间：API Gateway `kube-system`、Group1-xxx `kmc-ingress`、IPAM `kmc-system`\n\n"
+                "诊断原则：\n"
+                "- 控制面 Deployment/Pod（apiserver/cm/vk/vpc-cni-controller）状态与重启\n"
+                "- 控制面组件异常时查 Pod 日志定位根因（崩溃/报错）→ get_kmc_pod_logs\n"
+                "- 共享 etcd（5 节点，etcd_views）/ KMC 自身 etcd 健康/leader/延迟（多集群同时异常优先怀疑）→ get_kmc_etcd_status\n"
+                "- 共享组件链路：API Gateway（VK→SCI）、Group1-xxx（logs/exec 隧道）、IPAM（固定 IP）\n"
+                "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
+                + _EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_kmc_tools(),
+            "skills": [
+                "/agent_data/skills/serverless-architecture/",
+                "/agent_data/skills/control-plane-diagnosis/",
+                "/agent_data/skills/etcd-diagnosis/",
+            ],
+        },
+        {
+            "name": "sci-argus-expert",
+            "description": (
+                "查询并分析 SCI 物理集群的 Argus 监控指标时序：节点健康、工作负载 Pod（burst-*）"
+                "资源/重启/OOM。适用场景：需要数据面集群指标时间线时委派。"
+            ),
+            "system_prompt": (
+                "你是 SCI 物理集群（工作负载执行）指标时序分析专家。\n"
+                "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别数据面集群异常时序。\n\n"
+                "⚠ 关键约束：你只有 query_argus_sci_* 与 query_argus_sci_etcd 工具，没有文件工具。\n"
+                "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
+                "pod（单 Pod）/ sci_etcd（SCI 自身 etcd）。\n"
+                "所有参数必须从消息开头的「Serverless 拓扑视图（sci_views）」区块解析（优先级最高）：\n"
+                "- monitor_name / cluster_name ← mapping.sci_* 字段\n"
+                "- namespace / workload_name ← serverless_resource(关联) 或 sci_pod.namespace\n"
+                "- pod_name / node_name ← sci_pod.name / sci_pod.node_name\n"
+                "- SCI 自身 etcd 查询：sci_views 中 kind=EtcdMember 条目（sci-etcd-*，host_name 可选）\n"
+                "不自造参数；若区块未提供足够参数，回复'需要 <参数名>'，不要模拟工具调用。\n\n"
+                "诊断原则：\n"
+                "- 识别 SCI 节点健康、工作负载 Pod 资源/重启/OOM 突变时间点\n"
+                "- 工作负载 Pod 名前缀 burst-（逻辑 Pod 的物理形态）\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                + _ARGUS_EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_sci_argus_tools(),
+        },
+        {
+            "name": "sci-expert",
+            "description": (
+                "诊断 SCI 物理集群：用户工作负载 Pod（burst-*，固定 IP）、节点/kubelet、自研 VPC-CNI"
+                "（kube-system DaemonSet）、IP 分配/冲突、容器运行时。适用场景：Pod Pending/"
+                "ContainerCreating、IP 冲突、网络不通、固定 IP 保留失败时委派。"
+            ),
+            "system_prompt": (
+                "你是 SCI 物理集群诊断专家（运行 Serverless 用户工作负载的数据面集群）。\n\n"
+                "⚠ 角色边界：你的职责是验证 Coordinator 委派的特定假设，返回结构化验证结论。\n"
+                "你不需要生成完整诊断报告——那是 Coordinator 的职责。\n\n"
+                "关键约束：\n"
+                "- cluster_name 用物理集群名（拓扑 mapping.sci_cluster），非逻辑集群名\n"
+                "- 工作负载命名空间 = burst-ns-<master_id>（拓扑 mapping 派生）\n"
+                "- 工作负载 Pod 名 = burst-<serverless_ns>-<serverless_pod_name>（命名规则）\n"
+                "- 逻辑资源关联经「环境拓扑」区块（serverless_views 的 physical_pods）\n\n"
+                "诊断原则：\n"
+                "- 用户 Pod 状态/重启/OOM 与固定 IP（VPC-CNI/IPAM 分配记录）\n"
+                "- 节点/kubelet 与 VPC-CNI DaemonSet 状态（网络不通/IP 冲突优先怀疑）\n"
+                "- 与逻辑集群状态对比（VK 同步链路故障时两视图不一致）\n"
+                "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
+                + _EXPERT_RETURN_SUFFIX
+            ),
+            "tools": get_sci_tools(),
+            "skills": [
+                "/agent_data/skills/serverless-architecture/",
+                "/agent_data/skills/kubernetes-diagnosis/",
+                "/agent_data/skills/container-runtime-diagnosis/",
+            ],
+        },
     ]
 
-    # Filter out K8s-specific experts when entity_type is "host"
-    if entity_type == "host":
-        _K8S_EXPERTS = {"k8s-argus-expert", "k8s-expert"}
-        subagents = [s for s in subagents if s["name"] not in _K8S_EXPERTS]
+    # Filter experts: scene profile takes precedence (scene-driven assembly).
+    if scene_profile is not None:
+        _allowed = set(scene_profile.experts)
+        subagents = [s for s in subagents if s["name"] in _allowed]
+    else:
+        # Legacy requests (no scene framework — single-host / dedicated-pod
+        # frontends) never use Serverless experts.
+        _SLS_EXPERTS = {
+            "serverless-argus-expert", "serverless-expert",
+            "kmc-argus-expert", "kmc-expert",
+            "sci-argus-expert", "sci-expert",
+        }
+        subagents = [s for s in subagents if s["name"] not in _SLS_EXPERTS]
+        if entity_type == "host":
+            _K8S_EXPERTS = {"k8s-argus-expert", "k8s-expert"}
+            subagents = [s for s in subagents if s["name"] not in _K8S_EXPERTS]
 
     return subagents
 
@@ -400,12 +603,15 @@ def build_agent(
     system_prompt: str | None = None,
     report_path: str = "",
     ledger_path: str = "",
+    scene_profile: Any | None = None,
     entity_type: str = "",
     hostname: str = "",
     entity_name: str = "",
     start_time: str = "",
     end_time: str = "",
     param_overrides: dict | None = None,
+    topology: dict | None = None,
+    topology_unavailable: bool = False,
 ):
     settings = settings or Settings.from_env()
 
@@ -455,7 +661,7 @@ def build_agent(
         )},
     )
 
-    subagent_configs = _build_subagents(mode, entity_type=entity_type)
+    subagent_configs = _build_subagents(mode, scene_profile=scene_profile, entity_type=entity_type)
 
     # Tool dedup middleware — prevents duplicate tool calls (same name+args)
     # within a session, with circuit breaker for repeated failures and
@@ -477,6 +683,8 @@ def build_agent(
         start_time=start_time,
         end_time=end_time,
         param_overrides=param_overrides,
+        topology=topology,
+        topology_unavailable=topology_unavailable,
         valid_subagents=[sa["name"] for sa in subagent_configs],
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
@@ -498,7 +706,9 @@ def build_agent(
     return create_deep_agent(
         model=model,
         tools=tools,
-        system_prompt=system_prompt or make_system_prompt(report_path, ledger_path),
+        system_prompt=system_prompt or make_system_prompt(
+            report_path, ledger_path,
+            agent_names=[sa["name"] for sa in subagent_configs]),
         backend=shared_backend,
         # NOTE: deepagents' memory= parameter is intentionally NOT used.
         # AGENTS.md is loaded and injected by DiagnosisLedgerMiddleware

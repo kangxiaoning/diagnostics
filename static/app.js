@@ -17,22 +17,26 @@ const skillsBar = document.getElementById("skillsBar");
 const skillSuggestions = document.getElementById("skillSuggestions");
 
 // ── Param override refs ──
-const taskTypeEl = document.getElementById("taskType");
+const sceneSelectEl = document.getElementById("sceneSelect");
+const clusterTypeRow = document.getElementById("clusterTypeRow");
+const clusterTypeSelectEl = document.getElementById("clusterTypeSelect");
 const paramFieldsContainer = document.getElementById("paramFieldsContainer");
 const paramFieldsHost = document.getElementById("paramFieldsHost");
 const paramFieldsCommon = document.getElementById("paramFieldsCommon");
 
-// ═══════════════════ Param Overrides Toggle ═══════════════════
-taskTypeEl.addEventListener("change", () => {
-  const type = taskTypeEl.value;
+// ═══════════════════ Scene-driven Param Overrides ═══════════════════
+function applySceneFields() {
+  const scene = sceneSelectEl.value;
   const show = (el) => el.classList.remove("hidden");
   const hide = (el) => el.classList.add("hidden");
 
-  if (type === "container") {
+  clusterTypeRow.classList.add("hidden");
+  if (scene === "single_pod") {
     show(paramFieldsContainer);
     hide(paramFieldsHost);
     show(paramFieldsCommon);
-  } else if (type === "host") {
+    show(clusterTypeRow); // 集群类型：专有集群 / Serverless
+  } else if (scene === "single_host") {
     hide(paramFieldsContainer);
     show(paramFieldsHost);
     show(paramFieldsCommon);
@@ -41,13 +45,15 @@ taskTypeEl.addEventListener("change", () => {
     hide(paramFieldsHost);
     hide(paramFieldsCommon);
   }
-});
+}
+sceneSelectEl.addEventListener("change", applySceneFields);
 
 function buildParamOverrides() {
-  const type = taskTypeEl.value;
-  if (!type) return null;
+  const scene = sceneSelectEl.value;
+  if (!scene) return null;
 
-  const overrides = { task_type: type };
+  // task_type 语义保留（hostname_resolver 依赖 container 判断触发主机名解析）
+  const overrides = { task_type: scene === "single_host" ? "host" : "container" };
   const startTime = document.getElementById("paramStartTime").value;
   const endTime = document.getElementById("paramEndTime").value;
 
@@ -57,7 +63,7 @@ function buildParamOverrides() {
     if (endTime) overrides.fault_time_range.end_time = endTime.replace("T", " ") + ":00";
   }
 
-  if (type === "container") {
+  if (scene === "single_pod") {
     const cn = document.getElementById("paramClusterName").value.trim();
     const ns = document.getElementById("paramNamespace").value.trim();
     const wt = document.getElementById("paramWorkloadType").value;
@@ -68,7 +74,7 @@ function buildParamOverrides() {
     if (wt) overrides.workload_type = wt;
     if (wn) overrides.workload_name = wn;
     if (pn) overrides.pod_name = pn;
-  } else if (type === "host") {
+  } else if (scene === "single_host") {
     const nc = document.getElementById("paramHostname").value.trim();
     if (nc) overrides.hostname = nc;
   }
@@ -765,16 +771,18 @@ formEl.addEventListener("submit", async (e) => {
       body: JSON.stringify({
         message: prompt,
         session_id: sessionId,
+        scene_id: sceneSelectEl.value || null,
+        cluster_type: sceneSelectEl.value === "single_pod" ? clusterTypeSelectEl.value : null,
         entity_type: (() => {
-          const t = taskTypeEl.value;
-          if (t === "host") return "hosts";
-          if (t === "container") return "kubernetes";
+          const s = sceneSelectEl.value;
+          if (s === "single_host") return "host";
+          if (s === "single_pod") return "kubernetes";
           return "";
         })(),
         entity_name: (() => {
-          const t = taskTypeEl.value;
-          if (t === "container") return document.getElementById("paramClusterName").value.trim();
-          if (t === "host") return document.getElementById("paramHostname").value.trim();
+          const s = sceneSelectEl.value;
+          if (s === "single_pod") return document.getElementById("paramClusterName").value.trim();
+          if (s === "single_host") return document.getElementById("paramHostname").value.trim();
           return "";
         })(),
         param_overrides: buildParamOverrides(),

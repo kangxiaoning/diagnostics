@@ -31,14 +31,23 @@
           </div>
         </div>
 
-        <!-- Param Overrides Bar — per-session diagnostic context -->
+        <!-- Param Overrides Bar — scene-driven diagnostic context -->
         <div class="param-bar" id="paramBar">
           <div class="param-bar-header">
-            <span class="param-bar-label">选择诊断对象类型</span>
-            <select id="taskType" class="param-select">
+            <span class="param-bar-label">选择诊断场景</span>
+            <select id="sceneSelect" class="param-select">
               <option value="">-- 请选择 --</option>
-              <option value="host">🖥 主机诊断</option>
-              <option value="container">📦 容器诊断</option>
+              <option value="single_host">🖥 单主机诊断</option>
+              <option value="single_pod">📦 单 Pod 诊断</option>
+              <option value="single_cluster" disabled>单集群诊断（未开放）</option>
+              <option value="multi_cluster" disabled>多集群诊断（未开放）</option>
+              <option value="multi_host" disabled>多主机诊断（未开放）</option>
+            </select>
+          </div>
+          <div class="param-row hidden" id="clusterTypeRow">
+            <select id="clusterTypeSelect" class="param-input param-select-inline">
+              <option value="dedicated">专有集群</option>
+              <option value="serverless">Serverless</option>
             </select>
           </div>
           <div class="param-fields hidden" id="paramFieldsContainer">

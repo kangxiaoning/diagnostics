@@ -16,8 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, HumanMessage
 
 from diagnostics.agent import build_agent
-from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.streaming import stream_agent_events
+from diagnostics.agent.topology_client import query_environment_topology
+from diagnostics.agent.topology_render import coordinator_block
 from diagnostics.config import ROOT_DIR, STATIC_DIR, Settings
 from diagnostics.server.schemas import ChatRequest
 from diagnostics.server.sessions import SessionStore
@@ -73,6 +74,16 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
         """Return all diagnostic skills for the frontend / command picker."""
         return get_all_skills()
 
+    @app.get("/api/scenes")
+    async def list_scenes() -> list[dict[str, object]]:
+        """Return enabled diagnostic scenes for the frontend scene selector.
+
+        Scene-driven assembly (design document scenario-framework §4): enabled
+        scenes only; scenes 3-5 are registered but disabled until implemented.
+        """
+        from diagnostics.agent.scene_profile import list_enabled_scenes
+        return list_enabled_scenes()
+
     @app.get("/api/history")
     async def list_history() -> list[dict[str, Any]]:
         """List completed diagnostic sessions with metadata."""
@@ -119,22 +130,50 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     return app
 
 
-def _auto_set_scenario(message: str) -> None:
+def _auto_set_scenario(message: str, cluster_type: str = "") -> None:
     """Match user message to mock scenario using declarative routing.
 
     Delegates to scenarios.match_scenario() which auto-sorts keyword rules
-    by specificity (more keywords = higher priority).  Adding or removing
-    scenarios only requires editing scenarios.py — no changes here.
+    by specificity (more keywords = higher priority).  cluster_type is
+    forwarded so routing is domain-scoped (Serverless requests only match
+    serverless scenarios), preventing cross-domain misrouting.  Adding or
+    removing scenarios only requires editing scenarios.py — no changes here.
     """
     from diagnostics.tools.mock.scenarios import match_scenario, set_scenario
 
-    matched = match_scenario(message)
+    matched = match_scenario(message, cluster_type)
     if matched:
         try:
             set_scenario(matched)
             logger.info("Mock scenario auto-set to %r", matched)
         except Exception:
             pass
+
+
+def _field_present(name: str, param_overrides: dict, message: str, entity_name: str) -> bool:
+    """Whether a scene input field is present (scene framework input validation).
+
+    Field names map to param_overrides keys; cluster_name may come from
+    entity_name, time_range from fault_time_range, description from message.
+    """
+    if name == "cluster_name":
+        return bool(param_overrides.get("cluster_name") or entity_name)
+    if name == "time_range":
+        return bool(param_overrides.get("fault_time_range"))
+    if name == "description":
+        return bool(message)
+    return bool(param_overrides.get(name))
+
+
+def _render_topology_summary(topology: dict) -> str:
+    """Render a RelationGraph into the Coordinator's compact topology block.
+
+    The Coordinator needs a global resource inventory (three views, Pod-level
+    placement stripped) plus the cluster mapping to route delegations without
+    guessing cluster/namespace names (design document §7.3).  Serialized JSON
+    keeps the authoritative structure as the single source of truth.
+    """
+    return coordinator_block(topology)
 
 
 def _build_augmented_message(
@@ -364,7 +403,42 @@ async def _chat_event_stream(
 
     # ── Auto-match mock scenario from user message (dev mode only) ──
     if os.getenv("DIAGNOSTICS_MODE", "mock") == "mock":
-        _auto_set_scenario(request.message)
+        _auto_set_scenario(request.message, request.cluster_type)
+
+    # ── Scene resolution (scene framework) ──
+    # When the frontend selects a scene (scene_id), resolve the SceneProfile,
+    # validate required inputs, and derive entity_type/entity_name accordingly.
+    # Legacy requests (no scene_id) keep the old auto-detect path untouched.
+    scene_profile = None
+    if request.scene_id:
+        from diagnostics.agent.scene_profile import resolve_profile
+
+        scene_profile = resolve_profile(request.scene_id, request.cluster_type or "")
+        if scene_profile is None:
+            yield sse("error", {
+                "message": f"未知场景 scene_id={request.scene_id!r}, cluster_type={request.cluster_type!r}",
+            })
+            return
+        if not scene_profile.enabled:
+            yield sse("error", {
+                "message": f"场景暂未开放：{scene_profile.label}（{scene_profile.scene_id}）",
+            })
+            return
+        _po = request.param_overrides or {}
+        _missing = [
+            f.name
+            for f in scene_profile.input_fields
+            if f.required
+            and not _field_present(f.name, _po, request.message, request.entity_name)
+        ]
+        if _missing:
+            yield sse("error", {"message": f"缺少必填输入项：{', '.join(_missing)}"})
+            return
+        # Derive entity_type / entity_name from the scene profile
+        if not request.entity_type and scene_profile.entity_type:
+            request.entity_type = scene_profile.entity_type
+        if not request.entity_name and scene_profile.scene_id == "single_pod":
+            request.entity_name = _po.get("cluster_name", "") or request.entity_name
 
     # ── Pre-resolve hostname for container scenarios ──
     # host-argus-expert needs a concrete hostname to query host-level
@@ -377,6 +451,12 @@ async def _chat_event_stream(
     if request.param_overrides:
         from diagnostics.agent.hostname_resolver import resolve_hostnames
         request.param_overrides = resolve_hostnames(request.param_overrides)
+        # ── Pre-resolve Argus monitor_name (host / dedicated-cluster scenes) ──
+        # Mirrors production timing: monitor_name is queried from user input
+        # BEFORE the agent is built, and stored in param_overrides. Serverless
+        # scenes keep their RelationGraph-provided monitor_name (topology).
+        from diagnostics.agent.monitor_resolver import resolve_monitor_name
+        request.param_overrides = resolve_monitor_name(request.param_overrides)
         hostname = (request.param_overrides or {}).get("hostname", "")
         time_range = (request.param_overrides or {}).get("fault_time_range", {}) or {}
         start_time = time_range.get("start_time", "")
@@ -396,20 +476,55 @@ async def _chat_event_stream(
         end_time,
     )
 
+    # ── Environment topology injection (Serverless scene) ──
+    # Query RelationGraph at session init (mirror of hostname pre-resolution)
+    # and render the topology anchor into the augmented message so the
+    # Coordinator can locate resources without guessing cluster/namespace names.
+    # On failure degrade to input-only diagnosis (design document §9-3).
+    _topology_data: dict | None = None
+    _topology_unavailable = False
+    if scene_profile is not None and scene_profile.topology_query:
+        try:
+            _topology_data = query_environment_topology(
+                cluster_name=(request.param_overrides or {}).get("cluster_name", request.entity_name),
+                namespace=(request.param_overrides or {}).get("namespace", ""),
+                workload_name=(request.param_overrides or {}).get("workload_name", ""),
+                pod_name=(request.param_overrides or {}).get("pod_name", ""),
+            )
+            if _topology_data:
+                _topology_summary = _render_topology_summary(_topology_data)
+                if _topology_summary:
+                    augmented_message = augmented_message + "\n\n" + _topology_summary
+            else:
+                # Query returned None (mock unavailable) — same degrade path.
+                _topology_data = None
+                _topology_unavailable = True
+        except Exception:
+            # 降级（design document §9-3/D2）：拓扑失败不阻塞诊断，标记不可用
+            logger.exception("topology query failed; degrade to input-only diagnosis")
+            _topology_data = None
+            _topology_unavailable = True
+
     # ── Generate report/ledger paths and build agent with formatted prompt ──
     report_path = _make_report_path(request.entity_type, request.entity_name)
     ledger_path = _make_ledger_path(report_path)
+    # system_prompt intentionally NOT pre-rendered here: the factory's
+    # fallback renders it with the assembled scene expert names, enabling
+    # scene-isolated few-shot examples and expert placeholder substitution
+    # (design document §9).
     agent = agent_factory(
         settings,
-        system_prompt=make_system_prompt(report_path, ledger_path),
         report_path=report_path,
         ledger_path=ledger_path,
+        scene_profile=scene_profile,
         entity_type=request.entity_type,
         hostname=hostname,
         entity_name=request.entity_name,
         start_time=start_time,
         end_time=end_time,
         param_overrides=request.param_overrides,
+        topology=_topology_data,
+        topology_unavailable=_topology_unavailable,
     )
 
     state.messages.append(HumanMessage(content=augmented_message))
@@ -557,6 +672,15 @@ async def _chat_event_stream(
                 for snap in tree.handle_round_start(event.payload.get("round", 0)):
                     yield _tree_sse(snap)
 
+            elif event.name == "prompt_injection":
+                # awrap_model_call: prompt-side injection delta (phase
+                # guidance / safety warnings / evidence audit).  Trace-only
+                # observability — not forwarded to the frontend.
+                trace.prompt_injection(
+                    event.payload.get("round", 0),
+                    event.payload.get("content", ""),
+                )
+
             elif event.name == "tool_executing":
                 # awrap_tool_call: tool about to run (precise timing)
                 yield sse("tool_executing", event.payload)
@@ -619,16 +743,21 @@ async def _chat_event_stream(
     except asyncio.CancelledError:
         logger.info("[session=%s] Stream cancelled by server", session_id)
         state.cancel_event.set()
-        for snap in tree.finalize():
-            yield _tree_sse(snap)
         # ── Disconnect fallback: preserve everything gathered so far ──
         # A cancelled stream means the CLIENT went away (lock screen /
-        # network drop), not that the diagnosis failed.  Without this
-        # save, a 30+ round diagnosis loses its report entirely
-        # (observed 2026-07-20 session be0c5650: 32 rounds, stream
-        # cancelled at the final write_file round, nothing persisted).
-        # Save result.json with the current ledger, and synthesize a
-        # report .md from the ledger when the LLM never got to write one.
+        # network drop / client-side timeout), not that the diagnosis
+        # failed.  Without this save, a 30+ round diagnosis loses its
+        # report entirely (observed 2026-07-20 session be0c5650: 32
+        # rounds, stream cancelled at the final write_file round,
+        # nothing persisted).
+        #
+        # CRITICAL: the save must run BEFORE any yield and this handler
+        # must not yield at all — inside a cancelled async generator,
+        # yield re-raises CancelledError (a BaseException), which would
+        # silently skip the fallback below and escape the generic
+        # `except Exception` (observed 2026-08-08 batch: three timeout
+        # sessions produced no result.json).  The client is gone anyway,
+        # so there is no consumer for further SSE events.
         try:
             elapsed = time.monotonic() - t_start
             report_text_str = "".join(report_text)
@@ -648,6 +777,9 @@ async def _chat_event_stream(
                          request.entity_type, request.entity_name,
                          elapsed, event_counters, len("".join(assistant_text)),
                          ledger=latest_ledger, content=report_text_str)
+            logger.info(
+                "[session=%s] disconnect fallback saved (report=%d chars)",
+                session_id, len(report_text_str))
         except Exception:
             logger.exception("[session=%s] disconnect fallback save failed", session_id)
         trace.finalize()

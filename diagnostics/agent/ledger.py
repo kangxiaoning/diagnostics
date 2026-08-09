@@ -394,7 +394,7 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
             return False
         if (node.get("status") == "pending"
                 and not node.get("deferred")
-                and not _economically_dead(node)):
+                and not _economically_dead(ledger, hid)):
             return False
     return True
 
@@ -801,7 +801,7 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
             and all(
                 hypotheses.get(hid, {}).get("status")
                 in _HARD_FAILED_STATUSES
-                or _economically_dead(hypotheses.get(hid, {}))
+                or _economically_dead(ledger, hid)
                 for hid in root_ids)):
         if can_commit_root_hypotheses(ledger):
             return "hypothesize"
@@ -832,6 +832,23 @@ def _argus_target_resolved(ledger: DiagnosisLedger) -> bool:
     if ledger.get("entity_type", "") == "host":
         return bool(ledger.get("hostname"))
     return bool(ledger.get("entity_name") or ledger.get("hostname"))
+
+
+def _required_argus(ledger: DiagnosisLedger) -> set[str]:
+    """Required Argus experts for the UNDERSTAND coverage gate (D1).
+
+    Mirrors the coverage rules in ``_coverage_ready`` / ``_serverless_coverage_ready``:
+    Serverless four-view, host single, dedicated container dual.  Used by the
+    proactive UNDERSTAND coverage-status hint (design document §5).
+    """
+    if ledger.get("topology") or ledger.get("_topology_unavailable"):
+        return {
+            "serverless-argus-expert", "kmc-argus-expert",
+            "sci-argus-expert", "host-argus-expert",
+        }
+    if ledger.get("entity_type", "") == "host":
+        return {"host-argus-expert"}
+    return {"host-argus-expert", "k8s-argus-expert"}
 
 
 def _coverage_ready(ledger: DiagnosisLedger) -> bool:
@@ -874,10 +891,38 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
             return True
         return (ledger.get("current_round", 0)
                 >= _NO_DELEGATION_FALLBACK_ROUND)
+    # Serverless scene (k8s-on-k8s): topology-aware coverage gate (D1/D2,
+    # see design document §7.2).  Topology injection marks the scene; on
+    # topology failure (_topology_unavailable) degrade to argus-only.
+    if ledger.get("topology") or ledger.get("_topology_unavailable"):
+        return _serverless_coverage_ready(ledger)
     if ledger.get("entity_type", "") == "host":
         return "host-argus-expert" in experts_delegated
     return ("host-argus-expert" in experts_delegated
             and "k8s-argus-expert" in experts_delegated)
+
+
+def _serverless_coverage_ready(ledger: DiagnosisLedger) -> bool:
+    """Serverless coverage gate (design document §7.2 D1/D2).
+
+    D1 (topology available): the four serverless view-layer argus experts
+    (logical serverless / KMC control-plane / SCI data-plane / physical host)
+    must ALL be delegated — four-view coverage before hypothesizing across
+    layers (Serverless workloads run on SCI physical nodes; host-argus covers
+    the physical-layer metrics that kmc/sci node overviews do not split).
+    D2 (topology failed): same four-expert judgement without the topology
+    requirement (mirror of ``_argus_unavailable``).
+    """
+    if not ledger.get("_topology_unavailable") and not ledger.get("topology"):
+        return False  # topology still pending — keep UNDERSTAND collecting
+    experts_delegated: set[str] = set()
+    for rd in ledger.get("rounds", []):
+        experts_delegated.update(rd.get("delegated_experts", []))
+    required = {
+        "serverless-argus-expert", "kmc-argus-expert",
+        "sci-argus-expert", "host-argus-expert",
+    }
+    return required.issubset(experts_delegated)
 
 
 def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
@@ -898,6 +943,12 @@ def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
     finalized = False
     for hid, node in hypotheses.items():
         if node.get("status") in ("pending", "inconclusive"):
+            # Idempotent: a node already shelved (deferred, selection
+            # cleared, reason recorded) needs no further mutation — the
+            # caller logs/persists only on actual change.
+            if node.get("deferred") and not node.get("selected") \
+                    and node.get("deferred_reason"):
+                continue
             node["deferred"] = True
             node["selected"] = False
             if not node.get("deferred_reason"):
@@ -1214,6 +1265,25 @@ def _render_hypothesis_tree(
                 )
 
 
+# Argus targeted-recheck channel note (design document §9, v3.5.1):
+# argus experts are the ONLY channel to monitoring time series (deep
+# experts carry no query_argus_* tools).  The note makes the channel
+# visible in VERIFY without listing argus experts alongside the deep
+# expert map (PG4 brevity): a hypothesis-driven targeted re-query —
+# specific time window/metric/object — yields new information, not a
+# repeat of UNDERSTAND's broad coverage sweep (2026-08-08 scenario-35
+# empirical: decisive evidence came from kmc-argus in VERIFY).  Abuse
+# is bounded by the view-aware G5 gate + dedup; no hard gate needed.
+_ARGUS_CHANNEL_NOTE_SUFFIX = (
+    "——与 UNDERSTAND 的广覆盖采集不同，须带假设聚焦的具体问题\n"
+)
+_ARGUS_CHANNEL_NOTE_SLS = (
+    "- 需定向复核监控时序（特定时间窗/指标/对象）→ 对应视角 argus 专家"
+    "（serverless/kmc/sci/host-argus-expert）"
+    + _ARGUS_CHANNEL_NOTE_SUFFIX
+)
+
+
 def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                      report_path: str = "") -> str:
     """Generate guidance text for the current phase.
@@ -1226,15 +1296,54 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
     duty = spec.get("duty", "")
     exit_txt = spec.get("exit", "")
     if phase == "understand":
+        # Scene-aware delegation rule (design document §9, 2026-08-05):
+        # only the CURRENT scene's required Argus set is shown.  The LLM
+        # must not see other scenes' delegation rules (avoids cognitive
+        # load and scene misclassification); the set is sourced from
+        # _required_argus — the same single source of truth as the D1
+        # coverage gate and the reactive coverage valve (§8).
+        if ledger.get("topology") or ledger.get("_topology_unavailable"):
+            delegation_rules = (
+                "- 单轮并行委派四个 Argus 专家（Serverless 四视角：逻辑/控制面/"
+                "数据面/物理主机）：\n"
+                "  task(subagent_type=\"serverless-argus-expert\") + "
+                "task(subagent_type=\"kmc-argus-expert\") + task(subagent_type=\"sci-argus-expert\") "
+                "+ task(subagent_type=\"host-argus-expert\")\n"
+                "  四视角 argus 时序齐备才判数据齐、可进入 HYPOTHESIZE\n"
+            )
+        elif ledger.get("entity_type", "") == "host":
+            delegation_rules = (
+                "- 仅委派 task(subagent_type=\"host-argus-expert\", "
+                "description=...) 采集主机指标\n"
+            )
+        else:
+            delegation_rules = (
+                "- 单轮并行委派两个 Argus 专家：task(subagent_type=\"host-argus-expert\") "
+                "+ task(subagent_type=\"k8s-argus-expert\")\n"
+                "  即使症状仅点名集群/Pod/DNS/节点也必须双委派——主机节点资源"
+                "（CPU/内存/磁盘 IO）是集群故障的底层维度，缺一则覆盖门控判数据不齐\n"
+            )
+        # Proactive coverage-status hint (design document §5): name the argus
+        # experts still missing so the LLM delegates them before the coverage
+        # gate (D1) blocks.  Selective (only when incomplete) and actionable.
+        _req = _required_argus(ledger)
+        _del: set[str] = set()
+        for rd in ledger.get("rounds", []):
+            _del.update(rd.get("delegated_experts", []))
+        _miss = _req - _del
+        coverage_hint = ""
+        if _miss:
+            coverage_hint = (
+                f"- 覆盖状态：已委派 {', '.join(sorted(_del & _req)) or '（无）'}；"
+                f"仍缺 **{', '.join(sorted(_miss))}**（覆盖门控要求全部委派）。\n"
+            )
         return (
             "你当前处于 UNDERSTAND 阶段。\n"
             f"- {duty}\n"
-            "- 委派 Argus 专家时使用上方「诊断会话参数」中的时间范围（禁止自行推断）\n"
-            "- 委派几个 Argus 专家由实体类型决定（与覆盖门控一致）：\n"
-            "  纯主机场景（entity_type=host）→ 仅 task(subagent_type=\"host-argus-expert\", description=...)\n"
-            "  K8s/容器集群场景 → 单轮并行委派两个：task(subagent_type=\"host-argus-expert\") + task(subagent_type=\"k8s-argus-expert\")\n"
-            "  即使症状仅点名集群/Pod/DNS/节点也必须双委派——主机节点资源（CPU/内存/磁盘 IO）是集群故障的底层维度，缺一则覆盖门控判数据不齐\n"
-            "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
+            + coverage_hint
+            + delegation_rules
+            + "- 委派 Argus 专家时使用上方「诊断会话参数」中的时间范围（禁止自行推断）\n"
+            + "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
             "- ⚠ 查看上方「已有工具调用结果」，禁止重复调用已执行过的工具\n"
             f"- ⚠ {exit_txt}"
         )
@@ -1254,6 +1363,11 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- 提交预算：全程最多 {MAX_COMMIT_CALLS} 次"
             f"（本次为第 {ledger.get('_commit_count', 0) + 1} 次）；"
             "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
+            "- ⚠ 字段契约：每条假设必须含 statement/probability/rationale 三字段，"
+            "statement 必填且为一句完整根因表述——缺失会导致提交失败（预算不返还）\n"
+            "- ⚠ 同源合并：若多个候选描述的是同一故障的机制/因果链上下游"
+            "（如\"内存超限 OOMKilled\"与\"memory limit 配置过低\"互为表里），"
+            "应合并为一条假设；仅当证据显示独立故障源并存时才提交多条\n"
             "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
             "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
             "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
@@ -1266,13 +1380,49 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         active = ledger["hypotheses"].get(active_id, {})
         stmt = active.get("statement", "?")
         disp_id = fmt_hid(active_id) if active_id != "?" else "?"
+        sls_verify = ""
+        # Scene-aware expert map (design document §9, 2026-08-05): only the
+        # CURRENT scene's verification experts are shown (same principle as
+        # UNDERSTAND: no other-scene delegation rules in view).
+        if ledger.get("topology") or ledger.get("_topology_unavailable"):
+            expert_map = (
+                "- Serverless 场景委派映射：主机/SCI/KMC 节点假设 → "
+                "task(subagent_type=\"host-expert\")；逻辑集群假设 → "
+                "task(subagent_type=\"serverless-expert\")；KMC 控制面假设 → "
+                "task(subagent_type=\"kmc-expert\")；SCI 数据面假设 → "
+                "task(subagent_type=\"sci-expert\")\n"
+                + _ARGUS_CHANNEL_NOTE_SLS
+            )
+        elif ledger.get("entity_type", "") == "host":
+            expert_map = (
+                "- 主机假设（CPU/内存/磁盘/网络/GPU）→ "
+                "task(subagent_type=\"host-expert\", description=...) 委派验证\n"
+                "- 需定向复核监控时序（特定时间窗/指标）→ "
+                "task(subagent_type=\"host-argus-expert\")"
+                + _ARGUS_CHANNEL_NOTE_SUFFIX
+            )
+        else:
+            expert_map = (
+                "- 主机假设 → task(subagent_type=\"host-expert\", description=...) 委派验证\n"
+                "- K8s 假设 → task(subagent_type=\"k8s-expert\", description=...) 委派验证\n"
+                "- 需定向复核监控时序（特定时间窗/指标/对象）→ "
+                "host-argus-expert / k8s-argus-expert"
+                + _ARGUS_CHANNEL_NOTE_SUFFIX
+            )
+        # Proactive next-action directive (design document
+        # proactive-guidance §5.3): single render_verify_directive
+        # decision-tree output, placed first (primacy) so the LLM sees
+        # the right action before the duty/expert-map bullets — same
+        # primacy rationale as the EVALUATE exit banner.
+        _vd = render_verify_directive(ledger)
+        _vd_block = (_vd + "\n") if _vd else ""
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
-            f"- {duty}\n"
-            "- 主机假设 → task(subagent_type=\"host-expert\", description=...) 委派验证\n"
-            "- K8s 假设 → task(subagent_type=\"k8s-expert\", description=...) 委派验证\n"
-            "- GPU 假设 → task(subagent_type=\"gpu-expert\", description=...) 委派验证\n"
-            f"- 委派时明确\"验证假设{disp_id}\"并传入假设上下文\n"
+            + _vd_block
+            + f"- {duty}\n"
+            + expert_map
+            + "- 委派时明确\"验证假设"
+            f"{disp_id}\"并传入假设上下文\n"
             f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
             "- ⚠ 若假设仅部分不成立（某环节被证伪但核心机制已确认），用"
             " confirmed + statement_update 修正表述，禁止整体 refuted\n"
@@ -1304,13 +1454,36 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             _tags = []
             for h in pending:
                 _tag = fmt_hid(h)
-                if _economically_dead(ledger["hypotheses"][h]):
+                if _economically_dead(ledger, h):
                     _tag += "（增益<κ，委派已被门控——请 record_finding 终结或搁置）"
                 _tags.append(_tag)
             pending_hint = (
                 f"\n- ⚠ 仍有待验证的假设: "
                 f"{', '.join(_tags)}，使用 select_path 切换验证"
             )
+        # Proactive dead-node hint (design document §9 E2).  pending_hint
+        # only renders once a root cause is confirmed; with NO confirmed root
+        # cause an economically dead node is otherwise invisible — the LLM
+        # cannot compute delegation_value vs κ itself and may select_path a
+        # dead node straight into the G5 delegation gate.  Name the dead nodes
+        # here so the reaction never has to fire.  Renders only when dead
+        # nodes exist AND no root cause is confirmed yet (with one,
+        # pending_hint already annotates them — no duplication, and selective
+        # injection forbids always-on noise).
+        dead_hint = ""
+        if not root_cause_hyp_ids:
+            _dead = [
+                fmt_hid(hid)
+                for hid, n in ledger.get("hypotheses", {}).items()
+                if _economically_dead(ledger, hid)
+            ]
+            if _dead:
+                dead_hint = (
+                    f"\n- ⚠ 验证增益已低于成本（委派已被门控，勿再 "
+                    f"select_path 委派验证）的假设: {', '.join(_dead)}"
+                    "——请用 record_finding 依据已有证据终结（或让其保持搁置），"
+                    "将验证精力集中于上方点名的阻塞假设"
+                )
         _retry_option = (
             "  · 本层全部 refuted 或验证增益已低于成本（经济死亡）、"
             "提交预算未用尽 → commit_hypotheses 换方向提交新一批假设\n"
@@ -1324,17 +1497,30 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # hypothesis is confirmed) misleads the LLM into thinking the
         # diagnosis is done and it should write the report.
         _should_exit, _exit_reason, _ = check_exit_conditions(ledger)
+        # Parallel suggestion is rendered once and shared with VERIFY
+        # (SSOT, design document parallel-delegation §4.2).
+        _psug = render_parallel_suggestion(ledger)
+        parallel_hint = f"\n- {_psug}" if _psug else ""
         # NB: the "what to do next" advice (select_path 验证/证伪、无法定论
         # 可 defer) lives in PHASE_SPEC evaluate duty — single source; the
         # banner only carries the live verdict + the prohibition.
-        exit_banner = (
-            f"\n- ⛔ 禁止调用 write_file：出口判据当前未满足——{_exit_reason}。"
-            "待判据满足后系统会自动进入 REPORT 并提示你写入报告。\n"
-            "  即使台账已列出「根因」，只要上方判据未满足就仍属 EVALUATE，"
-            "主动 write_file 会被门控拦截。"
-        )
+        # Proactive exit-condition directive (SSOT: render_exit_directive),
+        # placed FIRST so the LLM sees the blocker + phase-appropriate actions
+        # before anything else (primacy — avoids the buried-banner dilution
+        # observed in scenario 32 where the LLM looped on unproductive actions).
+        _directive = render_exit_directive(ledger, "evaluate")
+        if _directive:
+            exit_banner = "\n## 退出条件诊断（系统计算，无需你判断）\n" + _directive + "\n"
+        else:
+            exit_banner = (
+                f"\n- ⛔ 禁止调用 write_file：出口判据当前未满足——{_exit_reason}。"
+                "待判据满足后系统会自动进入 REPORT 并提示你写入报告。\n"
+                "  即使台账已列出「根因」，只要上方判据未满足就仍属 EVALUATE，"
+                "主动 write_file 会被门控拦截。"
+            )
         return (
             "你当前处于 EVALUATE 阶段。\n"
+            + exit_banner +
             f"- {duty}\n"
             "- 下一步路径菜单：\n"
             "  · 现有证据已可判定某未决假设 → 直接 record_finding 记录结论"
@@ -1358,7 +1544,13 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "不要因为次要信息缺失而过度降低根因概率。\n"
             f"- 推进：{exit_txt}"
             + pending_hint
-            + exit_banner
+            + dead_hint
+            # Parallel-delegation suggestion (design document
+            # parallel-delegation §4.2 T8): the complementary-expert
+            # delegations empirically happen in EVALUATE (auto-heal
+            # path), so the decision point needs the same guidance —
+            # same renderer as the VERIFY directive (SSOT).
+            + parallel_hint
         )
     if phase == "report":
         n_causes = len(ledger.get("root_causes", []))
@@ -1456,12 +1648,18 @@ def record_round(
     next_plan: str = "",
     _seq: int = 0,
     delegated_experts: list[str] | None = None,
+    delegated_for: str | None = None,
 ) -> None:
     """Record a tool call within the current diagnosis round.
 
     NOTE: current_round is synced from the middleware's _model_call_count
     (via before_model hook), NOT incremented here. This ensures round
     numbers reflect actual LLM invocations, not individual tool calls.
+
+    *delegated_for* records WHICH hypothesis a task() delegation targeted
+    (design document parallel-delegation §5 D2) — a structured fact that
+    makes per-hypothesis delegated-expert sets, parallel-group keys, and
+    audit trails derivable from the rounds history.
     """
     focus_id = ledger["active_path"][-1] if ledger["active_path"] else None
     entry = RoundRecord(
@@ -1476,6 +1674,8 @@ def record_round(
     )
     if delegated_experts:
         entry["delegated_experts"] = delegated_experts
+    if delegated_for:
+        entry["delegated_for"] = delegated_for
     ledger["rounds"].append(entry)
 
 
@@ -1533,8 +1733,85 @@ def delegation_value(node: HypothesisNode) -> float:
     return eig / COST_DELEGATION
 
 
-def _economically_dead(node: HypothesisNode) -> bool:
-    """软终态（v2.9）：未决但验证增益已低于成本（delegation_value < κ）。
+# ── View-aware delegation value (design document parallel-delegation §8) ──
+# D6's freshness decay assumes "the same evidence re-examined rarely flips
+# the outcome" — but a NEW observability view is not the same evidence.
+# The 2026-08-08 scenario-35 replay proved multi-view cross-validation is
+# sometimes the ONLY path to a verdict (host/SCI/KMC views each contributed
+# new evidence), and with view-blind decay any hypothesis at
+# _delegate_count=1 + _inconclusive_count=1 has value ≤ 0.125 < κ — the
+# gate would kill legitimate multi-view verification.  F therefore decays
+# on SAME-VIEW prior delegations only; n_inc stays global.
+
+def _view_delegation_count(
+    ledger: DiagnosisLedger, hid: str, expert: str,
+) -> int:
+    """Prior delegations for *hid* covering the SAME view as *expert*."""
+    from diagnostics.agent.scene_profile import EXPERT_VIEW
+
+    view = EXPERT_VIEW.get(expert, "")
+    n = 0
+    has_d2 = False
+    for rd in ledger.get("rounds", []):
+        if rd.get("delegated_for") == hid:
+            has_d2 = True
+            for e in rd.get("delegated_experts", []):
+                if EXPERT_VIEW.get(e, "") == view:
+                    n += 1
+    if has_d2:
+        return n
+    # Legacy fallback (pre-D2 ledgers): derive from evidence sources.
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    for e in node.get("evidence", []):
+        s = str(e.get("source", ""))
+        if s.startswith("expert:"):
+            if EXPERT_VIEW.get(s.split("expert:", 1)[-1], "") == view:
+                n += 1
+    return n
+
+
+def _value_with_view(node: HypothesisNode, same_view_deleg: int) -> float:
+    """delegation_value with F decayed by same-view delegations only."""
+    n = same_view_deleg + node.get("_inconclusive_count", 0)
+    eig = _uncertainty(node) * (0.5 ** n)
+    if (node.get("_delegate_count", 0) == 0
+            and node.get("status") in ("pending", "inconclusive")):
+        eig *= _EPISTEMIC_BONUS
+    return eig / COST_DELEGATION
+
+
+def delegation_value_for(
+    ledger: DiagnosisLedger, hid: str, expert: str | None = None,
+) -> float:
+    """View-aware delegation value for hypothesis *hid*.
+
+    *expert* given → value of delegating THAT expert (G5 gate semantics,
+    per-call).  *expert*=None → best case over the remaining assembled
+    experts (exit-model / dead-detection semantics: "is ANY verification
+    action still worth its cost").  Falls back to the legacy view-blind
+    value when the ledger carries no scene_experts snapshot (D1).
+    """
+    node = ledger.get("hypotheses", {}).get(hid)
+    if node is None:
+        return 0.0
+    if expert is not None:
+        return _value_with_view(node, _view_delegation_count(ledger, hid, expert))
+    scene_experts = ledger.get("scene_experts") or []
+    if not scene_experts:
+        return delegation_value(node)
+    delegated = _delegated_experts_for(ledger, hid)
+    remaining = [e for e in scene_experts if e not in delegated]
+    # All experts already tried → best case is the least-degraded view.
+    pool = remaining or list(scene_experts)
+    return max(
+        (_value_with_view(node, _view_delegation_count(ledger, hid, e))
+         for e in pool),
+        default=0.0,
+    )
+
+
+def _economically_dead(ledger: DiagnosisLedger, hid: str) -> bool:
+    """软终态（v2.9）：未决但验证增益已低于成本（best-case delegation value < κ）。
 
     A hypothesis that is still pending/inconclusive but can no longer be
     delegated (G5 would hard-block it) must not block direction changes:
@@ -1544,12 +1821,19 @@ def _economically_dead(node: HypothesisNode) -> bool:
     logic treats it as dead.  deferred nodes are NOT dead: an explicit
     shelve is a revivable direction (G9 revival channel), matching the
     E2′ exclusion.
+
+    View-aware (design document parallel-delegation §8): dead means NO
+    remaining expert view offers gain ≥ cost — a hypothesis with an
+    untried complementary view is still alive.
     """
+    node = ledger.get("hypotheses", {}).get(hid)
+    if node is None:
+        return False
     if node.get("status") not in ("pending", "inconclusive"):
         return False
     if node.get("deferred"):
         return False
-    return delegation_value(node) < KAPPA_STOP
+    return delegation_value_for(ledger, hid) < KAPPA_STOP
 
 
 def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
@@ -1577,7 +1861,7 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
             continue
         if node.get("status") == "pending" and node.get("probability", 0) <= 15:
             continue
-        v = delegation_value(node)
+        v = delegation_value_for(ledger, hid)
         if v > best_v:
             best_v = v
             best_d = (
@@ -1669,15 +1953,15 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         # proxy).
         if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
             survivors = [
-                node for hid in root_ids
+                (hid, node) for hid in root_ids
                 if (node := hypotheses.get(hid)) is not None
                 and node.get("status") not in _HARD_FAILED_STATUSES
             ]
             if survivors and all(
                     node.get("status") in ("pending", "inconclusive")
                     and not node.get("deferred")
-                    and delegation_value(node) < KAPPA_STOP
-                    for node in survivors):
+                    and delegation_value_for(ledger, hid) < KAPPA_STOP
+                    for hid, node in survivors):
                 return True, (
                     f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批假设预算用尽，"
                     "残余未决假设的验证增益均低于成本（κ），未确认根因"
@@ -1725,3 +2009,371 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         f"残余不确定性 R={r:.2f} 源于经济上已死的未决假设，"
         f"报告中标注为未验证）"
     ), confirmed_ids[0]
+
+
+def _exit_blocker(ledger: DiagnosisLedger) -> dict | None:
+    """Return the hypothesis blocking the exit (max delegation_value >= κ), or None.
+
+    Exit condition S2 requires every pending/inconclusive hypothesis to be
+    economically dead (delegation_value < κ).  A hypothesis above κ is a
+    potential competing root cause that must be resolved before REPORT
+    (multi-root protection).  This is the deterministic, code-maintained
+    predicate behind the exit directive (design document §5/§6.3).
+    """
+    best: dict | None = None
+    best_v = -1.0
+    for h, node in ledger.get("hypotheses", {}).items():
+        if (node.get("status") in ("pending", "inconclusive")
+                and not node.get("deferred")):
+            v = delegation_value_for(ledger, h)
+            if v >= KAPPA_STOP and v > best_v:
+                best_v = v
+                best = {
+                    "id": h,
+                    "statement": node.get("statement", ""),
+                    "probability": node.get("probability", 0),
+                    "delegation_value": round(v, 3),
+                    "delegated": node.get("_delegate_count", 0),
+                    "inconclusive": node.get("_inconclusive_count", 0),
+                }
+    return best
+
+
+def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
+    """Render the system-injected disclosure section listing unverified
+    competing hypotheses (design document §6.3 E2' release-with-disclosure,
+    v3.6.0).
+
+    Appended to the report content by the write_file gate (release) and
+    by the report-capture path (rewrite backstop) whenever unresolved
+    hypotheses remain — multi-root-cause protection via deterministic
+    DISCLOSURE (code-injected, does not depend on LLM compliance)
+    instead of blocking.  Lists ALL unresolved hypotheses regardless of
+    deferred state (a shelved hypothesis is still an unverified fact the
+    reader must see); Returns "" when no unresolved hypotheses remain.
+    """
+    lines = []
+    for hid, n in ledger.get("hypotheses", {}).items():
+        if n.get("status") in ("pending", "inconclusive"):
+            if n.get("status") == "inconclusive":
+                _st = "证据不足（inconclusive）"
+            else:
+                _st = "未验证"
+            if n.get("deferred"):
+                _st += "，已搁置"
+            lines.append(
+                f"- **{fmt_hid(hid)}**（概率 {n.get('probability')}%，{_st}）："
+                f"{n.get('statement', '')}"
+            )
+    if not lines:
+        return ""
+    return (
+        "\n\n---\n\n## 未验证竞争假设（系统披露）\n\n"
+        "> 本报告在确认根因后生成；以下竞争假设尚未完成验证，系统已将其搁置。"
+        "若故障症状持续或复发，建议优先针对以下方向继续排查：\n\n"
+        + "\n".join(lines)
+    )
+
+
+def render_exit_directive(ledger: DiagnosisLedger, phase: DiagnosisPhase) -> str:
+    """Render an actionable, phase-aware exit-condition directive (SSOT).
+
+    Consumed by the proactive exit_banner (in `_phase_guidance`, injected
+    every EVALUATE round) and the VERIFY directive's exit-risk overlay.
+    Names the blocking hypothesis and lists ONLY the actions available in
+    the current phase.  Options are verify-first ordered and carry an
+    anti-fabrication caveat to mitigate constraint-evasive fabrication
+    (arXiv 2606.14831 — agents may fabricate a verdict to evade the block).
+    Returns "" when there is no blocker (exit condition satisfied).
+
+    v3.6.0 (release-with-disclosure): the directive no longer forbids
+    write_file — verification stays the RECOMMENDED option, but closing
+    out is legitimate: the write_file gate releases the report and
+    deterministically injects the unverified-hypothesis disclosure
+    (design document §6.3 — disclosure, not blocking, protects against
+    dropped second root causes).
+
+    v3.8.0 (S1-aware branch): WITHOUT a confirmed root cause the message
+    must NOT claim "已确认根因" nor promise "write_file 不会拦截" — the
+    generic gate DOES block when S1 fails, and a contradicting promise
+    deterministically manufactures the retry loop (2026-08-08 scenario
+    gpu_oom: 4 consecutive write_file blocks, rounds 22-25).  The no-
+    confirmed branch names the residual hypothesis and lists the honest
+    exits: verify (new view / argus re-check), refute, shelve — after
+    which the gate releases an honest "root cause not confirmed" report
+    with disclosure.
+    """
+    blocker = _exit_blocker(ledger)
+    if blocker is None:
+        return ""
+    hid = fmt_hid(blocker["id"])
+    stmt = blocker["statement"]
+    p = blocker["probability"]
+    dv = blocker["delegation_value"]
+    _has_confirmed = any(
+        n.get("status") == "confirmed"
+        for n in ledger.get("hypotheses", {}).values()
+    )
+    if not _has_confirmed:
+        # S1 not satisfied — honest-negative-exit guidance.
+        header = (
+            f"⚠ 尚无确认根因（无 p≥80 的 confirmed 假设）。"
+            f"残余未决假设 {hid}（{stmt}，p={p}%，验证价值 {dv}≥κ={KAPPA_STOP}）仍可行动。"
+        )
+        if phase == "evaluate":
+            actions = (
+                "请选择（EVALUATE 可用动作）：\n"
+                f"  ① select_path 切换到 {hid} → 委派新视角专家验证（推荐；监控时序定向复核可委派对应 argus 专家）\n"
+                f"  ② 现有证据已明确排除 → record_finding 判 {hid} refuted\n"
+                f"  ③ 反复委派仍无法定论 → select_path(deprioritized=True) 搁置 {hid}\n"
+                "全部假设终态或搁置后，系统将放行「未确认根因」的诚实报告"
+                "（披露已排除方向与未决方向）。\n"
+                "⛔ 不要直接 write_file——无确认根因时会被拦截。"
+            )
+        elif phase == "verify":
+            actions = (
+                "请选择（VERIFY 可用动作）：\n"
+                f"  ① task 委派新视角专家验证 {hid}（推荐）\n"
+                f"  ② 现有证据已明确排除 → record_finding 判 {hid} refuted；无法定论判 inconclusive\n"
+                "⛔ 不要直接 write_file——无确认根因时会被拦截。"
+            )
+        else:
+            actions = f"请先验证、终结或搁置 {hid}，再考虑生成报告。"
+        return header + "\n" + actions
+    header = (
+        f"⚠ 已确认根因，但竞争假设 {hid}"
+        f"（{stmt}，p={p}%，验证价值 {dv}≥κ={KAPPA_STOP}）尚未验证。"
+    )
+    if phase == "evaluate":
+        actions = (
+            "请选择（EVALUATE 可用动作）：\n"
+            f"  ① select_path 切换到 {hid} → 进入 VERIFY 委派专家验证（推荐：多视角证据更完备）\n"
+            f"  ② select_path(deprioritized=True) 搁置 {hid}（若反复委派仍无法定论）\n"
+            f"  ③ record_finding 终结 {hid}（仅当现有证据已明确判定；不得为满足退出条件而随意终结）\n"
+            "  ④ 若评估后决定收口：直接 write_file 生成报告——系统将自动搁置未验证假设"
+            "并在报告末尾披露（多根因保护），不会拦截。"
+        )
+    elif phase == "verify":
+        actions = (
+            "请选择（VERIFY 可用动作）：\n"
+            f"  ① task 委派专家验证 {hid}（推荐：多视角证据更完备）\n"
+            f"  ② record_finding 终结 {hid}（仅当现有证据已明确判定；不得为满足退出条件而随意终结）\n"
+            "  ③ 若评估后决定收口：直接 write_file 生成报告——系统将自动搁置未验证假设"
+            "并在报告末尾披露（多根因保护），不会拦截。"
+        )
+    else:
+        actions = f"请先验证或搁置 {hid}，再考虑生成报告。"
+    return header + "\n" + actions
+
+
+def _delegated_experts_for(ledger: DiagnosisLedger, hid: str) -> set[str]:
+    """Experts already delegated for hypothesis *hid*.
+
+    Derived from the rounds history ``delegated_for`` fact (design
+    document parallel-delegation §5 D2); unioned with legacy evidence
+    source parsing so ledgers written before D2 still work (B9).
+    """
+    out: set[str] = set()
+    for rd in ledger.get("rounds", []):
+        if rd.get("delegated_for") == hid:
+            out.update(rd.get("delegated_experts", []))
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    for e in node.get("evidence", []):
+        s = str(e.get("source", ""))
+        if s.startswith("expert:"):
+            out.add(s.split("expert:", 1)[-1])
+    return out
+
+
+def _parallel_candidates(
+    ledger: DiagnosisLedger, hid: str, node: HypothesisNode,
+) -> list[str]:
+    """Complementary-expert candidates for a parallel delegation group.
+
+    candidates = scene_experts (assembled directory snapshot, D1)
+                 − experts already delegated for *hid* (D2)
+    ordered by: uncovered views first (EXPERT_VIEW, D3), deep before
+    argus within a view (inspection class is an ordering prior, never
+    an exclusion — the decisive evidence in the 2026-08-08 scenario-35
+    replay came from an argus-class expert).
+    """
+    from diagnostics.agent.scene_profile import EXPERT_VIEW
+
+    scene_experts = ledger.get("scene_experts") or []
+    if not scene_experts:
+        return []
+    delegated = _delegated_experts_for(ledger, hid)
+    candidates = [e for e in scene_experts if e not in delegated]
+    covered_views = {EXPERT_VIEW.get(e, "") for e in delegated}
+    candidates.sort(
+        key=lambda e: (EXPERT_VIEW.get(e, "") in covered_views,
+                       "-argus" in e))
+    return candidates
+
+
+def _format_expert_names(candidates: list[str]) -> str:
+    from diagnostics.agent.scene_profile import EXPERT_VIEW
+
+    return "、".join(
+        f"{e}（{EXPERT_VIEW.get(e, '互补视角')}）" for e in candidates)
+
+
+def render_parallel_suggestion(ledger: DiagnosisLedger) -> str:
+    """Formal parallel-delegation suggestion (design document
+    parallel-delegation §4).
+
+    Fires ONLY when the focus hypothesis is already judged inconclusive
+    (the deterministic "single view insufficient" signal) — the pending
+    state gets the conditional seeding via render_verify_directive
+    instead, so the two never fire together (mutually exclusive
+    predicates, WIRE).  Single renderer consumed by BOTH the VERIFY
+    directive and the EVALUATE direction menu (SSOT, T8).
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    active_path = ledger.get("active_path") or []
+    active_id = active_path[-1] if active_path else None
+    node = hypotheses.get(active_id) if active_id is not None else None
+    if node is None or node.get("status") != "inconclusive":
+        return ""
+    if not _delegated_experts_for(ledger, active_id):
+        return ""
+    # §4.1 cond 3 (view-aware): at least one candidate must clear the
+    # G5 gate — the guidance never suggests what the gate would block.
+    candidates = [
+        e for e in _parallel_candidates(ledger, active_id, node)
+        if delegation_value_for(ledger, active_id, e) >= KAPPA_STOP
+    ]
+    if not candidates:
+        return ""
+    hid = fmt_hid(active_id)
+    if len(candidates) >= 2:
+        names = _format_expert_names(candidates[:3])
+        return (
+            f"⚠ {hid} 单视角证据不足（inconclusive）。建议同轮并行委派互补视角专家："
+            f"{names}——多视角交叉一次性取证。约束：并行委派须全部指向同一假设 "
+            f"{hid}（单焦点），description 须含「验证假设 {hid}」字样。"
+            "也可基于已有证据 record_finding 判定。"
+        )
+    if len(candidates) == 1:
+        names = _format_expert_names(candidates)
+        return (
+            f"⚠ {hid} 单视角证据不足（inconclusive）。建议委派互补视角专家 "
+            f"{names} 继续验证（description 须含「验证假设 {hid}」字样）；"
+            "也可基于已有证据 record_finding 判定。"
+        )
+    return ""
+
+
+def render_verify_directive(ledger: DiagnosisLedger) -> str:
+    """Render a phase-aware VERIFY action directive (proactive guidance).
+
+    State -> instruction decision tree (design document
+    proactive-guidance §5.3): mirrors the reactive gates' predicates
+    forward so the LLM is told the right next action BEFORE it acts,
+    instead of being corrected after a wasted round.  The three branch
+    predicates are mutually exclusive by focus-hypothesis state; the
+    exit-risk clause (priority 4) is ADDITIVE — merged into the same
+    sentence as priority 1/2 (never a separate block, avoids the
+    instruction-collision that sinks compliance, WIRE arXiv:2605.27784).
+
+    Branch predicates (ledger-derived, deterministic):
+      1 value-floor   delegation_value < κ  (delegation would be G5-blocked)
+      2 harvest-nudge already delegated + expert evidence + still pending
+                      (the G4 predicate brought forward from 3 rounds to 0)
+      3 no-evidence   _delegate_count == 0  -> silent (static duty covers it)
+      4 exit-risk     a confirmed root exists AND a competing hypothesis is
+                      still actionable (max value >= κ) — the E2' predicate
+                      moved forward from the write_file gate.
+
+    Granularity for priority 1 is "name + numbers + one-line rationale"
+    (PG4: the full EIG breakdown would bury the one action that matters,
+    Lost in the Middle; one line of rationale closes the CEF evasion
+    path "the block is incidental, let me rephrase and re-delegate").
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    active_path = ledger.get("active_path") or []
+    active_id = active_path[-1] if active_path else None
+    node = hypotheses.get(active_id) if active_id is not None else None
+
+    has_confirmed = any(
+        n.get("status") == "confirmed" for n in hypotheses.values())
+    blocker = _exit_blocker(ledger)
+    exit_risk = has_confirmed and blocker is not None
+
+    anti_fab = "（不得为满足退出条件而随意终结）"
+    directive = ""
+    if node is not None and node.get("status") == "pending":
+        # Best-case view-aware value: the floor message is accurate only
+        # when NO remaining expert view could clear the G5 gate.
+        dv = delegation_value_for(ledger, active_id)
+        if dv < KAPPA_STOP:
+            # Priority 1 — delegation on the focus hypothesis is about to
+            # be hard-blocked by G5; steer to a record_finding verdict.
+            directive = (
+                f"⚠ {fmt_hid(active_id)} 委派价值 {dv:.3f}<κ={KAPPA_STOP}"
+                f"（价值随委派次数指数衰减，再委派无新信息增益）——"
+                f"再委派将被门控拦截，请 record_finding 依据已有证据终结 "
+                f"{fmt_hid(active_id)}{anti_fab}。"
+            )
+        elif node.get("_delegate_count", 0) >= 1:
+            expert_sources = [
+                str(e.get("source", "")).split("expert:", 1)[-1]
+                for e in node.get("evidence", [])
+                if str(e.get("source", "")).startswith("expert:")
+            ]
+            if expert_sources:
+                # Priority 2 — expert conclusion is back but not yet
+                # recorded; nudge record_finding instead of drifting into
+                # write_file (the 2026-08-07 scenario-32 soft loop).
+                # T9 pre-verdict seeding (design document
+                # parallel-delegation §4.2): when >=2 complementary
+                # experts remain, plant the parallel-group option BEFORE
+                # the verdict so an inconclusive judgement already knows
+                # its next action — one round earlier than the formal
+                # suggestion (predicates mutually exclusive: pending
+                # seeds, inconclusive suggests).
+                seeding = ""
+                candidates = [
+                    e for e in _parallel_candidates(ledger, active_id, node)
+                    if delegation_value_for(ledger, active_id, e) >= KAPPA_STOP
+                ]
+                if len(candidates) >= 2:
+                    seeding = (
+                        "若判定证据不足（inconclusive），建议下一步同轮并行"
+                        "委派互补专家："
+                        f"{_format_expert_names(candidates[:3])}；"
+                    )
+                if seeding:
+                    directive = (
+                        f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
+                        f"（结论见上方证据），可判定时直接 record_finding 落账；"
+                        f"{seeding}{anti_fab}。"
+                    )
+                else:
+                    directive = (
+                        f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
+                        f"（结论见上方证据），可判定时直接 record_finding 落账；"
+                        f"证据不足可再委派（价值仍≥κ）{anti_fab}。"
+                    )
+        # Priority 3 (no delegation yet) stays silent — the static duty
+        # already directs task delegation; injecting here would be noise
+        # (selective injection, PG3).
+    elif node is not None and node.get("status") == "inconclusive":
+        # Parallel-delegation branch (design document parallel-delegation
+        # §4): single view proved insufficient — offer the complementary
+        # group up front instead of letting the LLM drift into serial
+        # re-querying (the 2026-08-08 scenario-35 six-round drain).
+        directive = render_parallel_suggestion(ledger)
+
+    if exit_risk:
+        # Priority 4 — the E2' competing-hypothesis predicate, moved
+        # forward.  v3.6.0: no longer "forbid write_file" — the gate
+        # releases with disclosure; the proactive hint keeps verification
+        # the recommended option.
+        if directive:
+            directive += " ⚠ 竞争假设尚未验证：建议先验证；若收口，系统将自动披露未验证假设。"
+        else:
+            # SSOT: same renderer the EVALUATE exit_banner consumes, so
+            # the proactive hints never diverge.
+            directive = render_exit_directive(ledger, "verify")
+    return directive

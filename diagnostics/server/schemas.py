@@ -14,6 +14,17 @@ class ChatRequest(BaseModel):
         default="",
         description="Entity identifier: hostname or cluster name. Empty means auto-detect.",
     )
+    scene_id: str | None = Field(
+        default=None,
+        description=(
+            "Scene identifier: single_host / single_pod / ...  "
+            "Empty means legacy auto-detect (no scene framework)."
+        ),
+    )
+    cluster_type: str | None = Field(
+        default=None,
+        description="Cluster type for the single_pod scene: 'dedicated' or 'serverless'.",
+    )
     param_overrides: dict[str, Any] | None = Field(
         default=None,
         description=(
