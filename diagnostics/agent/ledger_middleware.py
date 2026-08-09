@@ -41,13 +41,15 @@ from diagnostics.agent.ledger import (
     _coverage_ready,
     _economically_dead,
     _parse_hypothesis_num,
+    _phase_guidance,
+    _required_argus,
     activate_hypothesis,
     add_evidence_to_active,
     add_hypotheses,
     backtrack,
     can_commit_root_hypotheses,
     check_exit_conditions,
-    delegation_value,
+    delegation_value_for,
     derive_phase,
     finalize_pending_for_report,
     fmt_hid,
@@ -61,6 +63,8 @@ from diagnostics.agent.ledger import (
     select_path,
 )
 from deepagents.middleware._utils import append_to_system_message
+
+from diagnostics.agent.topology_render import build_argus_compact_view, build_host_views, expert_view, render_json_block
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +102,14 @@ def _force_report(ledger: dict) -> None:
     marker is set, a stale selected/active hypothesis can no longer
     pull the derived phase back to "verify".  The phase itself is NOT
     stored (derived on demand, P1).
+
+    Also records _exit_path="forced" so natural exits (E1/E2/E3 via
+    check_exit_conditions, which leave _forced_terminal unset and record
+    _exit_path="natural") stay distinguishable from guardrail-forced
+    ones in post-hoc analysis (design document §3 step 1).
     """
     ledger["_forced_terminal"] = True
+    ledger["_exit_path"] = "forced"
 
 
 # ── Phase tool gating (design document §7) ──
@@ -121,56 +131,72 @@ _FILE_TOOL_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "edit_file": ("file_path", "old_string", "new_string"),
 }
 
-_PHASE_TOOL_GATE: dict[str, frozenset[str]] = {
+# ── L4 hostname normalization gateway (design document §8.1⑥) ──
+# Host-level Argus metric tools — their `hostname` parameter contract is a
+# physical host name (monitoring endpoint semantics).  The gateway in
+# awrap_tool_call normalizes node IPs (node_name) passed by the LLM into
+# host names using the in-session topology.  No mock whitelist is involved
+# (the scope guard middleware was removed — see README), so the mechanism
+# holds for the mock backend and any future production backend alike.
+_HOST_ARGUS_TOOLS: frozenset[str] = frozenset({
+    "query_argus_cpu", "query_argus_memory",
+    "query_argus_disk", "query_argus_network",
+})
+
+
+def _looks_like_ipv4(value: str) -> bool:
+    """True when the value is shaped like an IPv4 address (detects an LLM
+    passing a node IP as the hostname tool parameter)."""
+    parts = value.split(".")
+    return len(parts) == 4 and all(
+        p.isdigit() and 0 <= int(p) <= 255 for p in parts
+    )
+
+# ── Phase tool ALLOWLIST (design document §7, v2.9.8) ──
+# Tools are gated by a POSITIVE per-phase whitelist (default-deny): a tool
+# not in the phase's business whitelist — and not in the global read-only
+# scaffolding set — is rejected.  Previously this was a DENYLIST
+# (_PHASE_TOOL_GATE) with a missing "evaluate" key (no phase gate at all)
+# and every new tool defaulted to allowed in all phases; v2.9.8 aligns with
+# §7 "whitelist filter" and default-deny security (see §11).
+_READONLY_SCOPES: frozenset[str] = frozenset({
+    "read_file", "ls", "grep", "glob", "write_todos",
+})
+
+_PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
     # UNDERSTAND collects data only — committing hypotheses before the
     # coverage gate opens would skip HYPOTHESIZE entirely.
-    "understand": frozenset({
-        "commit_hypotheses", "record_finding", "select_path", "backtrack",
-    }),
+    "understand": frozenset({"task"}),
     # HYPOTHESIZE only commits; no findings/paths/delegations yet
     # (§7 whitelist: commit_hypotheses + read_file).  Letting task()
     # through here would pull VERIFY behaviour forward and expose the
     # G5 delegation-value gate outside its designed phase.
-    "hypothesize": frozenset({
-        "record_finding", "select_path", "backtrack", "task",
-    }),
+    "hypothesize": frozenset({"commit_hypotheses"}),
     # VERIFY delegates + records findings; no commits/paths.
-    "verify": frozenset({
-        "commit_hypotheses", "select_path", "backtrack",
-    }),
+    "verify": frozenset({"task", "record_finding"}),
     # EVALUATE picks direction; recording a finding is ALSO legal here
     # (v2.8.1: record_finding is an evidence-ledgering EVENT, not a phase
     # milestone — Statecharts shared-event semantics, valid in VERIFY as
     # the T3 transition and in EVALUATE as an internal self-transition).
-    # Gating it in evaluate contradicted the evaluate guidance itself
-    # ("confirmed 假设需更具体 → record_finding(statement_update=...)";
-    # multi-root secondary confirmations) and the v2.7.1 confirmed→confirmed
-    # strengthening channel, which has no legal path back to verify
-    # (select_path/backtrack/auto-heal all target pending/inconclusive
-    # only).  Production evidence: 2026-07-25 "record_finding blocked by
-    # phase gate in evaluate" ×5 (round 5 retries).  Semantic guards stay
-    # in the tool handler (Defect D anti-flip, refuted frozen, ID
-    # validation), so allowing it here opens no abuse surface.
-    # write_file is deliberately NOT gated here — the dedicated write_file
-    # gate above (check_exit_conditions / _forced_terminal / report) is
-    # the correct guard for "may I write the report now".  Gating
-    # write_file by phase would kill the legitimate escape hatch where
-    # exit conditions are met while the derived phase still reads
-    # "evaluate" (observed 2026-07-20 32-round session: round-14/18
-    # write_file from evaluate was rejected by the phase gate, the report
-    # content was lost twice, and diagnosis wandered for 18 more rounds).
+    # Semantic guards stay in the tool handler (Defect D anti-flip, refuted
+    # frozen, ID validation), so allowing it here opens no abuse surface.
+    # task (auto-heal T5') is also legal here (§7).
+    # write_file is deliberately NOT in the allowlist — the dedicated
+    # write_file gate (check_exit_conditions / _forced_terminal / report)
+    # is the correct guard for "may I write the report now"; gating it by
+    # phase would kill the legitimate escape hatch where exit conditions
+    # are met while the derived phase still reads "evaluate".
+    "evaluate": frozenset({"select_path", "commit_hypotheses", "backtrack",
+                           "record_finding", "task"}),
     # REPORT only writes the report; diagnosis tools are locked out.
-    "report": frozenset({
-        "commit_hypotheses", "record_finding", "select_path", "backtrack",
-        "task",
-    }),
+    "report": frozenset(),
 }
 
 _PHASE_ALLOWED_HINT: dict[str, str] = {
     "understand": "task(*-argus-expert), read_file",
     "hypothesize": "commit_hypotheses",
     "verify": "task(*-expert), record_finding",
-    "evaluate": "select_path / commit_hypotheses / backtrack / record_finding",
+    "evaluate": "select_path / commit_hypotheses / backtrack / record_finding / task",
     "report": "write_file",
 }
 
@@ -378,6 +404,99 @@ def _classify_argus_data(ledger: dict) -> str:
     if saw_all_normal:
         return "all_normal"
     return ""
+
+
+# ── Argus coverage intervention helpers (design document §9, v2.9.7) ──
+# All argus-coverage interventions (G2 coverage valve, re-delegation,
+# stall injections, interception messages) share ONE scene-aware source of
+# truth: _required_argus (Serverless four-view / host single / dedicated
+# dual).  Previously each injection point hardcoded the host/k8s dual
+# expert pair and mis-fired on Serverless sessions (forcibly injecting the
+# forbidden k8s-argus-expert) — see design document §11 (2026-08-05).
+
+def _argus_coverage_gap(ledger: dict) -> list[str]:
+    """Current scene's missing argus experts (sorted; SSOT _required_argus)."""
+    required = _required_argus(ledger)
+    delegated: set[str] = set()
+    for r in ledger.get("rounds", []):
+        delegated.update(r.get("delegated_experts", []))
+    return sorted(required - delegated)
+
+
+def _argus_delegation_desc(expert: str, entity: str, time_hint: str) -> str:
+    """Scene-aware delegation description for an argus expert."""
+    if expert == "k8s-argus-expert":
+        return (
+            f"查询并分析 {entity} 集群 Argus K8s 指标时序"
+            f"（query_argus_k8s_cluster: API延迟/etcd/DNS/节点就绪，"
+            f"query_argus_k8s_node/workload/pod: 节点/工作负载/Pod 维度，"
+            f"query_argus_k8s_etcd: etcd 指标）。{time_hint}。"
+            if entity else
+            "查询并分析 K8s 集群 Argus 指标时序"
+            "（集群概览、节点状态、工作负载、Pod 重启、etcd）"
+        )
+    if expert == "serverless-argus-expert":
+        return (
+            f"查询并分析 {entity} 逻辑集群 Argus 指标时序"
+            f"（API延迟/Deployment状态更新/Pod事件）。{time_hint}。"
+            if entity else
+            "查询并分析逻辑集群 Argus 指标时序"
+            "（API 延迟、状态更新、Pod 事件）"
+        )
+    if expert == "kmc-argus-expert":
+        return (
+            f"查询并分析 {entity} KMC 控制面 Argus 指标时序"
+            f"（apiserver CPU/API延迟/连接数/队列）。{time_hint}。"
+            if entity else
+            "查询并分析 KMC 控制面 Argus 指标时序"
+            "（apiserver CPU、API 延迟）"
+        )
+    if expert == "sci-argus-expert":
+        return (
+            f"查询并分析 {entity} SCI 数据面 Argus 指标时序"
+            f"（节点/Pod/CNI/驱逐）。{time_hint}。"
+            if entity else
+            "查询并分析 SCI 数据面 Argus 指标时序"
+            "（节点、Pod、CNI、驱逐）"
+        )
+    # host-argus-expert (default)
+    return (
+        f"查询并分析主机 {entity} 的 Argus 指标时序"
+        f"（CPU/内存/磁盘/网络 1min 粒度）。{time_hint}。"
+        if entity else
+        "查询并分析主机 Argus 监控指标时序（CPU、内存、磁盘 IO、网络）"
+    )
+
+
+def _build_argus_delegation_calls(
+    experts: list[str], entity: str, time_hint: str
+) -> list[dict]:
+    """Synthetic task() calls for the given argus experts (scene-aware)."""
+    import uuid as _uuid
+    synthetic: list[dict] = []
+    for expert in experts:
+        synthetic.append({
+            "name": "task",
+            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
+            "args": {
+                "subagent_type": expert,
+                "description": _argus_delegation_desc(expert, entity, time_hint),
+            },
+        })
+    return synthetic
+
+
+def _render_argus_delegation_hint(ledger: dict, missing: list[str]) -> str:
+    """Force-delegation warning listing the current scene's missing experts."""
+    names = "、".join(missing)
+    first = missing[0]
+    return (
+        f"⚠ [系统强制] 当前场景已采集 Argus 数据但缺少 Argus 专家（{names}）。\n"
+        "禁止在本轮调用 commit_hypotheses。\n"
+        f"你必须先调用 task(subagent_type=\"{first}\", description=...) "
+        f"委派 {first} 采集对应指标。\n"
+        "收到分析摘要后再提交假设。"
+    )
 
 
 def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
@@ -749,25 +868,19 @@ def _is_substantial_report_text(text: str) -> bool:
     return any(marker in text for marker in _REPORT_MARKERS)
 
 
-def _build_subagent_context(ledger: dict, subagent_type: str = "",
-                             max_chars: int = 24000) -> str:
-    """Extract already-collected evidence from the ledger for subagent injection.
+def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
+    """Stable context layers — unchanged within a session (design §5.2/§7.3).
 
-    When a subagent is delegated via task(), it normally sees only the
-    Coordinator's description.  This function extracts the key findings
-    already recorded in the ledger so the subagent can skip redundant
-    tool calls and focus on its specific verification task.
-
-    Injects three layers of context:
-    1. Session baseline — original user message + time range (all subagents)
-    2. Entity identifiers — hostname/cluster_name mapped to tool parameter names
-    3. Diagnostic evidence — already-collected data the subagent should not re-query
+    Layers: session baseline, entity identifiers, Serverless topology anchor
+    + per-role view JSON, frontend param_overrides.  Cached per subagent by
+    the caller (diagnosis middleware) since the topology is a read-only
+    session fact; only the dynamic layers (evidence) are recomputed.
     """
     lines: list[str] = []
 
     # ── Layer 1: Session baseline (all subagents) ──
     # NOTE: the raw user message is kept for symptom context only —
-    # parameter values in it are superseded by Layers 2/3, so the
+    # parameter values in it are superseded by the pre-resolved layers, so the
     # subagent must not copy entity names / time windows from here.
     user_message = ledger.get("user_message", "")
     if user_message:
@@ -780,7 +893,8 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
     entity_name = ledger.get("entity_name", "")
     entity_type = ledger.get("entity_type", "")
     hostname = ledger.get("hostname", "")
-    _host_experts = ("host-argus-expert", "host-expert", "gpu-expert")
+    # gpu-expert removed in v3.9.0 — GPU merged into the unified host-expert.
+    _host_experts = ("host-argus-expert", "host-expert")
     _k8s_experts = ("k8s-argus-expert", "k8s-expert")
 
     entity_hints: list[str] = []
@@ -789,6 +903,12 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
     if subagent_type in _k8s_experts and entity_name and entity_type == "kubernetes":
         entity_hints.append(f"  - cluster_name: **{entity_name}**")
         entity_hints.append("  - 实体类型: kubernetes")
+    # Argus monitor_name anchor — queried from user input BEFORE agent
+    # creation and stored in param_overrides (dedicated/host scenes);
+    # Serverless scenes get it from topology mapping instead (§2b below).
+    _monitor_name = (ledger.get("param_overrides") or {}).get("monitor_name", "")
+    if _monitor_name and subagent_type in (*_host_experts, *_k8s_experts):
+        entity_hints.append(f"  - monitor_name: **{_monitor_name}**")
 
     if entity_hints:
         lines.append(
@@ -797,6 +917,117 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
             "实体名/时间窗口与此处不一致，一律以此处为准）:\n"
             + "\n".join(entity_hints) + "\n"
         )
+
+    # ── Layer 2b: Serverless topology (design document §5.2/§7.3) ──
+    # Per-role context (Orchestrator pattern — each sub-agent receives only the
+    # topology slice it needs):
+    #   argus experts → compact+落点 view (namespace/workload/pod/node 参数来源)
+    #   deep experts  → full view JSON (Pod details kept) + cluster_name +
+    #                   naming rules — the view is the authoritative structure
+    #   host experts  → host_views (physical nodes aggregated, with roles)
+    # Injected only when topology present.
+    _topology = ledger.get("topology") or {}
+    _mapping = _topology.get("mapping", {})
+    _sls_argus = ("serverless-argus-expert", "kmc-argus-expert", "sci-argus-expert")
+    _sls_deep = ("serverless-expert", "kmc-expert", "sci-expert")
+    _view_key = {
+        "serverless-expert": "serverless_views",
+        "kmc-expert": "kmc_views",
+        "sci-expert": "sci_views",
+    }
+    _argus_view_key = {
+        "serverless-argus-expert": "serverless_views",
+        "kmc-argus-expert": "kmc_views",
+        "sci-argus-expert": "sci_views",
+    }
+    _monitor_key = {
+        "serverless-argus-expert": "serverless_monitor_name",
+        "kmc-argus-expert": "kmc_monitor_name",
+        "sci-argus-expert": "sci_monitor_name",
+    }
+    _cluster_key = {
+        "serverless-expert": "serverless_cluster",
+        "kmc-expert": "kmc_cluster",
+        "sci-expert": "sci_cluster",
+    }
+    _anchor: list[str] = []
+    if _mapping:
+        if subagent_type in _sls_argus:
+            _anchor.append(f"  - monitor_name: **{_mapping.get(_monitor_key[subagent_type], '')}**")
+        if subagent_type in _sls_deep:
+            _anchor.append(f"  - cluster_name: **{_mapping.get(_cluster_key[subagent_type], '')}**")
+        # host experts: physical-node dimension — inject host_views so
+        # host-argus can query host-level metrics by hostname and host-expert
+        # can investigate node pressure (design document §8.1⑥ / §7.3).
+        if subagent_type in _host_experts:
+            _host_views = build_host_views(_topology)
+            if _host_views:
+                if subagent_type == "host-argus-expert":
+                    # hostname 参数契约是主机名（监控端点语义，design document §8.1⑥）。
+                    # 只注入主机名清单——双值并置（host_name@node_name）会让模型自行
+                    # 选字段而误填节点 IP（2026-08-06 观测：8 次 query_argus_* 的
+                    # hostname 全为 10.30.x 节点 IP）。此清单是 query_argus_* 的
+                    # hostname 参数唯一取值来源，无噪音。
+                    _hostnames = [r["host_name"] or r["node_name"] for r in _host_views]
+                    _anchor.append(
+                        "  - 可查询主机名（query_argus_* 的 hostname 参数仅取自此列表，"
+                        "值为主机名，禁止使用节点 IP）: "
+                        + ", ".join(_hostnames)
+                    )
+                else:
+                    # 深度主机专家（host-expert / gpu-expert）可能需要 IP 作网络定位
+                    # 参考：host_name / node_name 分键，注明各自用途，避免模型混淆。
+                    import json as _json
+                    _nodes = "; ".join(
+                        _json.dumps(
+                            {k: r.get(k) for k in ("host_name", "node_name", "cluster", "roles")},
+                            ensure_ascii=False, separators=(",", ":"),
+                        )
+                        for r in _host_views
+                    )
+                    _anchor.append(
+                        "  - 物理节点（hostname 参数用 host_name；node_name 仅网络定位参考）: "
+                        + _nodes
+                    )
+        _k8s_n = _mapping.get("k8s_name", "")
+        _mid = _mapping.get("master_id", "")
+        if _k8s_n and _mid:
+            _anchor.append(
+                f"  - 命名规则: 控制面 ns=`{_k8s_n}-{_mid}`；工作负载 ns=`burst-ns-{_mid}`；"
+                "SCI Pod=`burst-<serverless_ns>-<serverless_pod_name>`"
+            )
+    if _anchor:
+        lines.append(
+            "## Serverless 拓扑锚点"
+            "（工具参数必须使用以下值；命名规则用于解析 SCI Pod/命名空间）:\n"
+            + "\n".join(_anchor) + "\n"
+        )
+
+    # Deep experts: full-view JSON injection (design document §7.3) — the
+    # expert resolves tool parameters (physical cluster / Pod / node) directly
+    # from its own view; the view keeps Pod-level details.
+    if subagent_type in _sls_deep:
+        _view_name = _view_key[subagent_type]
+        if _topology.get(_view_name):
+            lines.append(
+                render_json_block(
+                    f"Serverless 拓扑视图（{_view_name}）",
+                    expert_view(_topology, _view_name),
+                )
+            )
+
+    # Argus experts: compact+落点 view injection (§5A.5/5A.6/5A.7) — the argus
+    # expert resolves namespace/workload/pod/node tool parameters directly from
+    # the slice; shared etcd comes as an etcd_views block for serverless-argus.
+    if subagent_type in _sls_argus:
+        _aview_name = _argus_view_key[subagent_type]
+        if _topology.get(_aview_name):
+            lines.append(
+                render_json_block(
+                    f"Serverless 拓扑视图（{_aview_name}）",
+                    build_argus_compact_view(_topology, _aview_name),
+                )
+            )
 
     # ── Layer 3: Frontend param_overrides (JSON) ──
     param_overrides = ledger.get("param_overrides", {})
@@ -824,6 +1055,17 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
                 )
         except Exception:
             pass  # non-critical; skip on serialization failure
+
+    return "\n".join(lines)
+
+
+def _build_dynamic_ctx(ledger: dict) -> str:
+    """Dynamic context layers — evolve as the diagnosis progresses.
+
+    Tools already called, per-hypothesis evidence, expert analysis results.
+    Recomputed on every delegation.
+    """
+    lines: list[str] = []
 
     # ── Diagnostic tools already called (by Coordinator or prior experts) ──
     tools_called: set[str] = set()
@@ -857,7 +1099,34 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
             lines.append(f"\n已委派专家: {expert.get('expert', '?')} ({expert.get('skill', '?')})")
             lines.append(f"  结论: {finding}")
 
-    context = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _build_subagent_context(ledger: dict, subagent_type: str = "",
+                            max_chars: int = 24000,
+                            stable_cache: dict | None = None) -> str:
+    """Assemble the subagent context for task() delegation.
+
+    Stable layers (session baseline, topology anchor/view, param overrides)
+    are cached per subagent type via *stable_cache* (the diagnosis middleware
+    instance — session-scoped) since the topology is a read-only session fact;
+    dynamic layers (evidence) are recomputed on every delegation.
+    """
+    stable = _build_stable_ctx(ledger, subagent_type=subagent_type)
+    if stable_cache is not None and subagent_type:
+        cached = stable_cache.get(subagent_type)
+        if cached is None:
+            stable_cache[subagent_type] = stable
+        else:
+            stable = cached
+    dynamic = _build_dynamic_ctx(ledger)
+
+    parts: list[str] = []
+    if stable:
+        parts.append(stable)
+    if dynamic:
+        parts.append(dynamic)
+    context = "\n".join(parts)
     if len(context) > max_chars:
         context = context[:max_chars] + "\n...(已截断)"
     return context
@@ -1082,6 +1351,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         start_time: str = "",
         end_time: str = "",
         param_overrides: dict | None = None,
+        topology: dict | None = None,
+        topology_unavailable: bool = False,
         valid_subagents: list[str] | None = None,
     ) -> None:
         self.ledger_path = ledger_path
@@ -1089,6 +1360,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._model = model
         self._backend = backend
         self._is_subagent = is_subagent
+        self._topology = topology or {}
+        self._topology_unavailable = topology_unavailable
         self._entity_type = entity_type
         self._hostname = hostname
         self._entity_name = entity_name
@@ -1098,6 +1371,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Valid subagent names for task() validation (Coordinator only).
         # None/empty disables the check (tests, subagent instances).
         self._valid_subagents = tuple(valid_subagents or ())
+        # Stable subagent-context cache (session-scoped): topology is a
+        # read-only session fact, so the stable layers are built once per
+        # subagent type and reused across delegations (design §7.3).
+        self._stable_ctx_cache: dict[str, str] = {}
         # Agent memory (AGENTS.md), loaded once and injected before the
         # ledger block so the current diagnosis state stays at the
         # prompt tail.  Subagents skip injection.
@@ -1113,10 +1390,41 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._last_finding_round: int = 0
         self._last_evidence_round: int = 0  # round when diagnostic evidence last arrived
         self._last_task_round: int = 0
-        self._report_phase_start_round: int = 0  # track when REPORT phase began
+        # Single-focus batch validation (design document
+        # parallel-delegation §4.5): hypothesis ID of the first task()
+        # call admitted this round; a same-round task targeting a
+        # different hypothesis is the parallel-group abuse vector and is
+        # blocked.  Synchronous check-and-set in awrap_tool_call is
+        # atomic under asyncio cooperative scheduling (no await between
+        # check and set).  Reset whenever the round changes.
+        self._round_focus_hid: str | None = None
+        self._round_focus_round: int = -1
+        # Two distinct REPORT-phase anchors (design document §8 G6,
+        # 2026-08-09): ``_report_phase_start_round`` = the FIRST round
+        # where the LLM actually received REPORT guidance and had a
+        # write_file decision chance (set by before_model).  It must
+        # never be pre-set by post-response guardrails — pre-setting it
+        # to a round where the LLM had no chance to comply fires the
+        # "without write_file" warning on the very first REPORT decision
+        # round (observed 2026-08-09 session 59073d58: warning at round 7
+        # "started round 6" where round 6 was a silent VERIFY stall).
+        # ``_report_forced_enter_round`` = the round where a guardrail
+        # FORCED entry into REPORT (verify/evaluate stall, G7, max-rounds
+        # post-response paths); consumed only by the post-response
+        # REPORT-stall level computation, never by the before_model
+        # warning.
+        self._report_phase_start_round: int = 0
+        self._report_forced_enter_round: int = 0
         self._verify_stall_count: int = 0  # consecutive verify-phase stalls
         self._verify_stuck_last_fired: int = -100  # cooldown for verify-stuck valve
         self._evaluate_stall_count: int = 0  # consecutive evaluate-phase stalls
+        # (v3.6.0: E2' block counter removed — the gate now releases with
+        # disclosure instead of escalating blocks, design document §6.3)
+        # v3.8.0: generic exit-gate block counter — consecutive write_file
+        # blocks with S1 unsatisfied (no confirmed root cause); the 3rd
+        # block triggers the deterministic honest-negative exit (design
+        # document §6.3).
+        self._exit_block_count: int = 0
         self._round_emitted: bool = False  # prevent duplicate round_transition on goto re-entry
         self._last_commit_round: int = -1  # round when commit_hypotheses last ran
         self._last_select_round: int = 0   # round when select_path/backtrack last ran
@@ -1171,6 +1479,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         instance._model_call_count = coordinator._model_call_count
         return instance
 
+    def _resolve_host_name(self, value: str) -> str:
+        """Resolve a node IP (node_name) to its physical host name (host_name)
+        using the in-session topology's host views.
+
+        Also returns the value itself when it is already a known host name
+        (idempotent, harmless).  Returns "" for unknown values.  Backed by
+        the topology (mock and future production alike), NOT by any mock
+        whitelist — the scope guard middleware was removed (README).
+        (design document §8.1⑥)
+        """
+        if not value:
+            return ""
+        mapping = getattr(self, "_node_ip_to_host", None)
+        if mapping is None:
+            mapping = {}
+            _topo = (self._current_ledger or {}).get("topology") or self._topology
+            for _rec in build_host_views(_topo):
+                _hn = (_rec.get("host_name") or "").strip()
+                _nn = (_rec.get("node_name") or "").strip()
+                if _hn:
+                    mapping.setdefault(_hn, _hn)
+                if _hn and _nn and _nn != _hn:
+                    mapping[_nn] = _hn
+            self._node_ip_to_host = mapping
+        return mapping.get(value, "")
+
     # ── Fault profile extraction via structured output ──
 
     async def abefore_agent(self, state, runtime) -> dict | None:
@@ -1199,6 +1533,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         ledger["start_time"] = self._start_time
         ledger["end_time"] = self._end_time
         ledger["param_overrides"] = dict(self._param_overrides)
+        # Assembled expert directory snapshot (design document
+        # parallel-delegation §5 D1): the POST-FILTER subagent list is
+        # the ground truth of what task() can dispatch to — the
+        # complementary-expert computation must never suggest an
+        # unassembled expert.
+        ledger["scene_experts"] = list(self._valid_subagents)
+        # Serverless scene: topology (RelationGraph) injected at session init
+        # and availability flag — consumed by the coverage gate (D1/D2) and
+        # subagent context anchors (design document §5.2/§7.2).
+        ledger["topology"] = dict(self._topology)
+        ledger["_topology_unavailable"] = self._topology_unavailable
         # Extract the original user message from state (first HumanMessage)
         for msg in (state.get("messages") or []):
             if hasattr(msg, "type") and msg.type == "human":
@@ -1321,12 +1666,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 or ledger.get("report")
             )
             if legit_report and finalize_pending_for_report(ledger):
-                _force_report(ledger)
+                # Natural exit (check_exit_conditions / report written):
+                # do NOT set _forced_terminal — that marker is reserved
+                # for guardrail-forced entries (design document §3 step
+                # 1).  check_exit_conditions stays true after finalize
+                # (confirmed/refuted are terminal), so derive_phase keeps
+                # the session pinned to REPORT without the lock.  Record
+                # the path for post-hoc analysis instead.
+                if not ledger.get("_forced_terminal"):
+                    ledger["_exit_path"] = "natural"
                 self._persist_ledger(ledger)
                 logger.info(
                     "Phase guard: finalized pending hypotheses for REPORT "
-                    "(round %d)",
+                    "(round %d, exit_path=%s)",
                     self._model_call_count,
+                    ledger.get("_exit_path", "unknown"),
                 )
                 # Re-render context so the LLM sees finalized hypothesis tree
                 context_block = render_ledger_context(ledger, report_path=self.report_path,
@@ -1356,6 +1710,37 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             combined_block = f"{combined_block}\n\n{safety_block}" if combined_block else safety_block
         if audit_block:
             combined_block = f"{combined_block}\n\n{audit_block}" if combined_block else audit_block
+
+        # ── Observability: emit the injected guidance delta to the trace ──
+        # The trace records tool calls/results and LLM output but not the
+        # prompt side; without the stimulus, guardrail behavior (e.g.
+        # whether the exit banner was actually shown) is unverifiable from
+        # the trace alone.  Emit ONLY the per-round delta — phase guidance,
+        # safety-valve warnings, evidence audit.  The ledger data body is
+        # already captured by ledger snapshots; AGENTS.md is static.
+        # Best-effort: observability must never become a failure source
+        # (design document §8).
+        try:
+            _delta_parts: list[str] = []
+            _guidance = _phase_guidance(
+                derive_phase(ledger), ledger, self.report_path)
+            if _guidance:
+                _delta_parts.append("## 本步要求\n" + _guidance)
+            if safety_block:
+                _delta_parts.append("## 安全阀警告\n" + safety_block)
+            if audit_block:
+                _delta_parts.append("## 证据审计\n" + audit_block)
+            if _delta_parts:
+                _sw = getattr(
+                    getattr(request, "runtime", None), "stream_writer", None)
+                if _sw:
+                    _sw({
+                        "type": "prompt_injection",
+                        "round": self._model_call_count,
+                        "content": "\n\n".join(_delta_parts),
+                    })
+        except Exception:
+            pass
 
         # ── Timeout protection: prevent single LLM call from hanging forever ──
         # REPORT phase generates a long markdown report — use a longer timeout.
@@ -1504,7 +1889,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "timestamp": _dt.now(_tz.utc).isoformat(),
                         })
                 _force_report(ledger)
-                self._report_phase_start_round = self._model_call_count
+                # G7 post-response forced entry: record the SYSTEM entry
+                # round for level computation only; the before_model
+                # warning anchor is set by the first REPORT before_model.
+                self._report_forced_enter_round = self._model_call_count
 
                 # ── Auto-generate report from everything we have ──
                 # Skip regeneration when the LLM already wrote its
@@ -1667,7 +2055,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         _node["deferred_reason"] = (
                                             "[系统] REPORT 阶段自动搁置")
                             _force_report(ledger)
-                            self._report_phase_start_round = self._model_call_count
+                            # Branch A forced REPORT — post-response:
+                            # record system-entry round only (level
+                            # computation); warning anchor set by the
+                            # next before_model.
+                            self._report_forced_enter_round = self._model_call_count
                             self._persist_ledger(ledger)
                             logger.warning(
                                 "Safety: verify-phase stall (no tool calls, "
@@ -1843,7 +2235,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                             _node["deferred_reason"] = (
                                                 "[系统] REPORT 阶段自动搁置")
                                 _force_report(ledger)
-                                self._report_phase_start_round = self._model_call_count
+                                # Branch B 3rd-stall forced REPORT —
+                                # post-response: system-entry round only.
+                                self._report_forced_enter_round = self._model_call_count
                                 self._persist_ledger(ledger)
                                 logger.warning(
                                     "Safety: verify-phase stall (no tool calls, "
@@ -1908,7 +2302,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             # This keeps verify focused on recording the expert
                             # conclusion, per the ledger state machine.
                             _force_report(ledger)
-                            self._report_phase_start_round = self._model_call_count
+                            # Branch C (no recorded evidence) forced
+                            # REPORT — post-response: system-entry round
+                            # only; warning anchor set by before_model.
+                            self._report_forced_enter_round = self._model_call_count
                             self._persist_ledger(ledger)
 
         # ── Post-response: detect UNDERSTAND-phase stall ──
@@ -1958,29 +2355,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             if _st else
                             "时间窗口: 最近 6 小时"
                         )
-                        _required = ["host-argus-expert"]
-                        if ledger.get("entity_type") != "host":
-                            _required.append("k8s-argus-expert")
-                        import uuid as _uuid_re
-                        synthetic = []
-                        for expert in _required:
-                            desc = (
-                                f"查询并分析 {_entity} 集群 Argus K8s "
-                                f"指标时序（NotReady/Pod重启/API延迟/"
-                                f"etcd/DNS）。{_time_hint}。"
-                                if expert == "k8s-argus-expert"
-                                else f"查询并分析主机 {_entity} 的 Argus "
-                                f"指标时序（CPU/内存/磁盘/网络 1min 粒度"
-                                f"）。{_time_hint}。"
-                            )
-                            synthetic.append({
-                                "name": "task",
-                                "id": f"call_safety_{_uuid_re.uuid4().hex[:12]}",
-                                "args": {
-                                    "subagent_type": expert,
-                                    "description": desc,
-                                },
-                            })
+                        _required = list(_required_argus(ledger))
+                        synthetic = _build_argus_delegation_calls(
+                            _required, _entity, _time_hint)
                         response = ModelResponse(result=[AIMessage(
                             content=(
                                 "[系统提醒] Argus 专家反馈参数不全，已按"
@@ -2023,27 +2400,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # so coverage becomes complete and the normal
                         # UNDERSTAND→HYPOTHESIZE transition (T1) can fire.
                         if not _coverage_ready(ledger):
-                            # Identify which expert(s) are missing.
-                            experts_delegated: set[str] = set()
-                            for r in ledger.get("rounds", []):
-                                experts_delegated.update(
-                                    r.get("delegated_experts", []))
-                            has_host = "host-argus-expert" in experts_delegated
-                            has_k8s = "k8s-argus-expert" in experts_delegated
-                            is_host_only = (
-                                ledger.get("entity_type") == "host")
-
-                            missing: list[str] = []
-                            if not is_host_only and not has_k8s:
-                                missing.append("k8s-argus-expert")
-                            if not has_host:
-                                missing.append("host-argus-expert")
-                            # Host-only: only host-argus-expert matters.
-                            if is_host_only:
-                                missing = (
-                                    ["host-argus-expert"]
-                                    if not has_host else [])
-
+                            missing = _argus_coverage_gap(ledger)
                             if missing:
                                 logger.warning(
                                     "Safety: understand stall with "
@@ -2064,25 +2421,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     if _st else
                                     "时间窗口: 最近 6 小时"
                                 )
-                                import uuid as _uuid2
-                                synthetic = []
-                                for expert in missing:
-                                    desc = (
-                                        f"查询并分析 {_cluster} 集群 "
-                                        f"Argus 指标时序。{_time_hint}。"
-                                        if expert == "k8s-argus-expert"
-                                        else f"查询并分析主机 Argus "
-                                        f"指标时序（CPU/内存/磁盘/网络"
-                                        f" 1min 粒度）。{_time_hint}。"
-                                    )
-                                    synthetic.append({
-                                        "name": "task",
-                                        "id": f"call_safety_{_uuid2.uuid4().hex[:12]}",
-                                        "args": {
-                                            "subagent_type": expert,
-                                            "description": desc,
-                                        },
-                                    })
+                                synthetic = _build_argus_delegation_calls(
+                                    missing, _cluster, _time_hint)
                                 response = ModelResponse(result=[AIMessage(
                                     content=(
                                         f"[系统强制] Argus数据采集不完整"
@@ -2212,7 +2552,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     and not node.get("deferred")
                     and (node.get("status") == "inconclusive"
                          or node.get("probability", 0) > 15)
-                    and delegation_value(node) >= KAPPA_STOP
+                    and delegation_value_for(ledger, hid) >= KAPPA_STOP
                 ]
                 # Revivable nodes: explicitly shelved (deferred) but still
                 # undecided — select_path clears the shelved mark.
@@ -2243,7 +2583,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # happens in the REPORT-phase handler below).
                     finalize_pending_for_report(ledger)
                     _force_report(ledger)
-                    self._report_phase_start_round = self._model_call_count
+                    # G9 evaluate-stall terminal forced REPORT —
+                    # post-response: system-entry round only.
+                    self._report_forced_enter_round = self._model_call_count
                     self._persist_ledger(ledger)
                     logger.warning(
                         "Safety: evaluate stall terminal (round %d, "
@@ -2262,7 +2604,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # (a) T5 — select the highest-value actionable
                         # root (§6.2 delegation-value ordering).
                         hid = max(actionable,
-                                  key=lambda h: delegation_value(all_h[h]))
+                                  key=lambda h: delegation_value_for(ledger, h))
                         synthetic = [{
                             "name": "select_path",
                             "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
@@ -2514,13 +2856,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 )
                                 for m in result_list:
                                     if hasattr(m, "content") and isinstance(m.content, str):
+                                        # G14 reminder (v3.7.0): no longer
+                                        # hardcodes host-expert (scene-
+                                        # specific) and now distinguishes
+                                        # the confirmed evidence standard
+                                        # from the refuted/inconclusive
+                                        # path (G17 contract).
                                         m.content = m.content.rstrip() + (
                                             "\n\n⛔ [系统提醒] 当前活跃假设 "
                                             f"{fmt_hid(active_id)} 尚无专家验证证据。"
-                                            "请在本轮委派 host-expert "
-                                            "（task, subagent_type=host-expert）"
-                                            "验证此假设后，再调用 "
-                                            "record_finding 记录结论。"
+                                            "confirmed 判定须以专家验证结论为依据"
+                                            "——请委派 task 验证此假设"
+                                            "（按假设涉及领域选择对应专家；"
+                                            "监控时序定向复核可委派对应 argus 专家）；"
+                                            "若现有监控证据已明确证伪，可直接 "
+                                            "record_finding 判 refuted；"
+                                            "证据不足判 inconclusive。"
                                         )
                                         break
 
@@ -2551,7 +2902,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         or ledger.get("_report_auto_generated")):
                     ledger["report"] = _salvage_text
                     ledger["_report_auto_generated"] = False
-                    ledger["_forced_terminal"] = True
+                    _force_report(ledger)
                     _write_report_file(
                         self.report_path, _salvage_text,
                         self._AGENT_DATA_REAL,
@@ -2566,9 +2917,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     )
                     report_exists = True
                 if not report_exists:
+                    # Level computation anchors on the SYSTEM entry round
+                    # (guardrail-forced entry, `_report_forced_enter_round`)
+                    # when present; otherwise falls back to the before_model
+                    # warning anchor (natural exit path, set by the first
+                    # REPORT before_model).  Both never co-occur: a forced
+                    # entry sets forced_enter_round in post-response and
+                    # leaves phase_start_round=0 for the next before_model
+                    # to set — keeping the two semantics (system entry vs
+                    # LLM first decision chance) fully separated.
+                    _lvl_base = (
+                        self._report_forced_enter_round
+                        or self._report_phase_start_round
+                    )
                     rounds_in_report = (
-                        self._model_call_count
-                        - max(self._report_phase_start_round, 1)
+                        self._model_call_count - max(_lvl_base, 1)
                     )
                     if rounds_in_report < 2:
                         # ── Level 1: nudge — the LLM writes the report ──
@@ -2609,7 +2972,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # ── Level 2: Auto-generate as last resort ──
                         report_md = self._generate_report_from_ledger(ledger)
                         ledger["report"] = report_md
-                        ledger["_forced_terminal"] = True
+                        _force_report(ledger)
                         _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
                         self._persist_ledger(ledger)
                         logger.warning(
@@ -2679,21 +3042,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         if _st else
                         "时间窗口: 最近 6 小时"
                     )
-                    _k8s_desc = (
-                        f"查询并分析 {_cluster} 集群 Argus K8s 指标时序"
-                        f"（query_argus_nodes: NotReady/Pod重启/驱逐/Pending"
-                        f"，query_argus_services: API延迟/etcd/DNS）。{_time_hint}。"
-                        if _cluster else
-                        "查询并分析 K8s 集群 Argus 指标时序"
-                        "（节点状态、Pod 重启、API 延迟、DNS 延迟）"
-                    )
-                    _host_desc = (
-                        f"查询并分析 {_hostname} 主机 Argus 指标时序"
-                        f"（CPU/内存/磁盘/网络 1min 粒度）。{_time_hint}。"
-                        if _hostname else
-                        "查询并分析主机 Argus 监控指标时序"
-                        "（CPU、内存、磁盘 IO、网络）"
-                    )
 
                     logger.warning(
                         "Safety: round-1 understand-phase zero-tools "
@@ -2707,27 +3055,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # 2026-07-19.  The proven pattern: build a NEW
                     # ModelResponse whose AIMessage carries synthetic
                     # task() calls — the graph router then continues to
-                    # the tools node naturally.  Host-only scenarios have
-                    # no k8s-argus-expert subagent — inject host only.
-                    import uuid as _uuid
-                    synthetic: list[dict] = []
-                    if ledger.get("entity_type") != "host":
-                        synthetic.append({
-                            "name": "task",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {
-                                "subagent_type": "k8s-argus-expert",
-                                "description": _k8s_desc,
-                            },
-                        })
-                    synthetic.append({
-                        "name": "task",
-                        "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                        "args": {
-                            "subagent_type": "host-argus-expert",
-                            "description": _host_desc,
-                        },
-                    })
+                    # the tools node naturally.  Scene-aware: inject the
+                    # CURRENT scene's required argus set (SSOT
+                    # _required_argus) instead of a hardcoded host/k8s pair.
+                    _required = list(_required_argus(ledger))
+                    synthetic = _build_argus_delegation_calls(
+                        _required, _cluster or _hostname, _time_hint)
                     response = ModelResponse(result=[AIMessage(
                         content=(
                             "[系统安全阀] 第1轮回复未包含工具调用"
@@ -2848,22 +3181,145 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 ):
                     if not reason:
                         reason = "诊断尚未建立任何假设"
-                    logger.warning(
-                        "write_file blocked by exit-condition gate: %s "
-                        "(phase=%s, round=%d, path=%s)",
-                        reason,
-                        _phase(ledger),
-                        self._model_call_count,
-                        tool_args.get("file_path")
-                        or tool_args.get("path") or "",
-                    )
-                    return ToolMessage(
-                        content=(
-                            f"⛔ 暂时无法生成诊断报告: {reason}\n"
-                            "（REPORT 仅在根因确认、假设穷尽或证据饱和时开放）"
-                        ),
-                        tool_call_id=tool_call_id,
-                    )
+                    # ── E2' competing-hypothesis escalation (design document §6.3) ──
+                    # When write_file is blocked by an unverified competing
+                    # hypothesis (max delegation_value >= κ), the LLM often
+                    # loops on record_finding/select_path instead of delegating
+                    # the blocking hypothesis — a "soft loop" within the round
+                    # cap.  Escalate in 3 levels to break it deterministically
+                    # (best practice: flexible guidance + reliable code
+                    # backstop — "靠修改 Prompt 难彻底防循环，需确定性代码约束"):
+                    #   L1 actionable directive (name hypothesis + action)
+                    #   L2 strong directive (forbid retrying write_file)
+                    #   L3 deterministic defer — shelve the blocking hypothesis
+                    #      so the exit condition is satisfied and REPORT
+                    #      proceeds (same outcome as G9, just sooner & targeted).
+                    _is_e2 = ("可行动验证" in reason) or ("竞争性根因" in reason)
+                    if _is_e2:
+                        # ── E2' release-with-disclosure (design document
+                        # §6.3, v3.6.0) ──
+                        # S1 satisfied (root cause confirmed) but unverified
+                        # competing hypotheses remain.  Multi-root-cause
+                        # protection is achieved by deterministic
+                        # DISCLOSURE, not by blocking the report: blocking
+                        # created a soft loop whose failure mode is a
+                        # timeout with ZERO output (2026-08-08 batch: 3
+                        # blocked sessions, 3 timeouts, 0 reports — the
+                        # fail-closed path destroyed confirmed findings);
+                        # disclosure preserves the information (fail-open)
+                        # — the system shelves the remaining hypotheses and
+                        # injects a disclosure section into the report, so
+                        # no second-root-cause possibility is silently
+                        # dropped.  Proactive guidance (exit_banner /
+                        # VERIFY directive) still recommends verification
+                        # first; the LLM keeps the choice.
+                        from diagnostics.agent.ledger import (
+                            render_unverified_disclosure as _rud,
+                        )
+                        _disclosure = _rud(ledger)
+                        _disclosed = []
+                        for _h, _n in ledger.get("hypotheses", {}).items():
+                            if (_n.get("status") in ("pending", "inconclusive")
+                                    and not _n.get("deferred")):
+                                _n["deferred"] = True
+                                _n["selected"] = False
+                                _n["deferred_reason"] = (
+                                    "[系统] 报告收口：根因已确认，该竞争假设"
+                                    "未完成验证，已在报告中披露（design "
+                                    "document §6.3 E2′ 放行+披露，v3.6.0）"
+                                )
+                                _disclosed.append(fmt_hid(_h))
+                        if _disclosure and isinstance(
+                                tool_args.get("content"), str):
+                            tool_args["content"] = (
+                                tool_args["content"].rstrip() + _disclosure
+                            )
+                        self._persist_ledger(ledger)
+                        logger.warning(
+                            "write_file released with disclosure (round %d): "
+                            "shelved %s, disclosure injected (%d chars)",
+                            self._model_call_count, _disclosed,
+                            len(_disclosure),
+                        )
+                        # fall through — write_file proceeds (path
+                        # canonicalization, execution, report capture)
+                    else:
+                        # Non-E2' block (S1 not satisfied — no confirmed
+                        # root cause).  v3.8.0: the block message consumes
+                        # the SAME SSOT renderer as the proactive banner
+                        # (A2), and a deterministic exit engages after 3
+                        # consecutive blocks (A3): shelve all unresolved
+                        # hypotheses and release the report with the
+                        # disclosure section — an honest "root cause not
+                        # confirmed" report is a legitimate deliverable
+                        # (the anti-fabrication floor is unaffected: G17
+                        # already guarantees no fabricated confirmed
+                        # verdict exists for the report to cite).
+                        self._exit_block_count += 1
+                        if self._exit_block_count >= 3:
+                            from diagnostics.agent.ledger import (
+                                render_unverified_disclosure as _rud3,
+                            )
+                            _shelved = []
+                            for _h, _n in ledger.get(
+                                    "hypotheses", {}).items():
+                                if (_n.get("status")
+                                        in ("pending", "inconclusive")
+                                        and not _n.get("deferred")):
+                                    _n["deferred"] = True
+                                    _n["selected"] = False
+                                    _n["deferred_reason"] = (
+                                        "[系统] 确定性收口：连续 "
+                                        f"{self._exit_block_count} 次尝试生成报告，"
+                                        "诊断未确认根因，该假设搁置并在报告中披露"
+                                        "（design document §6.3 通用出口，v3.8.0）"
+                                    )
+                                    _shelved.append(fmt_hid(_h))
+                            _disc = _rud3(ledger)
+                            if _disc and isinstance(
+                                    tool_args.get("content"), str):
+                                tool_args["content"] = (
+                                    tool_args["content"].rstrip() + _disc
+                                )
+                            self._persist_ledger(ledger)
+                            logger.warning(
+                                "write_file deterministic exit (round %d, "
+                                "%d blocks): shelved %s, releasing honest "
+                                "no-root-cause report with disclosure",
+                                self._model_call_count,
+                                self._exit_block_count, _shelved,
+                            )
+                            # fall through — write_file proceeds
+                        else:
+                            from diagnostics.agent.ledger import (
+                                render_exit_directive as _red2,
+                            )
+                            _directive = _red2(ledger, _phase(ledger))
+                            logger.warning(
+                                "write_file blocked by exit-condition gate "
+                                "(L%d): %s (phase=%s, round=%d, path=%s)",
+                                self._exit_block_count,
+                                reason,
+                                _phase(ledger),
+                                self._model_call_count,
+                                tool_args.get("file_path")
+                                or tool_args.get("path") or "",
+                            )
+                            return ToolMessage(
+                                content=(
+                                    _directive
+                                    or (
+                                        f"⛔ 暂时无法生成诊断报告: {reason}\n"
+                                        "（REPORT 仅在根因确认、假设穷尽或"
+                                        "证据饱和时开放）"
+                                    )
+                                ),
+                                tool_call_id=tool_call_id,
+                            )
+                # write_file passed the gate (natural exit, forced terminal,
+                # E2' release-with-disclosure, or the v3.8.0 deterministic
+                # honest-negative exit) — reset the generic block counter.
+                self._exit_block_count = 0
                 # ── Canonicalize the report path (v2.5) ──
                 # The report path is system-generated and handed to the
                 # LLM, which merely carries it back — LLM path
@@ -2928,10 +3384,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             ledger = self._current_ledger
             if ledger is not None:
                 _phase_now = _phase(ledger)
-                _gate = _PHASE_TOOL_GATE.get(_phase_now)
-                if _gate is not None and tool_name in _gate:
+                _allow = _PHASE_ALLOWLIST.get(_phase_now, frozenset())
+                # write_file is governed by the dedicated exit-condition
+                # gate, NOT the phase allowlist (§7/§11); read-only
+                # scaffolding is exempt globally.
+                if (tool_name != "write_file"
+                        and tool_name not in _READONLY_SCOPES
+                        and tool_name not in _allow):
                     logger.warning(
-                        "%s blocked by phase gate in %s (round=%d)",
+                        "%s blocked by phase allowlist in %s (round=%d)",
                         tool_name, _phase_now, self._model_call_count,
                     )
                     return ToolMessage(
@@ -2965,6 +3426,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "query_argus_cpu", "query_argus_memory",
                 "query_argus_disk", "query_argus_network",
                 "query_argus_nodes", "query_argus_services",
+                "query_argus_k8s_cluster", "query_argus_k8s_node",
+                "query_argus_k8s_workload", "query_argus_k8s_pod",
+                "query_argus_k8s_etcd",
                 "query_argus_gpu",
             })
             if tool_name in _EXPERT_ONLY_TOOLS:
@@ -2975,14 +3439,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 return ToolMessage(
                     content=(
                         f"⚠️ {tool_name} 是专家专用工具，Coordinator 不能直接调用。\n"
-                        "请通过 task() 委派对应专家：\n"
-                        "- 主机指标(CPU/内存/磁盘/网络) → "
-                        "task(subagent_type='host-argus-expert', description='查询主机Argus指标时序')\n"
-                        "- K8s集群指标(节点/Pod/API/DNS) → "
-                        "task(subagent_type='k8s-argus-expert', description='查询K8s Argus指标时序')"
+                        "请通过 task() 委派当前场景的 Argus 专家"
+                        "（可用专家见 task 工具说明）采集对应指标。"
                     ),
                     tool_call_id=tool_call_id,
                 )
+
+        # ── L4: hostname 参数归一化（host-argus 网关）──
+        # query_argus_* 的 hostname 参数契约是"主机名"（监控端点语义），但
+        # LLM 可能误填节点 IP（node_name，如 10.30.1.12；2026-08-06 观测：
+        # round-1 的 8 次 query_argus_* 的 hostname 全为 10.30.x 节点 IP）。
+        # 此处用会话内拓扑的 node_name→host_name 映射做确定性归一化，并
+        # 记录观测统计（design document §8.1⑥）。
+        if tool_name in _HOST_ARGUS_TOOLS:
+            _hn = (tool_args or {}).get("hostname")
+            if _hn:
+                _resolved = self._resolve_host_name(str(_hn))
+                if _resolved and _resolved != _hn:
+                    logger.warning(
+                        "hostname normalized: %s -> %s (tool=%s, round=%d) — "
+                        "LLM passed node IP instead of host name",
+                        _hn, _resolved, tool_name, self._model_call_count,
+                    )
+                    tool_args["hostname"] = _resolved
+                    _ledger_now = self._current_ledger
+                    if _ledger_now is not None:
+                        _obs = _ledger_now.setdefault("hostname_normalization", {})
+                        _obs["normalized"] = _obs.get("normalized", 0) + 1
+                elif not _resolved and _looks_like_ipv4(str(_hn)):
+                    logger.warning(
+                        "hostname IP not resolvable to host name: %s "
+                        "(tool=%s, round=%d)",
+                        _hn, tool_name, self._model_call_count,
+                    )
+                    _ledger_now = self._current_ledger
+                    if _ledger_now is not None:
+                        _obs = _ledger_now.setdefault("hostname_normalization", {})
+                        _obs["unresolved_ip"] = _obs.get("unresolved_ip", 0) + 1
 
         # ── Inject ledger context into task() descriptions ──
         # Subagents normally see only the Coordinator's description and have
@@ -3037,10 +3530,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _gate_node = ledger["hypotheses"].get(_gate_hid)
                     if (_gate_node is not None
                             and _gate_node.get("status") in ("pending", "inconclusive")):
+                        # View-aware value (design document
+                        # parallel-delegation §8): F decays only on
+                        # SAME-VIEW prior delegations — a complementary
+                        # view is a new information source, not "the
+                        # same evidence re-examined" (D6).
                         from diagnostics.agent.ledger import (
-                            delegation_value, KAPPA_STOP,
+                            delegation_value_for, KAPPA_STOP,
                         )
-                        _v = delegation_value(_gate_node)
+                        _v = delegation_value_for(
+                            ledger, _gate_hid, subagent_type)
                         if _v < KAPPA_STOP:
                             logger.warning(
                                 "Delegation blocked by gain<cost gate: "
@@ -3063,6 +3562,56 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "- select_path 切换到其他未决假设\n"
                                     "- 若无 confirmed 根因且换批预算未用尽：commit_hypotheses 换方向\n"
                                     "- 若退出判据已满足：系统将自动进入 REPORT"
+                                ),
+                                tool_call_id=tool_call_id,
+                            )
+
+                # ── Single-focus batch validation (design document
+                # parallel-delegation §4.5) ──
+                # A same-round parallel group must target ONE hypothesis.
+                # The first ADMITTED task of the round (past the G5 gate
+                # above) sets the focus; subsequent same-round tasks must
+                # match it (cross-hypothesis is the parallel-abuse vector)
+                # and must carry a parseable hypothesis ID.  Placed after
+                # G5 so a gate-blocked task never claims the round focus;
+                # placed before auto-heal so a focus-blocked task never
+                # activates its hypothesis.  Check-and-set is synchronous
+                # — atomic under asyncio cooperative scheduling.
+                if not self._is_subagent:
+                    if self._round_focus_round != self._model_call_count:
+                        self._round_focus_round = self._model_call_count
+                        self._round_focus_hid = None
+                    if self._round_focus_hid is None:
+                        if _gate_hid:
+                            self._round_focus_hid = _gate_hid
+                    else:
+                        if not _gate_hid:
+                            logger.warning(
+                                "task() blocked by single-focus batch rule: "
+                                "no hypothesis ID in a same-round batch "
+                                "(focus=%s, round=%d)",
+                                self._round_focus_hid, self._model_call_count,
+                            )
+                            return ToolMessage(
+                                content=(
+                                    "⛔ 并行委派须在 description 中明确假设 ID"
+                                    "（如「验证假设 H2」），以便系统校验单焦点约束。"
+                                ),
+                                tool_call_id=tool_call_id,
+                            )
+                        if _gate_hid != self._round_focus_hid:
+                            logger.warning(
+                                "task() blocked by single-focus batch rule: "
+                                "%s targets %s but round focus is %s (round=%d)",
+                                subagent_type, _gate_hid,
+                                self._round_focus_hid, self._model_call_count,
+                            )
+                            return ToolMessage(
+                                content=(
+                                    "⛔ 单焦点约束：同轮并行委派必须指向同一假设"
+                                    f"（当前焦点 {fmt_hid(self._round_focus_hid)}）。"
+                                    f"对 {fmt_hid(_gate_hid)} 的委派已被拦截——"
+                                    "请验证完当前焦点假设后再切换。"
                                 ),
                                 tool_call_id=tool_call_id,
                             )
@@ -3090,7 +3639,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             target_hid, self._model_call_count,
                         )
 
-                ctx = _build_subagent_context(ledger, subagent_type=subagent_type)
+                ctx = _build_subagent_context(
+                    ledger,
+                    subagent_type=subagent_type,
+                    stable_cache=self._stable_ctx_cache,
+                )
                 # Idempotent wrap: if the Coordinator already pasted the
                 # session baseline into its description (learned from
                 # wrapped delegations visible in message history), skip
@@ -3238,12 +3791,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
             # Track delegated experts for coverage detection
             delegated = None
+            delegated_for = None
             if tool_name == "task":
                 expert = (tool_args.get("subagent_type")
                           or tool_args.get("subagent_name")
                           or tool_args.get("name"))
                 if expert:
                     delegated = [expert]
+                    # Structured delegation fact (design document
+                    # parallel-delegation §5 D2): makes per-hypothesis
+                    # delegated sets / parallel-group keys / audit
+                    # derivable from the rounds history.
+                    delegated_for = _parse_hypothesis_id_from_description(
+                        tool_args.get("description", ""),
+                        ledger.get("hypotheses", {}),
+                    )
 
             record_round(
                 ledger, derive_phase(ledger),
@@ -3252,6 +3814,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 key_findings=key_findings,
                 _seq=invocation_seq,
                 delegated_experts=delegated,
+                delegated_for=delegated_for,
             )
 
         # After ledger management tools, persist and emit snapshot
@@ -3286,8 +3849,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             except Exception:
                 pass  # stream_writer not available in all contexts
         elif tool_name == "task":
-            # Track consecutive task() calls without record_finding (stagnation)
-            self._consecutive_task_count += 1
+            # Group-level stall counting (design document
+            # parallel-delegation §4.3): G3 models STALL — rounds spent
+            # delegating without record_finding — so a same-round
+            # parallel batch (one round of waiting) increments once, not
+            # per task.  The value model's _delegate_count below stays
+            # per-task (information-exhaustion semantics, path-invariant
+            # between serial and parallel paths).
+            if self._last_task_round != self._model_call_count:
+                self._consecutive_task_count += 1
             self._last_task_round = self._model_call_count
 
             # Track per-(expert, hypothesis) delegation count (saturation)
@@ -3336,6 +3906,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             ledger.get("_report_auto_generated")
                             and content == ledger.get("report")
                         )
+                        # Disclosure backstop (design document §6.3,
+                        # v3.6.0): a rewrite with fresh LLM content would
+                        # otherwise silently drop the disclosure section
+                        # injected at gate-release time.  Re-append it
+                        # whenever unresolved hypotheses remain and the
+                        # section is absent — the disclosure obligation
+                        # attaches to the REPORT, not to a single write.
+                        if not _is_stub_echo:
+                            from diagnostics.agent.ledger import (
+                                render_unverified_disclosure as _rud2,
+                            )
+                            _disc = _rud2(ledger)
+                            if (_disc
+                                    and "未验证竞争假设（系统披露）"
+                                    not in content):
+                                content = content.rstrip() + _disc
                         ledger["report"] = content
                         if not _is_stub_echo:
                             ledger["_report_auto_generated"] = False
@@ -3551,7 +4137,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 grace if self._max_rounds_grace_used else 0
             ):
                 _force_report(ledger)
-                ledger["_forced_terminal"] = True
                 self._report_phase_start_round = round_num
                 mutated = True
                 # Replace the blunt "STOP NOW" directive with a comprehensive
@@ -3587,6 +4172,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _data_collection_tools = frozenset({
                 "task",
                 "query_argus_nodes", "query_argus_services",
+                "query_argus_k8s_cluster", "query_argus_k8s_node",
+                "query_argus_k8s_workload", "query_argus_k8s_pod",
+                "query_argus_k8s_etcd",
                 "query_argus_cpu",
                 "query_argus_memory", "query_argus_disk",
                 "query_argus_network", "query_argus_gpu",
@@ -3599,15 +4187,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             )
 
             if has_collected_data:
-                # ── Dual-expert coverage check (container/K8s scenarios) ──
-                # If only one type of Argus expert was delegated, the LLM
-                # likely missed the other.  Force delegation of
-                # the missing expert instead of prematurely forcing
+                # ── Scene-aware Argus coverage check ──
+                # The required Argus expert set is determined by the
+                # CURRENT scene via _required_argus (Serverless
+                # four-view, host single, dedicated container dual) —
+                # the same single source of truth as the UNDERSTAND
+                # coverage gate (D1) and the proactive coverage hint.
+                # When coverage is incomplete, force delegation of the
+                # missing expert instead of prematurely forcing
                 # commit_hypotheses.
                 #
                 # NOTE: Coordinator does NOT have Argus tools directly —
                 # detection uses delegated_experts (populated from
                 # task(subagent_type=...) calls), NOT tools_called.
+                # History: this block previously hardcoded the
+                # host/k8s dual-expert pair, mis-firing on Serverless
+                # sessions (forcing the forbidden k8s-argus-expert) —
+                # see design document §11 (2026-08-05).
                 experts_delegated: set[str] = set()
                 has_delegated = False
                 for r in rounds_history:
@@ -3615,8 +4211,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if "task" in r.get("tools_called", []):
                         has_delegated = True
 
-                has_host = "host-argus-expert" in experts_delegated
-                has_k8s = "k8s-argus-expert" in experts_delegated
                 is_host_only = ledger.get("entity_type") == "host"
 
                 if ledger.get("_argus_unavailable"):
@@ -3632,38 +4226,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "commit_hypotheses 提出假设，"
                             "后续专家诊断将继续验证并修正假设。"
                         )
-                # Only intervene when an expert WAS delegated but one
-                # domain is still uncovered — this indicates a container
-                # scenario where both experts are expected.
-                # Host-only scenarios skip this check entirely.
-                elif has_delegated and not is_host_only and has_host and not has_k8s:
+                # Only intervene when an expert WAS delegated but the
+                # scene's required Argus set is still incomplete.
+                # Host-only scenarios skip this check entirely (the
+                # scene has no cluster-level expert to force).
+                elif (has_delegated and not is_host_only
+                      and _argus_coverage_gap(ledger)):
+                    _missing = _argus_coverage_gap(ledger)
+                    _missing_name = _missing[0]
                     warnings.append(
-                        "⚠ [系统强制] 已采集主机 Argus 数据但缺少集群级 "
-                        "K8s Argus 数据（query_argus_nodes + "
-                        "query_argus_services）。\n"
-                        "禁止在本轮调用 commit_hypotheses。\n"
-                        "你必须先调用 task(subagent_type=\"k8s-argus-expert\", description=...) "
-                        "委派 K8s Argus 专家采集集群指标。\n"
-                        "收到 K8s Argus 专家的分析摘要后再提交假设。"
-                    )
+                        _render_argus_delegation_hint(ledger, _missing))
                     logger.warning(
-                        "Safety: partial Argus coverage (host only, "
-                        "round %d) — forcing k8s-argus-expert delegation",
-                        round_num,
-                    )
-                elif has_delegated and not is_host_only and has_k8s and not has_host:
-                    warnings.append(
-                        "⚠ [系统强制] 已采集 K8s Argus 数据但缺少主机级 "
-                        "Argus 数据（CPU/内存/磁盘/网络）。\n"
-                        "禁止在本轮调用 commit_hypotheses。\n"
-                        "你必须先调用 task(subagent_type=\"host-argus-expert\", description=...) "
-                        "委派主机 Argus 专家采集主机指标。\n"
-                        "收到主机 Argus 专家的分析摘要后再提交假设。"
-                    )
-                    logger.warning(
-                        "Safety: partial Argus coverage (k8s only, "
-                        "round %d) — forcing host-argus-expert delegation",
-                        round_num,
+                        "Safety: partial Argus coverage (missing: %s, "
+                        "round %d) — forcing %s delegation",
+                        ", ".join(_missing), round_num,
+                        _missing_name,
                     )
                 else:
                     # Data collected but no hypotheses
@@ -3739,15 +4316,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # nudge committing from user input (same semantics as
                 # the argus-degrade path).
                 if _phase(ledger) == "understand":
+                    _required_names = "、".join(_required_argus(ledger))
                     warnings.append(
                         "⚠ [系统强制] 当前是第"
                         f"{round_num}轮，你尚未提交任何假设，"
                         "且未调用任何诊断工具采集数据。\n"
                         "禁止输出纯文本分析，禁止调用 commit_hypotheses。\n"
-                        "你必须在本轮调用 task() 委派 Argus 专家"
-                        "（task(subagent_type=\"host-argus-expert\", description=...) + "
-                        "task(subagent_type=\"k8s-argus-expert\", description=...)）"
-                        "采集主机和集群的监控指标数据。\n"
+                        f"你必须在本轮调用 task() 委派 Argus 专家"
+                        f"（{_required_names}）采集监控指标数据。\n"
                         "这是诊断的第一步——没有数据就无法形成假设。"
                     )
                     logger.warning(
@@ -4027,6 +4603,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         elif current_phase != "report":
             # Reset trackers when leaving REPORT phase (e.g. backtrack)
             self._report_phase_start_round = 0
+            self._report_forced_enter_round = 0
 
         return ("\n\n".join(warnings) if warnings else ""), mutated
 
@@ -4068,6 +4645,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "后续如需细化假设，请用 record_finding(statement_update=...)）"
                 )
 
+            # Next-step guidance (design document §9, v3.6.1): a bare
+            # success confirmation leaves the model without a forward
+            # signal and measurably invites self-repetition (2026-08-08
+            # scenario-32 replay: the model re-emitted the same analysis
+            # text plus an empty-args commit_hypotheses on the very next
+            # round).  StateWright, positive form: a response should name
+            # the available transition, not only report the result.
+            _focus = next((h for h in created if h.get("selected")),
+                          created[0] if created else None)
+            if _focus is not None:
+                lines.append(
+                    f"下一步：已进入 VERIFY 阶段——请委派 task 验证焦点假设 "
+                    f"{fmt_hid(_focus['id'])}（按假设涉及领域选择对应专家），"
+                    "收到专家结论后用 record_finding 落账判定"
+                    "（confirmed 须以专家验证结论为依据）。"
+                )
+
             mw._persist_ledger(ledger)
             mw._current_ledger = ledger
 
@@ -4077,6 +4671,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="commit_hypotheses",
             description=(
                 "提交诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
+                "每个假设必须包含 statement（必填，一句完整根因表述）、probability(0-100)、"
+                "rationale 三个字段，缺一不可；statement 缺失会导致提交失败（预算不返还）。"
+                "若多个候选描述的是同一故障的机制/因果链上下游（如\"内存超限 OOMKilled\""
+                "与\"memory limit 配置过低\"互为表里），应合并为一条假设；"
+                "仅当证据显示独立故障源并存时才提交多条。"
                 "本工具只创建待验证假设，不产生任何结论；确认或证伪已有假设必须调用 "
                 "record_finding，重复提交不会确认任何假设。"
                 "假设为扁平结构（ID 为整数编号如 H1、H2），不支持在某假设下提交子假设；"
@@ -4163,6 +4762,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="select_path",
             description=(
                 "选择1条最接近根因的假设路径深入（EVALUATE阶段必须调用）。"
+                "目标必须是 pending/inconclusive 假设（含 deferred 复活）；"
+                "confirmed/refuted 终态假设不可选——confirmed 需细化请改用 "
+                "record_finding(statement_update=...)，refuted 已证伪不可复活。"
                 "未选中的假设自动搁置（deferred），可后续 backtrack 恢复。"
             ),
             coroutine=_run,
@@ -4243,6 +4845,45 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "该假设的验证已关闭，请基于其他未决假设继续诊断；"
                         "全部假设终态后系统会自动进入 REPORT。"
                     )
+
+            # ── G17: confirmed requires expert-verification evidence ──
+            # (design document §8 G17, v3.7.0 — evidence-standard gate,
+            # reactive backstop of the proactive contract declared in the
+            # tool description / VERIFY duty / commit receipt).  Rationale:
+            # a confirmed verdict is ACTION-guiding (ops will fix based on
+            # it), so it demands confirmatory-layer evidence (an expert's
+            # verification conclusion), while refuted/inconclusive are
+            # legitimate on screening-layer (monitoring) evidence alone —
+            # screening→confirmatory asymmetry.  Exemptions: reinforcing
+            # an already-confirmed node (it already carries expert
+            # evidence by construction); scenes with no assembled experts
+            # (deadlock prevention).
+            if (verdict == "confirmed"
+                    and hypothesis_id in ledger.get("hypotheses", {})):
+                _g17_node = ledger["hypotheses"][hypothesis_id]
+                if _g17_node.get("status") != "confirmed":
+                    _has_expert = any(
+                        str(e.get("source", "")).startswith("expert:")
+                        for e in _g17_node.get("evidence", [])
+                    )
+                    _experts = ledger.get("scene_experts") or []
+                    if not _has_expert and _experts:
+                        logger.warning(
+                            "record_finding blocked by G17: confirmed on "
+                            "%s without expert evidence (round=%d)",
+                            fmt_hid(hypothesis_id),
+                            self._model_call_count,
+                        )
+                        return (
+                            f"⛔ confirmed 判定需专家验证证据（证据标准门控）："
+                            f"{fmt_hid(hypothesis_id)} 尚无专家验证结论。"
+                            f"请委派 task 验证该假设（可用专家："
+                            f"{', '.join(_experts)}；监控时序定向复核可委派对应 "
+                            "argus 专家，description 带假设聚焦的具体问题），"
+                            "收到专家结论后再 record_finding confirmed。"
+                            "若现有监控证据已明确证伪，可直接判 refuted；"
+                            "证据不足请判 inconclusive。"
+                        )
 
             try:
                 record_finding(
@@ -4343,7 +4984,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # fallback inside check_exit_conditions covers the override's
             # intended case through the legitimate S1/S2 path.
             if should_exit:
-                _force_report(ledger)
+                # Natural exit (T4): the LLM's own record_finding satisfied
+                # the exit conditions — do NOT set the guardrail terminal
+                # marker.  _forced_terminal is reserved for guardrail-forced
+                # entries (design document §3 step 1); the exit conditions
+                # stay true after this finding, so derive_phase remains
+                # pinned to REPORT without the lock.  Record the path for
+                # post-hoc natural/forced classification (§10 _exit_path).
+                ledger["_exit_path"] = "natural"
             # else: phase is derived — partial-root / normal cases land on
             # evaluate/verify automatically, no snapshot write needed.
 
@@ -4401,8 +5049,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             description=(
                 "记录假设验证结论（VERIFY 阶段验证后必须调用；EVALUATE 阶段亦可调用——"
                 "confirmed 强化、次要根因确认、statement_update 精化）。"
-                "verdict: confirmed(已证实，可同时存在多个确认的根因/加剧因素)"
-                " | refuted(证据明确证伪，该假设不成立)"
+                "verdict: confirmed(已证实——须以对应领域专家验证结论为依据（expert 证据），"
+                "仅有监控数据不足支撑 confirmed，无专家证据的 confirmed 将被系统拦截；"
+                "可同时存在多个确认的根因/加剧因素)"
+                " | refuted(证据明确证伪，该假设不成立——监控反证即可直接判定)"
                 " | inconclusive(证据不足)。"
                 "注意：多个假设可以同时为confirmed（多根因场景），refuted仅用于证据明确否定的假设。"
                 "⚠ 若假设仅**部分不成立**（因果链中某一环节被证伪，但核心机制已被证据确认"
