@@ -36,6 +36,7 @@ from deepagents.backends.protocol import BackendProtocol
 from diagnostics.agent.ledger import (
     KAPPA_STOP,
     MAX_COMMIT_CALLS,
+    MAX_TOTAL_HYPOTHESES,
     DiagnosisLedger,
     DiagnosisLedgerState,
     _coverage_ready,
@@ -47,6 +48,7 @@ from diagnostics.agent.ledger import (
     add_evidence_to_active,
     add_hypotheses,
     backtrack,
+    can_append_hypothesis,
     can_commit_root_hypotheses,
     check_exit_conditions,
     delegation_value_for,
@@ -4621,6 +4623,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Convert Pydantic objects to plain dicts (args_schema parses JSON)
             specs = [h.model_dump() if hasattr(h, "model_dump") else dict(h) for h in hypotheses]
 
+            # Detect the append channel (T10′) BEFORE the call: the batch
+            # gate is closed (active pending) while the append guard is
+            # open.  add_hypotheses re-derives the same branch; this local
+            # copy only drives the receipt wording.
+            _is_append = (
+                bool(ledger.get("hypotheses"))
+                and not can_commit_root_hypotheses(ledger)
+                and can_append_hypothesis(ledger)
+            )
+
             try:
                 created = add_hypotheses(ledger, specs)
             except ValueError as e:
@@ -4634,16 +4646,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             for h in created:
                 sel = " ★" if h["selected"] else ""
                 lines.append(f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
-            _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
-            if _budget_left > 0:
+            if _is_append:
                 lines.append(
-                    f"（提交预算剩余 {_budget_left}/{MAX_COMMIT_CALLS} 次）"
+                    "（证据驱动追加：新假设已并入当前批，不占用换批预算；"
+                    f"假设总数 {len(ledger.get('hypotheses', {}))}"
+                    f"/{MAX_TOTAL_HYPOTHESES}）"
                 )
             else:
-                lines.append(
-                    f"（提交预算已用尽 {MAX_COMMIT_CALLS}/{MAX_COMMIT_CALLS} 次；"
-                    "后续如需细化假设，请用 record_finding(statement_update=...)）"
-                )
+                _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
+                if _budget_left > 0:
+                    lines.append(
+                        f"（提交预算剩余 {_budget_left}/{MAX_COMMIT_CALLS} 次）"
+                    )
+                else:
+                    lines.append(
+                        f"（提交预算已用尽 {MAX_COMMIT_CALLS}/{MAX_COMMIT_CALLS} 次；"
+                        "后续如需细化假设，请用 record_finding(statement_update=...)）"
+                    )
 
             # Next-step guidance (design document §9, v3.6.1): a bare
             # success confirmation leaves the model without a forward
@@ -4682,6 +4701,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "如需更具体的表述，用 record_finding(statement_update=...) 修正。"
                 "整个诊断最多提交2次（首批、换批共用此预算），总计不超过6个假设。"
                 "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述。"
+                "验证中途新证据指向当前假设集之外的全新方向时，可在 EVALUATE 阶段用本工具"
+                "追加1个新假设（单次仅1个；追加不占用换批预算，但总假设数不超过6个）——"
+                "区别于换批：换批是当前方向全部失败后的重开，追加是当前方向仍在验证中的补充。"
                 "提交后系统自动选择概率最高的假设进入验证。"
             ),
             coroutine=_run,
@@ -5039,9 +5061,45 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             else:
                 exit_hint = ""
             stmt_hint = f"\nℹ 假设表述已修正为: {statement_update}" if statement_update else ""
+            # ── Evidence-impact re-evaluation hint (design document §9,
+            # v3.10.0): a new finding may bear on the WHOLE differential,
+            # not just the focus hypothesis (iterative hypothesis testing
+            # — cue interpretation updates all candidates; LLMs do not
+            # reliably perform this revision spontaneously).  The receipt
+            # deterministically lists the remaining undecided hypotheses
+            # with current probabilities and names the two legal actions
+            # (cross-hypothesis ledgering / evidence-driven append).
+            # Selective injection: silence when no other undecided
+            # hypothesis exists, and never compete with an exit/retry
+            # directive (exit_hint already names the next action).
+            _impact_hint = ""
+            if not exit_hint:
+                _others = [
+                    n for _hid, n in ledger.get("hypotheses", {}).items()
+                    if _hid != hypothesis_id
+                    and n.get("status") in ("pending", "inconclusive")
+                ]
+                if _others:
+                    _items = "、".join(
+                        f"{fmt_hid(n['id'])}（p={n.get('probability')}%"
+                        f"{'，已搁置' if n.get('deferred') else ''}）"
+                        for n in _others
+                    )
+                    _impact_hint = (
+                        f"\nℹ 证据影响重估：本次证据若同时支持/排除其他未决假设"
+                        f"（{_items}），可直接 record_finding 落账"
+                        "（无需 select_path 切换）。"
+                    )
+                    if can_append_hypothesis(ledger):
+                        _impact_hint += (
+                            "若证据指向当前假设集之外的全新方向，"
+                            "可 commit_hypotheses 追加 1 个新假设"
+                            f"（总数 {len(ledger.get('hypotheses', {}))}"
+                            f"/{MAX_TOTAL_HYPOTHESES}，不占换批预算）。"
+                        )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
-                f"{evidence_summary}{stmt_hint}{exit_hint}"
+                f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}"
             )
 
         return StructuredTool.from_function(

@@ -73,6 +73,14 @@ MAX_LAYER_SIZE = 3
 REPLACES the current root layer instead of appending.  v2.7: the model
 is flat (no sub-hypotheses), so this is simply the per-batch cap."""
 
+# ── Total-hypothesis hard cap (outer convergence bound) ──
+# The documented invariant MAX_COMMIT_CALLS × MAX_LAYER_SIZE bounds the
+# TOTAL number of hypotheses per diagnosis.  v3.10.0: the evidence-driven
+# append channel (T10′) shares this cap — appends consume NO batch budget,
+# so this total cap (together with F-decay and the round caps) is what
+# keeps termination intact when hypotheses are added mid-diagnosis.
+MAX_TOTAL_HYPOTHESES = MAX_COMMIT_CALLS * MAX_LAYER_SIZE
+
 # Statuses that permanently close a hypothesis with a negative verdict.
 # (dead_end merged into refuted in the 5-state model.)
 _HARD_FAILED_STATUSES = frozenset({"refuted"})
@@ -399,6 +407,47 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
     return True
 
 
+def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
+    """Check if ONE evidence-driven hypothesis may be appended to the
+    current batch (design document §5 T10′, v3.10.0).
+
+    Distinct from the retry-batch path (T8): an append adds a single new
+    hypothesis while the current batch still has ACTIVE PENDING
+    hypotheses — new evidence pointing at a direction outside the current
+    differential must not wait for the whole batch to close (iterative
+    hypothesis testing: candidates are evidence/conflict driven, not
+    batch driven).  Guards:
+
+    - a batch already exists (the first batch uses the normal commit
+      path);
+    - no confirmed hypothesis anywhere (a confirmed root cause closes
+      hypothesis generation — refinement goes through
+      record_finding(statement_update=...));
+    - the batch commit budget is still open (an exhausted budget closes
+      ALL hypothesis creation, appends included);
+    - total hypotheses below MAX_TOTAL_HYPOTHESES — the outer
+      convergence bound (appends consume no batch budget, so the total
+      cap is what bounds hypothesis creation).
+
+    Callers must prefer the batch path whenever
+    can_commit_root_hypotheses holds (no active pending) — append is the
+    channel for the active-pending case only.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    if not hypotheses:
+        return False
+    if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
+        return False
+    if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+        return False
+    if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
+        return False
+    for node in hypotheses.values():
+        if node.get("status") == "confirmed":
+            return False
+    return True
+
+
 def _commit_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
     """Shared rejection text when the global commit budget is spent."""
     return (
@@ -421,9 +470,10 @@ def add_hypotheses(
     are rejected to prevent duplicate creation.  Use ``record_finding``
     to update an existing hypothesis's probability or verdict.
     """
-    if len(hypothesis_specs) > 3:
+    if len(hypothesis_specs) > MAX_LAYER_SIZE:
         raise ValueError(
-            f"最多3个假设，收到 {len(hypothesis_specs)} 个。请只提交可能性最大的3个。"
+            f"最多{MAX_LAYER_SIZE}个假设，收到 {len(hypothesis_specs)} 个。"
+            "请只提交可能性最大的3个。"
         )
 
     # ── Strip self-assigned ID prefixes ("H1: ...") from statements ──
@@ -463,43 +513,78 @@ def add_hypotheses(
                 f"而非 commit_hypotheses 重复提交。"
             )
 
-    # ── Commit budget (global) + retry-batch gate ──
+    # ── Commit budget (global) + retry-batch gate / append channel ──
     # Checked AFTER dedup so a rejected duplicate does not consume
     # budget.  can_commit_root_hypotheses folds in the global
     # MAX_COMMIT_CALLS check, so budget exhaustion surfaces first;
-    # the remaining False case is the retry-batch gate (confirmed or
-    # active-pending root still standing).
+    # a confirmed root anywhere closes hypothesis creation entirely;
+    # the remaining False case is an ACTIVE PENDING root — that is the
+    # evidence-driven append channel (T10′, v3.10.0): ONE new hypothesis
+    # joins the current batch WITHOUT consuming the batch budget (the
+    # MAX_TOTAL_HYPOTHESES cap is the outer convergence bound).
+    append_mode = False
     if not can_commit_root_hypotheses(ledger):
         if (ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS
                 or ledger.get("_root_commit_count", 0)
                 >= MAX_ROOT_COMMIT_BATCHES):
             raise ValueError(_commit_budget_exhausted_message(ledger))
-        raise ValueError(
-            "当前批仍有活跃 pending 或已 confirmed 的假设，不可换批。"
-            "请先用 record_finding 终结活跃假设，或用 select_path "
-            "切换验证焦点（deferred/inconclusive 假设不阻塞换批）。"
-            "若你的意图是确认某个已有假设为根因，请直接对该假设调用 "
-            "record_finding(verdict='confirmed')——重复提交不会确认它。"
-        )
-    ledger["_root_commit_count"] = ledger.get("_root_commit_count", 0) + 1
+        if any(n.get("status") == "confirmed" for n in hypotheses.values()):
+            raise ValueError(
+                "已有 confirmed 假设（根因已确认），不可提交新假设。"
+                "如需细化其表述，请用 record_finding(statement_update=...)；"
+                "若你的意图是确认某个已有假设为根因，请直接对该假设调用 "
+                "record_finding(verdict='confirmed')——重复提交不会确认它。"
+            )
+        # Active pending exists → append channel (T10′).
+        if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
+            raise ValueError(
+                f"假设总数已达上限 {MAX_TOTAL_HYPOTHESES} 个，不可追加。"
+                "请用 record_finding 终结或修正已有假设。"
+            )
+        if len(hypothesis_specs) > 1:
+            raise ValueError(
+                "证据驱动追加通道单次仅限 1 个新假设"
+                f"（收到 {len(hypothesis_specs)} 个）。"
+                "若意图是换批（当前方向全部失败后的重开），"
+                "deferred/inconclusive/经济死亡的假设不阻塞换批——"
+                "请先用 record_finding 处理活跃 pending 假设再提交。"
+            )
+        append_mode = True
 
-    # ── Hard invariant: root layer = CURRENT batch only ──
-    # A retry batch REPLACES the root layer instead of appending to
-    # it.  Prior-batch hypotheses stay in ``hypotheses`` (rendered
-    # under "已排除/降级假设") but no longer count as the current
-    # root layer — otherwise two batches accumulate to 6 roots and
-    # the "layer ≤ 3" invariant breaks (observed 2026-07-20 session:
-    # H1-H3 + H4-H6 coexisting as the root layer).
-    # First batch (no existing roots or all stale) keeps append
-    # semantics via a fresh list.
-    ledger["root_hypothesis_ids"] = []
+    # Total-cap enforcement for batch commits — MUST precede any ledger
+    # mutation so a rejected call consumes nothing (the cap can bind
+    # before the per-call limit once appends have joined).
+    if not append_mode:
+        _remaining = MAX_TOTAL_HYPOTHESES - len(hypotheses)
+        if len(hypothesis_specs) > _remaining:
+            raise ValueError(
+                f"假设总数上限 {MAX_TOTAL_HYPOTHESES} 个"
+                f"（已有 {len(hypotheses)} 个），"
+                f"本次最多可提交 {_remaining} 个。"
+            )
 
-    # ── Global commit budget consumption ──
-    # Every successful commit — first batch or retry batch — consumes
-    # exactly one unit.  With the per-call limit above, total
-    # hypotheses per diagnosis are bounded by
-    # MAX_COMMIT_CALLS × MAX_LAYER_SIZE = 6.
-    ledger["_commit_count"] = ledger.get("_commit_count", 0) + 1
+    if append_mode:
+        # T10′ append: consume NO batch budget; the appended hypothesis
+        # JOINS the current batch (root_hypothesis_ids extended below).
+        ledger["_append_count"] = ledger.get("_append_count", 0) + 1
+    else:
+        ledger["_root_commit_count"] = ledger.get("_root_commit_count", 0) + 1
+
+        # ── Hard invariant: root layer = CURRENT batch only ──
+        # A retry batch REPLACES the root layer instead of appending to
+        # it.  Prior-batch hypotheses stay in ``hypotheses`` (rendered
+        # under "已排除/降级假设") but no longer count as the current
+        # root layer — otherwise two batches accumulate to 6 roots and
+        # the "layer ≤ 3" invariant breaks (observed 2026-07-20 session:
+        # H1-H3 + H4-H6 coexisting as the root layer).
+        # First batch (no existing roots or all stale) keeps append
+        # semantics via a fresh list.
+        ledger["root_hypothesis_ids"] = []
+
+        # ── Global commit budget consumption ──
+        # Every successful BATCH commit — first batch or retry batch —
+        # consumes exactly one unit (appends do not, v3.10.0 T10′).
+        ledger["_commit_count"] = ledger.get("_commit_count", 0) + 1
 
     for spec in hypothesis_specs:
         hid = _next_hypothesis_id(hypotheses)
@@ -1512,6 +1597,20 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "提交预算未用尽 → commit_hypotheses 换方向提交新一批假设\n"
             if MAX_COMMIT_CALLS - ledger.get("_commit_count", 0) > 0 else ""
         )
+        # Evidence-driven append option (T10′, v3.10.0): shown only when
+        # the append channel is actually open AND the batch path is not
+        # (an open batch path already offers commit via _retry_option —
+        # rendering both would present two same-tool options with subtle
+        # semantic differences, an instruction-collision risk).  Positive
+        # form (design document §9): name the action and its condition.
+        _append_option = (
+            "  · 新证据指向当前假设集之外的全新方向 → commit_hypotheses "
+            "追加 1 个新假设（单次 1 个，并入当前批，不占用换批预算；"
+            f"当前假设总数 {len(ledger.get('hypotheses', {}))}"
+            f"/{MAX_TOTAL_HYPOTHESES}）\n"
+            if can_append_hypothesis(ledger)
+            and not can_commit_root_hypotheses(ledger) else ""
+        )
         # Live exit-condition verdict for the LLM.  In EVALUATE the state
         # machine has already ruled out exit (derive_phase), so this is
         # always "not satisfied" — surface the REASON so the LLM understands
@@ -1559,7 +1658,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "  · confirmed 假设需更具体 → record_finding(statement_update=...) "
             "修正其表述（假设为扁平结构，无层级深化）\n"
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
-            + _retry_option +
+            + _retry_option
+            + _append_option +
             "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
             "refuted 仅用于证据明确证伪的假设。多个假设可同为 confirmed。\n"
             "- ⚠ 独立故障源识别：当证据显示多个独立故障源同时存在"
