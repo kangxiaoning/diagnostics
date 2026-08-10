@@ -1344,7 +1344,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + delegation_rules
             + "- 委派 Argus 专家时使用上方「诊断会话参数」中的时间范围（禁止自行推断）\n"
             + "- 关注指标突变时间点和并发异常（同一分钟多条红线→可能独立根因）\n"
-            "- ⚠ 查看上方「已有工具调用结果」，禁止重复调用已执行过的工具\n"
+            "- 上方「已有工具调用结果」已含全部采集数据，直接复用即可\n"
             f"- ⚠ {exit_txt}"
         )
     if phase == "hypothesize":
@@ -1416,6 +1416,33 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # primacy rationale as the EVALUATE exit banner.
         _vd = render_verify_directive(ledger)
         _vd_block = (_vd + "\n") if _vd else ""
+        # Sub-state-focused signal rendering (design document §9 proactive
+        # guidance, 2026-08-10): the confirmed/ledgering details are only
+        # exposed once the current sub-state makes them the natural next
+        # action — never before (noise reduction: the LLM otherwise tends to
+        # run ahead and call record_finding(confirmed) before delegating).
+        #   state 1 (no delegation yet): focus delegation only; keep the
+        #     refuted/inconclusive escape channel (G17 asymmetric evidence
+        #     standard — screening-level counter-evidence may conclude).
+        #   state 2 (delegated, no expert evidence back): phase exit contract.
+        #   state 3 (expert evidence back): harvest-nudge already covers it.
+        _delegated = active.get("_delegate_count", 0) or 0
+        _has_expert_ev = any(
+            str(e.get("source", "")).startswith("expert:")
+            for e in active.get("evidence", [])
+        )
+        if _delegated == 0:
+            _record_hint = (
+                "- ⚠ 若现有监控证据已明确证伪该假设，可直接 record_finding 判"
+                " refuted/inconclusive（confirmed 须以专家验证结论为依据，"
+                "未委派直接 confirmed 会被系统拦截）\n"
+            )
+        elif _has_expert_ev:
+            _record_hint = ""
+        else:
+            _record_hint = (
+                f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
+            )
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
@@ -1423,14 +1450,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + expert_map
             + "- 委派时明确\"验证假设"
             f"{disp_id}\"并传入假设上下文\n"
-            f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
-            "- ⚠ 若假设仅部分不成立（某环节被证伪但核心机制已确认），用"
-            " confirmed + statement_update 修正表述，禁止整体 refuted\n"
-            "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
+            + _record_hint
+            + "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
             "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
-            "委派时明确要求专家「复用已有证据，仅补查缺失项」，禁止重跑相同检查"
-            "（重复调用会被去重拦截并浪费轮次）\n"
-            "- 禁止调用与当前假设无关的工具"
+            "委派时明确要求专家「复用已有证据，仅补查缺失项」\n"
         )
     if phase == "evaluate":
         # Direction is computed by the state machine and presented as
@@ -1492,8 +1515,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # Live exit-condition verdict for the LLM.  In EVALUATE the state
         # machine has already ruled out exit (derive_phase), so this is
         # always "not satisfied" — surface the REASON so the LLM understands
-        # why it is NOT in REPORT yet and must NOT call write_file.  Without
-        # this, the ledger context's "## 根因" label (populated the moment a
+        # why it is NOT in REPORT yet (positive framing; the write_file
+        # exit gate owns the rejection).  Without this, the ledger
+        # context's "## 根因" label (populated the moment a
         # hypothesis is confirmed) misleads the LLM into thinking the
         # diagnosis is done and it should write the report.
         _should_exit, _exit_reason, _ = check_exit_conditions(ledger)
@@ -1503,7 +1527,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         parallel_hint = f"\n- {_psug}" if _psug else ""
         # NB: the "what to do next" advice (select_path 验证/证伪、无法定论
         # 可 defer) lives in PHASE_SPEC evaluate duty — single source; the
-        # banner only carries the live verdict + the prohibition.
+        # banner only carries the live verdict + the positive next-step
+        # pointer (negative injunctions belong to the gates).
         # Proactive exit-condition directive (SSOT: render_exit_directive),
         # placed FIRST so the LLM sees the blocker + phase-appropriate actions
         # before anything else (primacy — avoids the buried-banner dilution
@@ -1513,10 +1538,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             exit_banner = "\n## 退出条件诊断（系统计算，无需你判断）\n" + _directive + "\n"
         else:
             exit_banner = (
-                f"\n- ⛔ 禁止调用 write_file：出口判据当前未满足——{_exit_reason}。"
-                "待判据满足后系统会自动进入 REPORT 并提示你写入报告。\n"
-                "  即使台账已列出「根因」，只要上方判据未满足就仍属 EVALUATE，"
-                "主动 write_file 会被门控拦截。"
+                f"\n- 出口判据当前未满足——{_exit_reason}，仍属 EVALUATE"
+                "（即使台账已列出「根因」）。\n"
+                "  判据满足后系统自动进入 REPORT 并提示写入报告；"
+                "当前请按下方路径菜单处理未决假设。"
             )
         return (
             "你当前处于 EVALUATE 阶段。\n"
@@ -1524,8 +1549,13 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- {duty}\n"
             "- 下一步路径菜单：\n"
             "  · 现有证据已可判定某未决假设 → 直接 record_finding 记录结论"
-            "（跨假设证据复用，无需重复委派——比 select_path 更省轮次）\n"
+            "（跨假设证据复用，无需重复委派——比 select_path 更省轮次；"
+            "仅限该假设已有专家验证结论的情形，confirmed 须以 expert 证据为依据，"
+            "未委派假设直接 confirmed 会被系统拦截）\n"
             "  · 证据不足、需继续验证 → select_path 切换到最可能的假设\n"
+            "- ℹ 若你在本阶段直接委派 task（描述指向某个未决假设，如"
+            "\"验证假设Hx\"），系统会自动聚焦该假设进入 VERIFY——等价于 "
+            "select_path 切换 + 委派一步完成，无需先 select_path\n"
             "  · confirmed 假设需更具体 → record_finding(statement_update=...) "
             "修正其表述（假设为扁平结构，无层级深化）\n"
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
@@ -1580,8 +1610,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                     "⚠ 当前报告是系统自动生成的简版占位（信息有限）。\n"
                     f"⛔ 优先动作：调用 write_file，基于 <diagnosis_ledger> 中的"
                     f"证据链撰写完整诊断报告并{_overwrite_hint}。\n"
-                    "⛔ 报告内容只能通过 write_file 写入文件——"
-                    "禁止在对话里输出完整报告正文。\n"
+                    "⛔ 报告正文一律经 write_file 写入文件。\n"
                     "- 若确认简版已足够，可跳过 write_file\n"
                     f"- 最后{summary_req}\n"
                     "- 总结面向运维工程师——禁止提及台账、报告文件路径等内部实现细节"
@@ -1616,7 +1645,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         return (
             "你当前处于 REPORT 阶段。\n"
             f"⛔ {path_hint}。\n"
-            "⛔ 禁止输出文本分析、总结或复盘 — 报告内容写入 write_file，不写在对话里。\n"
+            "⛔ 报告正文全部经 write_file 写入文件；写盘后再向用户输出总结。\n"
             f"- {duty}"
             + multi_hint + unverified_hint +
             "\n- 报告模板参考系统提示中的 REPORT 阶段说明\n"

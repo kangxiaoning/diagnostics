@@ -25,8 +25,7 @@ PHASE_SPEC: dict[str, dict] = {
             "先委派、后读技能：Argus 委派已发出后，才可按需 read_file 加载 "
             "SKILL.md / AGENTS.md 深化理解（首轮先读技能会延误数据采集）",
         ],
-        "exit": "必需 Argus 专家数据齐备后，系统自动进入 HYPOTHESIZE。"
-                "本阶段不提交假设。",
+        "exit": "必需 Argus 专家数据齐备后，系统自动进入 HYPOTHESIZE。",
     },
     "hypothesize": {
         "title": "阶段 2: HYPOTHESIZE（形成假设）",
@@ -36,7 +35,9 @@ PHASE_SPEC: dict[str, dict] = {
                 "换方向）。假设为扁平结构（ID 为整数编号如 H1、H2），不支持子假设。"
                 "若多个候选描述的是同一故障的机制/因果链上下游（如\"内存超限 OOMKilled\""
                 "与\"memory limit 配置过低\"互为表里），应合并为一条假设；"
-                "仅当证据显示独立故障源并存时才提交多条。",
+                "仅当证据显示独立故障源并存时才提交多条。"
+                "假设是基于监控筛查证据的竞争性候选，probability 即表达不确定性——"
+                "凡需深查的方向，直接写成假设提交即完成本阶段职责。",
         "actions": [
             "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
@@ -50,8 +51,7 @@ PHASE_SPEC: dict[str, dict] = {
     },
     "verify": {
         "title": "阶段 3: VERIFY（验证假设）",
-        "duty": "聚焦验证当前活动假设，每步只验证一个。你是调度者——通过委派获取验证结论，"
-                "不自行执行深度诊断。",
+        "duty": "聚焦验证当前活动假设，每步只验证一个。你是调度者——通过委派获取验证结论。",
         "actions": [
             "委派哪个专家验证当前假设，由系统按当前场景确定——每轮「本步要求」给出当前场景的专家委派映射（与场景可用专家一致）",
             "每轮聚焦验证一个假设。优先单专家委派、record_finding 后再推进；"
@@ -71,12 +71,14 @@ PHASE_SPEC: dict[str, dict] = {
         "title": "阶段 4: EVALUATE（评估结果）",
         "duty": "评估本层所有假设的验证结果，选择下一步路径。退出条件由系统判定——"
                 "满足时系统自动进入 REPORT，无需你判断；"
-                "未满足时禁止主动调用 write_file，必须先处理未决假设"
+                "未满足时先处理未决假设"
                 "（现有证据足够 → 直接 record_finding 判定；不足 → select_path 验证/证伪）；"
                 "已委派仍无法定论的假设可 defer 搁置，不必反复重试。",
         "actions": [
             "现有证据已足以判定某未决假设（跨假设证据复用）→ 直接 record_finding "
-            "记录结论，无需重复委派——比 select_path 更省轮次",
+            "记录结论，无需重复委派——比 select_path 更省轮次；"
+            "仅限该假设已有专家验证结论的情形（confirmed 须以 expert 证据为依据，"
+            "未委派假设直接 confirmed 会被系统拦截）",
             "有待验证假设但证据不足以判定 → select_path 切换到最可能的继续验证"
             "（可用 deprioritized 参数同时搁置反复无法定论的假设）",
             "confirmed 假设需更具体 → record_finding(statement_update=...) 修正表述"
