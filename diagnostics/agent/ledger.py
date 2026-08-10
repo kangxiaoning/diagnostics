@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Literal, NotRequired
+from typing import Annotated, Literal, NamedTuple, NotRequired
 
 from deepagents.graph import DeepAgentState
 from langchain.agents.middleware.types import PrivateStateAttr
@@ -775,6 +775,13 @@ def record_finding(
             node["status"] = "refuted"
             node["terminal_reason"] = "evidence_saturated"
             node["verdict_reason"] = evidence_summary
+
+    # State-driven guidance fact fields (design document §10, v3.10.1):
+    # _last_finding_round records when the last verdict was formalized;
+    # _g17_blocked_round is cleared (the G17 recovery path is resolved).
+    # These feed compute_next_action's "awaiting verdict" detection.
+    node["_last_finding_round"] = ledger.get("current_round", 0)
+    node["_g17_blocked_round"] = None
 
     if new_insights:
         node["rationale"] = (node.get("rationale", "") + " | 新发现: " + new_insights).strip(" |")
@@ -2393,6 +2400,105 @@ def render_parallel_suggestion(ledger: DiagnosisLedger) -> str:
     return ""
 
 
+# ── State-driven next-action computation (v3.10.1) ──
+# Pure function (P1): derives the single most valuable next action for a
+# hypothesis from ledger state.  Consumed by the proactive guidance layer
+# (render_verify_directive, P7) BEFORE the LLM decides, and by the reactive
+# backup layer (G17 receipt / write_file gate / deterministic exit) as the
+#依从率 residual safety net.  Literature: StateAct (ACL REALM 2025) — state
+# tracking enhances agent decisions 10-30%; GDE (de Kleer 1987) — next
+# measurement computed from state; Harm Recovery (arXiv:2604.18847) —
+# targeted recovery > comprehensive; EDF (arXiv:2602.01415) — adaptive
+# scaffolding with escalation; Belief-R (arXiv:2406.19764) — LLMs need
+# external scaffolding for belief revision.
+
+
+class ActionHint(NamedTuple):
+    """Computed next action for a hypothesis (pure derivation, not persisted)."""
+    action: str          # "record_finding" | "task" | None
+    urgency: str         # "critical" | "high" | "normal"
+    reason: str          # human-readable justification (Chinese)
+
+
+def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
+    """Derive the single most valuable next action for hypothesis ``hid``
+    from ledger state (pure function, design document §6/P1, v3.10.1).
+
+    Three fact fields (set by the middleware, §10) feed the computation:
+    ``_g17_blocked_round``, ``_last_evidence_round``, ``_last_finding_round``.
+    The function does NOT persist anything — it is the same family as
+    ``derive_phase`` / ``_economically_dead`` (派生态归一化, §11).
+
+    Returns ``None`` when no action is owed (terminal / economically dead).
+    """
+    node = ledger.get("hypotheses", {}).get(hid)
+    if not node or node.get("status") in ("confirmed", "refuted"):
+        return None
+
+    has_expert = any(
+        str(e.get("source", "")).startswith("expert:")
+        for e in node.get("evidence", [])
+    )
+    ev_round = node.get("_last_evidence_round", 0)
+    find_round = node.get("_last_finding_round", 0)
+    g17_round = node.get("_g17_blocked_round")
+    cur_round = ledger.get("current_round", 0)
+
+    # Priority 1: expert evidence exists but hasn't been formalized via
+    # record_finding (ev_round > find_round).  This is the "awaiting
+    # verdict" state — the LLM owes a record_finding call.
+    if has_expert and ev_round > find_round:
+        stall = cur_round - ev_round
+        if g17_round and g17_round < ev_round:
+            # G17 previously blocked confirmed, then the expert was
+            # delegated and returned (ev_round > g17_round).  The
+            # confirmed channel is now OPEN — proactively reassure to
+            # counteract Belief-R overcorrection (LLMs lose confidence
+            # after rejection and avoid the rejected action).
+            return ActionHint(
+                "record_finding", "critical",
+                f"G17 此前拦截了 {fmt_hid(hid)} 的 confirmed 判定，"
+                f"专家证据现已到位——confirmed 通道已开放，不会再被拦截",
+            )
+        if stall >= 2:
+            return ActionHint(
+                "record_finding", "high",
+                f"专家证据已等待 {stall} 轮未落账",
+            )
+        return ActionHint(
+            "record_finding", "normal",
+            f"专家已验证 {fmt_hid(hid)}，请落账判定",
+        )
+
+    # Priority 2: no expert evidence, delegation may be valuable.
+    if not has_expert and not _economically_dead(ledger, hid):
+        if node.get("_delegate_count", 0) == 0:
+            return ActionHint(
+                "task", "normal",
+                f"尚未委派专家验证 {fmt_hid(hid)}",
+            )
+        return ActionHint(
+            "record_finding", "normal",
+            f"已有 coordinator 证据，可落账判定 {fmt_hid(hid)}",
+        )
+
+    return None
+
+
+def _action_prefix(hid: str, ledger: DiagnosisLedger) -> str:
+    """Convert compute_next_action output into the VERIFY directive prefix
+    (v3.10.1).  Falls back to the original neutral wording when the
+    function returns None (e.g. no fact fields populated yet)."""
+    hint = compute_next_action(ledger, hid)
+    if not hint or hint.action != "record_finding":
+        return "可判定时直接 record_finding 落账"
+    if hint.urgency == "critical":
+        return f"{hint.reason}，请立即 record_finding 落账"
+    if hint.urgency == "high":
+        return f"{hint.reason}，请 record_finding 落账（否则系统将判定无进一步验证价值）"
+    return "请 record_finding 落账判定"
+
+
 def render_verify_directive(ledger: DiagnosisLedger) -> str:
     """Render a phase-aware VERIFY action directive (proactive guidance).
 
@@ -2475,13 +2581,13 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                 if seeding:
                     directive = (
                         f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
-                        f"（结论见上方证据），可判定时直接 record_finding 落账；"
+                        f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"{seeding}{anti_fab}。"
                     )
                 else:
                     directive = (
                         f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
-                        f"（结论见上方证据），可判定时直接 record_finding 落账；"
+                        f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"证据不足可再委派（价值仍≥κ）{anti_fab}。"
                     )
         # Priority 3 (no delegation yet) stays silent — the static duty

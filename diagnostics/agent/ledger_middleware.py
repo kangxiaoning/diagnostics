@@ -51,6 +51,7 @@ from diagnostics.agent.ledger import (
     can_append_hypothesis,
     can_commit_root_hypotheses,
     check_exit_conditions,
+    compute_next_action,
     delegation_value_for,
     derive_phase,
     finalize_pending_for_report,
@@ -1427,6 +1428,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # block triggers the deterministic honest-negative exit (design
         # document §6.3).
         self._exit_block_count: int = 0
+        self._det_exit_grace_used: bool = False  # v3.10.1: one-shot R3 grace
         self._round_emitted: bool = False  # prevent duplicate round_transition on goto re-entry
         self._last_commit_round: int = -1  # round when commit_hypotheses last ran
         self._last_select_round: int = 0   # round when select_path/backtrack last ran
@@ -3259,6 +3261,45 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # verdict exists for the report to cite).
                         self._exit_block_count += 1
                         if self._exit_block_count >= 3:
+                            # R3 (v3.10.1): Before auto-shelving, check if
+                            # any hypothesis has unrecorded expert evidence
+                            # (compute_next_action critical/high).  If so,
+                            # give ONE final chance instead of shelving —
+                            # the LLM owes a record_finding, not a dead end.
+                            if not self._det_exit_grace_used:
+                                _grace_hint = None
+                                for _h, _n in ledger.get(
+                                        "hypotheses", {}).items():
+                                    if _n.get("status") in (
+                                            "pending", "inconclusive"):
+                                        _ch = compute_next_action(ledger, _h)
+                                        if _ch and _ch.urgency in (
+                                                "critical", "high"):
+                                            _grace_hint = (_h, _ch)
+                                            break
+                                if _grace_hint:
+                                    self._det_exit_grace_used = True
+                                    _gh, _gc = _grace_hint
+                                    logger.warning(
+                                        "write_file deterministic exit "
+                                        "deferred (round %d): unrecorded "
+                                        "expert evidence on %s — injecting "
+                                        "final directive (urgency=%s)",
+                                        self._model_call_count,
+                                        fmt_hid(_gh), _gc.urgency,
+                                    )
+                                    return ToolMessage(
+                                        content=(
+                                            f"⚠ {fmt_hid(_gh)} "
+                                            f"{_gc.reason}。"
+                                            f"请立即 record_finding("
+                                            f"{fmt_hid(_gh)}, ...) 落账——"
+                                            "这是系统在自动搁置前的最后"
+                                            "一次提醒。若仍不落账，系统将"
+                                            "强制搁置该假设并生成报告。"
+                                        ),
+                                        tool_call_id=tool_call_id,
+                                    )
                             from diagnostics.agent.ledger import (
                                 render_unverified_disclosure as _rud3,
                             )
@@ -3297,6 +3338,28 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 render_exit_directive as _red2,
                             )
                             _directive = _red2(ledger, _phase(ledger))
+                            # R2 (v3.10.1): If a hypothesis has unrecorded
+                            # expert evidence, name it in the block message
+                            # — the LLM owes a record_finding, not a retry.
+                            _r2_hint = None
+                            for _h, _n in ledger.get(
+                                    "hypotheses", {}).items():
+                                if _n.get("status") in (
+                                        "pending", "inconclusive"):
+                                    _ch = compute_next_action(ledger, _h)
+                                    if _ch and _ch.action == "record_finding":
+                                        _r2_hint = (_h, _ch)
+                                        break
+                            _r2_suffix = ""
+                            if _r2_hint:
+                                _rh, _rc = _r2_hint
+                                _r2_suffix = (
+                                    f"\n⚠ {fmt_hid(_rh)} 已有专家验证证据"
+                                    f"但尚未 record_finding 落账——"
+                                    f"请先 record_finding("
+                                    f"{fmt_hid(_rh)}, ...) 落账，"
+                                    "系统确认后自动进入 REPORT。"
+                                )
                             logger.warning(
                                 "write_file blocked by exit-condition gate "
                                 "(L%d): %s (phase=%s, round=%d, path=%s)",
@@ -3315,13 +3378,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         "（REPORT 仅在根因确认、假设穷尽或"
                                         "证据饱和时开放）"
                                     )
-                                ),
+                                ) + _r2_suffix,
                                 tool_call_id=tool_call_id,
                             )
                 # write_file passed the gate (natural exit, forced terminal,
                 # E2' release-with-disclosure, or the v3.8.0 deterministic
                 # honest-negative exit) — reset the generic block counter.
                 self._exit_block_count = 0
+                self._det_exit_grace_used = False
                 # ── Canonicalize the report path (v2.5) ──
                 # The report path is system-generated and handed to the
                 # LLM, which merely carries it back — LLM path
@@ -3759,6 +3823,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             node["evidence"].append(new_evidence(
                                 source, summary, supports=None, tool_call_id=tool_call_id,
                             ))
+                            # Track evidence round for state-driven guidance
+                            # (design document §10, v3.10.1): compute_next_action
+                            # uses _last_evidence_round vs _last_finding_round
+                            # to detect "awaiting verdict" (expert returned but
+                            # record_finding not yet called).
+                            node["_last_evidence_round"] = self._model_call_count
                             if tool_name not in node["verification_tools"]:
                                 node["verification_tools"].append(tool_name)
                         else:
@@ -4896,13 +4966,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             fmt_hid(hypothesis_id),
                             self._model_call_count,
                         )
+                        # Track G17 block for state-driven recovery guidance
+                        # (design document §10, v3.10.1): compute_next_action
+                        # uses this to detect the "G17 recovery path" and
+                        # proactively reassure "confirmed 通道已开放" after
+                        # the expert returns (counteracts Belief-R
+                        # overcorrection).
+                        _g17_node["_g17_blocked_round"] = self._model_call_count
                         return (
                             f"⛔ confirmed 判定需专家验证证据（证据标准门控）："
                             f"{fmt_hid(hypothesis_id)} 尚无专家验证结论。"
                             f"请委派 task 验证该假设（可用专家："
                             f"{', '.join(_experts)}；监控时序定向复核可委派对应 "
                             "argus 专家，description 带假设聚焦的具体问题），"
-                            "收到专家结论后再 record_finding confirmed。"
+                            "收到专家结论后再 record_finding confirmed——"
+                            "专家证据到位后 confirmed 通道自动开放，不会再被拦截。"
                             "若现有监控证据已明确证伪，可直接判 refuted；"
                             "证据不足请判 inconclusive。"
                         )
