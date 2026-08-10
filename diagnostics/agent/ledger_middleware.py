@@ -52,6 +52,7 @@ from diagnostics.agent.ledger import (
     can_commit_root_hypotheses,
     check_exit_conditions,
     compute_next_action,
+    compute_report_guidance,
     delegation_value_for,
     derive_phase,
     finalize_pending_for_report,

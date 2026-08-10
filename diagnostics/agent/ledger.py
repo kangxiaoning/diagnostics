@@ -1649,10 +1649,28 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "  判据满足后系统自动进入 REPORT 并提示写入报告；"
                 "当前请按下方路径菜单处理未决假设。"
             )
+        # State-driven action recommendation (v3.10.2, P7): compute the
+        # single most valuable next action from ledger state and inject
+        # it BEFORE the menu (primacy — Anthropic Context Engineering:
+        # "smallest set of high-signal tokens").  The menu still lists
+        # all options below as fallback.
+        _eval_hint = compute_evaluate_action(ledger)
+        _eval_rec = ""
+        if _eval_hint:
+            _eval_rec = f"- ⭐ 系统推荐：{_eval_hint.reason}\n"
+        # Pre-write report constraint (v3.10.2, P7 proactive): inject the
+        # consistency constraint BEFORE the LLM calls write_file, not after.
+        # Anthropic Context Engineering: "pre-generation constraint injection,
+        # not post-generation validation."  Only when no confirmed root cause
+        # exists (honest-negative exit path).
+        _report_cons = compute_report_guidance(ledger)
+        _report_banner = f"\n- {_report_cons}\n" if _report_cons else ""
         return (
             "你当前处于 EVALUATE 阶段。\n"
             + exit_banner +
+            _report_banner +
             f"- {duty}\n"
+            + _eval_rec +
             "- 下一步路径菜单：\n"
             "  · 现有证据已可判定某未决假设 → 直接 record_finding 记录结论"
             "（跨假设证据复用，无需重复委派——比 select_path 更省轮次；"
@@ -2497,6 +2515,101 @@ def _action_prefix(hid: str, ledger: DiagnosisLedger) -> str:
     if hint.urgency == "high":
         return f"{hint.reason}，请 record_finding 落账（否则系统将判定无进一步验证价值）"
     return "请 record_finding 落账判定"
+
+
+def compute_evaluate_action(ledger: DiagnosisLedger) -> ActionHint | None:
+    """Derive the single most valuable next action in EVALUATE phase
+    (pure function, design document §9/P7, v3.10.2).
+
+    Literature: Anthropic Context Engineering (2025) — "smallest set of
+    high-signal tokens" at each decision point; GDE (de Kleer 1987) —
+    next measurement by expected information gain; StateAct (ACL REALM
+    2025) — state tracking enhances decisions.
+
+    Priority order:
+    1. Any pending hypothesis with unrecorded expert evidence →
+       record_finding (reuse compute_next_action, cross-phase).
+    2. Pending hypotheses ranked by delegation_value → recommend
+       highest for select_path.
+    3. Deferred hypotheses with revived value → backtrack.
+    4. can_append_hypothesis → commit_hypotheses (append).
+
+    Returns None when no action is owed (exit conditions should handle
+    the rest via render_exit_directive).
+    """
+    # Priority 1: unrecorded expert evidence on any pending hypothesis
+    for hid, node in ledger.get("hypotheses", {}).items():
+        if node.get("status") in ("pending", "inconclusive"):
+            hint = compute_next_action(ledger, hid)
+            if hint and hint.action == "record_finding":
+                return hint  # "先落账已有专家证据的假设"
+
+    # Priority 2: rank pending (non-deferred, non-dead) by value
+    _pending = []
+    for hid, node in ledger.get("hypotheses", {}).items():
+        if (node.get("status") in ("pending", "inconclusive")
+                and not node.get("deferred")
+                and not _economically_dead(ledger, hid)):
+            val = delegation_value_for(ledger, hid)
+            _pending.append((hid, val))
+    if _pending:
+        _pending.sort(key=lambda x: x[1], reverse=True)
+        best_hid, best_val = _pending[0]
+        return ActionHint(
+            "select_path", "normal",
+            f"{fmt_hid(best_hid)} 委派价值最高（{best_val:.2f}），推荐优先验证",
+        )
+
+    # Priority 3: deferred hypotheses worth reviving
+    _deferred = []
+    for hid, node in ledger.get("hypotheses", {}).items():
+        if node.get("deferred") and not _economically_dead(ledger, hid):
+            val = delegation_value_for(ledger, hid)
+            _deferred.append((hid, val))
+    if _deferred:
+        _deferred.sort(key=lambda x: x[1], reverse=True)
+        best_hid, best_val = _deferred[0]
+        return ActionHint(
+            "backtrack", "normal",
+            f"搁置假设 {fmt_hid(best_hid)} 价值已恢复（{best_val:.2f}），可 backtrack 恢复",
+        )
+
+    # Priority 4: retry batch (all roots refuted/dead + budget open)
+    if can_commit_root_hypotheses(ledger):
+        return ActionHint(
+            "commit_hypotheses", "normal",
+            "当前批已全部终结，请换批提交新一批假设",
+        )
+
+    # Priority 5: append channel (batch path closed, append open)
+    if can_append_hypothesis(ledger) and not can_commit_root_hypotheses(ledger):
+        return ActionHint(
+            "commit_hypotheses", "normal",
+            "新证据指向全新方向 → 可追加 1 个新假设",
+        )
+
+    return None
+
+
+def compute_report_guidance(ledger: DiagnosisLedger) -> str | None:
+    """Pre-write guidance based on exit path (pure function, design
+    document §9/P7, v3.10.2).
+
+    Literature: Anthropic Context Engineering (2025) — "almost entirely
+    focused on pre-generation constraint injection, not post-generation
+    validation."  Injects a consistency constraint BEFORE the LLM writes
+    the report so the report text does not contradict the ledger state.
+
+    Returns None when no constraint is needed (confirmed root cause exit).
+    """
+    has_confirmed = bool(ledger.get("root_cause_hypothesis_ids"))
+    if not has_confirmed:
+        return (
+            "⚠ 本次退出为无确认根因——报告正文不得声称"
+            "'根因已确认'，应表述为"
+            "'最可能根因（未完成验证）'并披露未验证假设及其概率。"
+        )
+    return None
 
 
 def render_verify_directive(ledger: DiagnosisLedger) -> str:
