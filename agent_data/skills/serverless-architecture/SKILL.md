@@ -1,6 +1,6 @@
 ---
 name: serverless-architecture
-description: Serverless 集群（k8s-on-k8s）静态架构与拓扑知识：KMC 控制面 / SCI 数据面分离、命名规则（控制面 ns `<k8s_name>-<master_id>`、工作负载 ns `burst-ns-<master_id>`、SCI Pod `burst-<ns>-<pod>`）、RelationGraph 三层视图；诊断 Serverless 故障前先读本技能建立目标定位。
+description: Serverless 集群（k8s-on-k8s）静态架构与拓扑知识：KMC 控制面 / SCI 数据面分离、命名规则（控制面 ns `<k8s_name>-<master_id>`、工作负载 ns `burst-ns-<master_id>`、SCI Pod `burst-<ns>-<pod>`）、RelationGraph 视图（serverless/kmc/sci 三层 + 第 4 视图 etcd_views 共享 etcd；注入层派生 host_views/host_nodes）；诊断 Serverless 故障前先读本技能建立目标定位。
 ---
 
 # Serverless 集群架构与拓扑（诊断知识）
