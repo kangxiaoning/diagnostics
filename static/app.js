@@ -38,15 +38,19 @@ function applySceneFields() {
     show(clusterTypeRow); // 集群类型：专有集群 / Serverless
   } else if (scene === "single_host") {
     hide(paramFieldsContainer);
+    hide(clusterTypeRow); // 单主机诊断仅需主机名与时间范围，不选择集群类型
     show(paramFieldsHost);
     show(paramFieldsCommon);
   } else {
     hide(paramFieldsContainer);
     hide(paramFieldsHost);
     hide(paramFieldsCommon);
+    hide(clusterTypeRow);
   }
 }
 sceneSelectEl.addEventListener("change", applySceneFields);
+// 页面加载即同步场景字段（防御性加固：不依赖 HTML 初始 hidden）
+document.addEventListener("DOMContentLoaded", applySceneFields);
 
 function buildParamOverrides() {
   const scene = sceneSelectEl.value;
