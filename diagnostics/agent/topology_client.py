@@ -84,6 +84,13 @@ def query_environment_topology(
           "is_sci_control_plane": false,
           "sci_control_plane_role": null
         }
+      ],
+      "etcd_views": [
+        {
+          "etcd_member": {"name": "<etcd-name>", "node_name": "<node-ip>", "host_name": "<hostname>"},
+          "cluster": "shared_etcd",
+          "roles": ["shared_etcd"]
+        }
       ]
     }
 
@@ -97,6 +104,12 @@ def query_environment_topology(
           etcd cluster.
         * sci_views — physical SCI view: burst workload Pods, SCI static Pods,
           vpc-cni DaemonSet Pods and coreDNS.
+        * etcd_views — shared-etcd view: systemd host services (no namespace),
+          `etcd_member` is an EtcdMemberRef {name, node_name, host_name} — the
+          etcd tools take host_name as the parameter.
+    - Derived views (NOT part of the RelationGraph model, injected layer only,
+      design document §7.3): host_views / host_nodes are aggregated by
+      topology_render from the three views + etcd_views.
     - Naming rules:
         * control-plane namespace = "<k8s_name>-<master_id>".
         * SCI workload namespace = "burst-ns-<master_id>".

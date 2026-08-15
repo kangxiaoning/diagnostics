@@ -61,6 +61,10 @@ MOCK_POD_NODE_MAP: dict[str, list[tuple[str, str, str]]] = {
         ("coredns-8f7b6c9d4-abc02", "worker-4", "10.0.2.22"),
         ("coredns-8f7b6c9d4-abc03", "worker-6", "10.0.2.23"),
     ],
+    # image_pull_backoff 场景：mock pod_logs 明确 "scheduled on worker-2"
+    "prod-us-east:default:new-deploy": [
+        ("new-deploy-abc12", "worker-2", "10.0.2.21"),
+    ],
 
     # ── Production scenario ──
     "pks-ehpc-1013-734964:sfe-default:eip-assistant": [

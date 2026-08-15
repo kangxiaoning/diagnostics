@@ -87,9 +87,21 @@ class SCIResourceViewItem(BaseModel):
     sci_control_plane_role: Optional[str] = None
 
 
+class EtcdMemberRef(BaseModel):
+    """共享 etcd member 引用（systemd 主机服务，无 K8s namespace/pod 概念）。
+
+    标识 = ETCD_NAME + 节点 IP + 物理机名；etcd 工具以 host_name 为参数，
+    配置（ETCD_DATA_DIR/ETCD_LISTEN_*）与日志（journalctl）由工具内部解析
+    （design document §6A.2：拓扑只给身份，深度解析下沉工具层）。
+    """
+    name: str           # ETCD_NAME（Raft member 标识）
+    node_name: str      # 节点 IP（peer/client 监听地址所在）
+    host_name: str      # 物理机名（systemd 单元所在主机；etcd tools 主参数）
+
+
 class EtcdMemberViewItem(BaseModel):
     """第4层：共享 etcd 视图（systemd 二进制主机服务，无 namespace/pod 概念）"""
-    etcd_member: PhysicalResourceRef  # kind=EtcdMember, name=ETCD_NAME, node_name=节点 IP, host_name=物理机
+    etcd_member: EtcdMemberRef  # name=ETCD_NAME, node_name=节点 IP, host_name=物理机
     cluster: str = "shared_etcd"     # 跨集群共享设施标记
     roles: List[str] = Field(default_factory=list)  # e.g. ["shared_etcd"]
 

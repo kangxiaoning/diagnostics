@@ -7,6 +7,8 @@ The RelationGraph dict is the authoritative topology fact.  This module only
 - Coordinator block: three-view identity-level compact inventory (+ etcd_views
   identity + host_nodes) — Pod-level placement (physical_pods / node_name /
   host_name) stripped; the Coordinator routes delegations by resource ownership.
+  etcd_views identity keeps only {name} (EtcdMemberRef — no kind/namespace,
+  systemd host service, design document §7.2).
 - Argus block (compact+落点): keeps name/node_name landing points and the
   association chain so the argus expert can resolve tool parameters
   (namespace/workload/pod/node) directly from the slice; strips host_name
@@ -133,7 +135,7 @@ def build_coordinator_inventory(topology: dict) -> dict:
     etcd: list[dict[str, Any]] = []
     for v in topology.get("etcd_views", []) or []:
         item: dict[str, Any] = {
-            "etcd_member": _resource_ref(v.get("etcd_member")),
+            "etcd_member": _etcd_member_identity(v.get("etcd_member")),
             "cluster": v.get("cluster") or "shared_etcd",
         }
         if v.get("roles"):
@@ -220,11 +222,23 @@ def build_argus_compact_view(topology: dict, view_key: str) -> dict:
     return payload
 
 
+def _etcd_member_identity(em: dict | None) -> dict:
+    """etcd_member → {name}（Coordinator 身份级，去 node/host——§5A.1）。
+
+    EtcdMemberRef 为 systemd 主机服务引用（无 kind/namespace）；身份级仅保留
+    ETCD_NAME，落点（node_name/host_name）见 argus 紧凑版（§5A.5）。
+    """
+    if not em:
+        return {}
+    return {k: em[k] for k in ("name",) if em.get(k) is not None}
+
+
 def _etcd_member_compact(v: dict) -> dict:
-    """etcd_views 条目 → {etcd_member: {kind, name, node_name, host_name}, cluster}（去 roles）。"""
+    """etcd_views 条目 → {etcd_member: {name, node_name, host_name}, cluster}（去 roles）。"""
     em = v.get("etcd_member") or {}
+    member = {k: em[k] for k in ("name", "node_name", "host_name") if em.get(k) is not None}
     return {
-        "etcd_member": _resource_ref(em, extra=("node_name", "host_name")),
+        "etcd_member": member,
         "cluster": v.get("cluster") or "shared_etcd",
     }
 
@@ -332,6 +346,102 @@ def render_json_block(title: str, payload: dict) -> str:
 def coordinator_block(topology: dict, title: str = "环境拓扑（Serverless RelationGraph）") -> str:
     """Render the Coordinator's compact topology block."""
     return render_json_block(title, build_coordinator_inventory(topology))
+
+
+def report_mapping_table(topology: dict) -> str:
+    """Report-level topology mapping table (design document §9, v3.14.0).
+
+    Logical resource → physical layer/object/landing, derived
+    deterministically from the RelationGraph.  The report's 拓扑映射
+    section is a transcription of structured ledger data, so it is
+    rendered by code and injected at report-write time instead of being
+    transcribed by the LLM (generative transcription of structured data
+    is a known fidelity-failure surface, design document §12).
+    Returns "" when the topology carries no mappable rows.
+    """
+    if not topology:
+        return ""
+
+    def _ref(ref: dict | None) -> str:
+        r = _resource_ref(ref)
+        if not r:
+            return ""
+        kind, name = r.get("kind", ""), r.get("name", "")
+        return f"{kind}/{name}" if kind else name
+
+    def _pod_desc(pod: dict) -> str:
+        desc = pod.get("name") or ""
+        if desc and pod.get("pod_id"):
+            desc += f"（IP {pod['pod_id']}）"
+        return desc
+
+    def _landing(pod: dict) -> str:
+        return pod.get("host_name") or pod.get("node_name") or ""
+
+    sci_views = topology.get("sci_views") or []
+    kmc_views = topology.get("kmc_views") or []
+    rows: list[str] = []
+    for v in topology.get("serverless_views") or []:
+        logical = _ref(v.get("resource"))
+        if not logical:
+            continue
+        res_name = (v.get("resource") or {}).get("name")
+        layer_raw = v.get("physical_cluster_type")
+        layer = getattr(layer_raw, "value", layer_raw) or ""
+        physical: list[str] = []
+        nodes: list[str] = []
+
+        def _add(desc: str, host: str) -> None:
+            if desc and desc not in physical:
+                physical.append(desc)
+            if host and host not in nodes:
+                nodes.append(host)
+
+        for p in v.get("physical_pods") or []:
+            _add(_pod_desc(p), _landing(p))
+        for sv in sci_views:
+            if (sv.get("serverless_resource") or {}).get("name") != res_name:
+                continue
+            _add(_pod_desc(sv.get("sci_pod") or {}),
+                 _landing(sv.get("sci_pod") or {}))
+        existing = {d.split("（")[0] for d in physical}
+        for kv in kmc_views:
+            if (kv.get("serverless_resource") or {}).get("name") != res_name:
+                continue
+            owner = kv.get("owner_kmc_deployment")
+            if owner:
+                oref = _resource_ref(owner)
+                _add(f"{oref.get('kind', 'Deployment')}/{oref.get('name', '')}", "")
+                continue
+            bare = ((kv.get("kmc_resource") or {}).get("name")) or ""
+            if bare and bare in existing:
+                continue
+            _add(_ref(kv.get("kmc_resource")), "")
+        rows.append(
+            f"| {logical} | {layer} | {'<br>'.join(physical) or '—'} "
+            f"| {'/'.join(nodes) or '—'} |"
+        )
+    etcd_hosts: list[str] = []
+    for ev in topology.get("etcd_views") or []:
+        h = _landing(ev.get("etcd_member") or {})
+        if h and h not in etcd_hosts:
+            etcd_hosts.append(h)
+    if etcd_hosts:
+        rows.append(f"| 共享 etcd | shared_etcd | etcd 集群 "
+                    f"| {'/'.join(etcd_hosts)} |")
+    if not rows:
+        return ""
+    m = topology.get("mapping") or {}
+    head = ""
+    if m.get("serverless_cluster"):
+        parts = [f"{k}={v}" for k, v in
+                 (("KMC", m.get("kmc_cluster")), ("SCI", m.get("sci_cluster")))
+                 if v]
+        head = (f"逻辑集群 **{m['serverless_cluster']}**"
+                + (f" → {'，'.join(parts)}" if parts else "") + "\n\n")
+    return (head
+            + "| 逻辑资源 | 物理层 | 物理对象 | 落点节点 |\n"
+            + "|---|---|---|---|\n" + "\n".join(rows))
 
 
 def expert_view(topology: dict, view_key: str) -> dict:
