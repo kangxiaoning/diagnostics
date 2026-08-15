@@ -18,12 +18,15 @@ class Settings:
     api_key: str = "lm-studio"
     api_key_configured: bool = False
     temperature: float = 0.2
-    # 8192 covers REPORT-phase generation (reasoning tokens + a full
-    # multi-thousand-token report) which could overflow the former 4096
-    # cap and truncate the write_file JSON payload (finish=length),
-    # degrading the report to plain text.  The cap is honored by ollama
+    # 16384 covers REPORT-phase generation AND reasoning-model subagent
+    # summaries: qwen3.6's thinking stream consumes output budget, so the
+    # former 8192 cap let a subagent's final summary be truncated at
+    # finish=length (content=0B) — losing all decisive evidence
+    # (2026-08-11, scenario 38).  Structured expert returns
+    # (response_format JSON) are compact, so the larger cap primarily
+    # protects the reasoning stream + full report.  Honored by ollama
     # via OllamaChatOpenAI's top-level max_tokens passthrough.
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     max_history_messages: int = 16
     app_title: str = "Linux Diagnostics Agent"
 
