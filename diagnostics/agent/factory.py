@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import pathlib
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
@@ -12,8 +14,12 @@ from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
+from diagnostics.agent.expert_stall_watchdog import ExpertStallWatchdogMiddleware
 from diagnostics.agent.file_tool_governance import ExpertFileToolGovernanceMiddleware
-from diagnostics.agent.ledger import DiagnosisLedgerState
+from diagnostics.agent.ledger import (
+    ARGUS_CLARIFICATION_MARKER,
+    DiagnosisLedgerState,
+)
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
@@ -91,6 +97,89 @@ _REPORT_DIRS = [
 for _d in _REPORT_DIRS:
     _d.mkdir(parents=True, exist_ok=True)
 
+# ── Expert structured-return schemas (deepagents response_format) ──────
+# Deepagents 0.6.10 SubAgent.response_format: when a subagent produces a
+# `structured_response` conforming to the schema, it is JSON-serialized and
+# returned as the ToolMessage content to the Coordinator, replacing the
+# default last-message text extraction (design document §8 G13 context,
+# 2026-08-11: expert summaries truncated by max_tokens lost decisive
+# evidence — structured JSON is compact and parseable even when short).
+# When the model cannot produce a structured response, deepagents falls
+# back to the last non-empty AIMessage text, so the text return contract
+# (_EXPERT_RETURN_SUFFIX) stays as the degraded path.
+
+# Deep diagnostic experts (host-expert / k8s-expert / serverless-expert /
+# kmc-expert / sci-expert): verdict + evidence + root cause.
+class DeepExpertFindings(BaseModel):
+    """Structured return for deep diagnostic subagents."""
+
+    verdict: Literal["confirmed", "refuted", "inconclusive"] = Field(
+        description="假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）"
+    )
+    key_evidence: list[str] = Field(
+        default_factory=list,
+        description="关键证据 1~3 条，每条标注数据来源（工具名/日志/事件）",
+    )
+    negative_evidence: list[str] = Field(
+        default_factory=list,
+        description="负证据必报：与假设矛盾、或未找到目标对象的证据（如目标 Pod 不存在/目标组件正常），与阳性证据同等重要，不得省略",
+    )
+    root_cause: str = Field(
+        default="",
+        description="根因判断：如已定位根因则陈述，否则说明还需什么数据",
+    )
+    confidence: str = Field(
+        default="",
+        description="置信度：高/中/低 + 百分比（如 中 70%）",
+    )
+
+
+# Argus time-series analysis experts (host-argus-expert / k8s-argus-expert /
+# serverless-argus-expert / kmc-argus-expert / sci-argus-expert): metrics
+# only, no deep diagnosis.  The `clarification` field carries the
+# ARGUS_CLARIFICATION_MARKER contract (design document §8 G2 / §9 v3.11.1)
+# when required parameters are missing — the coordinator-side classifier
+# matches it deterministically.
+class ArgusExpertFindings(BaseModel):
+    """Structured return for Argus time-series subagents."""
+
+    clarification: str = Field(
+        default="",
+        description=(
+            "参数缺失澄清：若因缺少必要参数（如 hostname/monitor_name）无法执行任何查询，"
+            f"以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数；否则为空字符串。"
+        ),
+    )
+    mutation_points: list[str] = Field(
+        default_factory=list,
+        description="突变时间点：指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）",
+    )
+    anomaly_ranking: list[str] = Field(
+        default_factory=list,
+        description="异常排序（按严重程度）：🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总（如「其余 N 个节点/指标均正常、无突变」）",
+    )
+    negative_evidence: list[str] = Field(
+        default_factory=list,
+        description="负证据必报：关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要",
+    )
+    concurrent_anomalies: list[str] = Field(
+        default_factory=list,
+        description="并发异常：同一时间点发生的多个异常（暗示共同根因）",
+    )
+    cross_domain: list[str] = Field(
+        default_factory=list,
+        description="跨域关联：不同子系统指标之间的时序因果推断",
+    )
+    preliminary_judgment: str = Field(
+        default="",
+        description="初步判断：基于指标关联的根因推断（一句话）",
+    )
+    confidence: str = Field(
+        default="",
+        description="置信度：高/中/低 + 百分比（如 中 70%）",
+    )
+
+
 # Common return format suffix for all subagents — enables Coordinator to
 # parse expert results into structured record_finding calls.
 # Suffix appended to every subagent system_prompt.
@@ -120,6 +209,11 @@ _EXPERT_RETURN_SUFFIX = (
     "- 收益递减时立即停止：当连续 2 次工具调用未获得新证据时，直接返回已有结论\n"
     "- 关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
     "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
+    "- 交付方式：当你看到工具列表中带有 `DeepExpertFindings`（结构化结论工具）时，"
+    "证据收齐后调用它返回结构化 JSON（verdict/key_evidence/negative_evidence/root_cause/confidence），"
+    "这是交付验证结论的标准方式，Coordinator 据此落账；字段按下方说明填写，负证据不得省略。\n"
+    "- 兜底方式：若 `DeepExpertFindings` 不在工具列表（未注入结构化 schema），"
+    "则按下方文本格式直接输出结论。\n"
     "- 假设验证: {confirmed|refuted|inconclusive}\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
     "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
@@ -137,9 +231,26 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 你只负责指标采集与关联分析——假设与结论的台账登记由 Coordinator 统一完成。\n"
     "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
+    "- 区分采集目的，合理分配采集深度：\n"
+    "  - 定位对象（委派描述指定的目标实体及其落点、或已观测到异常的指标）→ 完整采集其关键指标维度；\n"
+    "  - 排除对象（其余节点/组件，仅用于确认「该方向正常」）→ 以确认「无异常突变」为目标，"
+    "用尽量少的概览性查询覆盖关键维度即可，确认无突变即止，无需逐对象逐指标展开。\n"
+    # Clarification contract (design document §8 G2 / §9, v3.11.1):
+    # deterministic marker the coordinator-side classifier matches —
+    # contractual protocol, not keyword enumeration (§11 S1 否决理由).
+    "- 参数缺失澄清标记: 若因缺少必要参数（如 hostname）无法执行任何查询，"
+    f"回复必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数——"
+    "系统依此标记识别缺口并转交 Coordinator 处理；禁止省略前缀，禁止臆造参数。\n"
     "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
+    "- 交付方式：当你看到工具列表中带有 `ArgusExpertFindings`（结构化结论工具）时，"
+    "指标收齐后调用它返回结构化 JSON（clarification/mutation_points/anomaly_ranking/negative_evidence/"
+    "concurrent_anomalies/cross_domain/preliminary_judgment/confidence），"
+    "这是交付时序结论的标准方式，Coordinator 据此分类；字段按下方说明填写，负证据不得省略。\n"
+    "- 兜底方式：若 `ArgusExpertFindings` 不在工具列表（未注入结构化 schema），"
+    "则按下方文本格式直接输出结论。\n"
     "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
-    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 / ✅正常，每条标注具体数值\n"
+    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总"
+    "（如「其余 N 个节点/指标均正常、无突变」）\n"
     "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
     "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
     "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
@@ -409,7 +520,7 @@ def _build_subagents(
         # 场景 single_pod+serverless 的 6 个专属专家 + host 双专家（host-argus-expert/
         # host-expert 复用）。参数语义（design document §5.2）：argus 专家用 monitor_name
         # （拓扑 mapping），深度专家用物理集群 cluster_name（拓扑 mapping.kmc_cluster /
-        # sci_cluster / serverless_cluster）；命名规则见 serverless-architecture 技能。
+        # sci_cluster / serverless_cluster）；命名规则见本模块专家 system_prompt。
         {
             "name": "serverless-argus-expert",
             "description": (
@@ -459,7 +570,6 @@ def _build_subagents(
             ),
             "tools": get_serverless_tools(),
             "skills": [
-                "/agent_data/skills/serverless-architecture/",
                 "/agent_data/skills/kubernetes-diagnosis/",
             ],
         },
@@ -514,7 +624,6 @@ def _build_subagents(
             ),
             "tools": get_kmc_tools(),
             "skills": [
-                "/agent_data/skills/serverless-architecture/",
                 "/agent_data/skills/control-plane-diagnosis/",
                 "/agent_data/skills/etcd-diagnosis/",
             ],
@@ -570,7 +679,6 @@ def _build_subagents(
             ),
             "tools": get_sci_tools(),
             "skills": [
-                "/agent_data/skills/serverless-architecture/",
                 "/agent_data/skills/kubernetes-diagnosis/",
                 "/agent_data/skills/container-runtime-diagnosis/",
             ],
@@ -593,6 +701,17 @@ def _build_subagents(
         if entity_type == "host":
             _K8S_EXPERTS = {"k8s-argus-expert", "k8s-expert"}
             subagents = [s for s in subagents if s["name"] not in _K8S_EXPERTS]
+
+    # Structured return contracts (deepagents response_format): argus
+    # experts return metrics findings; deep experts return verdict +
+    # evidence.  Coordinator-side parsing (ledger_middleware) reads these
+    # fields; the text return contract remains the degraded fallback.
+    for _sa in subagents:
+        _sa["response_format"] = (
+            ArgusExpertFindings
+            if _sa["name"].endswith("-argus-expert")
+            else DeepExpertFindings
+        )
 
     return subagents
 
@@ -695,11 +814,18 @@ def build_agent(
     # the Coordinator's file tools (report writing) stay untouched.
     governance_subagent = ExpertFileToolGovernanceMiddleware()
 
+    # Zero-yield stall watchdog (design document §8 G19, v3.11.0):
+    # consecutive executed-but-unproductive calls (empty/no-data/error)
+    # — soft wrap-up guidance, then hard block.  Sits AFTER dedup and
+    # file governance so it only observes genuinely-executed calls
+    # (outer-layer rejections have their own escalation ladders).
+    stall_watchdog = ExpertStallWatchdogMiddleware()
+
     # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     # Governance runs before ledger so denied calls skip ledger bookkeeping.
-    _subagent_middleware = [dedup_subagent, governance_subagent, subagent_ledger, _WRITE_TODOS_EXCLUSION]
+    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger, _WRITE_TODOS_EXCLUSION]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 

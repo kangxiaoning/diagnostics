@@ -35,9 +35,14 @@ PHASE_SPEC: dict[str, dict] = {
                 "换方向）。假设为扁平结构（ID 为整数编号如 H1、H2），不支持子假设。"
                 "若多个候选描述的是同一故障的机制/因果链上下游（如\"内存超限 OOMKilled\""
                 "与\"memory limit 配置过低\"互为表里），应合并为一条假设；"
+                "同理，「现象层描述」（如「leader 选举风暴」）与其「深层机制」（如「WAL fsync 延迟」）、"
+                "「概括性描述」（如「某组件异常」）与其「具体落点」（如「某节点该组件降级」）"
+                "均属同一根因，应合并为一条（深层机制/具体落点作为 statement 细化，不并列）；"
                 "仅当证据显示独立故障源并存时才提交多条。"
-                "假设是基于监控筛查证据的竞争性候选，probability 即表达不确定性——"
-                "凡需深查的方向，直接写成假设提交即完成本阶段职责。",
+                "假设是基于监控筛查证据的竞争性候选——是待验证的猜测、非已确认结论，"
+                "probability 即表达不确定性；提交只是记录候选、非断定根因。"
+                "凡需深查或确证的方向，直接写成假设提交即完成本阶段职责，"
+                "确证由提交后的验证阶段完成。",
         "actions": [
             "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
@@ -64,6 +69,10 @@ PHASE_SPEC: dict[str, dict] = {
             "收到结论后必须调用 record_finding 记录；若原始表述不准确，用 statement_update 修正",
             "若假设仅部分不成立（某环节被证伪但核心机制已确认），用 confirmed + statement_update，"
             "禁止整体 refuted",
+            "委派验证前，先在心里明确本假设的预期观测——若成立预期查到什么证据、"
+            "若不成立预期看到什么；专家返回后据此对照判定：结论符合成立预期 → confirmed"
+            "（需专家证据），符合不成立预期 → refuted，既不支持也不排除 → inconclusive。"
+            "预期观测仅供你自己判定用，不要写入委派 description（保持委派中立）",
         ],
         "exit": "record_finding 完成后进入 EVALUATE。",
     },
@@ -91,6 +100,12 @@ PHASE_SPEC: dict[str, dict] = {
             "区别于换批——换批是当前方向全部失败后的重开，追加是当前方向仍在验证中的补充）",
             "多根因场景：证据支持的假设即使非主根因也应标记 confirmed；"
             "refuted 仅用于证据明确证伪的假设",
+            "验证某假设后，其结论（尤其 refuted 的证据）可能使其他未决假设的表述不再成立："
+            "先重审假设集——表述已不准的未决假设，用 record_finding 且不填 verdict"
+            "（纯表述修正，statement_update 传新表述）修正；已被新证据排除的，用 refuted 落账；"
+            "指向全新方向的，commit_hypotheses 追加。主动更新比硬验证已不成立的假设更省轮次",
+            "收敛前核对现象覆盖：已确认根因是否解释了全部关键故障现象？"
+            "若仍有未解释的关键现象（多根因/复合故障），继续提假设验证，不要过早收敛",
         ],
         "exit": "退出条件满足时系统自动进入 REPORT：把握足够（已确认根因 p≥80）"
                 "且无可行动验证（全部未决假设的验证增益均低于成本，重复委派价值衰减）；"
@@ -181,6 +196,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 **委派描述中立性（design document §9 v3.2.2）**：描述只陈述**症状 + 待验证问题**，**禁止预设异常方向或疑似结论**（如把"Pod 为何 Pending"写成"检查 OOMKilled 事件"）——引导性描述会污染专家取证（谄媚效应：模型倾向迎合提示中暗示的观点，arXiv:2310.13548），让专家客观勘察后再下结论。
 </delegation_params>
+{serverless_routing}
 
 <evidence_integrity>
 ## 证据完整性契约（design document §9 v3.2.2）
@@ -218,7 +234,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 （按诊断步骤描述关键发现，标注每个证据的来源和置信度）
 
 ## 根因分析
-- **最终假设**：已被证实的根因（如有多根因，按条目分别列出）
+- **最终假设**：已被证实的根因（如有多根因，按条目分别列出）；每条根因的证据层级（【深度确证】/【指标直接观测】）与置信度由系统附录基于台账确定性标注，无需手动标注
 - **排除的假设**：验证后被排除的竞争性假设及排除原因
 - **证据链**：工具A发现X → 工具B确认Y → 专家C验证Z
 
@@ -231,8 +247,11 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 3. 预防措施与长期改进建议
 
 ## 附录
-- 委派的专家及各自关键发现
+- 委派的专家及各自关键发现（注：根因证据层级、拓扑映射（如适用）、委派专家清单、排除假设清单由系统附录确定性生成并自动注入——无需手写，正文可引用其内容）
 ```
+
+**根因断言范围**（严格遵守）：
+- 根因陈述不得超出证据支撑范围——仅有监控指标证据时，根因限定于指标直接可观测的事实（什么发生了）；未经深度专家验证的机制性解释（为什么发生）必须标注【推断】
 
 **报告内容禁止项**（严格遵守）：
 - 禁止提及诊断台账文件路径、诊断追踪文件（ledger JSON、*-trace.md）
@@ -500,7 +519,7 @@ _SERVERLESS_REPORT_ADDENDUM = """
 <report_contract_serverless>
 ## Serverless 报告附加契约（本场景必含章节清单）
 
-- [ ] **拓扑映射**章节：用户逻辑资源 → 物理 Pod → 节点的映射表（含 KMC 控制面组件归属），数据取自会话注入的「环境拓扑」，禁止凭空编造
+- [ ] **拓扑映射**：映射表由系统附录确定性注入（数据取自会话拓扑，无需手写、禁止凭空编造）
 - [ ] 证据链中每条证据标注来源视角（`cluster_view`）：serverless（逻辑集群）/ kmc（控制面）/ sci（数据面）/ host（物理主机）
 - [ ] 根因结论必须同时给出逻辑集群症状与物理集群根因位置的对应关系
 </report_contract_serverless>
@@ -511,6 +530,66 @@ def _render_report_addendum(agent_names: list[str] | None) -> str:
     """Render the scene-conditional report addendum (empty for most scenes)."""
     if agent_names and _infer_scene(agent_names) == "serverless":
         return _SERVERLESS_REPORT_ADDENDUM
+    return ""
+
+
+# Scene-conditional fault-surface routing knowledge (serverless routing).
+# Injected after <delegation_params> only for the serverless scene; empty
+# for all others.  This is STATIC, always-required routing knowledge (which
+# expert handles which fault surface + symptom→path) — per Anthropic context
+# engineering, static/stable knowledge belongs in the prompt, not behind
+# lazy skill loading (the LLM may not read it).  Content is aligned with the
+# architecture reference §8 (fault-surface classification + symptom fast
+# lookup) — that spec is the single source of truth for serverless static
+# architecture knowledge.
+_SERVERLESS_ROUTING = """
+<serverless_routing>
+## Serverless 场景故障面路由决策辅助（本场景专属）
+
+以下用于**选择委派对象**：根据症状优先匹配**单一最可能**的故障面，委派其负责专家验证；
+仅当该方向证据不足或已排除时，再考虑次可能故障面。**勿逐一排查所有故障面**（一次只聚焦一个方向）。
+
+故障面 → 负责专家 → 关键排查入口：
+
+1. **逻辑集群控制面组件**（apiserver / controller-manager / scheduler / virtualNode / vpc-cni-controller）
+   症状：API 超时/拒绝、资源协调停滞、固定 IP 分配异常
+   → kmc-expert（必要时 serverless-expert 补逻辑 API 视角）
+   排查入口：`<k8s_name>-<master_id>` 命名空间 Deployment/Pod（含 vpc-cni-controller）；etcd-proxy sidecar 健康
+2. **共享 etcd 集群**（独立物理机，5 节点）
+   症状：多逻辑集群同时异常、写超时、watch 中断
+   → kmc-expert（etcd 状态/指标）
+   排查入口：5 节点 etcd 集群健康/leader/延迟；key 前缀隔离数据
+3. **共享辅助组件**（API Gateway / Group1-xxx / IPAM）
+   症状：virtualNode→SCI 链路断（API Gateway）、logs/exec 失败（Group1-xxx）、新 Pod 无 IP（IPAM）
+   → kmc-expert
+   排查入口：`kube-system`/`kmc-system`/`kmc-ingress` 命名空间组件状态
+4. **SCI 工作负载 + VPC-CNI**（数据面）
+   症状：Pod Pending/ContainerCreating、IP 冲突、网络不通、Pod 频繁重启
+   → sci-expert（必要时补充 serverless/kmc 视角查 vpc-cni-controller/IPAM）
+   排查入口：SCI 节点 CNI DaemonSet、Pod 固定 IP、IPAM 绑定记录
+5. **virtualNode 同步链路**（VK 与物理集群 watch）
+   症状：逻辑状态 ≠ 物理状态
+   → serverless-expert 与 sci-expert 双视图对照（本面固有跨层，两视图对比是必要的）
+   排查入口：拓扑锚点（RelationGraph）双视图对照
+6. **物理节点**
+   症状：节点资源压力、节点 NotReady
+   → host-expert / host-argus-expert
+   排查入口：节点 CPU/内存/磁盘/网络（`host_name`）
+
+症状 → 优先排查方向（按最可能单一方向委派，勿逐条展开）：
+- Pod 一直 Pending/ContainerCreating → 优先查 IPAM/vpc-cni-controller 是否分配 IP（最常见原因）；IP 已分配则查 SCI 节点 CNI
+- kubectl logs 失败但 Pod Running → Group1-xxx 隧道（KMC `kmc-ingress` DaemonSet → SCI 节点）
+- 单集群 API 超时 → 该集群 apiserver/etcd-proxy（KMC `<k8s_name>-<master_id>`）
+- 多集群同时异常 → 共享 etcd 集群（首要）；其次 KMC 节点资源或共享组件
+- 网络不通/IP 冲突 → VPC-CNI 与 IPAM 固定 IP 分配记录（SCI 层）
+</serverless_routing>
+"""
+
+
+def _render_serverless_routing(agent_names: list[str] | None) -> str:
+    """Render the scene-conditional fault-surface routing (serverless only)."""
+    if agent_names and _infer_scene(agent_names) == "serverless":
+        return _SERVERLESS_ROUTING
     return ""
 
 
@@ -570,6 +649,8 @@ def make_system_prompt(
     prompt = prompt.replace("{examples}", _render_examples(agent_names))
     prompt = prompt.replace(
         "{scene_report_addendum}", _render_report_addendum(agent_names))
+    prompt = prompt.replace(
+        "{serverless_routing}", _render_serverless_routing(agent_names))
     prompt = prompt.replace("{report_path}", report_path or "{report_path}")
     prompt = prompt.replace("{ledger_path}", ledger_path or "{ledger_path}")
     for var, name in _expert_placeholder_map(agent_names or []).items():
