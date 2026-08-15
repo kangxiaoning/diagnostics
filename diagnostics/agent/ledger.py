@@ -85,6 +85,26 @@ MAX_TOTAL_HYPOTHESES = MAX_COMMIT_CALLS * MAX_LAYER_SIZE
 # (dead_end merged into refuted in the 5-state model.)
 _HARD_FAILED_STATUSES = frozenset({"refuted"})
 
+# ── Confirmed-root predicate (design document §6 S1) ──
+# A "confirmed root cause" requires BOTH a confirmed verdict AND
+# probability ≥ 80 — the record_finding contract states "低于 80 的
+# confirmed 不被视为已确认根因", and S1's exit semantics are "a
+# confirmed root cause with p ≥ 80".  The root_causes tracker and its
+# cleanup pass MUST share this predicate with S1 so a low-confidence
+# confirmed hypothesis (e.g. a synonymous hypothesis stamped confirmed
+# with p=0) can never surface as a "root cause" while S1 refuses to
+# count it — the two would otherwise drift (observed 2026-08-14,
+# scenario 36: root_causes=2 but S1 only recognized 1).
+CONFIRMED_ROOT_MIN_PROBABILITY = 80
+
+
+def is_confirmed_root(node: dict) -> bool:
+    """True iff ``node`` qualifies as a confirmed root cause (S1 semantics)."""
+    return (
+        node.get("status") == "confirmed"
+        and node.get("probability", 0) >= CONFIRMED_ROOT_MIN_PROBABILITY
+    )
+
 # ── Quantified exit model (design document §6, v2.1) ──
 # 退出时机 = 继续验证的期望信息增益 < 成本，且当前把握足够。
 # Value of a verification action: value(a) = EIG(a) / c(a), where
@@ -247,6 +267,7 @@ def new_hypothesis(
         terminal_reason="",      # refuted sub-classification (ex-dead_end)
         _delegate_count=0,       # successful expert delegations targeting it
         _inconclusive_count=0,   # inconclusive verdicts on this node (D6)
+        _statement_only_updates=0,  # pure wording refinements (verdict omitted)
     )
 
 
@@ -715,15 +736,20 @@ def activate_hypothesis(ledger: DiagnosisLedger, hid: str) -> None:
 def record_finding(
     ledger: DiagnosisLedger,
     hypothesis_id: str,
-    verdict: Verdict,
+    verdict: Verdict | None,
     evidence_summary: str,
-    probability_update: int,
+    probability_update: int | None,
     new_insights: str = "",
     statement_update: str = "",
 ) -> None:
     """Record a verification finding for a hypothesis.
 
     Args:
+        verdict: confirmed/refuted/inconclusive.  When None, this is a
+            PURE statement refinement (iterative-hypothesis-update): only
+            the statement is replaced, no verdict is formalized and no
+            verification state advances (probability/status/evidence are
+            untouched).
         statement_update: If provided, replaces the hypothesis statement
             with a more accurate version discovered during verification
             (e.g. "etcd compaction" → "etcd NOSPACE alarm").
@@ -732,11 +758,19 @@ def record_finding(
     hypothesis_id = resolve_hypothesis_id(ledger, hypothesis_id)
 
     node = hypotheses[hypothesis_id]
-    node["probability"] = max(0, min(100, probability_update))
 
     # Update statement if a more accurate version was found during verification
     if statement_update:
         node["statement"] = statement_update
+
+    # Pure statement refinement (verdict omitted): wording-only update that
+    # does not advance verification state.  Bounded by the middleware B′
+    # guard (≤2 per hypothesis); here we only bump the counter and return.
+    if verdict is None:
+        node["_statement_only_updates"] = node.get("_statement_only_updates", 0) + 1
+        return
+
+    node["probability"] = max(0, min(100, probability_update or 0))
 
     supports = verdict == "confirmed"
     if evidence_summary:
@@ -794,15 +828,24 @@ def add_evidence_to_active(
     supports: bool | None = None,
     tool_call_id: str | None = None,
     tool_name: str | None = None,
+    structured: dict | None = None,
 ) -> None:
-    """Add evidence to the current active hypothesis (auto from tool calls)."""
+    """Add evidence to the current active hypothesis (auto from tool calls).
+
+    *structured* (optional) preserves the raw structured expert return
+    (deepagents response_format JSON) on the evidence entry for exact
+    downstream parsing (verdict inference / argus classification).
+    """
     if not ledger["active_path"]:
         return
     active_id = ledger["active_path"][-1]
     node = ledger["hypotheses"].get(active_id)
     if node is None:
         return
-    node["evidence"].append(new_evidence(source, summary, supports, tool_call_id))
+    _ev = new_evidence(source, summary, supports, tool_call_id)
+    if structured is not None:
+        _ev["structured"] = structured
+    node["evidence"].append(_ev)
     if tool_name and tool_name not in node["verification_tools"]:
         node["verification_tools"].append(tool_name)
 
@@ -1376,6 +1419,38 @@ _ARGUS_CHANNEL_NOTE_SLS = (
 )
 
 
+# ── Argus 参数澄清契约（design document §8 G2 / §9, v3.11.1）─────────
+# 契约化标记（非关键词枚举）：argus 专家返回契约要求参数澄清回执以该
+# 标记开头，给协调者侧分类器一个确定性信号（规避关键词穷举隐患——
+# 同 §11 S1 否决理由）；旧措辞保留为契约采纳前的回退兼容。
+ARGUS_CLARIFICATION_MARKER = "【需要参数】"
+ARGUS_PARAM_MISSING_PATTERNS = (
+    ARGUS_CLARIFICATION_MARKER,
+    "需要补充",
+    "需要更具体的信息",
+    "需要 hostname",
+)
+
+
+def argus_param_clarification_pending(
+        ledger: DiagnosisLedger) -> list[str]:
+    """已委派但返回参数澄清（未返回监控数据）的 argus 专家名单
+    （design document §9, v3.11.1）。同一专家后续返回实质数据则解除
+    pending 状态。供 HYPOTHESIZE 数据缺口补救指引的选择性注入。"""
+    pending: list[str] = []
+    for rnd in ledger.get("rounds", []):
+        kf = str(rnd.get("key_findings", ""))
+        for expert in rnd.get("delegated_experts", []):
+            if not str(expert).endswith("argus-expert"):
+                continue
+            if any(p in kf for p in ARGUS_PARAM_MISSING_PATTERNS):
+                if expert not in pending:
+                    pending.append(expert)
+            elif kf.strip() and expert in pending:
+                pending.remove(expert)
+    return pending
+
+
 def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                      report_path: str = "") -> str:
     """Generate guidance text for the current phase.
@@ -1442,13 +1517,34 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
     if phase == "hypothesize":
         retry_hint = ""
         if ledger.get("_root_commit_count", 0) > 0 and ledger.get("hypotheses"):
+            # v3.11.0: structured failure digest at the decision point
+            # (design document §9) — replaces the indirect "see above"
+            # pointer when prior-batch failures exist.
+            digest = render_failure_digest(ledger)
             retry_hint = (
                 f"\n- ⚠ 这是第 {ledger.get('_commit_count', 0) + 1}"
                 f"/{MAX_COMMIT_CALLS} 次假设提交（最后一次）。"
-                "前一批已全部证伪（见上方「已排除/降级假设」）。\n"
+                "前一批已全部证伪/验证价值耗尽。\n"
                 "  新假设必须基于排除证据换方向推断，"
                 "禁止与已排除假设重复或仅换措辞。"
-            )
+            ) + digest
+        # v3.11.1: data-gap remedy hint (design document §9) — when a
+        # required argus expert was delegated but returned a parameter
+        # clarification (no metrics), name the legal channel BEFORE the
+        # LLM attempts an in-phase re-delegation: write the gap direction
+        # as a hypothesis; VERIFY re-queries with complete parameters.
+        # Selective injection (P7 / Proactive Memory Agent §12).
+        gap_hint = ""
+        if not ledger.get("hypotheses"):
+            _clarified = argus_param_clarification_pending(ledger)
+            if _clarified:
+                gap_hint = (
+                    f"\n- ⚠ {'、'.join(_clarified)} 已委派但未返回监控数据"
+                    "（请求补充参数）——该维度证据缺口请直接写成假设"
+                    "（probability 体现不确定性）；VERIFY 阶段将以假设聚焦"
+                    "方式定向补查（委派描述须带完整实体与参数）。"
+                    "本阶段职责不变：提交假设。"
+                )
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
             f"- {duty}\n"
@@ -1466,6 +1562,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "导致漏判独立故障源。\n"
             f"- 完成后必须调用 commit_hypotheses 提交假设（{exit_txt}）"
             + retry_hint
+            + gap_hint
         )
     if phase == "verify":
         active_id = ledger["active_path"][-1] if ledger["active_path"] else "?"
@@ -1987,6 +2084,21 @@ def _economically_dead(ledger: DiagnosisLedger, hid: str) -> bool:
         return False
     if node.get("deferred"):
         return False
+    # ── F1 conflict override (v3.12.0, design document §8 G17-E2/G20
+    # context, 2026-08-12 scenario 37) ──
+    # When the metric-layer evidence for *hid* is CONFLICTED (argus
+    # cluster/node anomaly + target-entity normal), the E2/G20 guards
+    # deterministically require a deep-expert verification BEFORE any
+    # verdict.  That "necessary verification" must not be silently
+    # killed by the soft economic-death model — cost optimisation cannot
+    # override an evidence-standard requirement (AgentDoG §12: safety
+    # dimension over cost dimension; OpenAI SDK §12: guardrails must
+    # change state, not deadlock).  While the conflict is unresolved the
+    # hypothesis stays alive for deep delegation; once a deep expert
+    # returns, evidence is no longer all-argus, the conflict clears and
+    # the economic model resumes normally (self-healing).
+    if _argus_conflict_signal(ledger, hid) is not None:
+        return False
     return delegation_value_for(ledger, hid) < KAPPA_STOP
 
 
@@ -2077,8 +2189,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     # suppresses them whenever any confirmation exists tree-wide.
     confirmed_ids = [
         hid for hid, node in hypotheses.items()
-        if node.get("status") == "confirmed"
-        and node.get("probability", 0) >= 80
+        if is_confirmed_root(node)
     ]
 
     # ── E2 exhaustion (fast lane): all roots refuted, budget spent ──
@@ -2229,6 +2340,252 @@ def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
     )
 
 
+def unrecorded_evidence_hypotheses(
+        ledger: DiagnosisLedger) -> list[tuple[str, "HypothesisNode"]]:
+    """Undecided hypotheses carrying expert evidence newer than the last
+    recorded finding (design document §6.3 evidence closure, v3.11.0).
+
+    Same predicate family as ``compute_next_action``'s "awaiting verdict"
+    detection (expert evidence present ∧ ``_last_evidence_round`` >
+    ``_last_finding_round``) — pure derivation from ledger fact fields,
+    never persisted (P1).  Terminal nodes are excluded: their verdict
+    already closed the evidence loop.
+    """
+    out: list[tuple[str, HypothesisNode]] = []
+    for hid, node in ledger.get("hypotheses", {}).items():
+        if node.get("status") not in ("pending", "inconclusive"):
+            continue
+        has_expert = any(
+            str(e.get("source", "")).startswith("expert:")
+            for e in node.get("evidence", [])
+        )
+        if (has_expert
+                and node.get("_last_evidence_round", 0)
+                > node.get("_last_finding_round", 0)):
+            out.append((hid, node))
+    return out
+
+
+def render_unrecorded_evidence_appendix(ledger: DiagnosisLedger) -> str:
+    """Render the system-injected appendix disclosing gathered-but-
+    unrecorded expert evidence (design document §6.3, v3.11.0).
+
+    Evidence closure at report time: expert conclusions that were
+    collected but never formalized via record_finding must still reach
+    the reader.  Deterministic DISCLOSURE (code-injected, does not depend
+    on LLM compliance) — the same fail-open philosophy as the E2'
+    unverified-hypothesis disclosure; blocking exit until ledgering would
+    risk zero-output timeouts.  Literature: MAST (arXiv:2503.13657)
+    FM-3.1 premature termination / FM-2.4 information withholding.
+    Returns "" when no unrecorded expert evidence exists.
+    """
+    pairs = unrecorded_evidence_hypotheses(ledger)
+    if not pairs:
+        return ""
+    lines = []
+    for hid, node in pairs:
+        expert_evs = [
+            e for e in node.get("evidence", [])
+            if str(e.get("source", "")).startswith("expert:")
+        ]
+        latest = expert_evs[-1] if expert_evs else {}
+        src = (str(latest.get("source", "")).split("expert:", 1)[-1]
+               or "expert")
+        summary = _clean_evidence_text(str(latest.get("summary", "")), 600)
+        lines.append(
+            f"- **{fmt_hid(hid)}**（p={node.get('probability')}%，"
+            f"{node.get('status')}）：{node.get('statement', '')}\n"
+            f"  - {src} 结论（未落账）：{summary}"
+        )
+    return (
+        "\n\n---\n\n## 已采集未落账证据（系统附录）\n\n"
+        "> 以下假设的专家验证结论在诊断过程中已采集，但未形成正式判定"
+        "（record_finding）即收口。系统如实披露原始专家证据，供后续排查参考：\n\n"
+        + "\n".join(lines)
+    )
+
+
+def _evidence_layer_label(node: dict) -> str:
+    """Deterministic evidence-layer label for a confirmed root cause
+    (design document §9, v3.14.0): a pure function of the ledger's
+    evidence sources — any deep-expert conclusion → 深度确证; argus-only
+    (metric layer) → 指标直接观测.  Whether the STATEMENT overclaims
+    beyond its layer stays a semantic obligation of the report contract
+    (【推断】 marking); code only reports the facts.
+    """
+    sources = [
+        str(e.get("source", ""))
+        for e in node.get("evidence", [])
+        if str(e.get("source", "")).startswith("expert:")
+    ]
+    if not sources:
+        return "协调员记录"
+    if all("-argus-expert" in s for s in sources):
+        return "指标直接观测"
+    return "深度确证"
+
+
+def render_derived_report_appendix(ledger: DiagnosisLedger) -> str:
+    """Render ledger-derived report sections deterministically (design
+    document §9, v3.14.0): per-root-cause evidence-layer labels +
+    confidence, Serverless topology mapping, delegated-expert list with
+    key conclusions, refuted hypotheses with reasons.
+
+    Deterministic logic must be code, not prompt obligations: every
+    section here is a pure function of the ledger, and transcription of
+    structured data through the generative path is a known
+    fidelity-failure surface (hallucination literature, design document
+    §12).  Injected on every gate-passing report write — the same
+    fail-open channel as the v3.11.0 evidence-closure appendix.
+    Returns "" when there is nothing to derive.
+    """
+    hypotheses = ledger.get("hypotheses", {})
+    sections: list[str] = []
+
+    # 1. Root-cause evidence layers + confidence.
+    confirmed = [
+        (hid, n) for hid, n in hypotheses.items()
+        if n.get("status") == "confirmed"
+    ]
+    if confirmed:
+        lines = []
+        for hid, node in confirmed:
+            lines.append(
+                f"- **{fmt_hid(hid)}**（置信度 {node.get('probability')}%）"
+                f"【{_evidence_layer_label(node)}】："
+                f"{node.get('statement', '')}"
+            )
+        sections.append(
+            "### 根因证据层级\n\n"
+            "> 【深度确证】=领域专家经日志/事件/状态验证；"
+            "【指标直接观测】=监控指标直接呈现故障事实"
+            "（机制性解释未经深度验证，正文引用时视为推断）\n\n"
+            + "\n".join(lines)
+        )
+
+    # 2. Serverless topology mapping (scene-conditional).
+    topology = ledger.get("topology")
+    if topology:
+        from diagnostics.agent.topology_render import report_mapping_table
+        table = report_mapping_table(topology)
+        if table:
+            sections.append("### 拓扑映射\n\n" + table)
+
+    # 3. Delegated experts + latest key conclusion (from rounds[]).
+    delegated: list[str] = []
+    for r in ledger.get("rounds", []):
+        for e in r.get("delegated_experts") or []:
+            if e and e not in delegated:
+                delegated.append(e)
+    if delegated:
+        lines = []
+        for expert in delegated:
+            latest: dict | None = None
+            for node in hypotheses.values():
+                for e in node.get("evidence", []):
+                    if str(e.get("source", "")) == f"expert:{expert}":
+                        latest = e
+            finding = ""
+            if latest:
+                structured = latest.get("structured")
+                if (isinstance(structured, dict)
+                        and structured.get("preliminary_judgment")):
+                    finding = _clean_evidence_text(
+                        str(structured["preliminary_judgment"]), 200)
+                else:
+                    finding = _clean_evidence_text(
+                        str(latest.get("summary", "")), 200)
+            lines.append(f"- {expert}" + (f"：{finding}" if finding else ""))
+        sections.append("### 委派专家与关键结论\n\n" + "\n".join(lines))
+
+    # 4. Refuted hypotheses with reasons.
+    refuted = [
+        (hid, n) for hid, n in hypotheses.items()
+        if n.get("status") == "refuted"
+    ]
+    if refuted:
+        lines = []
+        for hid, node in refuted:
+            reason = _clean_evidence_text(
+                str(node.get("verdict_reason") or ""), 200)
+            lines.append(
+                f"- **{fmt_hid(hid)}**：{node.get('statement', '')}"
+                + (f"——{reason}" if reason else "")
+            )
+        sections.append("### 排除的假设\n\n" + "\n".join(lines))
+
+    if not sections:
+        return ""
+    return (
+        "\n\n---\n\n## 系统附录：台账派生数据（系统确定性生成）\n\n"
+        "> 以下内容由系统从诊断台账确定性生成（非 LLM 转录），"
+        "与正文具有同等效力：\n\n"
+        + "\n\n".join(sections)
+    )
+
+
+def render_failure_digest(ledger: DiagnosisLedger) -> str:
+    """Render a structured digest of the failed batch for retry-batch
+    HYPOTHESIZE guidance (design document §9, v3.11.0).
+
+    Prior-batch failures are the generation context for the new batch:
+    HypoGeniC (arXiv:2404.04326) conditions hypothesis generation on
+    falsified hypotheses WITH their outcomes; MAI-DxO (§12) explicitly
+    maintains eliminated entries in the differential list.  The digest
+    renders at the decision point (本步要求) rather than relying on the
+    mid-context 已排除 section (Lost in the Middle, §12).  Covers
+    prior-batch refuted nodes AND economically-dead survivors (soft
+    terminals block the retry gate exactly like refuted ones, §10);
+    deferred nodes stay excluded (shelved = revivable direction, not a
+    failure).  Returns "" outside retry-batch context (first batch) or
+    when nothing failed.
+    """
+    if ledger.get("_root_commit_count", 0) < 1:
+        return ""
+    # v3.11.1 fix: digest 渲染时机是换批提交之前——此时 root_hypothesis_ids
+    # 仍指向前一批（新批尚未提交），故绝不能按 "不在当前批" 过滤（否则恰好
+    # 排除全部失败节点，摘要恒为空）。正确语义：渲染所有 refuted / 经济死亡
+    # 且非 deferred 的节点（换批时全部假设都属于失败批）。2026-08-11 三场景
+    # 复跑实证（场景 18/2 换批摘要缺失）。
+    lines: list[str] = []
+    for hid, node in ledger.get("hypotheses", {}).items():
+        status = node.get("status")
+        if status == "refuted":
+            tag = {
+                "evidence_saturated": "证据饱和",
+                "timeout_unreached": "未及验证(超时)",
+                "auto_finalized": "系统关闭",
+            }.get(node.get("terminal_reason") or "", "已证伪")
+        elif (status in ("pending", "inconclusive")
+                and not node.get("deferred")
+                and _economically_dead(ledger, hid)):
+            tag = "验证价值耗尽"
+        else:
+            continue
+        reason = _clean_evidence_text(
+            (node.get("verdict_reason") or node.get("rationale", "")
+             or "(无记录)"), 200)
+        counter = ""
+        contra = [
+            e for e in node.get("evidence", [])
+            if e.get("supports") is False
+        ]
+        if contra:
+            counter = ("；关键反证：" + _clean_evidence_text(
+                str(contra[-1].get("summary", "")), 150))
+        lines.append(
+            f"- [{tag}] {fmt_hid(hid)} {node.get('statement', '')}："
+            f"{reason}{counter}"
+        )
+    if not lines:
+        return ""
+    return (
+        "\n- ⚠ 前批失败摘要（新批必须吸收这些排除证据，"
+        "禁止重复或仅换措辞）：\n"
+        + "\n".join("  " + line for line in lines)
+    )
+
+
 def render_exit_directive(ledger: DiagnosisLedger, phase: DiagnosisPhase) -> str:
     """Render an actionable, phase-aware exit-condition directive (SSOT).
 
@@ -2337,6 +2694,114 @@ def _delegated_experts_for(ledger: DiagnosisLedger, hid: str) -> set[str]:
         if s.startswith("expert:"):
             out.add(s.split("expert:", 1)[-1])
     return out
+
+
+# ── Argus conflict-signal detection (design document §8 G13 context,
+# 2026-08-11 scenario 38) ────────────────────────────────────────────
+# K8s observability reality (Azure/Microsoft + ACK docs, 2026-08 search):
+# a Pod's OOMKilled/CrashLoopBackOff is an *event-state* fact that does
+# NOT surface in the metric time series (memory-limit pressure is
+# invisible in metrics; kubectl describe pod's Last State + Events are
+# authoritative).  Therefore an argus-class expert returning "target
+# entity normal" while *also* reporting cluster-level anomalies (restart
+# count up / OOM count > 0) leaves a *conflict*: the metric layer cannot
+# refute an event-state hypothesis.  The verify directive must steer the
+# coordinator to a deep expert (log/event inspection) instead of letting
+# the single-dimension negative evidence silently kill the hypothesis
+# (proactive guidance, design document proactive-guidance §5.3 — the
+# directive leads, the record_finding gate (C2) only backstops).
+# ── Line-level classification (avoids whole-text cross-matching: the
+# string "重启计数 0" would otherwise hit BOTH the anomaly "重启" and the
+# normal "重启.*0" regexes).  Anomaly lines are those starting with a
+# severity marker (🔴/⚠) OR a mutation point with a trend (上升/突增/0→N);
+# normal lines start with ✅ or are negative evidence about the target.
+_ARGUS_ANOMALY_LINE = re.compile(
+    r"^🔴|^⚠|OOM|oom|CrashLoopBackOff|驱逐|evict|"
+    r"拒绝|reject|失败|超标|突增|上升|峰值|0 ?→ ?[1-9]|1 ?→ ?[2-9]",
+    re.IGNORECASE,
+)
+_ARGUS_CLUSTER_SCOPE = re.compile(
+    r"集群|cluster|节点|node|工作负载|deployment|namespace|命名空间|全局|整体",
+    re.IGNORECASE,
+)
+_ARGUS_TARGET_NORMAL = re.compile(
+    r"✅.*(正常|0)|目标.*(正常|0)|.*(重启计数|restart).*0|.*OOMKilled.*0|无 OOM|无OOM|未触发",
+    re.IGNORECASE,
+)
+
+
+def _argus_conflict_signal(ledger: DiagnosisLedger, hid: str) -> str | None:
+    """Detect a metric-layer conflict for hypothesis *hid*.
+
+    A conflict exists when ALL expert evidence for *hid* comes from
+    argus-class experts (``*-argus-expert``) AND an argus return reports
+    an anomaly (🔴/⚠/OOM/restart-up, scoped to cluster/node/workload
+    layer) while ALSO reporting the target entity as normal.  Metric-
+    layer "target normal" cannot refute an event-state hypothesis (Pod
+    OOMKilled is invisible in metrics; the authoritative sources are
+    logs/events — Azure/ACK docs), so the coordinator must deep-dive with
+    a deep expert instead of concluding (proactive guidance §5.3: the
+    directive leads; the record_finding gate only backstops).
+
+    Returns a short rationale string when a conflict is detected, else
+    None.  Structured returns (``structured`` field) are checked first;
+    the formatted summary text is the degraded path.
+
+    Line-level classification: an anomaly line must start with a
+    severity marker or a mutation point (0→N trend); a "✅ … 0" or a
+    target-restart-0 negative line is normal, never an anomaly — so a
+    lone "重启计数 0" row cannot self-conflict.
+    """
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    expert_sources = [
+        str(e.get("source", ""))
+        for e in node.get("evidence", [])
+        if str(e.get("source", "")).startswith("expert:")
+    ]
+    if not expert_sources:
+        return None
+    # Conflict only when every expert view so far is metric-layer.
+    if not all("-argus-expert" in s for s in expert_sources):
+        return None
+    for e in node.get("evidence", []):
+        if not str(e.get("source", "")).startswith("expert:"):
+            continue
+        structured = e.get("structured")
+        lines: list[str] = []
+        if isinstance(structured, dict):
+            for key in ("anomaly_ranking", "mutation_points",
+                        "negative_evidence"):
+                lines.extend(str(i) for i in (structured.get(key) or []))
+            # preliminary_judgment often carries the cross-layer reading.
+            _pj = structured.get("preliminary_judgment")
+            if _pj:
+                lines.append(str(_pj))
+        else:
+            # Text fallback: split on newlines, keep informative lines.
+            for ln in str(e.get("summary") or "").splitlines():
+                s = ln.strip()
+                if s:
+                    lines.append(s)
+        if not lines:
+            continue
+        has_anomaly = False
+        has_target_normal = False
+        for ln in lines:
+            if _ARGUS_ANOMALY_LINE.search(ln):
+                # Severity-marker anomalies count only when scoped to a
+                # non-target layer (cluster/node/workload/global) — a
+                # 🔴 about the target itself is not a conflict.
+                if _ARGUS_CLUSTER_SCOPE.search(ln):
+                    has_anomaly = True
+            if _ARGUS_TARGET_NORMAL.search(ln):
+                has_target_normal = True
+        if has_anomaly and has_target_normal:
+            return (
+                "argus 指标层同时报告（集群/节点/工作负载级）异常与目标实体"
+                "正常——指标层无法覆盖 Pod 事件状态（OOMKilled 在指标中不可见），"
+                "需委派深度专家查日志/事件确认目标实体。"
+            )
+    return None
 
 
 def _parallel_candidates(
@@ -2600,16 +3065,31 @@ def compute_report_guidance(ledger: DiagnosisLedger) -> str | None:
     validation."  Injects a consistency constraint BEFORE the LLM writes
     the report so the report text does not contradict the ledger state.
 
-    Returns None when no constraint is needed (confirmed root cause exit).
+    Returns None when no constraint is needed (confirmed root cause exit
+    with no unrecorded evidence).
+
+    v3.11.0: also flags gathered-but-unrecorded expert evidence
+    (evidence closure, §6.3) — the LLM-authored report body must cite
+    it first-hand; the system additionally injects the appendix
+    deterministically at write time.
     """
+    parts: list[str] = []
+    unrecorded = unrecorded_evidence_hypotheses(ledger)
+    if unrecorded:
+        names = "、".join(fmt_hid(h) for h, _ in unrecorded)
+        parts.append(
+            f"⚠ {names} 已有专家验证证据但未 record_finding 落账——"
+            "报告证据链须如实引用这些证据（不得遗漏）；"
+            "写盘时系统将自动注入「已采集未落账证据」附录。"
+        )
     has_confirmed = bool(ledger.get("root_cause_hypothesis_ids"))
     if not has_confirmed:
-        return (
+        parts.append(
             "⚠ 本次退出为无确认根因——报告正文不得声称"
             "'根因已确认'，应表述为"
             "'最可能根因（未完成验证）'并披露未验证假设及其概率。"
         )
-    return None
+    return "\n".join(parts) if parts else None
 
 
 def render_verify_directive(ledger: DiagnosisLedger) -> str:
@@ -2703,6 +3183,71 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                         f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"证据不足可再委派（价值仍≥κ）{anti_fab}。"
                     )
+                # Evidence-scope calibration (design document §9,
+                # v3.13.0): when every expert conclusion so far is
+                # metric-layer (argus-class) and no conflict fired, the
+                # verdict channel stays open — but the recorded
+                # conclusion must stay within what metrics directly
+                # observe ("what happened").  A mechanism claim ("why")
+                # is either deep-verified or explicitly labeled an
+                # inference in the report (claim-grounding literature:
+                # Nature 2025 s41467-025-58551-6; MiniCheck
+                # arXiv:2404.10774).  Fail-open disclosure, same
+                # philosophy as E2' — the conflict override below
+                # replaces this whole directive when it fires.
+                if all("-argus-expert" in s for s in expert_sources):
+                    directive += (
+                        " ⚠ 证据均为监控指标层：落账结论须限定于指标"
+                        "直接可观测的范围（发生了什么）；机制性断言"
+                        "（为何发生）请委派深度专家确证，或在报告中"
+                        "明确标注为推断。"
+                    )
+        # C1 conflict override (proactive guidance §5.3, 2026-08-11
+        # scenario 38): when the metric-layer evidence is CONFLICTED
+        # (cluster/node anomaly + target-entity normal), the directive
+        # steers to a deep-dive BEFORE any record_finding verdict — the
+        # metric layer cannot refute an event-state hypothesis.  This
+        # OVERRIDES the harvest-nudge (priority 2) instead of appending
+        # to it: two competing action instructions in one directive
+        # collapse joint compliance to ~35% (WIRE arXiv:2605.27784,
+        # design document §12/§11) — the coordinator must get exactly ONE
+        # recommended action.  The conflict clears automatically once a
+        # deep expert returns (evidence is no longer all-argus), so the
+        # record_finding channel reopens next round — stated explicitly
+        # in the directive to counter Belief-R overcorrection (design
+        # document §11 v3.10.1: post-gate fear made the LLM skip the
+        # verdict entirely).
+        conflict_hint = _argus_conflict_signal(ledger, active_id) if node is not None else None
+        if conflict_hint:
+            _deep_candidates = [
+                e for e in _parallel_candidates(ledger, active_id, node)
+                if not e.endswith("-argus-expert")
+                and delegation_value_for(ledger, active_id, e) >= KAPPA_STOP
+            ]
+            _deep_names = _format_expert_names(_deep_candidates[:3])
+            if _deep_names:
+                # E3: machine-readable single-action statement — the
+                # recommended action is a task delegation with an
+                # explicit description contract (WASP 2025 structured
+                # output: explicit single instruction beats open prose).
+                _conflict_txt = (
+                    f"{conflict_hint}"
+                    f"当前唯一推荐动作：委派深度专家（{_deep_names}）"
+                    f"查目标实体日志/事件确认后再判定——description 须含"
+                    f"「验证假设 {fmt_hid(active_id)}」；"
+                    f"深度专家返回后若已确认，record_finding 通道自动开放，"
+                    f"不会被拦截。"
+                )
+            else:
+                # No deep candidates (all-metric scene) — fall back to
+                # the unblocked verdict so the coordinator is not left
+                # with an impossible instruction (deadlock prevention).
+                _conflict_txt = (
+                    f"{conflict_hint}"
+                    f"当前场景无可用深度专家；可基于现有证据 record_finding 判定，"
+                    f"或委派任一未验证视角专家补证。"
+                )
+            directive = _conflict_txt
         # Priority 3 (no delegation yet) stays silent — the static duty
         # already directs task delegation; injecting here would be noise
         # (selective injection, PG3).

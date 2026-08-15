@@ -37,6 +37,7 @@ from diagnostics.agent.ledger import (
     KAPPA_STOP,
     MAX_COMMIT_CALLS,
     MAX_TOTAL_HYPOTHESES,
+    ARGUS_PARAM_MISSING_PATTERNS,
     DiagnosisLedger,
     DiagnosisLedgerState,
     _coverage_ready,
@@ -57,15 +58,21 @@ from diagnostics.agent.ledger import (
     derive_phase,
     finalize_pending_for_report,
     fmt_hid,
+    is_confirmed_root,
     ledger_to_json,
     new_evidence,
     new_ledger,
     record_finding,
     record_round,
+    render_derived_report_appendix,
+    render_failure_digest,
     render_ledger_context,
+    render_unrecorded_evidence_appendix,
     resolve_hypothesis_id,
     select_path,
+    unrecorded_evidence_hypotheses,
 )
+from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from deepagents.middleware._utils import append_to_system_message
 
 from diagnostics.agent.topology_render import build_argus_compact_view, build_host_views, expert_view, render_json_block
@@ -239,6 +246,15 @@ _STAGNATION_THRESHOLD = 3           # G3 停滞阈值（design document §8）�
 _MIN_ROUND_FOR_SAFETY = 3           # Don't activate safety checks before this round
 _VERIFY_STUCK_GAP = 3               # Rounds without verdict/evidence progress → verify-stuck
 _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interventions
+# ── F2 bounded-block degrade (v3.12.0, design document §8 G17-E2
+# context, 2026-08-12 scenario 37) ──
+# Max consecutive G17-E2 confirmed blocks before the guard degrades to
+# pass-with-disclosure.  Prevents a record_finding→G17-E2 deadlock when
+# the model keeps retrying the verdict instead of delegating a deep
+# expert (the F1 conflict override re-opens that delegation, so this
+# limit is only reached on refusal).  Symmetric with C2 — both conflict
+# guards share the same bound.
+_E2_BLOCK_LIMIT = 4
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
 
@@ -274,15 +290,100 @@ _REFUTED_PATTERNS = re.compile(
 )
 
 
+def _parse_expert_json(text: str) -> dict | None:
+    """Parse a structured expert return (deepagents response_format JSON).
+
+    Returns the parsed dict, or None when *text* is not a structured
+    JSON object (degraded text-format path).  Guards against non-dict
+    JSON (lists/strings) and partial/truncated payloads.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _expert_verdict_from_structured(data: dict) -> str | None:
+    """Read the verdict field of a structured deep-expert return.
+
+    Returns 'confirmed'/'refuted' only — 'inconclusive' normalizes to
+    None, matching the text-path semantics of ``_infer_verdict_from_text``
+    (no decisive signal → caller decides inconclusive).
+    """
+    verdict = data.get("verdict")
+    if verdict in ("confirmed", "refuted"):
+        return verdict
+    return None
+
+
+def _format_expert_summary(output: str) -> str:
+    """Format a structured expert return (JSON) as readable evidence text.
+
+    Falls back to the raw output when it is not a structured JSON object
+    (degraded text-format path).  The formatted text keeps the field
+    labels used by the text-signal regexes (``假设验证:`` / clarification
+    marker) so downstream consumers stay compatible.
+    """
+    data = _parse_expert_json(output)
+    if data is None:
+        return output or ""
+    lines: list[str] = []
+
+    # Argus experts: clarification marker leads (contract §8 G2 / §9).
+    clarification = data.get("clarification") or ""
+    if clarification:
+        lines.append(clarification)
+
+    verdict = data.get("verdict")
+    if verdict:
+        lines.append(f"假设验证: {verdict}")
+    for label, key in (
+        ("突变时间点", "mutation_points"),
+        ("异常排序", "anomaly_ranking"),
+        ("关键证据", "key_evidence"),
+        ("负证据", "negative_evidence"),
+        ("并发异常", "concurrent_anomalies"),
+        ("跨域关联", "cross_domain"),
+    ):
+        items = data.get(key) or []
+        if items:
+            lines.append(f"{label}: " + "; ".join(str(i) for i in items))
+    for label, key in (
+        ("根因判断", "root_cause"),
+        ("初步判断", "preliminary_judgment"),
+        ("置信度", "confidence"),
+    ):
+        value = data.get(key) or ""
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
 def _infer_verdict_from_text(text: str) -> str | None:
     """Analyze expert output text for explicit verdict signals.
 
     Returns 'confirmed', 'refuted', or None if no clear signal found.
     Used by verify-stall detection to make reliable auto-decisions
     instead of blindly defaulting to inconclusive.
+
+    Structured returns (deepagents response_format JSON) are checked
+    first via the ``verdict`` field; the text-signal regexes are the
+    degraded path for text-format expert returns.
     """
     if not text:
         return None
+    # Structured JSON first — the verdict field is authoritative.
+    data = _parse_expert_json(text)
+    if data is not None:
+        verdict = _expert_verdict_from_structured(data)
+        if verdict is not None:
+            return verdict
     # Check confirmed signals first (more specific patterns)
     if _CONFIRMED_PATTERNS.search(text):
         return "confirmed"
@@ -345,10 +446,10 @@ def _build_evidence_audit(ledger: dict) -> str:
 
 # Argus outcome classification patterns (design document §8 G2, v2.5).
 # Three semantically distinct outcomes must NOT be conflated:
-_ARGUS_PARAM_MISSING_PATTERNS = (
-    "需要补充",            # expert asking for missing params
-    "需要更具体的信息",     # expert asking for clarification
-)
+# v3.11.1: param-missing 模式表收敛至 ledger 模块 SSOT（含契约化澄清
+# 标记 ARGUS_CLARIFICATION_MARKER 与回退旧措辞），此处仅保留别名以
+# 保持 _classify_argus_data 函数体不变。
+_ARGUS_PARAM_MISSING_PATTERNS = ARGUS_PARAM_MISSING_PATTERNS
 _ARGUS_FAILURE_PATTERNS = (
     "无监控数据返回",
     "无数据返回",
@@ -391,6 +492,33 @@ def _classify_argus_data(ledger: dict) -> str:
     saw_all_normal = False
     for r in expert_rounds:
         kf = r.get("key_findings", "")
+        # Structured argus returns (deepagents response_format JSON):
+        # classification fields take precedence over text patterns.
+        data = _parse_expert_json(kf)
+        if data is not None:
+            clarification = data.get("clarification") or ""
+            if any(p in clarification for p in _ARGUS_PARAM_MISSING_PATTERNS):
+                saw_param_missing = True
+                continue
+            # Structured data present (mutation points / ranking /
+            # negative evidence / judgment) → real diagnostic data.
+            if (data.get("mutation_points") or data.get("anomaly_ranking")
+                    or data.get("negative_evidence")
+                    or data.get("preliminary_judgment")
+                    or data.get("concurrent_anomalies")
+                    or data.get("cross_domain")):
+                # All-normal structured return (ranking all ✅, no
+                # mutations) still counts as real data, but surfaces the
+                # all_normal classification for observability.
+                _mutations = data.get("mutation_points") or []
+                _ranking = data.get("anomaly_ranking") or []
+                if not _mutations and _ranking and all(
+                        "✅" in str(i) for i in _ranking):
+                    saw_all_normal = True
+                else:
+                    return ""  # at least one expert returned real data
+                continue
+            # Empty structured object — no signal; fall through to text.
         if any(p in kf for p in _ARGUS_PARAM_MISSING_PATTERNS):
             saw_param_missing = True
         elif any(p in kf for p in _ARGUS_FAILURE_PATTERNS):
@@ -1309,17 +1437,22 @@ class SelectPathInput(BaseModel):
 
 class RecordFindingInput(BaseModel):
     hypothesis_id: str = Field(description="验证的假设ID")
-    verdict: str = Field(
+    verdict: str | None = Field(
+        default=None,
         description="验证结论，只能取三者之一: confirmed(已证实) | "
                     "refuted(已排除) | inconclusive(证据不足)。"
                     "禁止使用变体（如 partially confirmed）；"
-                    "若仅部分成立，用 confirmed + statement_update 修正表述",
+                    "若仅部分成立，用 confirmed + statement_update 修正表述。"
+                    "若仅需修正其他未决假设的表述而不落结论"
+                    "（迭代假设更新），留空并提供 statement_update。",
         pattern="^(confirmed|refuted|inconclusive)$",
     )
-    evidence_summary: str = Field(description="验证证据摘要")
-    probability_update: int = Field(
+    evidence_summary: str = Field(default="", description="验证证据摘要")
+    probability_update: int | None = Field(
+        default=None,
         validation_alias=AliasChoices("probability_update", "probability"),
-        description="更新后的概率 0-100", ge=0, le=100,
+        description="更新后的概率 0-100；纯表述修正（verdict 留空）时忽略",
+        ge=0, le=100,
     )
     new_insights: str = Field(
         default="",
@@ -1475,6 +1608,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             report_path=coordinator.report_path,
             backend=coordinator._backend,
             is_subagent=True,
+            # Share the session's read-only topology so the L4 hostname
+            # normalization gateway (design document §8.1⑥) can resolve
+            # node IPs → host names inside subagents.  Without this, a
+            # subagent's _topology stays empty and `_resolve_host_name`
+            # falls back to an empty map (IPs are not normalized; they
+            # hit production Argus as wrong endpoints).
+            topology=coordinator._topology,
         )
         instance._current_ledger = coordinator._current_ledger
         # Inherit the Coordinator's round count so any future code that
@@ -1621,7 +1761,33 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Subagent: skip ledger context injection and safety warnings.
         # The Coordinator already passes relevant context via task() description.
         if self._is_subagent:
-            return await handler(request)
+            _resp = await handler(request)
+            # ── Truncation observability (design document §8 G13 context,
+            # 2026-08-11 scenario 38) ──
+            # reasoning-stream truncation (finish_reason=length) silently
+            # drops the subagent's structured return (content=0B → the
+            # decisive evidence never reaches the Coordinator).  Warn so
+            # the post-hoc analysis can distinguish "expert found nothing"
+            # from "expert output was cut off".
+            try:
+                _rlist = (
+                    _resp.result
+                    if isinstance(_resp.result, list)
+                    else [_resp.result]
+                )
+                for _m in _rlist:
+                    _rm = getattr(_m, "response_metadata", None) or {}
+                    if _rm.get("finish_reason") == "length":
+                        logger.warning(
+                            "Subagent model output truncated "
+                            "(finish_reason=length, round %d) — structured "
+                            "return may be incomplete; check delegation",
+                            self._model_call_count,
+                        )
+                        break
+            except Exception:
+                pass  # observability only — never crash the subagent
+            return _resp
 
         # self._current_ledger takes priority over state — tools update it in-memory
         # between rounds and state may lag behind without Command-based updates.
@@ -2091,11 +2257,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             #   3rd stall → auto-decision
                             self._verify_stall_count += 1
 
-                            # Extract expert output text for signal analysis
+                            # Extract expert output text for signal analysis.
+                            # Structured returns (deepagents response_format
+                            # JSON) are preferred — the verdict field is
+                            # authoritative and survives formatting.
                             expert_text = ""
                             for ev in node.get("evidence", []):
                                 src = ev.get("source", "")
                                 if isinstance(src, str) and src.startswith("expert:"):
+                                    _struct = ev.get("structured")
+                                    if isinstance(_struct, dict):
+                                        _v = _expert_verdict_from_structured(_struct)
+                                        if _v is not None:
+                                            expert_text = _v
+                                            break
                                     expert_text = ev.get("summary", "")
                                     break
 
@@ -2735,6 +2910,73 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             else:
                 # Real tool call made — the loop advances on its own.
                 self._evaluate_stall_count = 0
+                # ── F3: conflict-gate loop detection (v3.12.0, design
+                # document §8 G17-E2/G20 context, 2026-08-12 scenario 37)
+                # ──
+                # A record_finding→G17-E2/C2 deadlock in EVALUATE (the
+                # model keeps retrying the verdict instead of delegating a
+                # deep expert) burns rounds and can hit the wall-clock
+                # timeout.  Detect it: the active hypothesis's conflict
+                # block counters have grown AND no deep-expert evidence
+                # arrived since the last block — inject a synthetic
+                # delegation hint that re-opens the deep path (F1 already
+                # exempted it from the gain<cost gate, so the delegation
+                # will succeed).  Only fires while the conflict is
+                # unresolved (block_count keeps growing); once a deep
+                # expert returns, the conflict clears and counters stop.
+                if ledger and ledger.get("hypotheses"):
+                    _ap = ledger.get("active_path") or []
+                    _ahid = _ap[-1] if _ap else None
+                    if _ahid and _ahid in ledger["hypotheses"]:
+                        _an = ledger["hypotheses"][_ahid]
+                        _bc = (_an.get("_g17e2_block_count", 0)
+                               + _an.get("_c2_block_count", 0))
+                        _has_deep = any(
+                            str(e.get("source", "")).startswith("expert:")
+                            and "-argus-expert" not in str(e.get("source", ""))
+                            for e in _an.get("evidence", [])
+                        )
+                        _last_block_round = max(
+                            _an.get("_g17_blocked_round") or 0,
+                            _an.get("_c2_blocked_round") or 0,
+                        )
+                        # At least 2 consecutive blocks, no deep evidence
+                        # since — the loop is spinning on the verdict.
+                        if (_bc >= 2 and not _has_deep
+                                and _last_block_round
+                                >= self._model_call_count - 2):
+                            _deep_hint = [e for e in
+                                          (ledger.get("scene_experts") or [])
+                                          if not e.endswith("-argus-expert")]
+                            logger.warning(
+                                "F3: conflict-gate loop on %s "
+                                "(g17e2_blocks=%d c2_blocks=%d, round=%d) — "
+                                "injecting deep-delegation hint",
+                                fmt_hid(_ahid),
+                                _an.get("_g17e2_block_count", 0),
+                                _an.get("_c2_block_count", 0),
+                                self._model_call_count,
+                            )
+                            _f3_hint = (
+                                f"⛔ [系统检测] {fmt_hid(_ahid)} 的 confirmed/refuted "
+                                f"判定已连续被冲突门控拦截——指标层证据存在"
+                                f"（集群/节点/工作负载级）异常与目标实体正常并存，"
+                                f"系统已开放深度专家委派通道（不受成本门控限制）。"
+                                f"请立即委派深度专家"
+                                f"{('（' + '、'.join(_deep_hint[:3]) + '）') if _deep_hint else ''}"
+                                f"查目标实体日志/事件确认后再判定；"
+                                f"深度专家证据到位后冲突自动清除、门控自动放行。"
+                            )
+                            # Text-only AIMessage would terminate the loop;
+                            # inject a harmless ls call to keep it alive so
+                            # the hint reaches the LLM (same mechanism as
+                            # G13 gentle reminder).
+                            import uuid as _uuid3
+                            _inject_tool_calls(response, [{
+                                "name": "ls",
+                                "id": f"call_f3_{_uuid3.uuid4().hex[:12]}",
+                                "args": {"path": "/agent_data"},
+                            }], content_override=_f3_hint)
 
         # ── Post-response: detect HYPOTHESIZE-phase stall (G12) ──
         # HYPOTHESIZE has two entry paths (design document §4/§5): T1
@@ -2771,15 +3013,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
                     "args": {"path": "/agent_data"},
                 }]
-                _directive = (
-                    "请立即调用 commit_hypotheses 提交新一批假设——"
-                    "必须基于已排除证据换方向推断，"
-                    "禁止与已排除假设重复或仅换措辞。"
-                    if _has_prior else
-                    "你尚未提交任何假设。请立即调用 commit_hypotheses "
-                    "提交首批竞争性假设（≤3 个，按概率降序，各附依据）——"
-                    "禁止以纯文本结束本阶段。"
-                )
+                if _has_prior:
+                    _directive = (
+                        "请立即调用 commit_hypotheses 提交新一批假设——"
+                        "必须基于已排除证据换方向推断，"
+                        "禁止与已排除假设重复或仅换措辞。"
+                    )
+                    # v3.11.0: structured failure digest (SSOT with the
+                    # HYPOTHESIZE guidance, design document §9).
+                    _directive += render_failure_digest(ledger) or ""
+                else:
+                    _directive = (
+                        "你尚未提交任何假设。请立即调用 commit_hypotheses "
+                        "提交首批竞争性假设（≤3 个，按概率降序，各附依据）——"
+                        "禁止以纯文本结束本阶段。"
+                    )
                 response = ModelResponse(result=[AIMessage(
                     content=(
                         "[系统提醒] 当前处于 HYPOTHESIZE 阶段"
@@ -3387,6 +3635,57 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # honest-negative exit) — reset the generic block counter.
                 self._exit_block_count = 0
                 self._det_exit_grace_used = False
+                # ── Stub-echo detection (v3.14.2 bugfix) — a synthetic
+                # write_file (G7 timeout / verify-stall fallback) carries
+                # the auto-generated stub verbatim.  Appendix injection
+                # below would mutate it and break the downstream G10
+                # stub-echo test (content != report → stub mark cleared →
+                # overwrite invitation permanently disabled).  Detect the
+                # stub echo BEFORE injection and skip appendices — the
+                # stub needs none (G10 invites a real rewrite instead).
+                _is_stub_echo_write = (
+                    bool(ledger.get("_report_auto_generated"))
+                    and isinstance(tool_args.get("content"), str)
+                    and tool_args["content"] == ledger.get("report")
+                )
+                # ── Evidence-closure appendix (design document §6.3,
+                # v3.11.0) — gathered-but-unrecorded expert evidence is
+                # deterministically disclosed on EVERY gate-passing write
+                # (natural exit included), so it can never be silently
+                # dropped from the report (fail-open; MAST FM-3.1/FM-2.4).
+                _appendix = render_unrecorded_evidence_appendix(ledger)
+                if (_appendix
+                        and not _is_stub_echo_write
+                        and isinstance(tool_args.get("content"), str)
+                        and "已采集未落账证据" not in tool_args["content"]):
+                    tool_args["content"] = (
+                        tool_args["content"].rstrip() + _appendix
+                    )
+                    logger.warning(
+                        "write_file evidence-closure appendix injected "
+                        "(round %d, %d chars)",
+                        self._model_call_count, len(_appendix),
+                    )
+                # ── Ledger-derived sections (design document §9,
+                # v3.14.0): evidence-layer labels, topology mapping,
+                # delegated experts and refuted hypotheses are computed
+                # from the ledger and injected on every gate-passing
+                # write — structured ledger data never depends on LLM
+                # transcription (fail-open, same channel as the
+                # evidence-closure appendix above).
+                _derived = render_derived_report_appendix(ledger)
+                if (_derived
+                        and not _is_stub_echo_write
+                        and isinstance(tool_args.get("content"), str)
+                        and "系统附录：台账派生数据" not in tool_args["content"]):
+                    tool_args["content"] = (
+                        tool_args["content"].rstrip() + _derived
+                    )
+                    logger.warning(
+                        "write_file ledger-derived appendix injected "
+                        "(round %d, %d chars)",
+                        self._model_call_count, len(_derived),
+                    )
                 # ── Canonicalize the report path (v2.5) ──
                 # The report path is system-generated and handed to the
                 # LLM, which merely carries it back — LLM path
@@ -3605,9 +3904,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         from diagnostics.agent.ledger import (
                             delegation_value_for, KAPPA_STOP,
                         )
+                        # ── F1 conflict override (v3.12.0, design document
+                        # §8 G17-E2/G20 context, 2026-08-12 scenario 37) ──
+                        # When the metric-layer evidence for this hypothesis
+                        # is CONFLICTED (argus anomaly + target-entity
+                        # normal), E2/G20 deterministically REQUIRE a
+                        # deep-expert verification before any verdict.  A
+                        # deep expert is exactly the verification the guards
+                        # demand — its delegation must NOT be killed by the
+                        # soft gain<cost model (cost optimisation cannot
+                        # override an evidence-standard requirement; the
+                        # same override keeps the record_finding→E2 deadlock
+                        # from forming).  Once the deep expert returns, the
+                        # conflict clears and the economic model resumes.
                         _v = delegation_value_for(
                             ledger, _gate_hid, subagent_type)
-                        if _v < KAPPA_STOP:
+                        _f1_conflict = _argus_conflict_signal(
+                            ledger, _gate_hid)
+                        _f1_is_deep = not subagent_type.endswith("-argus-expert")
+                        if _v < KAPPA_STOP and not (
+                                _f1_conflict and _f1_is_deep):
                             logger.warning(
                                 "Delegation blocked by gain<cost gate: "
                                 "%s value=%.3f < κ=%.2f (delegated=%d, "
@@ -3803,6 +4119,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if tool_name not in _LEDGER_TOOLS:
                 source = f"expert:{tool_args.get('subagent_type', '?')}" if tool_name == "task" else f"tool:{tool_name}"
                 summary = output or ""
+                # Structured expert returns (deepagents response_format
+                # JSON) are formatted into readable evidence text; the
+                # raw JSON is preserved on the evidence entry under
+                # ``structured`` for exact downstream parsing.
+                _structured_expert = None
+                if tool_name == "task":
+                    _structured_expert = _parse_expert_json(output)
+                    if _structured_expert is not None:
+                        summary = _format_expert_summary(output)
 
                 if summary:
                     # Diagnostic data arrived — counts as verify-phase
@@ -3821,9 +4146,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )
                         if target_hid and target_hid in ledger.get("hypotheses", {}):
                             node = ledger["hypotheses"][target_hid]
-                            node["evidence"].append(new_evidence(
+                            _ev = new_evidence(
                                 source, summary, supports=None, tool_call_id=tool_call_id,
-                            ))
+                            )
+                            if _structured_expert is not None:
+                                _ev["structured"] = _structured_expert
+                            node["evidence"].append(_ev)
                             # Track evidence round for state-driven guidance
                             # (design document §10, v3.10.1): compute_next_action
                             # uses _last_evidence_round vs _last_finding_round
@@ -3838,6 +4166,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 supports=None,
                                 tool_call_id=tool_call_id,
                                 tool_name=tool_name,
+                                structured=_structured_expert,
                             )
                     else:
                         add_evidence_to_active(
@@ -3845,6 +4174,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             supports=None,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
+                            structured=_structured_expert,
                         )
 
             # Build key_findings from tool output.
@@ -3995,6 +4325,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     and "未验证竞争假设（系统披露）"
                                     not in content):
                                 content = content.rstrip() + _disc
+                            # Evidence-closure backstop (design document
+                            # §6.3, v3.11.0): a rewrite with fresh content
+                            # must not drop the unrecorded-evidence
+                            # appendix either — the disclosure obligation
+                            # attaches to the report, not a single write.
+                            _apx = render_unrecorded_evidence_appendix(ledger)
+                            if (_apx
+                                    and "已采集未落账证据" not in content):
+                                content = content.rstrip() + _apx
+                            # Ledger-derived sections (design document
+                            # §9, v3.14.0) — deterministic rendering on
+                            # the rewrite path too.
+                            _drv = render_derived_report_appendix(ledger)
+                            if (_drv
+                                    and "系统附录：台账派生数据" not in content):
+                                content = content.rstrip() + _drv
                         ledger["report"] = content
                         if not _is_stub_echo:
                             ledger["_report_auto_generated"] = False
@@ -4871,9 +5217,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         async def _run(
             hypothesis_id: str,
-            verdict: str,
-            evidence_summary: str,
-            probability_update: int,
+            verdict: str | None = None,
+            evidence_summary: str = "",
+            probability_update: int | None = None,
             new_insights: str = "",
             statement_update: str = "",
         ) -> str:
@@ -4887,6 +5233,52 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 hypothesis_id = resolve_hypothesis_id(ledger, hypothesis_id)
             except ValueError as e:
                 return f"记录失败: {e}"
+
+            # ── B′: pure statement refinement (v3.14.1, iterative-
+            # hypothesis-update) ──
+            # verdict omitted + statement_update present = refine THIS
+            # hypothesis's wording without formalizing a verdict — the
+            # channel for updating OTHER pending hypotheses' statements
+            # after verifying H1 (Belief-R: LLMs need scaffolding to
+            # revise beliefs; design document §5).  Pure refinement is
+            # zero-new-evidence and does not advance state, so it is
+            # invisible to G5/S2/E3 economic-exit invariants — an
+            # unbounded channel would let the LLM dodge convergence.
+            # Bounded to 2 per hypothesis (gain converges after one
+            # correction + one tolerance redo; cost 2×0.5 aligns with a
+            # batch-commit, symmetric with E3's "3rd saturation").
+            if verdict is None:
+                _pure_node = ledger.get("hypotheses", {}).get(hypothesis_id)
+                if _pure_node is None:
+                    return f"错误: 假设 {fmt_hid(hypothesis_id)} 不存在"
+                if _pure_node.get("status") != "pending":
+                    return (
+                        f"⚠ 纯表述修正仅针对 pending(未验证) 假设："
+                        f"{fmt_hid(hypothesis_id)} 当前 status="
+                        f"{_pure_node.get('status')}，请用正常 record_finding "
+                        "落 verdict 推进状态。"
+                    )
+                if not statement_update:
+                    return (
+                        "错误: 纯表述修正必须提供 statement_update（修正后的表述）。"
+                    )
+                if _pure_node.get("_statement_only_updates", 0) >= 2:
+                    return (
+                        f"⛔ 假设 {fmt_hid(hypothesis_id)} 已纯表述修正 2 次，"
+                        "继续修正不产生新信息。请落 verdict 推进状态："
+                        "refuted（若已可排除）/ inconclusive（证据不足）/ "
+                        "confirmed（有专家证据支持）。"
+                    )
+                record_finding(ledger, hypothesis_id, None, "", None,
+                               "", statement_update)
+                mw._persist_ledger(ledger)
+                mw._current_ledger = ledger
+                _cnt = _pure_node.get("_statement_only_updates", 1)
+                return (
+                    f"✅ 已修正 {fmt_hid(hypothesis_id)} 的表述"
+                    f"（纯修正 {_cnt}/2 次）。"
+                    "该假设仍为 pending，后续验证请据此新表述委派专家。"
+                )
 
             # Capture old statement for root_causes sync
             old_statement = ""
@@ -4960,6 +5352,82 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         for e in _g17_node.get("evidence", [])
                     )
                     _experts = ledger.get("scene_experts") or []
+                    # ── G17-E2: conflicted argus evidence ≠ confirmatory ──
+                    # (2026-08-11 scenario 38, design document §8 G17 —
+                    # "confirmed demands confirmatory-layer evidence; the
+                    # monitoring layer alone is insufficient", screening→
+                    # confirmatory two-stage §12).  An argus-class expert
+                    # IS an "expert" to the _has_expert check, but a
+                    # CONFLICTED argus return (cluster/node anomaly +
+                    # target-entity normal) is still screening-layer: the
+                    # metric layer cannot see Pod event states, so it
+                    # cannot confirm an event-state hypothesis.  Mirrors
+                    # C2 (refuted guard) — symmetric deterministic
+                    # backstop when the proactive directive (C1) was not
+                    # followed.  Deep-delegation clears the conflict
+                    # automatically (evidence is no longer all-argus), so
+                    # the channel reopens — same soft-gate semantics.
+                    _g17e2_conflict = (
+                        _argus_conflict_signal(ledger, hypothesis_id)
+                        if _has_expert else None
+                    )
+                    if _g17e2_conflict and _experts:
+                        _deep_avail = [e for e in _experts
+                                       if not e.endswith("-argus-expert")]
+                        # ── F2 bounded-block degrade (v3.12.0, design
+                        # document §8 G17-E2 context, 2026-08-12 scenario
+                        # 37) ──
+                        # A repeated confirmed attempt that keeps hitting
+                        # G17-E2 (while deep delegation stays possible but
+                        # the LLM keeps retrying the verdict) must not
+                        # deadlock the loop.  After E2_BLOCK_LIMIT
+                        # consecutive blocks, the guard DEGRADES: it lets
+                        # the verdict through with a disclosure note (OpenAI
+                        # SDK §12: a guardrail that only returns text lets
+                        # the model retry forever — bound it).  The F1
+                        # conflict override already re-opens deep
+                        # delegation, so the degrade path is reached only
+                        # when the model refuses to take that route.
+                        _g17_node["_g17e2_block_count"] = (
+                            _g17_node.get("_g17e2_block_count", 0) + 1
+                        )
+                        if _g17_node["_g17e2_block_count"] > _E2_BLOCK_LIMIT:
+                            logger.warning(
+                                "record_finding G17-E2 degraded after %d "
+                                "blocks on %s (round=%d) — passing with "
+                                "disclosure",
+                                _g17_node["_g17e2_block_count"],
+                                fmt_hid(hypothesis_id),
+                                self._model_call_count,
+                            )
+                            return (
+                                f"⚠ confirmed 判定已通过（G17-E2 冲突门控"
+                                f"连续 {_g17_node['_g17e2_block_count']} 次拦截后"
+                                f"降级放行）：{fmt_hid(hypothesis_id)} 的 argus "
+                                f"证据仍存在指标层冲突（集群/节点/工作负载级异常"
+                                f"与目标实体正常并存），本判定未经深度专家日志/事件"
+                                f"确认，系统在报告中披露此冲突。"
+                            )
+                        logger.warning(
+                            "record_finding blocked by G17-E2: confirmed on "
+                            "%s with conflicted argus evidence (round=%d)",
+                            fmt_hid(hypothesis_id),
+                            self._model_call_count,
+                        )
+                        _g17_node["_g17_blocked_round"] = self._model_call_count
+                        return (
+                            f"⛔ confirmed 判定与现有监控证据冲突（证据标准门控）："
+                            f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
+                            f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
+                            f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该冲突"
+                            f"证据不满足 confirmed 的确证层标准。"
+                            f"请先委派深度专家"
+                            f"{('（' + '、'.join(_deep_avail[:3]) + '）') if _deep_avail else ''}"
+                            f"查目标实体日志/事件确认后再 record_finding confirmed；"
+                            "深度专家证据到位后 confirmed 通道自动开放，不会再被拦截。"
+                            "若现有监控证据已明确证伪，可直接判 refuted；"
+                            "证据不足请判 inconclusive。"
+                        )
                     if not _has_expert and _experts:
                         logger.warning(
                             "record_finding blocked by G17: confirmed on "
@@ -4986,6 +5454,118 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "证据不足请判 inconclusive。"
                         )
 
+            # ── C2: argus-conflict refute guard (reactive backstop,
+            # design document §8 G13 context, 2026-08-11 scenario 38) ──
+            # Refuting an event-state hypothesis (OOMKilled/CrashLoopBackOff)
+            # on metric-layer evidence alone is unsafe when the argus
+            # evidence is CONFLICTED (cluster/node anomaly + target-entity
+            # normal): the metric layer cannot see Pod event states, so the
+            # "target normal" negative evidence does not actually refute.
+            # The proactive directive (C1) already steers to a deep-dive;
+            # this gate backstops a premature refuted verdict.  Soft gate:
+            # first occurrence warns and blocks; a second call with the
+            # same verdict after deep-delegation is allowed (state moved).
+            if (verdict == "refuted"
+                    and hypothesis_id in ledger.get("hypotheses", {})):
+                _c2_conflict = _argus_conflict_signal(ledger, hypothesis_id)
+                if _c2_conflict:
+                    _c2_node = ledger["hypotheses"][hypothesis_id]
+                    # ── F2 bounded-block degrade (symmetric with G17-E2,
+                    # v3.12.0) ── same deadlock bound applies: after
+                    # _E2_BLOCK_LIMIT consecutive C2 blocks the guard
+                    # passes refuted with disclosure instead of looping.
+                    _c2_node["_c2_block_count"] = (
+                        _c2_node.get("_c2_block_count", 0) + 1
+                    )
+                    if _c2_node["_c2_block_count"] > _E2_BLOCK_LIMIT:
+                        logger.warning(
+                            "record_finding C2 degraded after %d blocks on "
+                            "%s (round=%d) — passing with disclosure",
+                            _c2_node["_c2_block_count"],
+                            fmt_hid(hypothesis_id),
+                            self._model_call_count,
+                        )
+                        return (
+                            f"⚠ refuted 判定已通过（C2 冲突门控连续 "
+                            f"{_c2_node['_c2_block_count']} 次拦截后降级放行）："
+                            f"{fmt_hid(hypothesis_id)} 的 argus 证据仍存在指标层"
+                            f"冲突（集群/节点/工作负载级异常与目标实体正常并存），"
+                            f"本判定未经深度专家日志/事件确认，系统在报告中披露。"
+                        )
+                    logger.warning(
+                        "record_finding blocked by C2: refuted on %s with "
+                        "conflicted argus evidence (round=%d)",
+                        fmt_hid(hypothesis_id),
+                        self._model_call_count,
+                    )
+                    _c2_node["_c2_blocked_round"] = self._model_call_count
+                    return (
+                        f"⛔ refuted 判定与现有监控证据冲突（证据充分性门控）："
+                        f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
+                        f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
+                        f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该负证据"
+                        f"不足以证伪事件类假设。请先委派深度专家（查目标实体日志/"
+                        f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
+                        f"可再次 record_finding refuted（通道自动开放）。"
+                    )
+            # ── G18: ceremonial-repeat guard (design document §8,
+            # v3.11.0) ──
+            # A record_finding that (a) repeats the CURRENT status
+            # (inconclusive→inconclusive / confirmed→confirmed), (b) has
+            # seen NO new expert evidence since the last finding, and
+            # (c) carries no statement_update, produces zero information
+            # gain (MAST FM-1.3 step repetition, the single most frequent
+            # multi-agent failure mode; LLMs do not self-correct without
+            # external scaffolding — arXiv:2310.01798).  Unchecked, it
+            # burns rounds and can game the E3 streak (three ceremonial
+            # inconclusives would masquerade as "evidence saturation").
+            # Graduated response (dedup-F2 philosophy): the first pass is
+            # ALLOWED with a warning (a one-off probability refinement is
+            # legitimate); the second is hard-blocked with the legal
+            # action menu.  First-ever verdicts (pending→inconclusive)
+            # and verdict CHANGES are never ceremonial (status moves).
+            _g18_warn = ""
+            _g18_node = ledger.get("hypotheses", {}).get(hypothesis_id)
+            if (_g18_node is not None and not statement_update
+                    and _g18_node.get("_last_finding_round") is not None):
+                _same_verdict = (
+                    (verdict == "inconclusive"
+                     and _g18_node.get("status") == "inconclusive")
+                    or (verdict == "confirmed"
+                        and _g18_node.get("status") == "confirmed")
+                )
+                _no_new_evidence = (
+                    _g18_node.get("_last_evidence_round", 0)
+                    <= _g18_node.get("_last_finding_round", 0)
+                )
+                if _same_verdict and _no_new_evidence:
+                    _cer_count = _g18_node.get("_ceremonial_count", 0) + 1
+                    _g18_node["_ceremonial_count"] = _cer_count
+                    if _cer_count >= 2:
+                        logger.warning(
+                            "record_finding blocked by G18 (ceremonial "
+                            "repeat): %s verdict=%s, no new evidence since "
+                            "last finding (round=%d)",
+                            fmt_hid(hypothesis_id), verdict,
+                            self._model_call_count,
+                        )
+                        return (
+                            f"⛔ 重复落账无信息增量（仪式性验证防护）："
+                            f"{fmt_hid(hypothesis_id)} 已处于 {verdict} 状态，"
+                            "且自上次落账以来无新专家证据——重复记录相同判定"
+                            "不产生任何新信息。\n"
+                            "合法动作：\n"
+                            "- 若认为仍有验证价值：委派互补视角专家获取新证据后再判定\n"
+                            "- 若现有证据已支持其他结论：改用对应 verdict（confirmed/refuted）终结\n"
+                            "- 若仅需修正表述：使用 statement_update 参数\n"
+                            "- 若其他假设待处理：select_path 切换 / commit_hypotheses 追加"
+                        )
+                    _g18_warn = (
+                        f"\n⚠ 注意：本次落账与当前状态一致（{verdict}→{verdict}）"
+                        "且期间无新专家证据——属低信息增量操作；"
+                        "再次无新证据重复落账将被系统拦截。"
+                    )
+
             try:
                 record_finding(
                     ledger, hypothesis_id, verdict,
@@ -4999,15 +5579,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)
 
             # ── Root-cause tracking (v2.7 flat model) ──
-            # Every confirmed hypothesis IS a root cause — there are no
-            # sub-hypotheses, so no topmost/refinement disambiguation is
-            # needed.  Multi-root scenarios simply accumulate confirmed
-            # nodes.
+            # A confirmed root cause requires BOTH confirmed AND p ≥ 80
+            # (design document §6 S1 / record_finding contract) — shared
+            # predicate is_confirmed_root.  A low-confidence confirmed
+            # hypothesis (e.g. a synonymous hypothesis stamped confirmed
+            # with p=0) is NOT a root cause; it stays in hypotheses for
+            # the LLM to either strengthen (p≥80) or re-verify.
             cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
             causes: list[str] = ledger.setdefault("root_causes", [])
             hypotheses = ledger.get("hypotheses", {})
             for hid, node in hypotheses.items():
-                if node.get("status") != "confirmed":
+                if not is_confirmed_root(node):
                     continue
                 if hid in cids:
                     continue  # already tracked
@@ -5036,11 +5618,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
             # ── Cleanup: drop non-confirmed entries ──
             # Ensures refuted/deprioritized hypotheses never appear as
-            # root causes.
+            # root causes.  Also drops low-confidence confirmed (p<80)
+            # so the tracker stays aligned with S1 (is_confirmed_root).
             hypotheses_dict = ledger.get("hypotheses", {})
             cids[:] = [
                 cid for cid in cids
-                if hypotheses_dict.get(cid, {}).get("status") == "confirmed"
+                if is_confirmed_root(hypotheses_dict.get(cid, {}))
             ]
             # Rebuild root_causes to match cleaned cids
             causes[:] = [
@@ -5107,6 +5690,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "禁止调用任何诊断工具，禁止输出纯文本分析。"
                     "立即基于 <diagnosis_ledger> 中的证据链生成报告并调用 write_file。"
                 )
+                # Evidence-closure proactive note (design document §6.3,
+                # v3.11.0): name hypotheses whose expert evidence was
+                # never formalized — the report body must cite it; the
+                # system additionally injects the appendix at write time.
+                _unrec = unrecorded_evidence_hypotheses(ledger)
+                if _unrec:
+                    _unames = "、".join(fmt_hid(_h) for _h, _ in _unrec)
+                    exit_hint += (
+                        f"\n⚠ {_unames} 有专家验证证据未落账——"
+                        "报告证据链须如实引用这些证据（不得遗漏）；"
+                        "系统将同时自动注入「已采集未落账证据」附录。"
+                    )
                 # ── Do NOT auto-generate report here ──
                 # The safety valve in _build_safety_warnings fires on the
                 # next round when ledger["report"] is still empty, giving
@@ -5178,7 +5773,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
-                f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}"
+                f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_g18_warn}"
             )
 
         return StructuredTool.from_function(
@@ -5188,6 +5783,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "confirmed 强化、次要根因确认、statement_update 精化）。"
                 "verdict: confirmed(已证实——须以对应领域专家验证结论为依据（expert 证据），"
                 "仅有监控数据不足支撑 confirmed，无专家证据的 confirmed 将被系统拦截；"
+                "以 argus 监控专家结论 confirmed 时，结论范围须限定于指标直接可观测的事实"
+                "——机制性断言（为何发生）须委派深度专家确证，或在报告中标注为推断；"
                 "可同时存在多个确认的根因/加剧因素)"
                 " | refuted(证据明确证伪，该假设不成立——监控反证即可直接判定)"
                 " | inconclusive(证据不足)。"
@@ -5203,6 +5800,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "已 confirmed 的假设允许再次调用本工具强化置信度/修正表述/补充证据"
                 "（verdict 必须仍为 confirmed，禁止翻转；这是已确认假设唯一的精化通道）；"
                 "refuted 假设不可再记录。"
+                "纯表述修正（迭代假设更新）：仅修正某个未决(pending)假设的表述而不落结论时，"
+                "可省略 verdict、只填 statement_update——用于验证其他假设后修正剩余未决假设"
+                "的过时表述；每个假设最多纯修正 2 次（第 3 次须落 verdict）。"
                 "所有root假设均到达终态且满足退出判据时自动进入REPORT阶段。"
             ),
             coroutine=_run,
@@ -5354,6 +5954,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     continue  # skip non-expert rounds
                 # Truncate long findings
                 kf_short = kf
+                # Structured expert returns are stored as JSON in
+                # key_findings (kept for exact classification); render
+                # them as readable text in the report timeline.
+                if _parse_expert_json(kf) is not None:
+                    kf_short = _format_expert_summary(kf).replace("\n", " ")
                 if kf_short:
                     lines.append(
                         f"- **第{r['round']}轮{expert_label}**: {kf_short}"
