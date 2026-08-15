@@ -279,6 +279,13 @@ async function openHistory(item) {
   } else {
     historyNodes.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-3);font-size:12px"><p>无诊断过程数据<br>（此报告为功能上线前生成）</p></div>';
   }
+  // Force a settle pass: double-rAF lets the history-open reflow (chatPanel
+  // hidden, graph width 100%) and node font layout finish before the edge
+  // draw measures container/node sizes. Without this the first draw may
+  // measure a 0-sized container and only succeed after a window resize.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (_historyGraph) _scheduleHistoryEdgeRedraw();
+  }));
 
   // Render hypothesis tree from saved ledger (if present)
   // Only render into history-specific containers — do NOT pollute
@@ -421,11 +428,16 @@ function _buildLevelsFrom(nodes, nodeOrder, edges) {
 let _historyGraph = null;   // reference to current history graph for redraws
 let _historyDrawTimer = null;
 let _historyLedger = null;  // reference to current history ledger for hypothesis view
+let _historyRetryRaf = 0;   // bounded-retry RAF for zero-size / not-yet-laid-out containers
+let _historyRetryCount = 0;
+const HISTORY_REDRAW_MAX_RETRIES = 120; // ~2s @60fps, then defer to ResizeObserver/resize/click
 
 function drawHistoryEdges(g) {
   _historyGraph = g;
+  _historyRetryCount = 0;
   clearTimeout(_historyDrawTimer);
   _historyDrawTimer = setTimeout(() => _scheduleHistoryEdgeRedraw(), 5);
+  _ensureHistoryGraphObserver();
 }
 
 function _redrawHistoryEdges() {
@@ -435,8 +447,13 @@ function _redrawHistoryEdges() {
   const graphEl = document.getElementById("historyGraph");
   const gr = graphEl.getBoundingClientRect();
   if (gr.width === 0 || gr.height === 0) {
-    // DOM not laid out yet — retry next frame
-    requestAnimationFrame(() => _redrawHistoryEdges());
+    // DOM not laid out yet (e.g. history-open reflow not settled) — bounded retry,
+    // then defer to the ResizeObserver / window resize / next click for a redraw.
+    if (_historyRetryCount < HISTORY_REDRAW_MAX_RETRIES) {
+      _historyRetryCount++;
+      cancelAnimationFrame(_historyRetryRaf);
+      _historyRetryRaf = requestAnimationFrame(() => _redrawHistoryEdges());
+    }
     return;
   }
   const sx = graphEl.scrollLeft, sy = graphEl.scrollTop;
@@ -444,10 +461,25 @@ function _redrawHistoryEdges() {
   svg.setAttribute("width", graphEl.scrollWidth);
   svg.setAttribute("height", graphEl.scrollHeight);
 
-  let totalW = 0, count = 0;
+  let totalW = 0, count = 0, laidOut = false;
   for (const n of g.nodes.values()) {
-    if (n.el) { totalW += n.el.getBoundingClientRect().width; count++; }
+    if (n.el) {
+      const nr = n.el.getBoundingClientRect();
+      if (nr.height > 0) laidOut = true;
+      totalW += nr.width; count++;
+    }
   }
+  // Nodes are not laid out yet (fonts pending / content still reflowing).
+  // Drawing now would produce a viewBox with zero scrollHeight; bounded retry.
+  if (!laidOut) {
+    if (_historyRetryCount < HISTORY_REDRAW_MAX_RETRIES) {
+      _historyRetryCount++;
+      cancelAnimationFrame(_historyRetryRaf);
+      _historyRetryRaf = requestAnimationFrame(() => _redrawHistoryEdges());
+    }
+    return;
+  }
+  _historyRetryCount = 0;
   const avgW = count > 0 ? totalW / count : 200;
   const scale = avgW / 200;
   const arrowW = Math.round(5 * scale), arrowH = Math.round(4 * scale), refX = Math.round(4.2 * scale);
@@ -484,7 +516,28 @@ function _redrawHistoryEdges() {
 let _historyDrawRaf = 0;
 function _scheduleHistoryEdgeRedraw() {
   cancelAnimationFrame(_historyDrawRaf);
+  cancelAnimationFrame(_historyRetryRaf);
+  _historyRetryCount = 0;
   _historyDrawRaf = requestAnimationFrame(() => _redrawHistoryEdges());
+}
+// Persistent ResizeObserver for the history graph: redraws edges as soon as the
+// history graph container settles to a nonzero size (e.g. after the history-open
+// reflow completes). This removes the dependence on a window "resize" event —
+// the reason the graph only appeared after opening DevTools (which fired resize).
+let _historyGraphObserver = null;
+function _ensureHistoryGraphObserver() {
+  if (_historyGraphObserver) return;
+  if (typeof ResizeObserver === "undefined") return;
+  const graphEl = document.getElementById("historyGraph");
+  if (!graphEl) return;
+  _historyGraphObserver = new ResizeObserver(() => {
+    if (!_historyGraph) return;
+    const gr = graphEl.getBoundingClientRect();
+    if (gr.width > 0 && gr.height > 0) {
+      _scheduleHistoryEdgeRedraw();
+    }
+  });
+  _historyGraphObserver.observe(graphEl);
 }
 window.addEventListener("resize", () => {
   if (_historyGraph) {
