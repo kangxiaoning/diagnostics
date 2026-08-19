@@ -113,7 +113,7 @@ awrap_tool_call (每次工具调用后)
 
 | 工具 | 调用阶段 | 作用 |
 |------|---------|------|
-| `commit_hypotheses` | HYPOTHESIZE | 提交 ≤3 个假设（按概率降序），自动选择最高概率进入 verifying |
+| `propose_hypotheses` | HYPOTHESIZE | 提交 ≤3 个假设（按概率降序），自动选择最高概率进入 verifying |
 | `select_path` | EVALUATE | 选择 1 条路径深入，未选中自动 deprioritized（可回溯） |
 | `record_finding` | VERIFY 后 | 记录 confirmed/refuted/inconclusive，自动检查退出条件 |
 
@@ -891,7 +891,7 @@ awrap_tool_call 被调用
 **台账管理**：
 
 通过四个工具驱动假设树生命周期：
-- `commit_hypotheses` — 提交 ≤3 个假设（按概率降序），自动选中最高概率进入 verifying
+- `propose_hypotheses` — 提交 ≤3 个假设（按概率降序），自动选中最高概率进入 verifying
 - `select_path` — 选择一条路径深入，未选中的自动 deprioritized（可回溯）
 - `record_finding` — 记录 confirmed / refuted / inconclusive，自动检查退出条件
 - `backtrack` — 回溯到最近被降级的假设重新验证
@@ -919,7 +919,7 @@ Coordinator 尝试调用 query_argus_k8s_cluster(...)
 | 机制 | 阈值 | 触发后行为 |
 |------|------|-----------|
 | 最大轮次 | ≥20 | 强制进入 REPORT，禁止再调任何诊断工具 |
-| Understand 停滞（有数据） | ≥2轮无假设 | 强制要求 `commit_hypotheses` |
+| Understand 停滞（有数据） | ≥2轮无假设 | 强制要求 `propose_hypotheses` |
 | Understand 停滞（无数据） | ≥2轮无诊断工具 | 强制要求采集数据 |
 | Round-1 零工具 | 首轮纯文本 | 注入合成 task() 委派 Argus 专家（含集群名/主机名/时间窗口） |
 | Verify 停滞 | 连续N次 task() 无 record_finding | **3级递进**：1级温和提醒 → 2级强提醒+推断结论 → 3级自动决策+强制 REPORT |

@@ -694,7 +694,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
 
                 # 🔑 Detect diagnosis ledger updates via custom stream
                 # DiagnosisLedgerMiddleware emits ledger snapshots via stream_writer
-                # when commit_hypotheses/select_path/record_finding tools fire.
+                # when propose_hypotheses/select_path/record_finding tools fire.
                 if isinstance(value, dict) and "_diagnosis_ledger" in value:
                     ledger = value["_diagnosis_ledger"]
                     if ledger and isinstance(ledger, dict):

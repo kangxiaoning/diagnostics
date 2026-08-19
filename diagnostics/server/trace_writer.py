@@ -189,7 +189,7 @@ class TraceWriter:
     def ledger_update(self, ledger: dict) -> None:
         """Record a diagnosis ledger snapshot (hypothesis tree evolution).
 
-        Called when commit_hypotheses / select_path / record_finding fires.
+        Called when propose_hypotheses / select_path / record_finding fires.
         Accumulates compact snapshots that are appended to the trace on finalize.
         """
         if not ledger or not isinstance(ledger, dict):

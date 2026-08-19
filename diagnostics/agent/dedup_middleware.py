@@ -89,7 +89,7 @@ _SCAFFOLDING_TOOLS = frozenset({
 })
 
 _LEDGER_TOOLS = frozenset({
-    "commit_hypotheses", "select_path", "record_finding", "backtrack",
+    "propose_hypotheses", "select_path", "record_finding", "backtrack",
 })
 
 _DEDUP_SKIP = _SCAFFOLDING_TOOLS | _LEDGER_TOOLS | {"task"}

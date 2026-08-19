@@ -38,21 +38,21 @@ PHASE_SPEC: dict[str, dict] = {
                 "同理，「现象层描述」（如「leader 选举风暴」）与其「深层机制」（如「WAL fsync 延迟」）、"
                 "「概括性描述」（如「某组件异常」）与其「具体落点」（如「某节点该组件降级」）"
                 "均属同一根因，应合并为一条（深层机制/具体落点作为 statement 细化，不并列）；"
-                "仅当证据显示独立故障源并存时才提交多条。"
+                "仅当证据显示独立故障源并存时才提出多条。"
                 "假设是基于监控筛查证据的竞争性候选——是待验证的猜测、非已确认结论，"
-                "probability 即表达不确定性；提交只是记录候选、非断定根因。"
-                "凡需深查或确证的方向，直接写成假设提交即完成本阶段职责，"
-                "确证由提交后的验证阶段完成。",
+                "probability 即表达不确定性；提出只是记录候选、非断定根因。"
+                "凡需深查或确证的方向，直接写成假设提出即完成本阶段职责，"
+                "确证在提出后自动进行。",
         "actions": [
-            "调用 commit_hypotheses 提交（系统自动聚焦概率最高的进入验证）",
+            "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
-            "statement 必填且为一句完整的根因表述（缺失会导致提交失败并重试）",
-            "预算硬约束：整个诊断最多提交 2 次（首批/换批共用），每次最多 3 个，"
+            "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）",
+            "预算硬约束：整个诊断最多提出 2 次（首批/换批共用），每次最多 3 个，"
             "总计不超过 6 个假设；预算用尽后只能用 record_finding(statement_update=...) 修正已有假设",
-            "换批：第 2 次提交在前批无 confirmed 且无活跃 pending 后开放"
+            "换批：第 2 次提出在前批无 confirmed 且无活跃 pending 后开放"
             "（搁置/inconclusive 不阻塞），必须基于已排除证据换方向，禁止重复或仅换措辞",
         ],
-        "exit": "commit_hypotheses 成功后进入 VERIFY。",
+        "exit": "propose_hypotheses 成功后进入 VERIFY。",
     },
     "verify": {
         "title": "阶段 3: VERIFY（验证假设）",
@@ -93,9 +93,9 @@ PHASE_SPEC: dict[str, dict] = {
             "confirmed 假设需更具体 → record_finding(statement_update=...) 修正表述"
             "（假设为扁平结构，无层级深化）",
             "本层全部 refuted 且有可回溯（搁置/inconclusive）假设 → backtrack",
-            "本层全部 refuted 或验证增益已低于成本（经济死亡）、提交预算未用尽 → "
-            "commit_hypotheses 换方向（搁置/经济死亡假设不阻塞换批）",
-            "验证中新证据指向当前假设集之外的全新方向 → commit_hypotheses 追加 1 个新假设"
+            "本层全部 refuted 或验证增益已低于成本（经济死亡）、提出预算未用尽 → "
+            "propose_hypotheses 换方向（搁置/经济死亡假设不阻塞换批）",
+            "验证中新证据指向当前假设集之外的全新方向 → propose_hypotheses 追加 1 个新假设"
             "（证据驱动追加：单次 1 个、并入当前批、不占用换批预算、总假设数 ≤6；"
             "区别于换批——换批是当前方向全部失败后的重开，追加是当前方向仍在验证中的补充）",
             "多根因场景：证据支持的假设即使非主根因也应标记 confirmed；"
@@ -103,7 +103,7 @@ PHASE_SPEC: dict[str, dict] = {
             "验证某假设后，其结论（尤其 refuted 的证据）可能使其他未决假设的表述不再成立："
             "先重审假设集——表述已不准的未决假设，用 record_finding 且不填 verdict"
             "（纯表述修正，statement_update 传新表述）修正；已被新证据排除的，用 refuted 落账；"
-            "指向全新方向的，commit_hypotheses 追加。主动更新比硬验证已不成立的假设更省轮次",
+            "指向全新方向的，propose_hypotheses 追加。主动更新比硬验证已不成立的假设更省轮次",
             "收敛前核对现象覆盖：已确认根因是否解释了全部关键故障现象？"
             "若仍有未解释的关键现象（多根因/复合故障），继续提假设验证，不要过早收敛",
         ],
@@ -114,7 +114,7 @@ PHASE_SPEC: dict[str, dict] = {
     "report": {
         "title": "阶段 5: REPORT（生成报告）",
         "duty": "基于诊断台账（证据链）生成报告并交付。系统已自动终结所有挂起假设，"
-                "你无需再调用 record_finding / commit_hypotheses。",
+                "你无需再调用 record_finding / propose_hypotheses。",
         "summary": "用 3~5 句话向用户总结：根因（多根因分别列出）、关键证据、"
                    "最重要的修复建议",
         "actions": [
@@ -153,12 +153,12 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 <core_principles>
 始终遵循以下原则，按优先级排序：
 
-1. **禁止文本模拟** — 你**必须**通过工具调用（task/commit_hypotheses/record_finding/write_file）完成每一步诊断。**绝对禁止**用纯文本模拟工具调用或诊断过程。
+1. **禁止文本模拟** — 你**必须**通过工具调用（task/propose_hypotheses/record_finding/write_file）完成每一步诊断。**绝对禁止**用纯文本模拟工具调用或诊断过程。
 2. **安全优先** — 评估用户意图，拒绝恶意或破坏性请求。诊断过程只读优先。
 3. **证据驱动** — 任何结论需至少两个独立来源佐证（工具输出、专家分析、日志交叉验证）。
-4. **假设驱动** — 维护竞争性假设，每批最多3个，基于证据更新概率；整个诊断最多提交2批假设（总数不超过6个）；验证中途新证据指向全新方向时可在 EVALUATE 阶段追加1个新假设（不占换批预算）；预算用尽后用 record_finding(statement_update=...) 修正已有假设而非新增。
+4. **假设驱动** — 维护竞争性假设，每批最多3个，基于证据更新概率；整个诊断最多提出2批假设（总数不超过6个）；验证中途新证据指向全新方向时可在 EVALUATE 阶段追加1个新假设（不占换批预算）；预算用尽后用 record_finding(statement_update=...) 修正已有假设而非新增。
 5. **渐进聚焦** — 每步只验证一个假设，调用最少必要工具（通常1~3个），禁止发散。
-6. **台账优先** — 所有假设和结论必须通过 commit_hypotheses / record_finding 提交到诊断台账，不能仅在文本中陈述。
+6. **台账优先** — 所有假设和结论必须通过 propose_hypotheses / record_finding 写入诊断台账，不能仅在文本中陈述。
 </core_principles>
 
 <diagnostic_flow>
@@ -173,7 +173,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 你的诊断由诊断台账驱动（每轮注入到你的上下文）。当前阶段由系统状态机判定，**阶段可用工具由系统门控**——越阶段的调用会被拒绝并返回纠正提示，按提示行动即可。
 
 **你的工具范围**：
-- **台账工具**：commit_hypotheses / select_path / record_finding / backtrack
+- **台账工具**：propose_hypotheses / select_path / record_finding / backtrack
 - **取证工具仅专家 sub-agent 可用**：监控指标查询、主机/GPU/K8s 深度诊断等取证能力由专家持有——你通过委派（task）获取证据，不直接执行取证
 
 {flow_sections}
@@ -315,12 +315,12 @@ UNDERSTAND (委派当前场景的 Argus 专家并行采集):
   (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[
+  → propose_hypotheses(hypotheses=[
       {{statement: "Pod内存超限OOMKilled", probability: 50, rationale: "重启伴随内存飙升"}},
       {{statement: "节点资源压力导致kubelet异常", probability: 30, rationale: "NotReady 与压力时间点重合"}},
       {{statement: "控制面API Server间歇超时", probability: 20, rationale: "API延迟波动"}}
     ])
-  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会提交失败)
+  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会导致调用失败)
   (同源合并：上例 H1"内存超限"与"容器 memory limit 配置过低"若证据互为表里，应合并为一条 statement，
    而非拆成两条——同一条根因的两个方面，不是独立故障源)
   (系统自动聚焦 H1 进入 VERIFY)
@@ -332,7 +332,7 @@ VERIFY (聚焦 H1, 委派当前场景领域专家):
       probability_update=90,
       statement_update="JVM堆配置(-Xmx 1536m)超过容器 memory limit(1Gi)导致 OOMKilled")
   （验证中发现更具体的根因表述时，用 statement_update 一步到位修正——
-    假设为扁平结构，不需要也不能提交子假设）
+    假设为扁平结构，不需要也不能提出子假设）
 
 EVALUATE → 退出条件满足（根因确认 p≥80，系统自动进入 REPORT）
 REPORT:
@@ -351,12 +351,12 @@ UNDERSTAND (委派当前场景的 Argus 专家并行采集):
   (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[
+  → propose_hypotheses(hypotheses=[
       {{statement: "KMC 控制面 apiserver 高负载导致 API 超时", probability: 50, rationale: "API 延迟突增与状态更新延迟同步"}},
       {{statement: "逻辑集群到 KMC 控制面的隧道异常", probability: 30, rationale: "症状集中在逻辑集群 API 面"}},
       {{statement: "共享 etcd 故障影响控制面状态同步", probability: 20, rationale: "状态更新延迟疑似存储链路"}}
     ])
-  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会提交失败)
+  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会导致调用失败)
   (系统自动聚焦 H1 进入 VERIFY)
 
 VERIFY (聚焦 H1, 委派当前场景领域专家):
@@ -377,7 +377,7 @@ VERIFY (聚焦 H1, 委派当前场景领域专家):
       evidence_summary="节点资源未见明显异常",
       probability_update=0)
   （验证中发现更具体的根因表述时，用 statement_update 一步到位修正——
-    假设为扁平结构，不需要也不能提交子假设）
+    假设为扁平结构，不需要也不能提出子假设）
 
 EVALUATE → 退出条件满足（根因确认 p≥80，系统自动进入 REPORT）
 REPORT:
@@ -399,12 +399,12 @@ UNDERSTAND (委派当前场景的 Argus 专家):
   (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[
+  → propose_hypotheses(hypotheses=[
       {{statement: "进程 CPU 占用异常导致主机过载", probability: 50, rationale: "CPU 打满伴随服务延迟"}},
       {{statement: "内存不足触发 swap 抖动", probability: 30, rationale: "响应延迟与内存压力时间点重合"}},
       {{statement: "磁盘 IO 瓶颈导致进程阻塞", probability: 20, rationale: "偶发超时疑似 IO 等待"}}
     ])
-  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会提交失败)
+  (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会导致调用失败)
   (系统自动聚焦 H1 进入 VERIFY)
 
 VERIFY (聚焦 H1, 委派当前场景领域专家):
@@ -419,7 +419,7 @@ VERIFY (聚焦 H1, 委派当前场景领域专家):
       evidence_summary="GPU 温度/利用率/显存正常",
       probability_update=0)
   （验证中发现更具体的根因表述时，用 statement_update 一步到位修正——
-    假设为扁平结构，不需要也不能提交子假设）
+    假设为扁平结构，不需要也不能提出子假设）
 
 EVALUATE → 退出条件满足（根因确认 p≥80，系统自动进入 REPORT）
 REPORT:
@@ -437,7 +437,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
+  → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
 
 VERIFY (技能驱动委派 — 要求专家按 SKILL.md 步骤执行):
   → task(subagent_type="serverless-expert", description="验证假设H1: conntrack表满。使用conntrack-diagnosis技能，检查conntrack状态、dmesg、连接分布。")
@@ -464,7 +464,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
+  → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
 
 VERIFY (技能驱动委派 — 要求专家按 SKILL.md 步骤执行):
   → task(subagent_type="host-expert", description="验证假设H1: conntrack表满。使用conntrack-diagnosis技能，检查conntrack状态、dmesg、连接分布。")
@@ -491,7 +491,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
-  → commit_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
+  → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
 
 VERIFY (技能驱动委派 — 要求专家按 SKILL.md 步骤执行):
   → task(subagent_type="host-expert", description="验证假设H1: conntrack表满。使用conntrack-diagnosis技能，检查conntrack状态、dmesg、连接分布。")

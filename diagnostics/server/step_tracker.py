@@ -140,7 +140,7 @@ TOOL_LABELS: dict[str, str] = {
     "check_sci_cni_status": "检查SCI-CNI状态",
     "get_sci_pod_ip": "查看SCI-Pod-IP",
     # Ledger management tools
-    "commit_hypotheses": "提交诊断假设",
+    "propose_hypotheses": "提出诊断假设",
     "select_path": "选择诊断路径",
     "record_finding": "记录验证结论",
     "backtrack": "回溯假设路径",
