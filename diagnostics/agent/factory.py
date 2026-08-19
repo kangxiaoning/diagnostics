@@ -7,7 +7,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from deepagents import create_deep_agent
+from deepagents import (
+    GeneralPurposeSubagentProfile,
+    HarnessProfile,
+    create_deep_agent,
+    register_harness_profile,
+)
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 
@@ -78,13 +83,34 @@ except ImportError:
     get_system_overview = None
     check_kubernetes_control_plane = check_kubernetes_nodes = check_kubernetes_pods = None
 
-# Hide write_todos from the model's tool list.  Unlike excluded_middleware
-# (which removes TodoListMiddleware entirely and destabilized qwen3.6's
-# tool-call serialization per the 2026-07-19 experiment), _ToolExclusionMiddleware
-# keeps TodoListMiddleware in the stack — only the tool name is filtered from
-# request.tools before the model sees them.  BASE_AGENT_PROMPT never references
-# write_todos, so hiding it introduces no prompt/tool mismatch.
-_WRITE_TODOS_EXCLUSION = _ToolExclusionMiddleware(excluded=frozenset({"write_todos"}))
+# Hide write_todos + delete from the model's tool list.  Unlike
+# excluded_middleware (which removes TodoListMiddleware entirely and
+# destabilized qwen3.6's tool-call serialization per the 2026-07-19
+# experiment), _ToolExclusionMiddleware keeps TodoListMiddleware in the stack —
+# only the tool name is filtered from request.tools before the model sees them.
+# BASE_AGENT_PROMPT never references write_todos, so hiding it introduces no
+# prompt/tool mismatch.  `delete` is added because deepagents 0.7.x exposes a
+# real destructive delete tool on non-sandbox backends (0.6.x filtered it via
+# _supports_delete); this read-only diagnostic system must never expose it.
+_EXCLUDED_TOOLS = _ToolExclusionMiddleware(excluded=frozenset({"write_todos", "delete"}))
+
+# ── Harness profile: disable the auto-added general-purpose subagent ──
+# deepagents auto-adds a general-purpose subagent that sits outside the
+# ledger / file-governance gates (it inherits every diagnostic tool plus the
+# full filesystem toolset — a latent governance-bypass channel). This is a
+# read-only diagnostic system, so that subagent is removed entirely.
+# OllamaChatOpenAI subclasses ChatOpenAI, whose _get_ls_params reports
+# ls_provider="openai", so the provider-level "openai" key resolves via
+# _harness_profile_for_model's provider-only fallback.  (`delete` is hidden
+# via _EXCLUDED_TOOLS above rather than profile excluded_tools, to avoid
+# stacking two _ToolExclusionMiddleware instances — their identical middleware
+# .name would trip langchain's duplicate-name check.)
+register_harness_profile(
+    "openai",
+    HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+    ),
+)
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 AGENT_DATA_ROOT = PROJECT_ROOT / "agent_data"
@@ -750,17 +776,16 @@ def build_agent(
         model_kwargs={"tool_choice": "auto"},
     )
 
-    # write_todos is hidden from the model via _ToolExclusionMiddleware
-    # (module-level _WRITE_TODOS_EXCLUSION, appended to both Coordinator
-    # and subagent middleware stacks).  This filters the tool from
-    # request.tools while keeping TodoListMiddleware in the stack.
-    # The 2026-07-19 experiment showed that *removing* TodoListMiddleware
-    # (via excluded_middleware) destabilizes qwen3.6's tool-call
-    # serialization — malformed XML / mangled names rose from ~0% to ~75%.
-    # The tool-exclusion approach avoids this: the middleware stays (its
-    # state management / serialization stabilization is preserved), only
-    # the write_todos tool is hidden.  BASE_AGENT_PROMPT never references
-    # write_todos, so there is no prompt/tool mismatch.
+    # write_todos + delete are hidden from the model via _ToolExclusionMiddleware
+    # (module-level _EXCLUDED_TOOLS, appended to both Coordinator and subagent
+    # middleware stacks).  This filters the tools from request.tools while
+    # keeping TodoListMiddleware in the stack.  The 2026-07-19 experiment
+    # showed that *removing* TodoListMiddleware (via excluded_middleware)
+    # destabilizes qwen3.6's tool-call serialization — malformed XML / mangled
+    # names rose from ~0% to ~75%.  The tool-exclusion approach avoids this:
+    # the middleware stays (its state management / serialization stabilization
+    # is preserved), only the write_todos tool is hidden.  BASE_AGENT_PROMPT
+    # never references write_todos, so there is no prompt/tool mismatch.
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
     mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
@@ -825,7 +850,7 @@ def build_agent(
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     # Governance runs before ledger so denied calls skip ledger bookkeeping.
-    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger, _WRITE_TODOS_EXCLUSION]
+    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger, _EXCLUDED_TOOLS]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 
@@ -843,6 +868,6 @@ def build_agent(
         # diagnosis state stays at the prompt tail.
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[dedup_middleware, ledger_middleware, _WRITE_TODOS_EXCLUSION],
+        middleware=[dedup_middleware, ledger_middleware, _EXCLUDED_TOOLS],
         state_schema=DiagnosisLedgerState,
     )
