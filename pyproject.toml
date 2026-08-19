@@ -3,7 +3,7 @@ name = "diagnostics"
 version = "1.0.0"
 requires-python = ">=3.14"
 dependencies = [
-    "deepagents>=0.6.8",
+    "deepagents>=0.7.7",
     "fastapi>=0.116.0",
     "langchain-openai>=1.1.2",
     "python-dotenv>=1.0.0",
