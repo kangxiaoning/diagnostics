@@ -2,7 +2,7 @@
 
 This middleware:
 1. Injects a compact ledger summary into the system message each LLM call
-2. Provides three hypothesis management tools (commit_hypotheses, select_path, record_finding)
+2. Provides three hypothesis management tools (propose_hypotheses, select_path, record_finding)
 3. Auto-records evidence from diagnostic tool calls
 4. Persists the ledger to the filesystem on key changes
 
@@ -18,6 +18,7 @@ import pathlib
 import re
 from collections.abc import Awaitable, Callable
 
+from langchain.agents.middleware import hook_config
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     ExtendedModelResponse,
@@ -35,7 +36,7 @@ from deepagents.backends.protocol import BackendProtocol
 
 from diagnostics.agent.ledger import (
     KAPPA_STOP,
-    MAX_COMMIT_CALLS,
+    MAX_PROPOSE_CALLS,
     MAX_TOTAL_HYPOTHESES,
     ARGUS_PARAM_MISSING_PATTERNS,
     DiagnosisLedger,
@@ -50,7 +51,7 @@ from diagnostics.agent.ledger import (
     add_hypotheses,
     backtrack,
     can_append_hypothesis,
-    can_commit_root_hypotheses,
+    can_propose_root_hypotheses,
     check_exit_conditions,
     compute_next_action,
     compute_report_guidance,
@@ -86,7 +87,7 @@ logger = logging.getLogger(__name__)
 #
 #   _phase(ledger)          — derived phase, honouring the forced-REPORT
 #                             marker below (guardrail equivalent of the
-#                             old committed phase).
+#                             old proposed phase).
 #   _force_report(ledger)   — guardrail "force REPORT" action: marks the
 #                             ledger so every subsequent derivation lands
 #                             on REPORT via check_exit_conditions-friendly
@@ -175,15 +176,15 @@ _READONLY_SCOPES: frozenset[str] = frozenset({
 })
 
 _PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
-    # UNDERSTAND collects data only — committing hypotheses before the
+    # UNDERSTAND collects data only — proposing hypotheses before the
     # coverage gate opens would skip HYPOTHESIZE entirely.
     "understand": frozenset({"task"}),
-    # HYPOTHESIZE only commits; no findings/paths/delegations yet
-    # (§7 whitelist: commit_hypotheses + read_file).  Letting task()
+    # HYPOTHESIZE only proposes; no findings/paths/delegations yet
+    # (§7 whitelist: propose_hypotheses + read_file).  Letting task()
     # through here would pull VERIFY behaviour forward and expose the
     # G5 delegation-value gate outside its designed phase.
-    "hypothesize": frozenset({"commit_hypotheses"}),
-    # VERIFY delegates + records findings; no commits/paths.
+    "hypothesize": frozenset({"propose_hypotheses"}),
+    # VERIFY delegates + records findings; no proposes/paths.
     "verify": frozenset({"task", "record_finding"}),
     # EVALUATE picks direction; recording a finding is ALSO legal here
     # (v2.8.1: record_finding is an evidence-ledgering EVENT, not a phase
@@ -197,7 +198,7 @@ _PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
     # is the correct guard for "may I write the report now"; gating it by
     # phase would kill the legitimate escape hatch where exit conditions
     # are met while the derived phase still reads "evaluate".
-    "evaluate": frozenset({"select_path", "commit_hypotheses", "backtrack",
+    "evaluate": frozenset({"select_path", "propose_hypotheses", "backtrack",
                            "record_finding", "task"}),
     # REPORT only writes the report; diagnosis tools are locked out.
     "report": frozenset(),
@@ -205,9 +206,9 @@ _PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
 
 _PHASE_ALLOWED_HINT: dict[str, str] = {
     "understand": "task(*-argus-expert), read_file",
-    "hypothesize": "commit_hypotheses",
+    "hypothesize": "propose_hypotheses",
     "verify": "task(*-expert), record_finding",
-    "evaluate": "select_path / commit_hypotheses / backtrack / record_finding / task",
+    "evaluate": "select_path / propose_hypotheses / backtrack / record_finding / task",
     "report": "write_file",
 }
 
@@ -225,7 +226,7 @@ _SCAFFOLDING_TOOLS = frozenset({
 
 # Ledger management tools (handled by this middleware)
 _LEDGER_TOOLS = frozenset({
-    "commit_hypotheses", "select_path", "record_finding", "backtrack",
+    "propose_hypotheses", "select_path", "record_finding", "backtrack",
 })
 
 # ── Safety mechanism thresholds ──
@@ -442,7 +443,7 @@ def _build_evidence_audit(ledger: dict) -> str:
 # Patterns found in expert / tool responses that indicate NO meaningful
 # data was returned.  Used by understand-phase safety valves to
 # distinguish "collected rich data" from "collected nothing useful"
-# and trigger early REPORT instead of forcing commit_hypotheses.
+# and trigger early REPORT instead of forcing propose_hypotheses.
 
 # Argus outcome classification patterns (design document §8 G2, v2.5).
 # Three semantically distinct outcomes must NOT be conflated:
@@ -624,10 +625,10 @@ def _render_argus_delegation_hint(ledger: dict, missing: list[str]) -> str:
     first = missing[0]
     return (
         f"⚠ [系统强制] 当前场景已采集 Argus 数据但缺少 Argus 专家（{names}）。\n"
-        "禁止在本轮调用 commit_hypotheses。\n"
+        "禁止在本轮调用 propose_hypotheses。\n"
         f"你必须先调用 task(subagent_type=\"{first}\", description=...) "
         f"委派 {first} 采集对应指标。\n"
-        "收到分析摘要后再提交假设。"
+        "收到分析摘要后再提出假设。"
     )
 
 
@@ -668,7 +669,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
         tools_used.update(tools)
 
     _scaff = {"task", "write_file", "read_file", "edit_file",
-              "commit_hypotheses", "select_path", "record_finding", "backtrack",
+              "propose_hypotheses", "select_path", "record_finding", "backtrack",
               "ls", "glob", "grep", "write_todos", "read_todos"}
     diagnostic = sorted(tools_used - _scaff)
     lines.append(f"- 总轮次: {current_round} | 工具调用: {total_tools} 次 | 委派专家: {total_tasks} 次")
@@ -738,7 +739,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
             lines.append("")
     else:
         lines.append("## 2. 假设验证结果")
-        lines.append("（未提交假设 — 诊断在数据采集阶段被中断）")
+        lines.append("（未提出假设 — 诊断在数据采集阶段被中断）")
         lines.append("")
 
     # ── 3. Best conclusions ──
@@ -1286,7 +1287,7 @@ def _make_cache_key(tool_name: str, args: dict) -> str:
 def _sanitize_ledger(ledger: dict) -> dict:
     """Strip internal fields from ledger before sending to frontend/streaming."""
     internal_keys = {"_inconclusive_streak", "_backtrack_count",
-                     "_root_commit_count", "_commit_count"}
+                     "_root_propose_count", "_propose_count"}
     return {k: v for k, v in ledger.items() if k not in internal_keys}
 
 
@@ -1397,7 +1398,7 @@ def _parse_hypothesis_id_from_description(
 
 class HypothesisSpec(BaseModel):
     # statement 必填——实证：模型曾漏填第 2 个假设的 statement 触发
-    # Field required 错误浪费轮次（场景25 换批提交）。
+    # Field required 错误浪费轮次（场景25 换批提出）。
     statement: str = Field(
         description="假设陈述（必填，每个假设都必须提供，勿遗漏；"
                     "简洁陈述因果链，如『X 导致 Y』）",
@@ -1411,7 +1412,7 @@ class DeprioritizedSpec(BaseModel):
     reason: str = Field(description="降级原因")
 
 
-class CommitHypothesesInput(BaseModel):
+class ProposeHypothesesInput(BaseModel):
     hypotheses: list[HypothesisSpec] = Field(
         description="假设列表（最多3个，按概率降序）",
     )
@@ -1520,6 +1521,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         )
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
+        # Stall guidance pending transfer: set by post-response stall
+        # detection (awrap_model_call) when it wants to force the loop
+        # onward; consumed by after_model, which moves it into the
+        # `_stall_guidance` state field and issues jump_to="model".
+        self._pending_guidance: str | None = None
         # Safety mechanism tracking
         self._consecutive_task_count: int = 0  # global: stagnation detection
         self._same_delegate_count: int = 0     # per-key: delegation saturation
@@ -1564,7 +1570,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         self._exit_block_count: int = 0
         self._det_exit_grace_used: bool = False  # v3.10.1: one-shot R3 grace
         self._round_emitted: bool = False  # prevent duplicate round_transition on goto re-entry
-        self._last_commit_round: int = -1  # round when commit_hypotheses last ran
+        self._last_propose_round: int = -1  # round when propose_hypotheses last ran
         self._last_select_round: int = 0   # round when select_path/backtrack last ran
         self._max_rounds_grace_used: bool = False  # one-shot progress grace flag
         # ── Performance metrics ──
@@ -1583,7 +1589,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             []
             if is_subagent
             else [
-                self._make_commit_hypotheses_tool(),
+                self._make_propose_hypotheses_tool(),
                 self._make_select_path_tool(),
                 self._make_record_finding_tool(),
                 self._make_backtrack_tool(),
@@ -1751,6 +1757,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "(round %d): %s", self._model_call_count, exc,
                 )
 
+    # ── Stall recovery: after_model issues jump_to="model" ──
+    # The post-response stall valves (awrap_model_call) write their guidance
+    # into self._pending_guidance instead of injecting a synthetic ls tool
+    # call.  This hook moves that guidance into the `_stall_guidance` state
+    # field and issues jump_to="model", which routes the loop back to the
+    # model node (skipping the tools node) so the model re-decides with the
+    # guidance injected into its system message next round.
+    #
+    # jump_to must come from after_model (NOT awrap_model_call): the
+    # model→tools edge only includes the loop-entry destination when an
+    # after_model node exists; without one, jump_to="model" routes to a
+    # non-existent node (verified by a controlled test).
+    @hook_config(can_jump_to=["model"])
+    def after_model(self, state, runtime) -> dict | None:
+        if self._pending_guidance:
+            guidance = self._pending_guidance
+            self._pending_guidance = None
+            return {"jump_to": "model", "_stall_guidance": guidance}
+        return None
+
     # ── Context injection ──
 
     async def awrap_model_call(
@@ -1828,7 +1854,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #   - ledger["report"] — report already generated by the system.
         # Premature finalization would deprioritize resumable hypotheses
         # that the LLM still needs to harden (refuted/dead_end) before a
-        # fresh root-hypothesis batch may be committed.
+        # fresh root-hypothesis batch may be proposed.
         if (_phase(ledger) == "report"
                 or derive_phase(ledger) == "report"):
             legit_report = bool(
@@ -1881,6 +1907,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             combined_block = f"{combined_block}\n\n{safety_block}" if combined_block else safety_block
         if audit_block:
             combined_block = f"{combined_block}\n\n{audit_block}" if combined_block else audit_block
+
+        # ── Stall guidance: consume the transient _stall_guidance set by
+        # after_model on the previous round.  Injected into the SYSTEM message
+        # (not the conversation) so the model sees a system directive instead
+        # of a self-authored assistant turn.  Cleared in the normal return
+        # path below (the same Command that persists the ledger).
+        _stall_guidance = request.state.get("_stall_guidance") if request.state else None
+        if _stall_guidance:
+            combined_block = f"{combined_block}\n\n{_stall_guidance}" if combined_block else _stall_guidance
 
         # ── Observability: emit the injected guidance delta to the trace ──
         # The trace records tool calls/results and LLM output but not the
@@ -2145,7 +2180,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "🔧委派专家诊断",
                     "📊**host-argus-expert分析摘要**",
                     "📊**k8s-argus-expert分析摘要**",
-                    "🔧提交诊断假设",
+                    "🔧提出诊断假设",
                     "🔧记录验证结论",
                     "🔧写入文件",
                     "报告已写入",
@@ -2299,24 +2334,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "record_finding (round %d) — nudging",
                                     active_id, self._model_call_count,
                                 )
-                                import uuid as _uuid
-                                synthetic = [{
-                                    "name": "ls",
-                                    "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                                    "args": {"path": "/agent_data"},
-                                }]
+                                self._pending_guidance = (
+                                    "你已收到专家验证结果但未调用 "
+                                    "record_finding 记录结论。\n"
+                                    f"请立即对假设 {fmt_hid(active_id)} "
+                                    "调用 record_finding（confirmed / "
+                                    "refuted / inconclusive 由你根据证据"
+                                    "判定；证据不足就给 inconclusive）。"
+                                    "禁止以纯文本结束本阶段。"
+                                )
                                 response = ModelResponse(result=[AIMessage(
-                                    content=(
-                                        "⛔ [系统提醒] 你已收到专家验证结果但"
-                                        "未调用 record_finding 记录结论。\n"
-                                        f"请立即对假设 {fmt_hid(active_id)} "
-                                        "调用 record_finding（confirmed / "
-                                        "refuted / inconclusive 由你根据证据"
-                                        "判定；证据不足就给 inconclusive）。"
-                                        "禁止以纯文本结束本阶段。"
-                                    ),
+                                    content="",
                                 )])
-                                _inject_tool_calls(response, synthetic)
                                 # No count reset: escalation must be
                                 # monotonic (reminder → degrade → terminal)
                                 # across CONSECUTIVE stalls.  Any real tool
@@ -2489,10 +2518,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             self._persist_ledger(ledger)
 
         # ── Post-response: detect UNDERSTAND-phase stall ──
-        # When the LLM outputs plain text without calling commit_hypotheses
+        # When the LLM outputs plain text without calling propose_hypotheses
         # in UNDERSTAND phase (round >= 2, data collected, no hypotheses),
         # inject a SystemMessage to force the agent loop to continue.
-        # Without this, the LLM can output "🔧提交诊断假设" as text
+        # Without this, the LLM can output "🔧提出诊断假设" as text
         # (not a tool call) and the agent loop exits with no hypotheses.
         # Mirrors the verify-phase stall detection above.
         ledger = self._current_ledger
@@ -2568,12 +2597,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                         # "all_normal" needs no special handling: the
                         # findings are recorded in the ledger and the
-                        # normal coverage/commit flow continues (如实
+                        # normal coverage/propose flow continues (如实
                         # 记录，继续推进).
                         # ── Coverage-aware stall handling ──
                         # If Argus coverage is incomplete (e.g. only
                         # k8s-argus-expert delegated, host-argus-expert
-                        # missing), injecting commit_hypotheses is
+                        # missing), injecting propose_hypotheses is
                         # guaranteed to be blocked by the phase gate
                         # (understand phase tool whitelist, §7).
                         # Instead, force delegation of the missing expert
@@ -2587,7 +2616,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "incomplete coverage (round %d, "
                                     "missing: %s) — forcing expert "
                                     "delegation instead of "
-                                    "commit_hypotheses",
+                                    "propose_hypotheses",
                                     self._model_call_count,
                                     ", ".join(missing),
                                 )
@@ -2617,7 +2646,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 # all expected experts already delegated
                                 # (should not normally happen).  Nudge the
                                 # loop alive with a harmless read-only call
-                                # — do NOT inject a placeholder commit: it
+                                # — do NOT inject a placeholder propose: it
                                 # would be rejected by the UNDERSTAND phase
                                 # gate, consume root-batch budget, and
                                 # pollute the hypothesis tree (same
@@ -2628,55 +2657,42 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "gate not ready), nudging continuation",
                                     self._model_call_count,
                                 )
-                                import uuid as _uuid3
-                                synthetic = [{
-                                    "name": "ls",
-                                    "id": f"call_safety_{_uuid3.uuid4().hex[:12]}",
-                                    "args": {"path": "/agent_data"},
-                                }]
+                                self._pending_guidance = (
+                                    "监控数据采集状态异常（专家已委派但覆盖门控"
+                                    "未就绪）。请查看已有工具调用结果：若数据已"
+                                    "返回，请基于数据继续诊断流程。"
+                                )
                                 response = ModelResponse(result=[AIMessage(
-                                    content=(
-                                        "[系统提醒] 监控数据采集状态异常"
-                                        "（专家已委派但覆盖门控未就绪）。"
-                                        "请查看已有工具调用结果：若数据已返回，"
-                                        "请基于数据继续诊断流程。"
-                                    ),
+                                    content="",
                                 )])
-                                _inject_tool_calls(response, synthetic)
                         else:
                             # Coverage is ready (or the argus-failure
-                            # degrade bypassed T1) — nudge commit via a
+                            # degrade bypassed T1) — nudge propose via a
                             # harmless read-only call.  Do NOT inject a
-                            # placeholder commit_hypotheses: a placeholder
+                            # placeholder propose_hypotheses: a placeholder
                             # root batch consumes batch budget and pollutes
                             # the tree (same principle as the G9 evaluate
                             # valve, design document §8).
                             logger.warning(
                                 "Safety: understand stall (round %d) — "
-                                "LLM output text without commit_hypotheses, "
-                                "nudging commit via synthetic call",
+                                "LLM output text without propose_hypotheses, "
+                                "nudging propose via jump_to guidance",
                                 self._model_call_count,
                             )
-                            import uuid as _uuid4
-                            synthetic = [{
-                                "name": "ls",
-                                "id": f"call_safety_{_uuid4.uuid4().hex[:12]}",
-                                "args": {"path": "/agent_data"},
-                            }]
+                            self._pending_guidance = (
+                                "Argus 监控平台故障（空数据/报错），监控数据"
+                                "不可用。请基于用户描述的故障现象立即调用 "
+                                "propose_hypotheses 提出假设，后续专家诊断将"
+                                "继续验证并修正。"
+                                if ledger.get("_argus_unavailable")
+                                else
+                                "你已连续输出纯文本而未提出假设。请立即基于"
+                                "已有数据调用 propose_hypotheses 提出假设"
+                                "（最多3个，按概率降序，各附依据）。"
+                            )
                             response = ModelResponse(result=[AIMessage(
-                                content=(
-                                    "[系统强制] Argus 监控平台故障（空数据"
-                                    "/报错），监控数据不可用。请基于用户描述"
-                                    "的故障现象立即调用 commit_hypotheses "
-                                    "提交假设，后续专家诊断将继续验证并修正。"
-                                    if ledger.get("_argus_unavailable")
-                                    else
-                                    "[系统强制] 你已连续输出纯文本而未提交假设。"
-                                    "请立即基于已有数据调用 commit_hypotheses "
-                                    "提交假设（最多3个，按概率降序，各附依据）。"
-                                ),
+                                content="",
                             )])
-                            _inject_tool_calls(response, synthetic)
 
         # ── Post-response: EVALUATE-phase loop abandonment (guardrail G9) ──
         # Trigger: the LLM ends its EVALUATE turn without tool calls
@@ -2699,7 +2715,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #         with the LLM);
         #     (c) layer fully hard-failed/economically dead + batch
         #         budget open → harmless nudge reminding the LLM to
-        #         commit_hypotheses (T8; no placeholder commit — that
+        #         propose_hypotheses (T8; no placeholder propose — that
         #         would consume batch budget and pollute the tree).
         #   2nd consecutive offence, or no legal direction at all — 兜底
         #     (G7 pattern): finalize undecided hypotheses via
@@ -2753,7 +2769,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if node.get("status") == "confirmed"
                     and node.get("probability", 0) < 80
                 ]
-                batch_open = can_commit_root_hypotheses(ledger)
+                batch_open = can_propose_root_hypotheses(ledger)
 
                 if (self._evaluate_stall_count >= 1
                         or (not actionable and not revivable
@@ -2851,13 +2867,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         hid = max(
                             strengthenable,
                             key=lambda h: all_h[h].get("probability", 0))
-                        synthetic = [{
-                            "name": "ls",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {"path": "/agent_data"},
-                        }]
-                        content = (
-                            "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具。\n"
+                        self._pending_guidance = (
+                            "当前处于 EVALUATE 阶段但未调用工具。\n"
                             f"已确认假设 {fmt_hid(hid)} 概率 "
                             f"{all_h[hid].get('probability')}% 低于根因确认门槛"
                             "（80%）。请基于已有证据调用 "
@@ -2877,36 +2888,36 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # this layer (all roots hard-failed or economically
                         # dead, v2.9) and the batch budget is open.  Nudge
                         # via a harmless call; do NOT inject
-                        # commit_hypotheses itself — a placeholder
+                        # propose_hypotheses itself — a placeholder
                         # hypothesis would consume batch budget and pollute
                         # the tree.
-                        synthetic = [{
-                            "name": "ls",
-                            "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                            "args": {"path": "/agent_data"},
-                        }]
-                        content = (
-                            "[系统提醒] 当前处于 EVALUATE 阶段但未调用工具，"
+                        self._pending_guidance = (
+                            "当前处于 EVALUATE 阶段但未调用工具，"
                             "本层假设已全部证伪或验证增益已低于成本"
                             "（经济死亡，禁止再委派验证）。\n"
-                            f"假设提交预算仍开放（已用 "
-                            f"{ledger.get('_commit_count', 0)}"
-                            f"/{MAX_COMMIT_CALLS} 次）。请立即调用 "
-                            "commit_hypotheses 提交新一批假设"
+                            f"假设提出预算仍开放（已用 "
+                            f"{ledger.get('_propose_count', 0)}"
+                            f"/{MAX_PROPOSE_CALLS} 次）。请立即调用 "
+                            "propose_hypotheses 提出新一批假设"
                             "（必须基于已排除证据换方向，禁止重复或仅换措辞）。"
                         )
                         logger.warning(
-                            "Safety: evaluate stall (round %d, commit %d/%d "
-                            "open) — nudging commit_hypotheses via "
-                            "synthetic call",
+                            "Safety: evaluate stall (round %d, propose %d/%d "
+                            "open) — nudging propose_hypotheses via "
+                            "jump_to guidance",
                             self._model_call_count,
-                            ledger.get("_commit_count", 0),
-                            MAX_COMMIT_CALLS,
+                            ledger.get("_propose_count", 0),
+                            MAX_PROPOSE_CALLS,
                         )
-                    response = ModelResponse(result=[AIMessage(
-                        content=content,
-                    )])
-                    _inject_tool_calls(response, synthetic)
+                    if self._pending_guidance:
+                        # strengthen / T8：引导已写入 self._pending_guidance
+                        # （走 system 通道），response 清空以丢弃 stall 纯文本
+                        response = ModelResponse(result=[AIMessage(content="")])
+                    else:
+                        # revive deferred：select_path 是有意义的动作，保留
+                        # content + tool_calls 注入
+                        response = ModelResponse(result=[AIMessage(content=content)])
+                        _inject_tool_calls(response, synthetic)
             else:
                 # Real tool call made — the loop advances on its own.
                 self._evaluate_stall_count = 0
@@ -2958,7 +2969,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 self._model_call_count,
                             )
                             _f3_hint = (
-                                f"⛔ [系统检测] {fmt_hid(_ahid)} 的 confirmed/refuted "
+                                f"{fmt_hid(_ahid)} 的 confirmed/refuted "
                                 f"判定已连续被冲突门控拦截——指标层证据存在"
                                 f"（集群/节点/工作负载级）异常与目标实体正常并存，"
                                 f"系统已开放深度专家委派通道（不受成本门控限制）。"
@@ -2967,27 +2978,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 f"查目标实体日志/事件确认后再判定；"
                                 f"深度专家证据到位后冲突自动清除、门控自动放行。"
                             )
-                            # Text-only AIMessage would terminate the loop;
-                            # inject a harmless ls call to keep it alive so
-                            # the hint reaches the LLM (same mechanism as
-                            # G13 gentle reminder).
-                            import uuid as _uuid3
-                            _inject_tool_calls(response, [{
-                                "name": "ls",
-                                "id": f"call_f3_{_uuid3.uuid4().hex[:12]}",
-                                "args": {"path": "/agent_data"},
-                            }], content_override=_f3_hint)
+                            # Force the loop onward via jump_to (after_model) —
+                            # the hint rides the system channel, and the
+                            # record_finding verdict is dropped (it would be
+                            # re-blocked by the conflict gate).
+                            self._pending_guidance = _f3_hint
+                            response = ModelResponse(result=[AIMessage(
+                                content="",
+                            )])
 
         # ── Post-response: detect HYPOTHESIZE-phase stall (G12) ──
         # HYPOTHESIZE has two entry paths (design document §4/§5): T1
         # (first batch — coverage just became ready, the ledger has NO
         # hypotheses yet) and T8 (retry batch — the current batch is all
         # hard-failed and budget remains).  In BOTH, if the LLM outputs
-        # plain text instead of calling commit_hypotheses, the agent loop
+        # plain text instead of calling propose_hypotheses, the agent loop
         # would exit silently with no report (2026-07-31 scenario-24
         # swap_thrashing: 2 rounds, zero hypotheses, no report, no ledger
-        # persisted).  Nudge via a harmless synthetic call — do NOT inject
-        # commit_hypotheses itself: a placeholder hypothesis would consume
+        # persisted).  Nudge via jump_to guidance — do NOT inject
+        # propose_hypotheses itself: a placeholder hypothesis would consume
         # batch budget and pollute the tree (same principle as the G9
         # evaluate valve, §8).  No round gate: the phase cannot occur
         # before round 2 (s₀=UNDERSTAND, T1 coverage needs ≥2 rounds), and
@@ -2995,27 +3004,33 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # always correct.  This mirrors the sibling verify-stall valve
         # (which also fires with no round gate).
         ledger = self._current_ledger
-        if ledger and _phase(ledger) == "hypothesize":
+        if (ledger and _phase(ledger) == "hypothesize"
+                and not self._pending_guidance):
+            # The `not self._pending_guidance` guard makes the stall valves
+            # explicitly mutually exclusive.  The UNDERSTAND valve may degrade
+            # argus failure (understand → hypothesize) and set
+            # _pending_guidance in the same response; without this guard the
+            # HYPOTHESIZE valve would then also fire (its _response_ends_loop
+            # sees the now-empty response) and overwrite the argus-failure
+            # guidance.  (The pre-jump_to implementation relied on the
+            # understand valve injecting a tool call — which made
+            # _response_ends_loop False — as an *implicit* mutual exclusion;
+            # the empty-response + jump_to rewrite removed that, so the
+            # exclusion is now explicit.)
             if _response_ends_loop(response):
                 _has_prior = bool(ledger.get("hypotheses"))
                 logger.warning(
-                    "Safety: hypothesize-phase stall (round %d, commit "
-                    "%d/%d, %s) — nudging commit_hypotheses via "
-                    "synthetic call",
+                    "Safety: hypothesize-phase stall (round %d, propose "
+                    "%d/%d, %s) — nudging propose_hypotheses via "
+                    "jump_to guidance",
                     self._model_call_count,
-                    ledger.get("_commit_count", 0),
-                    MAX_COMMIT_CALLS,
+                    ledger.get("_propose_count", 0),
+                    MAX_PROPOSE_CALLS,
                     "retry-batch" if _has_prior else "first-batch",
                 )
-                import uuid as _uuid
-                synthetic = [{
-                    "name": "ls",
-                    "id": f"call_safety_{_uuid.uuid4().hex[:12]}",
-                    "args": {"path": "/agent_data"},
-                }]
                 if _has_prior:
                     _directive = (
-                        "请立即调用 commit_hypotheses 提交新一批假设——"
+                        "请立即调用 propose_hypotheses 提出新一批假设——"
                         "必须基于已排除证据换方向推断，"
                         "禁止与已排除假设重复或仅换措辞。"
                     )
@@ -3024,23 +3039,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _directive += render_failure_digest(ledger) or ""
                 else:
                     _directive = (
-                        "你尚未提交任何假设。请立即调用 commit_hypotheses "
-                        "提交首批竞争性假设（≤3 个，按概率降序，各附依据）——"
+                        "你尚未提出任何假设。请立即调用 propose_hypotheses "
+                        "提出首批竞争性假设（≤3 个，按概率降序，各附依据）——"
                         "禁止以纯文本结束本阶段。"
                     )
+                self._pending_guidance = (
+                    "当前处于 HYPOTHESIZE 阶段"
+                    f"（假设提出预算已用 "
+                    f"{ledger.get('_propose_count', 0)}"
+                    f"/{MAX_PROPOSE_CALLS} 次）。\n"
+                    f"{_directive}"
+                )
                 response = ModelResponse(result=[AIMessage(
-                    content=(
-                        "[系统提醒] 当前处于 HYPOTHESIZE 阶段"
-                        f"（假设提交预算已用 "
-                        f"{ledger.get('_commit_count', 0)}"
-                        f"/{MAX_COMMIT_CALLS} 次）。\n"
-                        f"{_directive}"
-                    ),
+                    content="",
                 )])
-                _inject_tool_calls(response, synthetic)
 
         # ── Post-response: detect VERIFY ledger-only stall ──
-        # When the LLM uses ledger tools (select_path, commit_hypotheses)
+        # When the LLM uses ledger tools (select_path, propose_hypotheses)
         # but fails to follow up with a diagnostic delegation (task),
         # the verifying hypothesis remains unverified and the session
         # exits without expert evidence.  Detection uses state, not a
@@ -3065,13 +3080,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     )
                     # If no expert evidence yet, the LLM usually needs
                     # to delegate a diagnostic expert — BUT don't stall
-                    # on hypotheses just created by commit_hypotheses
+                    # on hypotheses just created by propose_hypotheses
                     # (this or the previous round).  They naturally have
                     # no evidence yet and the LLM should have a chance
                     # to delegate before we intervene.
                     if (not has_expert_evidence
                             and self._model_call_count
-                            - self._last_commit_round > 1):
+                            - self._last_propose_round > 1):
                         ai_msgs = [
                             m for m in (response.result if isinstance(response.result, list) else [response.result])
                             if hasattr(m, "tool_calls")
@@ -3206,21 +3221,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "alive, no stub yet)",
                             self._model_call_count,
                         )
-                        import uuid as _uuid_r1
-                        synthetic = [{
-                            "name": "ls",
-                            "id": f"call_safety_{_uuid_r1.uuid4().hex[:12]}",
-                            "args": {"path": "/agent_data"},
-                        }]
+                        self._pending_guidance = (
+                            "REPORT 阶段禁止纯文本收尾。\n"
+                            "你必须在下一轮调用 write_file 将完整诊断"
+                            f"报告写入 {self.report_path}。\n"
+                            "禁止调用任何诊断工具，禁止输出纯文本分析。"
+                        )
                         response = ModelResponse(result=[AIMessage(
-                            content=(
-                                "⛔ [系统提醒] REPORT 阶段禁止纯文本收尾。\n"
-                                "你必须在下一轮调用 write_file 将完整诊断"
-                                f"报告写入 {self.report_path}。\n"
-                                "禁止调用任何诊断工具，禁止输出纯文本分析。"
-                            ),
+                            content="",
                         )])
-                        _inject_tool_calls(response, synthetic)
                     else:
                         # ── Level 2: Auto-generate as last resort ──
                         report_md = self._generate_report_from_ledger(ledger)
@@ -3369,7 +3378,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if self._current_ledger is not None:
             return ExtendedModelResponse(
                 model_response=response,
-                command=Command(update={"_diagnosis_ledger": self._current_ledger}),
+                command=Command(update={
+                    "_diagnosis_ledger": self._current_ledger,
+                    # Consume the stall guidance after injecting it this round.
+                    "_stall_guidance": None,
+                }),
             )
         return response
 
@@ -3715,13 +3728,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # ── REPORT-phase gate: prevent restarting diagnosis after
         # a root cause has been confirmed.  Creating new hypotheses
         # or backtracking after confirmation would create confusing
-        # frontend trees (write_file → commit_hypotheses → ...).
+        # frontend trees (write_file → propose_hypotheses → ...).
         #
         # Exception: if ALL root hypotheses are exhausted (refuted /
         # dead-end) and NO root cause has been confirmed, allow
-        # commit_hypotheses / backtrack — the first attempt failed
+        # propose_hypotheses / backtrack — the first attempt failed
         # and the LLM should be able to propose a new round.
-        if tool_name in ("commit_hypotheses", "backtrack"):
+        if tool_name in ("propose_hypotheses", "backtrack"):
             ledger = self._current_ledger
             if ledger and _phase(ledger) == "report":
                 cids = ledger.get("root_cause_hypothesis_ids", [])
@@ -3943,7 +3956,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     "请选择：\n"
                                     "- record_finding 对该假设给出结论（confirmed/refuted/inconclusive）\n"
                                     "- select_path 切换到其他未决假设\n"
-                                    "- 若无 confirmed 根因且换批预算未用尽：commit_hypotheses 换方向\n"
+                                    "- 若无 confirmed 根因且换批预算未用尽：propose_hypotheses 换方向\n"
                                     "- 若退出判据已满足：系统将自动进入 REPORT"
                                 ),
                                 tool_call_id=tool_call_id,
@@ -4228,10 +4241,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._same_delegate_count = 0
                 self._last_delegate_key = ""
                 self._last_finding_round = self._model_call_count
-            # commit_hypotheses marks the UNDERSTAND→VERIFY boundary;
+            # propose_hypotheses marks the UNDERSTAND→VERIFY boundary;
             # reset stagnation counters so that UNDERSTAND-phase Argus task()
             # calls do not accumulate into the VERIFY-phase threshold.
-            elif tool_name == "commit_hypotheses":
+            elif tool_name == "propose_hypotheses":
                 self._consecutive_task_count = 0
             # select_path / backtrack also count as diagnostic progress
             # (the LLM is actively navigating the hypothesis tree).
@@ -4494,7 +4507,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
            grace when diagnosis is still advancing; forces REPORT only after
            progress stalls past the cap (or the grace is exhausted).
         2. **Understand stagnation (P2/P3)**: When round >= 2 but no hypotheses
-           committed, inject a strong directive to force commit_hypotheses.
+           proposed, inject a strong directive to force propose_hypotheses.
            Runs independently of the min-round-for-safety threshold.
         3. **Stagnation detection (P2/P3)**: After ≥3 consecutive task() calls
            without record_finding, auto-records an inconclusive finding for
@@ -4511,7 +4524,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # ── P1: Maximum round limit — progress-aware, then synthesis + REPORT ──
         # The round cap is a stagnation backstop, not a blunt cutoff: when
         # the diagnosis is still making progress (recent record_finding /
-        # commit_hypotheses / select_path / new evidence), grant a one-shot
+        # propose_hypotheses / select_path / new evidence), grant a one-shot
         # grace extension instead of interrupting mid-verification.  Only
         # fire when the process has gone quiet — no ledger progress in the
         # last _PROGRESS_WINDOW rounds — or after the grace was consumed.
@@ -4521,7 +4534,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # tighter cap: history shows rounds beyond ~24 in this state are
         # unproductive wandering.  (v2.7 flat model: the depth≥1 clause
         # was removed with sub-hypotheses.)
-        is_complex = bool(ledger.get("_root_commit_count", 0) > 1)
+        is_complex = bool(ledger.get("_root_propose_count", 0) > 1)
         cap = _MAX_ROUNDS_COMPLEX if is_complex else _MAX_ROUNDS
         grace = _MAX_ROUNDS_COMPLEX_GRACE if is_complex else _MAX_ROUNDS_GRACE
 
@@ -4529,7 +4542,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if round_num >= cap and not ledger.get("_forced_terminal"):
             last_progress = max(
                 self._last_finding_round,
-                self._last_commit_round,
+                self._last_propose_round,
                 self._last_select_round,
                 self._last_evidence_round,
             )
@@ -4573,8 +4586,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # ── Understand-phase stagnation safety valve ──
         # Runs independently of _MIN_ROUND_FOR_SAFETY.  Differentiate
         # between:
-        #   (a) Diagnostic data WAS collected → force commit_hypotheses
-        #       (round >= 3 only — at round 2 the LLM commits in its
+        #   (a) Diagnostic data WAS collected → force propose_hypotheses
+        #       (round >= 3 only — at round 2 the LLM proposes in its
         #       response on the normal path, so a round-2 directive is a
         #       false "系统强制" injection observed in every session)
         #   (b) Diagnostic data was NOT collected → force data collection
@@ -4582,7 +4595,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #   (c) Partial Argus coverage → force the missing expert (round >= 2)
         #   (d) All experts returned empty data → short-circuit to REPORT
         # Without this valve, the LLM may output analysis as plain text
-        # instead of calling commit_hypotheses, causing the loop to exit.
+        # instead of calling propose_hypotheses, causing the loop to exit.
         if (
             round_num >= 2
             and not ledger.get("hypotheses")
@@ -4614,7 +4627,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # coverage gate (D1) and the proactive coverage hint.
                 # When coverage is incomplete, force delegation of the
                 # missing expert instead of prematurely forcing
-                # commit_hypotheses.
+                # propose_hypotheses.
                 #
                 # NOTE: Coordinator does NOT have Argus tools directly —
                 # detection uses delegated_experts (populated from
@@ -4635,14 +4648,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if ledger.get("_argus_unavailable"):
                     # Argus platform failure (v2.5 degrade): coverage and
                     # delegation interventions are pointless — argus is
-                    # unavailable.  Just keep nudging commit from user
+                    # unavailable.  Just keep nudging propose from user
                     # input; the normal flow continues with domain
                     # experts collecting evidence in VERIFY.
                     if round_num >= 3 and _phase(ledger) == "hypothesize":
                         warnings.append(
                             "⚠ [系统提示] Argus 监控平台故障，监控数据不"
                             "可用。\n请基于用户描述的故障现象调用 "
-                            "commit_hypotheses 提出假设，"
+                            "propose_hypotheses 提出假设，"
                             "后续专家诊断将继续验证并修正假设。"
                         )
                 # Only intervene when an expert WAS delegated but the
@@ -4687,7 +4700,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "⚠ [系统提示] Argus 监控平台故障（返回空数据"
                             "或报错），监控数据不可用。\n"
                             "请基于用户描述的故障现象调用 "
-                            "commit_hypotheses 提出假设，"
+                            "propose_hypotheses 提出假设，"
                             "后续专家诊断将继续验证并修正假设。"
                         )
                     elif _argus_state == "all_normal":
@@ -4700,47 +4713,47 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "ℹ [系统提示] Argus 指标全部正常（已如实"
                                 "记录）。\n用户仍报告了故障现象——请结合"
                                 "用户输入与已记录的正常基线调用 "
-                                "commit_hypotheses 提出假设。"
+                                "propose_hypotheses 提出假设。"
                             )
                     elif round_num >= 3 and _phase(ledger) == "hypothesize":
                         # Coverage gate already opened (phase derives to
-                        # hypothesize) but the LLM still hasn't committed —
+                        # hypothesize) but the LLM still hasn't proposed —
                         # a genuine stagnation signal.  Round-2 exemption:
-                        # on the normal path the LLM commits in its round-2
+                        # on the normal path the LLM proposes in its round-2
                         # response, so a round-2 directive is always a
                         # false positive.  When the gate has NOT opened yet
                         # (still understand), the partial-coverage branch
                         # above owns the corrective message instead — telling
-                        # the LLM to commit here would be rejected by the
+                        # the LLM to propose here would be rejected by the
                         # phase tool gate.
                         warnings.append(
                             "⛔ [系统强制] 数据采集已完成，当前已是第"
-                            f"{round_num}轮，你仍未提交任何假设。\n"
+                            f"{round_num}轮，你仍未提出任何假设。\n"
                             "禁止继续调用诊断工具。\n"
-                            "立即基于已有 Argus 数据调用 commit_hypotheses，"
+                            "立即基于已有 Argus 数据调用 propose_hypotheses，"
                             "否则诊断将提前终止。"
                         )
                         logger.warning(
                             "Safety: hypothesize stagnation with data (round %d, "
-                            "no hypotheses) — forcing commit",
+                            "no hypotheses) — forcing propose",
                             round_num,
                         )
             else:
                 # No data collected.  _coverage_ready treats "never
                 # delegated" as ready (ledger.py), so at round>=2 the
                 # derived phase is already hypothesize — the old text
-                # ("禁止调用 commit_hypotheses，必须委派 Argus") ALWAYS
+                # ("禁止调用 propose_hypotheses，必须委派 Argus") ALWAYS
                 # contradicted the phase guidance.  Only demand
                 # delegation while genuinely in UNDERSTAND; otherwise
-                # nudge committing from user input (same semantics as
+                # nudge proposing from user input (same semantics as
                 # the argus-degrade path).
                 if _phase(ledger) == "understand":
                     _required_names = "、".join(_required_argus(ledger))
                     warnings.append(
                         "⚠ [系统强制] 当前是第"
-                        f"{round_num}轮，你尚未提交任何假设，"
+                        f"{round_num}轮，你尚未提出任何假设，"
                         "且未调用任何诊断工具采集数据。\n"
-                        "禁止输出纯文本分析，禁止调用 commit_hypotheses。\n"
+                        "禁止输出纯文本分析，禁止调用 propose_hypotheses。\n"
                         f"你必须在本轮调用 task() 委派 Argus 专家"
                         f"（{_required_names}）采集监控指标数据。\n"
                         "这是诊断的第一步——没有数据就无法形成假设。"
@@ -4756,7 +4769,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "⚠ [系统提示] 当前已是第"
                         f"{round_num}轮，尚未委派专家采集监控数据。\n"
                         "可调用 task() 委派 Argus 专家采集数据，或直接基于"
-                        "用户描述的故障现象调用 commit_hypotheses 提出假设，"
+                        "用户描述的故障现象调用 propose_hypotheses 提出假设，"
                         "后续专家诊断将继续验证并修正假设。"
                     )
 
@@ -4852,7 +4865,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # rejects in every phase this branch can fire in.
                     _p2_actions = {
                         "understand": "继续委派 Argus 专家完成数据采集",
-                        "hypothesize": "调用 commit_hypotheses 提交假设",
+                        "hypothesize": "调用 propose_hypotheses 提出假设",
                         "evaluate": "调用 select_path 选择下一步验证方向",
                         "report": "调用 write_file 生成诊断报告",
                     }
@@ -4893,7 +4906,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     for e in node.get("evidence", [])
                 )
                 # A fresh select_path/backtrack restarts the verification
-                # clock — the LLM just committed to a recovery plan for
+                # clock — the LLM just proposed to a recovery plan for
                 # this hypothesis and must get the full gap window to
                 # execute it (aligned with the P1 max-rounds valve, which
                 # already counts _last_select_round as progress; observed
@@ -4946,12 +4959,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "⛔ 诊断已满足报告条件。必须立即调用 write_file "
                             f"将诊断报告写入 {self.report_path}。\n"
                             "禁止调用任何诊断工具、委派专家、record_finding、"
-                            "commit_hypotheses。"
+                            "propose_hypotheses。"
                         ),
                         "hypothesize": (
-                            "请调用 commit_hypotheses 提交新一批假设"
-                            f"（第 {ledger.get('_commit_count', 0) + 1}"
-                            f"/{MAX_COMMIT_CALLS} 次）——"
+                            "请调用 propose_hypotheses 提出新一批假设"
+                            f"（第 {ledger.get('_propose_count', 0) + 1}"
+                            f"/{MAX_PROPOSE_CALLS} 次）——"
                             "必须基于已排除证据换方向推断，"
                             "禁止与已排除假设重复或仅换措辞。"
                         ),
@@ -5005,9 +5018,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 f"（第{self._report_phase_start_round}轮起）。\n"
                 "⛔ 不要输出文本 — 你的唯一任务是立即调用 write_file。\n"
                 "系统已自动终结所有挂起假设，你无需再调用 "
-                "record_finding / commit_hypotheses。\n"
+                "record_finding / propose_hypotheses。\n"
                 "禁止调用任何诊断工具、委派专家、record_finding、"
-                "commit_hypotheses。\n"
+                "propose_hypotheses。\n"
                 "禁止输出分析、总结或复盘文字。\n"
                 f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
                 "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
@@ -5026,9 +5039,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         return ("\n\n".join(warnings) if warnings else ""), mutated
 
-    # ── Tool: commit_hypotheses ──
+    # ── Tool: propose_hypotheses ──
 
-    def _make_commit_hypotheses_tool(self) -> StructuredTool:
+    def _make_propose_hypotheses_tool(self) -> StructuredTool:
         mw = self
 
         async def _run(
@@ -5046,20 +5059,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # copy only drives the receipt wording.
             _is_append = (
                 bool(ledger.get("hypotheses"))
-                and not can_commit_root_hypotheses(ledger)
+                and not can_propose_root_hypotheses(ledger)
                 and can_append_hypothesis(ledger)
             )
 
             try:
                 created = add_hypotheses(ledger, specs)
             except ValueError as e:
-                return f"假设提交失败: {e}"
+                return f"假设调用失败: {e}"
 
             # Update phase and track creation round
-            mw._last_commit_round = mw._model_call_count
+            mw._last_propose_round = mw._model_call_count
 
             # Build confirmation
-            lines = [f"已提交 {len(created)} 个假设:"]
+            lines = [f"已提出 {len(created)} 个假设:"]
             for h in created:
                 sel = " ★" if h["selected"] else ""
                 lines.append(f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
@@ -5070,14 +5083,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     f"/{MAX_TOTAL_HYPOTHESES}）"
                 )
             else:
-                _budget_left = MAX_COMMIT_CALLS - ledger.get("_commit_count", 0)
+                _budget_left = MAX_PROPOSE_CALLS - ledger.get("_propose_count", 0)
                 if _budget_left > 0:
                     lines.append(
-                        f"（提交预算剩余 {_budget_left}/{MAX_COMMIT_CALLS} 次）"
+                        f"（提出预算剩余 {_budget_left}/{MAX_PROPOSE_CALLS} 次）"
                     )
                 else:
                     lines.append(
-                        f"（提交预算已用尽 {MAX_COMMIT_CALLS}/{MAX_COMMIT_CALLS} 次；"
+                        f"（提出预算已用尽 {MAX_PROPOSE_CALLS}/{MAX_PROPOSE_CALLS} 次；"
                         "后续如需细化假设，请用 record_finding(statement_update=...)）"
                     )
 
@@ -5085,7 +5098,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # success confirmation leaves the model without a forward
             # signal and measurably invites self-repetition (2026-08-08
             # scenario-32 replay: the model re-emitted the same analysis
-            # text plus an empty-args commit_hypotheses on the very next
+            # text plus an empty-args propose_hypotheses on the very next
             # round).  StateWright, positive form: a response should name
             # the available transition, not only report the result.
             _focus = next((h for h in created if h.get("selected")),
@@ -5104,27 +5117,27 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             return "\n".join(lines)
 
         return StructuredTool.from_function(
-            name="commit_hypotheses",
+            name="propose_hypotheses",
             description=(
-                "提交诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
+                "提出诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
                 "每个假设必须包含 statement（必填，一句完整根因表述）、probability(0-100)、"
-                "rationale 三个字段，缺一不可；statement 缺失会导致提交失败（预算不返还）。"
+                "rationale 三个字段，缺一不可；statement 缺失会导致调用失败（预算不返还）。"
                 "若多个候选描述的是同一故障的机制/因果链上下游（如\"内存超限 OOMKilled\""
                 "与\"memory limit 配置过低\"互为表里），应合并为一条假设；"
-                "仅当证据显示独立故障源并存时才提交多条。"
-                "本工具只创建待验证假设，不产生任何结论；确认或证伪已有假设必须调用 "
-                "record_finding，重复提交不会确认任何假设。"
-                "假设为扁平结构（ID 为整数编号如 H1、H2），不支持在某假设下提交子假设；"
+                "仅当证据显示独立故障源并存时才提出多条。"
+                "本工具只提出待验证的候选假设，不产生任何结论；确认或证伪已有假设必须调用 "
+                "record_finding，重复提出不会确认任何假设。"
+                "假设为扁平结构（ID 为整数编号如 H1、H2），不支持在某假设下提出子假设；"
                 "如需更具体的表述，用 record_finding(statement_update=...) 修正。"
-                "整个诊断最多提交2次（首批、换批共用此预算），总计不超过6个假设。"
+                "整个诊断最多提出2次（首批、换批共用此预算），总计不超过6个假设。"
                 "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述。"
                 "验证中途新证据指向当前假设集之外的全新方向时，可在 EVALUATE 阶段用本工具"
                 "追加1个新假设（单次仅1个；追加不占用换批预算，但总假设数不超过6个）——"
                 "区别于换批：换批是当前方向全部失败后的重开，追加是当前方向仍在验证中的补充。"
-                "提交后系统自动选择概率最高的假设进入验证。"
+                "提出后系统自动聚焦概率最高的假设。"
             ),
             coroutine=_run,
-            args_schema=CommitHypothesesInput,
+            args_schema=ProposeHypothesesInput,
         )
 
     # ── Tool: select_path ──
@@ -5154,7 +5167,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                          for d in (deprioritized or [])]
 
             # ── Idempotent select: already the active focus ──
-            # commit_hypotheses auto-selects the highest-probability
+            # propose_hypotheses auto-selects the highest-probability
             # hypothesis, so a select_path on that same hypothesis is a
             # no-op that must NOT churn state (a full select_path would
             # re-deprioritize its siblings for no benefit).  Explicit
@@ -5177,7 +5190,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 mw._current_ledger = ledger
                 return (
                     f"{fmt_hid(selected_hypothesis_id)} 已是当前验证焦点"
-                    "（commit 时已自动选中最高概率假设），无需重复 select_path。\n"
+                    "（提出时已自动选中最高概率假设），无需重复 select_path。\n"
                     "请直接调用 task() 委派专家验证该假设。"
                 )
 
@@ -5246,7 +5259,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # unbounded channel would let the LLM dodge convergence.
             # Bounded to 2 per hypothesis (gain converges after one
             # correction + one tolerance redo; cost 2×0.5 aligns with a
-            # batch-commit, symmetric with E3's "3rd saturation").
+            # batch-propose, symmetric with E3's "3rd saturation").
             if verdict is None:
                 _pure_node = ledger.get("hypotheses", {}).get(hypothesis_id)
                 if _pure_node is None:
@@ -5334,7 +5347,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # ── G17: confirmed requires expert-verification evidence ──
             # (design document §8 G17, v3.7.0 — evidence-standard gate,
             # reactive backstop of the proactive contract declared in the
-            # tool description / VERIFY duty / commit receipt).  Rationale:
+            # tool description / VERIFY duty / propose receipt).  Rationale:
             # a confirmed verdict is ACTION-guiding (ops will fix based on
             # it), so it demands confirmatory-layer evidence (an expert's
             # verification conclusion), while refuted/inconclusive are
@@ -5558,7 +5571,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "- 若认为仍有验证价值：委派互补视角专家获取新证据后再判定\n"
                             "- 若现有证据已支持其他结论：改用对应 verdict（confirmed/refuted）终结\n"
                             "- 若仅需修正表述：使用 statement_update 参数\n"
-                            "- 若其他假设待处理：select_path 切换 / commit_hypotheses 追加"
+                            "- 若其他假设待处理：select_path 切换 / propose_hypotheses 追加"
                         )
                     _g18_warn = (
                         f"\n⚠ 注意：本次落账与当前状态一致（{verdict}→{verdict}）"
@@ -5720,15 +5733,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # warning at round 8 after record_finding triggered exit
                 # at round 7).
             elif (_phase(ledger) == "hypothesize"
-                    and ledger.get("_root_commit_count", 0) > 0):
+                    and ledger.get("_root_propose_count", 0) > 0):
                 # All prior root hypotheses hard-failed and the retry
                 # budget is still open — nudge the LLM to submit a
                 # fresh batch in a new direction.
                 exit_hint = (
                     f"\n⚠ {reason}\n"
-                    "⛔ 请调用 commit_hypotheses 提交新一批假设"
-                    f"（第 {ledger.get('_commit_count', 0) + 1}"
-                    f"/{MAX_COMMIT_CALLS} 次，最后一次）——"
+                    "⛔ 请调用 propose_hypotheses 提出新一批假设"
+                    f"（第 {ledger.get('_propose_count', 0) + 1}"
+                    f"/{MAX_PROPOSE_CALLS} 次，最后一次）——"
                     "必须基于已排除证据换方向推断，"
                     "禁止与已排除假设重复或仅换措辞。"
                 )
@@ -5767,7 +5780,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if can_append_hypothesis(ledger):
                         _impact_hint += (
                             "若证据指向当前假设集之外的全新方向，"
-                            "可 commit_hypotheses 追加 1 个新假设"
+                            "可 propose_hypotheses 追加 1 个新假设"
                             f"（总数 {len(ledger.get('hypotheses', {}))}"
                             f"/{MAX_TOTAL_HYPOTHESES}，不占换批预算）。"
                         )
@@ -5824,17 +5837,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # No backtrack target.  If the root-batch budget is not
                 # exhausted, route to HYPOTHESIZE for a fresh batch
                 # instead of forcing REPORT.
-                if can_commit_root_hypotheses(ledger):
+                if can_propose_root_hypotheses(ledger):
                     # Phase derives to hypothesize via T8 (all roots
                     # hard-failed + budget left) — no snapshot write.
                     mw._persist_ledger(ledger)
                     mw._current_ledger = ledger
                     return (
-                        "没有可回溯的假设，但假设提交预算未用尽"
-                        f"（已用 {ledger.get('_commit_count', 0)}"
-                        f"/{MAX_COMMIT_CALLS} 次）。\n"
+                        "没有可回溯的假设，但假设提出预算未用尽"
+                        f"（已用 {ledger.get('_propose_count', 0)}"
+                        f"/{MAX_PROPOSE_CALLS} 次）。\n"
                         "已进入 HYPOTHESIZE 阶段。\n"
-                        "⛔ 请调用 commit_hypotheses 提交新一批假设——"
+                        "⛔ 请调用 propose_hypotheses 提出新一批假设——"
                         "必须基于已排除证据换方向推断，"
                         "禁止与已排除假设重复或仅换措辞。"
                     )
@@ -5846,8 +5859,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # pre-set — G6 timestamps the first derived REPORT round
                 # itself (see record_finding for rationale).
                 return (
-                    "回溯失败: 没有可回溯的假设，且假设提交预算已用尽"
-                    f"（{MAX_COMMIT_CALLS} 次）。\n"
+                    "回溯失败: 没有可回溯的假设，且假设提出预算已用尽"
+                    f"（{MAX_PROPOSE_CALLS} 次）。\n"
                     "已进入 REPORT 阶段（标注假设穷尽）。\n"
                     "⛔ 你必须在下一轮调用 write_file 将诊断报告写入"
                     f" {mw.report_path}。\n"

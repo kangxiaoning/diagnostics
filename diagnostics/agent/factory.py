@@ -14,7 +14,6 @@ from deepagents import (
     register_harness_profile,
 )
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
-from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
 
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
@@ -83,17 +82,6 @@ except ImportError:
     get_system_overview = None
     check_kubernetes_control_plane = check_kubernetes_nodes = check_kubernetes_pods = None
 
-# Hide write_todos + delete from the model's tool list.  Unlike
-# excluded_middleware (which removes TodoListMiddleware entirely and
-# destabilized qwen3.6's tool-call serialization per the 2026-07-19
-# experiment), _ToolExclusionMiddleware keeps TodoListMiddleware in the stack —
-# only the tool name is filtered from request.tools before the model sees them.
-# BASE_AGENT_PROMPT never references write_todos, so hiding it introduces no
-# prompt/tool mismatch.  `delete` is added because deepagents 0.7.x exposes a
-# real destructive delete tool on non-sandbox backends (0.6.x filtered it via
-# _supports_delete); this read-only diagnostic system must never expose it.
-_EXCLUDED_TOOLS = _ToolExclusionMiddleware(excluded=frozenset({"write_todos", "delete"}))
-
 # ── Harness profile: disable the auto-added general-purpose subagent ──
 # deepagents auto-adds a general-purpose subagent that sits outside the
 # ledger / file-governance gates (it inherits every diagnostic tool plus the
@@ -101,14 +89,25 @@ _EXCLUDED_TOOLS = _ToolExclusionMiddleware(excluded=frozenset({"write_todos", "d
 # read-only diagnostic system, so that subagent is removed entirely.
 # OllamaChatOpenAI subclasses ChatOpenAI, whose _get_ls_params reports
 # ls_provider="openai", so the provider-level "openai" key resolves via
-# _harness_profile_for_model's provider-only fallback.  (`delete` is hidden
-# via _EXCLUDED_TOOLS above rather than profile excluded_tools, to avoid
-# stacking two _ToolExclusionMiddleware instances — their identical middleware
-# .name would trip langchain's duplicate-name check.)
+# _harness_profile_for_model's provider-only fallback — and so does every
+# subagent that inherits the Coordinator's model.
+#
+# `delete` is hidden via the official excluded_tools mechanism: deepagents
+# auto-appends a _ToolExclusionMiddleware for it on both the main agent and
+# each subagent, filtering the tool from request.tools.  deepagents 0.7.x
+# exposes a real destructive delete tool on non-sandbox backends, which this
+# read-only system must never expose.
+# `write_todos` needs no exclusion here: since deepagents 0.7.x the
+# TodoListMiddleware (its write_todos tool + planning prompt) is opt-in and
+# only added by the built-in Codex harness profiles, which this model never
+# matches.  The previous approach only hid the tool name while the middleware
+# still injected its ~2KB planning prompt on every model call; that middleware
+# is no longer in the stack at all.
 register_harness_profile(
     "openai",
     HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+        excluded_tools=frozenset({"delete"}),
     ),
 )
 
@@ -776,16 +775,12 @@ def build_agent(
         model_kwargs={"tool_choice": "auto"},
     )
 
-    # write_todos + delete are hidden from the model via _ToolExclusionMiddleware
-    # (module-level _EXCLUDED_TOOLS, appended to both Coordinator and subagent
-    # middleware stacks).  This filters the tools from request.tools while
-    # keeping TodoListMiddleware in the stack.  The 2026-07-19 experiment
-    # showed that *removing* TodoListMiddleware (via excluded_middleware)
-    # destabilizes qwen3.6's tool-call serialization — malformed XML / mangled
-    # names rose from ~0% to ~75%.  The tool-exclusion approach avoids this:
-    # the middleware stays (its state management / serialization stabilization
-    # is preserved), only the write_todos tool is hidden.  BASE_AGENT_PROMPT
-    # never references write_todos, so there is no prompt/tool mismatch.
+    # Tool visibility: `delete` is stripped via the "openai" harness profile's
+    # excluded_tools (see register_harness_profile above), which deepagents
+    # applies to both the Coordinator and every subagent inheriting its model.
+    # `write_todos` is already absent — deepagents 0.7.x dropped
+    # TodoListMiddleware from the default stack (opt-in only), so neither the
+    # tool nor its planning prompt reaches the model.
 
     # Choose tools based on DIAGNOSTICS_MODE: "mock" (default) or "production"
     mode = os.getenv("DIAGNOSTICS_MODE", "mock").lower()
@@ -850,7 +845,7 @@ def build_agent(
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     # Governance runs before ledger so denied calls skip ledger bookkeeping.
-    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger, _EXCLUDED_TOOLS]
+    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 
@@ -868,6 +863,6 @@ def build_agent(
         # diagnosis state stays at the prompt tail.
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[dedup_middleware, ledger_middleware, _EXCLUDED_TOOLS],
+        middleware=[dedup_middleware, ledger_middleware],
         state_schema=DiagnosisLedgerState,
     )

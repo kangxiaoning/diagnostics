@@ -47,20 +47,20 @@ TerminalReason = Literal["evidence_saturated", "timeout_unreached", "auto_finali
 
 Verdict = Literal["confirmed", "refuted", "inconclusive"]
 
-# ── Hypothesis commit budget (GLOBAL, hard-coded) ──
-# At most this many commit_hypotheses CALLS per diagnosis — first batch
+# ── Hypothesis propose budget (GLOBAL, hard-coded) ──
+# At most this many propose_hypotheses CALLS per diagnosis — first batch
 # and retry batch (换批) BOTH consume from this single budget.  With the
 # per-call limit of MAX_LAYER_SIZE, a diagnosis can never exceed
-# MAX_COMMIT_CALLS × MAX_LAYER_SIZE = 6 hypotheses in total.
+# MAX_PROPOSE_CALLS × MAX_LAYER_SIZE = 6 hypotheses in total.
 # (v2.7 flat model: sub-hypotheses / deepening were removed — every
-# commit creates ROOT hypotheses only.)
-MAX_COMMIT_CALLS = 2
+# propose creates ROOT hypotheses only.)
+MAX_PROPOSE_CALLS = 2
 
 # ── Root-hypothesis batch gate ──
 # A retry batch of root hypotheses is only allowed after ALL root
 # hypotheses from prior batches are hard-failed (refuted/dead_end) —
-# and only while the global commit budget above is not exhausted.
-MAX_ROOT_COMMIT_BATCHES = 2
+# and only while the global propose budget above is not exhausted.
+MAX_ROOT_PROPOSE_BATCHES = 2
 
 # ── Hypothesis-list hard invariants (deterministic, code-enforced) ──
 # These are BUSINESS invariants — they cannot be expressed by tool-input
@@ -69,17 +69,17 @@ MAX_ROOT_COMMIT_BATCHES = 2
 # evidence: design document §11; the 2026-07-20
 # 32-round session (root layer grew to 6 via batch accumulation).
 MAX_LAYER_SIZE = 3
-"""Max hypotheses per commit call AND per current batch.  A retry batch
+"""Max hypotheses per propose call AND per current batch.  A retry batch
 REPLACES the current root layer instead of appending.  v2.7: the model
 is flat (no sub-hypotheses), so this is simply the per-batch cap."""
 
 # ── Total-hypothesis hard cap (outer convergence bound) ──
-# The documented invariant MAX_COMMIT_CALLS × MAX_LAYER_SIZE bounds the
+# The documented invariant MAX_PROPOSE_CALLS × MAX_LAYER_SIZE bounds the
 # TOTAL number of hypotheses per diagnosis.  v3.10.0: the evidence-driven
 # append channel (T10′) shares this cap — appends consume NO batch budget,
 # so this total cap (together with F-decay and the round caps) is what
 # keeps termination intact when hypotheses are added mid-diagnosis.
-MAX_TOTAL_HYPOTHESES = MAX_COMMIT_CALLS * MAX_LAYER_SIZE
+MAX_TOTAL_HYPOTHESES = MAX_PROPOSE_CALLS * MAX_LAYER_SIZE
 
 # Statuses that permanently close a hypothesis with a negative verdict.
 # (dead_end merged into refuted in the 5-state model.)
@@ -115,7 +115,7 @@ def is_confirmed_root(node: dict) -> bool:
 #     F(a,h) freshness decay = 0.5^n_prior_delegations(h) (inconclusive
 #            verdicts add an extra halving each — D6)
 #   c(a)   cost in round-equivalents (D3): delegation 2.0 / state-op 0.5 /
-#          batch commit 1.0 / direct query 0.3
+#          batch propose 1.0 / direct query 0.3
 # Exit requires BOTH:
 #   S1 (confidence sufficient): a confirmed root cause with p ≥ 80 AND
 #   S2 (no actionable verification): max available action value < KAPPA_STOP
@@ -142,7 +142,7 @@ observability."""
 
 COST_DELEGATION = 2.0
 COST_STATE_OP = 0.5
-COST_BATCH_COMMIT = 1.0
+COST_BATCH_PROPOSE = 1.0
 COST_QUERY = 0.3
 
 _EPISTEMIC_BONUS = 2.0
@@ -160,7 +160,7 @@ but never delegated (cf. scenario 25: H5 p=95, value 0.095 < kappa -> S2 exits).
 # LLMs sometimes prefix hypothesis statements with the ledger ID they
 # expect (e.g. "H1: 磁盘故障"), producing doubled prefixes in rendering
 # ("H1 [refuted] H1: 磁盘故障") and guidance ("聚焦验证 H1: H1: ...").
-# Strip such prefixes at commit time.  A trailing separator is required
+# Strip such prefixes at propose time.  A trailing separator is required
 # so legitimate content like "H100 交换机故障" is left untouched.
 _STATEMENT_ID_PREFIX_RE = re.compile(r"^\s*H\d+(?:\.\d+)?\s*[:：.．、]\s*")
 
@@ -186,10 +186,20 @@ class DiagnosisLedger(dict):
 # ── State schema ──
 
 class DiagnosisLedgerState(DeepAgentState):
-    """Extend deepagents state with a private diagnosis ledger field."""
+    """Extend deepagents state with private diagnosis fields."""
 
     _diagnosis_ledger: Annotated[
         NotRequired[DiagnosisLedger | None],
+        PrivateStateAttr,
+    ]
+    # Transient stall guidance: set by after_model when a stall is detected,
+    # consumed by awrap_model_call on the NEXT round (injected into the
+    # system message), then cleared.  Ordinary LastValue (NOT EphemeralValue)
+    # — the value must survive the before_model super-step to reach
+    # awrap_model_call, which EphemeralValue clears too early (verified by a
+    # controlled test; see .local/scripts/tests/test_jump_to_guidance.py).
+    _stall_guidance: Annotated[
+        NotRequired[str | None],
         PrivateStateAttr,
     ]
 
@@ -236,8 +246,8 @@ def new_ledger(entity_type: str = "", hostname: str = "",
         tool_results={},               # cache_key → {path, round, preview, lines, is_failure}
         _inconclusive_streak=0,
         _backtrack_count=0,
-        _root_commit_count=0,
-        _commit_count=0,
+        _root_propose_count=0,
+        _propose_count=0,
         entity_type=entity_type,
         hostname=hostname,
         entity_name=entity_name,
@@ -370,7 +380,7 @@ def _next_hypothesis_id(hypotheses: dict[str, HypothesisNode]) -> str:
     """Generate the next canonical hypothesis ID (max existing + 1).
 
     Scans existing IDs numerically, so repeated calls within a single
-    commit_hypotheses invocation (nodes are inserted as they are
+    propose_hypotheses invocation (nodes are inserted as they are
     created) never collide.
     """
     max_n = 0
@@ -383,10 +393,10 @@ def _next_hypothesis_id(hypotheses: dict[str, HypothesisNode]) -> str:
 
 # ── Hypothesis tree operations ──
 
-def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
+def can_propose_root_hypotheses(ledger: DiagnosisLedger) -> bool:
     """Check if a new batch of ROOT hypotheses may be submitted.
 
-    Budget rules (see ``MAX_ROOT_COMMIT_BATCHES``, v2.1 H2 relaxed):
+    Budget rules (see ``MAX_ROOT_PROPOSE_BATCHES``, v2.1 H2 relaxed):
 
     - First batch: always allowed (no root hypotheses yet).
     - Subsequent batches: allowed when the current batch has NO confirmed
@@ -402,14 +412,14 @@ def can_commit_root_hypotheses(ledger: DiagnosisLedger) -> bool:
       burial record_finding for a node the system itself forbids
       verifying is the same ritual-verification waste the rule above
       eliminated for deferred nodes.
-    - Any batch additionally requires the GLOBAL commit budget
-      (``MAX_COMMIT_CALLS``) to still be open — derive_phase (T8) and the
+    - Any batch additionally requires the GLOBAL propose budget
+      (``MAX_PROPOSE_CALLS``) to still be open — derive_phase (T8) and the
       backtrack tool both route through this predicate, so folding the
       global check in here keeps every caller coherent.
     """
-    if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+    if ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS:
         return False
-    if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
+    if ledger.get("_root_propose_count", 0) >= MAX_ROOT_PROPOSE_BATCHES:
         return False
     root_ids = ledger.get("root_hypothesis_ids", [])
     if not root_ids:
@@ -439,19 +449,19 @@ def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
     hypothesis testing: candidates are evidence/conflict driven, not
     batch driven).  Guards:
 
-    - a batch already exists (the first batch uses the normal commit
+    - a batch already exists (the first batch uses the normal propose
       path);
     - no confirmed hypothesis anywhere (a confirmed root cause closes
       hypothesis generation — refinement goes through
       record_finding(statement_update=...));
-    - the batch commit budget is still open (an exhausted budget closes
+    - the batch propose budget is still open (an exhausted budget closes
       ALL hypothesis creation, appends included);
     - total hypotheses below MAX_TOTAL_HYPOTHESES — the outer
       convergence bound (appends consume no batch budget, so the total
       cap is what bounds hypothesis creation).
 
     Callers must prefer the batch path whenever
-    can_commit_root_hypotheses holds (no active pending) — append is the
+    can_propose_root_hypotheses holds (no active pending) — append is the
     channel for the active-pending case only.
     """
     hypotheses = ledger.get("hypotheses", {})
@@ -459,9 +469,9 @@ def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
         return False
     if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
         return False
-    if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+    if ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS:
         return False
-    if ledger.get("_root_commit_count", 0) >= MAX_ROOT_COMMIT_BATCHES:
+    if ledger.get("_root_propose_count", 0) >= MAX_ROOT_PROPOSE_BATCHES:
         return False
     for node in hypotheses.values():
         if node.get("status") == "confirmed":
@@ -469,15 +479,15 @@ def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
     return True
 
 
-def _commit_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
-    """Shared rejection text when the global commit budget is spent."""
+def _propose_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
+    """Shared rejection text when the global propose budget is spent."""
     return (
-        f"假设提交预算已用尽（全程最多 {MAX_COMMIT_CALLS} 次，"
-        f"已提交 {ledger.get('_commit_count', 0)} 次）。不可再提交新假设。"
+        f"假设提出预算已用尽（全程最多 {MAX_PROPOSE_CALLS} 次，"
+        f"已提出 {ledger.get('_propose_count', 0)} 次）。不可再提出新假设。"
         "如需细化已有假设，请用 record_finding(statement_update=...) "
         "修正其表述；如需调整验证方向，用 select_path 切换焦点 / "
         "backtrack 恢复搁置假设；全部假设证伪时系统会自动进入 "
-        "REPORT（T9），无需手动提交。"
+        "REPORT（T9），无需手动提出。"
     )
 
 
@@ -494,7 +504,7 @@ def add_hypotheses(
     if len(hypothesis_specs) > MAX_LAYER_SIZE:
         raise ValueError(
             f"最多{MAX_LAYER_SIZE}个假设，收到 {len(hypothesis_specs)} 个。"
-            "请只提交可能性最大的3个。"
+            "请只提出可能性最大的3个。"
         )
 
     # ── Strip self-assigned ID prefixes ("H1: ...") from statements ──
@@ -531,30 +541,30 @@ def add_hypotheses(
             raise ValueError(
                 f"假设 '{spec['statement'][:80]}' 已存在。"
                 f"如需更新其概率或结论，请使用 record_finding 工具，"
-                f"而非 commit_hypotheses 重复提交。"
+                f"而非 propose_hypotheses 重复提出。"
             )
 
-    # ── Commit budget (global) + retry-batch gate / append channel ──
+    # ── Propose budget (global) + retry-batch gate / append channel ──
     # Checked AFTER dedup so a rejected duplicate does not consume
-    # budget.  can_commit_root_hypotheses folds in the global
-    # MAX_COMMIT_CALLS check, so budget exhaustion surfaces first;
+    # budget.  can_propose_root_hypotheses folds in the global
+    # MAX_PROPOSE_CALLS check, so budget exhaustion surfaces first;
     # a confirmed root anywhere closes hypothesis creation entirely;
     # the remaining False case is an ACTIVE PENDING root — that is the
     # evidence-driven append channel (T10′, v3.10.0): ONE new hypothesis
     # joins the current batch WITHOUT consuming the batch budget (the
     # MAX_TOTAL_HYPOTHESES cap is the outer convergence bound).
     append_mode = False
-    if not can_commit_root_hypotheses(ledger):
-        if (ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS
-                or ledger.get("_root_commit_count", 0)
-                >= MAX_ROOT_COMMIT_BATCHES):
-            raise ValueError(_commit_budget_exhausted_message(ledger))
+    if not can_propose_root_hypotheses(ledger):
+        if (ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS
+                or ledger.get("_root_propose_count", 0)
+                >= MAX_ROOT_PROPOSE_BATCHES):
+            raise ValueError(_propose_budget_exhausted_message(ledger))
         if any(n.get("status") == "confirmed" for n in hypotheses.values()):
             raise ValueError(
-                "已有 confirmed 假设（根因已确认），不可提交新假设。"
+                "已有 confirmed 假设（根因已确认），不可提出新假设。"
                 "如需细化其表述，请用 record_finding(statement_update=...)；"
                 "若你的意图是确认某个已有假设为根因，请直接对该假设调用 "
-                "record_finding(verdict='confirmed')——重复提交不会确认它。"
+                "record_finding(verdict='confirmed')——重复提出不会确认它。"
             )
         # Active pending exists → append channel (T10′).
         if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
@@ -568,11 +578,11 @@ def add_hypotheses(
                 f"（收到 {len(hypothesis_specs)} 个）。"
                 "若意图是换批（当前方向全部失败后的重开），"
                 "deferred/inconclusive/经济死亡的假设不阻塞换批——"
-                "请先用 record_finding 处理活跃 pending 假设再提交。"
+                "请先用 record_finding 处理活跃 pending 假设再提出。"
             )
         append_mode = True
 
-    # Total-cap enforcement for batch commits — MUST precede any ledger
+    # Total-cap enforcement for batch proposes — MUST precede any ledger
     # mutation so a rejected call consumes nothing (the cap can bind
     # before the per-call limit once appends have joined).
     if not append_mode:
@@ -581,7 +591,7 @@ def add_hypotheses(
             raise ValueError(
                 f"假设总数上限 {MAX_TOTAL_HYPOTHESES} 个"
                 f"（已有 {len(hypotheses)} 个），"
-                f"本次最多可提交 {_remaining} 个。"
+                f"本次最多可提出 {_remaining} 个。"
             )
 
     if append_mode:
@@ -589,7 +599,7 @@ def add_hypotheses(
         # JOINS the current batch (root_hypothesis_ids extended below).
         ledger["_append_count"] = ledger.get("_append_count", 0) + 1
     else:
-        ledger["_root_commit_count"] = ledger.get("_root_commit_count", 0) + 1
+        ledger["_root_propose_count"] = ledger.get("_root_propose_count", 0) + 1
 
         # ── Hard invariant: root layer = CURRENT batch only ──
         # A retry batch REPLACES the root layer instead of appending to
@@ -602,10 +612,10 @@ def add_hypotheses(
         # semantics via a fresh list.
         ledger["root_hypothesis_ids"] = []
 
-        # ── Global commit budget consumption ──
-        # Every successful BATCH commit — first batch or retry batch —
+        # ── Global propose budget consumption ──
+        # Every successful BATCH propose — first batch or retry batch —
         # consumes exactly one unit (appends do not, v3.10.0 T10′).
-        ledger["_commit_count"] = ledger.get("_commit_count", 0) + 1
+        ledger["_propose_count"] = ledger.get("_propose_count", 0) + 1
 
     for spec in hypothesis_specs:
         hid = _next_hypothesis_id(hypotheses)
@@ -860,7 +870,7 @@ def add_evidence_to_active(
 #   | from        | event / guard                                    | to          |
 #   |-------------|--------------------------------------------------|-------------|
 #   | understand  | T1  coverage ready (system)                      | hypothesize |
-#   | hypothesize | T10 commit_hypotheses success                    | verify      |
+#   | hypothesize | T10 propose_hypotheses success                    | verify      |
 #   | verify      | T3  record_finding                               | evaluate    |
 #   | evaluate    | T4  exit conditions E1-E3                        | report      |
 #   | evaluate    | T5  select_path on pending/deprioritized/…       | verify      |
@@ -938,7 +948,7 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
                 in _HARD_FAILED_STATUSES
                 or _economically_dead(ledger, hid)
                 for hid in root_ids)):
-        if can_commit_root_hypotheses(ledger):
+        if can_propose_root_hypotheses(ledger):
             return "hypothesize"
         return "report"  # T9 == E2
 
@@ -1002,7 +1012,7 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
         return False
     # v2.5 argus-failure degrade: when the argus monitoring platform
     # returned empty data / errors (and any one-shot param re-delegation
-    # was exhausted), the coverage gate is bypassed — the LLM commits
+    # was exhausted), the coverage gate is bypassed — the LLM proposes
     # hypotheses from user input and the normal VERIFY→EVALUATE→REPORT
     # flow continues with domain experts collecting evidence.
     if ledger.get("_argus_unavailable"):
@@ -1017,7 +1027,7 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
         # Data-free grace — restricted to scenarios with NO resolved
         # Argus target.  When the entity resolved (Argus data IS
         # available), flipping to HYPOTHESIZE here traps the LLM into
-        # data-less commits: the §7 gate blocks the very task()
+        # data-less proposes: the §7 gate blocks the very task()
         # delegation the prompt and the G2 valve demand (observed
         # 2026-07-30 session f62a11eb: round-1 skill reads — legal per
         # prompt — then the round-2 flip hard-blocked both argus
@@ -1171,7 +1181,7 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "write_file", "read_file", "edit_file",
     "write_todos", "read_todos",
     "ls", "glob", "grep",
-    "commit_hypotheses", "select_path", "record_finding", "backtrack",
+    "propose_hypotheses", "select_path", "record_finding", "backtrack",
     "list_diagnostic_capabilities", "get_system_overview",
 })
 
@@ -1203,12 +1213,12 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
     active_path_str = (" → ".join(fmt_hid(h) for h in ledger["active_path"])
                        if ledger["active_path"] else "(无)")
     batch_info = ""
-    if ledger.get("_commit_count"):
+    if ledger.get("_propose_count"):
         batch_info = (
-            f" | 假设提交: {ledger['_commit_count']}"
-            f"/{MAX_COMMIT_CALLS} 次"
+            f" | 假设提出: {ledger['_propose_count']}"
+            f"/{MAX_PROPOSE_CALLS} 次"
             f"（共 {len(ledger.get('hypotheses', {}))}"
-            f"/{MAX_COMMIT_CALLS * MAX_LAYER_SIZE} 个）"
+            f"/{MAX_PROPOSE_CALLS * MAX_LAYER_SIZE} 个）"
         )
     lines.append(f"## 当前诊断状态")
     lines.append(f"- 阶段: {phase} | 步骤: {ledger['current_round']}{batch_info} | 活动路径: {active_path_str}")
@@ -1516,14 +1526,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         )
     if phase == "hypothesize":
         retry_hint = ""
-        if ledger.get("_root_commit_count", 0) > 0 and ledger.get("hypotheses"):
+        if ledger.get("_root_propose_count", 0) > 0 and ledger.get("hypotheses"):
             # v3.11.0: structured failure digest at the decision point
             # (design document §9) — replaces the indirect "see above"
             # pointer when prior-batch failures exist.
             digest = render_failure_digest(ledger)
             retry_hint = (
-                f"\n- ⚠ 这是第 {ledger.get('_commit_count', 0) + 1}"
-                f"/{MAX_COMMIT_CALLS} 次假设提交（最后一次）。"
+                f"\n- ⚠ 这是第 {ledger.get('_propose_count', 0) + 1}"
+                f"/{MAX_PROPOSE_CALLS} 次假设提出（最后一次）。"
                 "前一批已全部证伪/验证价值耗尽。\n"
                 "  新假设必须基于排除证据换方向推断，"
                 "禁止与已排除假设重复或仅换措辞。"
@@ -1543,24 +1553,24 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                     "（请求补充参数）——该维度证据缺口请直接写成假设"
                     "（probability 体现不确定性）；VERIFY 阶段将以假设聚焦"
                     "方式定向补查（委派描述须带完整实体与参数）。"
-                    "本阶段职责不变：提交假设。"
+                    "本阶段职责不变：提出假设。"
                 )
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
             f"- {duty}\n"
-            f"- 提交预算：全程最多 {MAX_COMMIT_CALLS} 次"
-            f"（本次为第 {ledger.get('_commit_count', 0) + 1} 次）；"
+            f"- 提出预算：全程最多 {MAX_PROPOSE_CALLS} 次"
+            f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
             "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
             "- ⚠ 字段契约：每条假设必须含 statement/probability/rationale 三字段，"
-            "statement 必填且为一句完整根因表述——缺失会导致提交失败（预算不返还）\n"
+            "statement 必填且为一句完整根因表述——缺失会导致调用失败（预算不返还）\n"
             "- ⚠ 同源合并：若多个候选描述的是同一故障的机制/因果链上下游"
             "（如\"内存超限 OOMKilled\"与\"memory limit 配置过低\"互为表里），"
-            "应合并为一条假设；仅当证据显示独立故障源并存时才提交多条\n"
+            "应合并为一条假设；仅当证据显示独立故障源并存时才提出多条\n"
             "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
             "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
             "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
             "导致漏判独立故障源。\n"
-            f"- 完成后必须调用 commit_hypotheses 提交假设（{exit_txt}）"
+            f"- 完成后必须调用 propose_hypotheses 提出假设（{exit_txt}）"
             + retry_hint
             + gap_hint
         )
@@ -1698,22 +1708,22 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 )
         _retry_option = (
             "  · 本层全部 refuted 或验证增益已低于成本（经济死亡）、"
-            "提交预算未用尽 → commit_hypotheses 换方向提交新一批假设\n"
-            if MAX_COMMIT_CALLS - ledger.get("_commit_count", 0) > 0 else ""
+            "提出预算未用尽 → propose_hypotheses 换方向提出新一批假设\n"
+            if MAX_PROPOSE_CALLS - ledger.get("_propose_count", 0) > 0 else ""
         )
         # Evidence-driven append option (T10′, v3.10.0): shown only when
         # the append channel is actually open AND the batch path is not
-        # (an open batch path already offers commit via _retry_option —
+        # (an open batch path already offers propose via _retry_option —
         # rendering both would present two same-tool options with subtle
         # semantic differences, an instruction-collision risk).  Positive
         # form (design document §9): name the action and its condition.
         _append_option = (
-            "  · 新证据指向当前假设集之外的全新方向 → commit_hypotheses "
+            "  · 新证据指向当前假设集之外的全新方向 → propose_hypotheses "
             "追加 1 个新假设（单次 1 个，并入当前批，不占用换批预算；"
             f"当前假设总数 {len(ledger.get('hypotheses', {}))}"
             f"/{MAX_TOTAL_HYPOTHESES}）\n"
             if can_append_hypothesis(ledger)
-            and not can_commit_root_hypotheses(ledger) else ""
+            and not can_propose_root_hypotheses(ledger) else ""
         )
         # Live exit-condition verdict for the LLM.  In EVALUATE the state
         # machine has already ruled out exit (derive_phase), so this is
@@ -1839,7 +1849,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 )
             return (
                 "你当前处于 REPORT 阶段（诊断报告已写入）。\n"
-                "- 报告已保存，无需再调用 write_file / record_finding / commit_hypotheses\n"
+                "- 报告已保存，无需再调用 write_file / record_finding / propose_hypotheses\n"
                 f"- 请{summary_req}\n"
                 "- 总结面向运维工程师——禁止提及台账、报告文件路径等内部实现细节"
             )
@@ -2066,7 +2076,7 @@ def _economically_dead(ledger: DiagnosisLedger, hid: str) -> bool:
 
     A hypothesis that is still pending/inconclusive but can no longer be
     delegated (G5 would hard-block it) must not block direction changes:
-    it neither blocks the retry-batch gate (can_commit) nor keeps the
+    it neither blocks the retry-batch gate (can_propose) nor keeps the
     layer out of T8.  Its STATUS stays pending/inconclusive — the
     record_finding honesty semantics are unchanged; only the direction
     logic treats it as dead.  deferred nodes are NOT dead: an explicit
@@ -2135,12 +2145,12 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
                 f"已委派{node.get('_delegate_count', 0)}次/"
                 f"inconclusive {node.get('_inconclusive_count', 0)}次)"
             )
-    if (ledger.get("root_hypothesis_ids") and can_commit_root_hypotheses(ledger)
+    if (ledger.get("root_hypothesis_ids") and can_propose_root_hypotheses(ledger)
             and not has_confirmed):
-        v = 1.0 / COST_BATCH_COMMIT  # fresh batch: U=1, D=1, F=1
+        v = 1.0 / COST_BATCH_PROPOSE  # fresh batch: U=1, D=1, F=1
         if v > best_v:
             best_v = v
-            best_d = "换批提交新假设"
+            best_d = "换批提出新假设"
     return best_v, best_d
 
 
@@ -2198,9 +2208,9 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             hypotheses.get(hid, {}).get("status") in _HARD_FAILED_STATUSES
             for hid in root_ids
         )
-        if all_refuted and not can_commit_root_hypotheses(ledger):
+        if all_refuted and not can_propose_root_hypotheses(ledger):
             return True, (
-                f"假设穷尽: 提交预算已用尽（{MAX_COMMIT_CALLS} 次），"
+                f"假设穷尽: 提出预算已用尽（{MAX_PROPOSE_CALLS} 次），"
                 "所有假设均已证伪，未确认根因"
             ), None
         # ── E2′ economic exhaustion (fast lane) ──
@@ -2213,10 +2223,10 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         # 2026-07-30 production: write_file gate-rejected, LLM detoured
         # through backtrack for three rounds).  Deferred survivors still
         # block — explicitly shelved = revivable direction (G9 handles).
-        # The budget test uses the raw GLOBAL commit count, NOT the
-        # can_commit proxy (an active pending node would poison that
+        # The budget test uses the raw GLOBAL propose count, NOT the
+        # can_propose proxy (an active pending node would poison that
         # proxy).
-        if ledger.get("_commit_count", 0) >= MAX_COMMIT_CALLS:
+        if ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS:
             survivors = [
                 (hid, node) for hid in root_ids
                 if (node := hypotheses.get(hid)) is not None
@@ -2228,7 +2238,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
                     and delegation_value_for(ledger, hid) < KAPPA_STOP
                     for hid, node in survivors):
                 return True, (
-                    f"假设穷尽: {MAX_ROOT_COMMIT_BATCHES} 批假设预算用尽，"
+                    f"假设穷尽: {MAX_ROOT_PROPOSE_BATCHES} 批假设预算用尽，"
                     "残余未决假设的验证增益均低于成本（κ），未确认根因"
                 ), None
 
@@ -2540,10 +2550,10 @@ def render_failure_digest(ledger: DiagnosisLedger) -> str:
     failure).  Returns "" outside retry-batch context (first batch) or
     when nothing failed.
     """
-    if ledger.get("_root_commit_count", 0) < 1:
+    if ledger.get("_root_propose_count", 0) < 1:
         return ""
-    # v3.11.1 fix: digest 渲染时机是换批提交之前——此时 root_hypothesis_ids
-    # 仍指向前一批（新批尚未提交），故绝不能按 "不在当前批" 过滤（否则恰好
+    # v3.11.1 fix: digest 渲染时机是换批提出之前——此时 root_hypothesis_ids
+    # 仍指向前一批（新批尚未提出），故绝不能按 "不在当前批" 过滤（否则恰好
     # 排除全部失败节点，摘要恒为空）。正确语义：渲染所有 refuted / 经济死亡
     # 且非 deferred 的节点（换批时全部假设都属于失败批）。2026-08-11 三场景
     # 复跑实证（场景 18/2 换批摘要缺失）。
@@ -2997,7 +3007,7 @@ def compute_evaluate_action(ledger: DiagnosisLedger) -> ActionHint | None:
     2. Pending hypotheses ranked by delegation_value → recommend
        highest for select_path.
     3. Deferred hypotheses with revived value → backtrack.
-    4. can_append_hypothesis → commit_hypotheses (append).
+    4. can_append_hypothesis → propose_hypotheses (append).
 
     Returns None when no action is owed (exit conditions should handle
     the rest via render_exit_directive).
@@ -3040,16 +3050,16 @@ def compute_evaluate_action(ledger: DiagnosisLedger) -> ActionHint | None:
         )
 
     # Priority 4: retry batch (all roots refuted/dead + budget open)
-    if can_commit_root_hypotheses(ledger):
+    if can_propose_root_hypotheses(ledger):
         return ActionHint(
-            "commit_hypotheses", "normal",
-            "当前批已全部终结，请换批提交新一批假设",
+            "propose_hypotheses", "normal",
+            "当前批已全部终结，请换批提出新一批假设",
         )
 
     # Priority 5: append channel (batch path closed, append open)
-    if can_append_hypothesis(ledger) and not can_commit_root_hypotheses(ledger):
+    if can_append_hypothesis(ledger) and not can_propose_root_hypotheses(ledger):
         return ActionHint(
-            "commit_hypotheses", "normal",
+            "propose_hypotheses", "normal",
             "新证据指向全新方向 → 可追加 1 个新假设",
         )
 
