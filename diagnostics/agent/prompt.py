@@ -197,6 +197,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 **委派描述中立性（design document §9 v3.2.2）**：描述只陈述**症状 + 待验证问题**，**禁止预设异常方向或疑似结论**（如把"Pod 为何 Pending"写成"检查 OOMKilled 事件"）——引导性描述会污染专家取证（谄媚效应：模型倾向迎合提示中暗示的观点，arXiv:2310.13548），让专家客观勘察后再下结论。
 </delegation_params>
 {serverless_routing}
+{single_cluster_guidance}
 
 <evidence_integrity>
 ## 证据完整性契约（design document §9 v3.2.2）
@@ -593,6 +594,71 @@ def _render_serverless_routing(agent_names: list[str] | None) -> str:
     return ""
 
 
+# Scene-conditional convergence recipe (single-cluster scene, both cluster
+# types).  Injected after <delegation_params> only when the scene profile
+# carries system_prompt_ref="single_cluster" (scene spec §8.2: 前置引导 P7).
+# Positive recipe only — no prohibitions (positive/negative split, design
+# document §9); tool-level details stay inside the experts' own prompts,
+# the Coordinator sees delegation intent, not expert-internal tool calls.
+_SINGLE_CLUSTER_DEDICATED_GUIDANCE = """
+<single_cluster_guidance>
+## 单集群场景收敛配方（本场景专属）
+
+诊断对象是**集群整体**——围绕控制面、节点集、工作负载集三个故障域，先回答
+"集群的哪个部分病了"，再深挖该部分。UNDERSTAND 委派与后续深挖遵循三段式收敛：
+
+1. **集群概览定位故障域**：委派 k8s-argus-expert 时，要求先采集集群级概览
+   指标（API Server 延迟/错误、etcd、DNS、NotReady 节点数），回答"哪个故障域
+   异常"；节点/工作负载维度异常时，概览返回的**异常对象清单**（异常节点名/
+   工作负载名）是粗筛的输入。
+2. **节点/工作负载粗筛**：委派 host-argus-expert 时，要求用多节点资源概览
+   （CPU/内存/磁盘/网络四维）完成节点粗筛——「诊断参数」已给出节点范围时以
+   该范围为界；✅正常对象聚合一条汇总即可。
+3. **top-k 深挖**：VERIFY 仅对粗筛出的 top-k 异常对象（按严重度排序，建议
+   ≤5 个）委派深度专家；其余对象以"已排除（正常）"进入报告。
+
+集群级报告须含**影响范围**章节（受影响节点数/工作负载数）。
+</single_cluster_guidance>
+"""
+
+_SINGLE_CLUSTER_SERVERLESS_GUIDANCE = """
+<single_cluster_guidance>
+## 单集群场景收敛配方（本场景专属，Serverless）
+
+诊断对象是**3 个集群整体**——Serverless 逻辑集群 + KMC 控制面集群 + SCI 数据面
+集群，外加共享 etcd 视图；拓扑（集群级 RelationGraph）给出 3 集群对应关系与
+各视图资源清单。收敛路径：
+
+1. **四视角集群概览**：四个 argus 专家各采集本视角的集群级概览（控制面组件/
+   etcd/节点/工作负载聚合），先回答"哪个集群/视角异常"。
+2. **故障域定位**：结合多视角交叉证据定位症状源自哪个故障域——逻辑集群/
+   KMC 控制面/SCI 数据面/共享 etcd/物理节点；正常视角聚合一条汇总作为排除证据。
+3. **故障域深挖**：仅对定位到的故障域委派对应领域专家深挖；物理节点维度
+   同样先粗筛、仅对异常节点深挖。
+
+集群级报告须含 3 集群拓扑映射与故障域定位。
+</single_cluster_guidance>
+"""
+
+
+def _render_single_cluster_guidance(
+    agent_names: list[str] | None, system_prompt_ref: str = "",
+) -> str:
+    """Render the scene-conditional convergence recipe (single-cluster only).
+
+    Keyed by the scene profile's ``system_prompt_ref`` (="single_cluster"),
+    with the cluster-type variant resolved from the assembled expert set
+    (serverless experts vs. k8s experts) — additive on top of the
+    scene-inferred blocks (serverless routing still applies for the
+    serverless variant).
+    """
+    if system_prompt_ref != "single_cluster":
+        return ""
+    if _infer_scene(agent_names or []) == "serverless":
+        return _SINGLE_CLUSTER_SERVERLESS_GUIDANCE
+    return _SINGLE_CLUSTER_DEDICATED_GUIDANCE
+
+
 def _infer_scene(agent_names: list[str]) -> str:
     """Infer the current scene from its assembled expert names.
 
@@ -631,6 +697,7 @@ def make_system_prompt(
     report_path: str = "",
     ledger_path: str = "",
     agent_names: list[str] | None = None,
+    system_prompt_ref: str = "",
 ) -> str:
     """Format the system prompt with the given report and ledger paths.
 
@@ -642,6 +709,9 @@ def make_system_prompt(
             placeholders are replaced with this scene's concrete expert
             names and the scene-matched example is injected; when omitted,
             placeholders are left as-is and every example is injected.
+        system_prompt_ref: Scene-profile prompt reference (e.g.
+            "single_cluster") — activates the scene-conditional guidance
+            block on top of the agent-name-inferred scene blocks.
     """
     prompt = _SYSTEM_PROMPT_TEMPLATE.replace(
         "{flow_sections}", _render_flow(),
@@ -651,6 +721,9 @@ def make_system_prompt(
         "{scene_report_addendum}", _render_report_addendum(agent_names))
     prompt = prompt.replace(
         "{serverless_routing}", _render_serverless_routing(agent_names))
+    prompt = prompt.replace(
+        "{single_cluster_guidance}",
+        _render_single_cluster_guidance(agent_names, system_prompt_ref))
     prompt = prompt.replace("{report_path}", report_path or "{report_path}")
     prompt = prompt.replace("{ledger_path}", ledger_path or "{ledger_path}")
     for var, name in _expert_placeholder_map(agent_names or []).items():

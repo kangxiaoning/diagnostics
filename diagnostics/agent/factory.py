@@ -854,7 +854,8 @@ def build_agent(
         tools=tools,
         system_prompt=system_prompt or make_system_prompt(
             report_path, ledger_path,
-            agent_names=[sa["name"] for sa in subagent_configs]),
+            agent_names=[sa["name"] for sa in subagent_configs],
+            system_prompt_ref=getattr(scene_profile, "system_prompt_ref", "")),
         backend=shared_backend,
         # NOTE: deepagents' memory= parameter is intentionally NOT used.
         # AGENTS.md is loaded and injected by DiagnosisLedgerMiddleware

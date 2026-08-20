@@ -62,7 +62,17 @@ _SINGLE_POD_FIELDS = (
 _SINGLE_CLUSTER_FIELDS = (
     InputField("cluster_name", "集群名称"),
     InputField("time_range", "时间范围", type="time_range"),
-    InputField("node_scope", "节点范围", type="list"),
+    # node_scope 可选：留空 = 全集群排查（设计 spec §6.2），由 argus 概览
+    # 异常对象清单 + host-argus 全节点概览(C2) 收敛，不强制用户指定范围
+    InputField("node_scope", "节点范围", type="list", required=False),
+    InputField("description", "异常描述", required=False),
+)
+
+# single_cluster + serverless：无 node_scope（3 集群各有节点，语义模糊——
+# Serverless 收敛靠拓扑集群级视图 + 四视角 argus 定位故障域，见场景 spec 取舍 D3）
+_SINGLE_CLUSTER_SERVERLESS_FIELDS = (
+    InputField("cluster_name", "集群名称"),
+    InputField("time_range", "时间范围", type="time_range"),
     InputField("description", "异常描述", required=False),
 )
 
@@ -128,13 +138,37 @@ SCENE_REGISTRY: dict[tuple[str, str], SceneProfile] = {
         topology_query=True,
         system_prompt_ref="serverless",
     ),
-    # ── Scenes 3-5: reserved extension points (registered, disabled) ──
-    ("single_cluster", ""): SceneProfile(
+    # ── Scene 3: single cluster (cluster-wide diagnosis) ──
+    # Diagnosis target is the cluster as a whole (control-plane / node-set /
+    # workload-set fault domains) — scene spec §4.  The convergence recipe
+    # ("cluster overview → coarse filter → top-k deep dive") is injected via
+    # system_prompt_ref="single_cluster" (prompt-side scene-conditional
+    # block, mirroring the serverless routing mechanism); the ledger and the
+    # coverage gate stay scene-agnostic (dedicated dual / serverless four-view
+    # reuse the single_pod rules — the ledger cannot distinguish them and
+    # does not need to).
+    ("single_cluster", "dedicated"): SceneProfile(
         scene_id="single_cluster",
         label="单集群",
+        cluster_type="dedicated",
+        entity_type="kubernetes",
         input_fields=_SINGLE_CLUSTER_FIELDS,
-        enabled=False,
+        experts=("host-argus-expert", "k8s-argus-expert", "host-expert", "k8s-expert"),
+        understand_argus=("host-argus-expert", "k8s-argus-expert"),
+        system_prompt_ref="single_cluster",
     ),
+    ("single_cluster", "serverless"): SceneProfile(
+        scene_id="single_cluster",
+        label="单集群",
+        cluster_type="serverless",
+        entity_type="kubernetes",
+        input_fields=_SINGLE_CLUSTER_SERVERLESS_FIELDS,
+        experts=_serverless_experts(),
+        understand_argus=_serverless_argus(),
+        topology_query=True,
+        system_prompt_ref="single_cluster",
+    ),
+    # ── Scenes 4-5: reserved extension points (registered, disabled) ──
     ("multi_cluster", ""): SceneProfile(
         scene_id="multi_cluster",
         label="多集群",
@@ -149,8 +183,10 @@ SCENE_REGISTRY: dict[tuple[str, str], SceneProfile] = {
     ),
 }
 
-# 可选的 cluster_type 集合（single_pod 场景）
-SINGLE_POD_CLUSTER_TYPES: tuple[str, ...] = ("dedicated", "serverless")
+# 可选的 cluster_type 集合（single_pod 与 single_cluster 场景共享）
+CLUSTER_TYPES: tuple[str, ...] = ("dedicated", "serverless")
+# 向后兼容别名（既有导入方仍可用）
+SINGLE_POD_CLUSTER_TYPES: tuple[str, ...] = CLUSTER_TYPES
 
 
 # ── Expert → view-phrase registry (design document parallel-delegation §5 D3) ──
@@ -180,10 +216,12 @@ EXPERT_VIEW: dict[str, str] = {
 def resolve_profile(scene_id: str, cluster_type: str = "") -> SceneProfile | None:
     """Resolve a SceneProfile by scene_id + cluster_type.
 
-    ``single_pod`` defaults to ``dedicated`` when cluster_type is missing
-    (legacy frontend compatibility).  Unknown combinations return None.
+    ``single_pod`` / ``single_cluster`` default to ``dedicated`` when
+    cluster_type is missing (legacy frontend compatibility, contract A1).
+    Unknown combinations return None.
     """
-    key = (scene_id, cluster_type or ("dedicated" if scene_id == "single_pod" else ""))
+    default_ct = "dedicated" if scene_id in ("single_pod", "single_cluster") else ""
+    key = (scene_id, cluster_type or default_ct)
     return SCENE_REGISTRY.get(key)
 
 
@@ -194,7 +232,7 @@ def list_enabled_scenes() -> list[dict[str, object]]:
         if not p.enabled:
             continue
         entry: dict[str, object] = {"scene_id": sid, "label": p.label, "cluster_type": ctype}
-        if sid == "single_pod":
-            entry["cluster_types"] = list(SINGLE_POD_CLUSTER_TYPES)
+        if sid in ("single_pod", "single_cluster"):
+            entry["cluster_types"] = list(CLUSTER_TYPES)
         out.append(entry)
     return out
