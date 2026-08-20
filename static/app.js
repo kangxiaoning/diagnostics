@@ -22,7 +22,9 @@ const clusterTypeRow = document.getElementById("clusterTypeRow");
 const clusterTypeSelectEl = document.getElementById("clusterTypeSelect");
 const paramFieldsContainer = document.getElementById("paramFieldsContainer");
 const paramFieldsHost = document.getElementById("paramFieldsHost");
+const paramFieldsCluster = document.getElementById("paramFieldsCluster");
 const paramFieldsCommon = document.getElementById("paramFieldsCommon");
+const nodeScopeRow = document.getElementById("nodeScopeRow");
 
 // ═══════════════════ Scene-driven Param Overrides ═══════════════════
 function applySceneFields() {
@@ -31,24 +33,37 @@ function applySceneFields() {
   const hide = (el) => el.classList.add("hidden");
 
   clusterTypeRow.classList.add("hidden");
+  hide(nodeScopeRow);
   if (scene === "single_pod") {
     show(paramFieldsContainer);
     hide(paramFieldsHost);
+    hide(paramFieldsCluster);
     show(paramFieldsCommon);
     show(clusterTypeRow); // 集群类型：专有集群 / Serverless
   } else if (scene === "single_host") {
     hide(paramFieldsContainer);
     hide(clusterTypeRow); // 单主机诊断仅需主机名与时间范围，不选择集群类型
+    hide(paramFieldsCluster);
     show(paramFieldsHost);
     show(paramFieldsCommon);
+  } else if (scene === "single_cluster") {
+    hide(paramFieldsContainer);
+    hide(paramFieldsHost);
+    show(paramFieldsCluster);
+    show(paramFieldsCommon);
+    show(clusterTypeRow); // 集群类型：专有集群 / Serverless
+    // 节点范围仅 dedicated 有意义（Serverless 3 集群节点由拓扑派生）
+    if (clusterTypeSelectEl.value === "dedicated") show(nodeScopeRow);
   } else {
     hide(paramFieldsContainer);
     hide(paramFieldsHost);
+    hide(paramFieldsCluster);
     hide(paramFieldsCommon);
     hide(clusterTypeRow);
   }
 }
 sceneSelectEl.addEventListener("change", applySceneFields);
+clusterTypeSelectEl.addEventListener("change", applySceneFields);
 // 页面加载即同步场景字段（防御性加固：不依赖 HTML 初始 hidden）
 document.addEventListener("DOMContentLoaded", applySceneFields);
 
@@ -56,8 +71,11 @@ function buildParamOverrides() {
   const scene = sceneSelectEl.value;
   if (!scene) return null;
 
-  // task_type 语义保留（hostname_resolver 依赖 container 判断触发主机名解析）
-  const overrides = { task_type: scene === "single_host" ? "host" : "container" };
+  // task_type 语义保留（hostname_resolver 仅对 container 触发主机名解析）：
+  // single_cluster 无 Pod 锚点，天然跳过解析
+  const taskType = scene === "single_host" ? "host"
+    : scene === "single_cluster" ? "cluster" : "container";
+  const overrides = { task_type: taskType };
   const startTime = document.getElementById("paramStartTime").value;
   const endTime = document.getElementById("paramEndTime").value;
 
@@ -81,6 +99,17 @@ function buildParamOverrides() {
   } else if (scene === "single_host") {
     const nc = document.getElementById("paramHostname").value.trim();
     if (nc) overrides.hostname = nc;
+  } else if (scene === "single_cluster") {
+    const cn = document.getElementById("paramClusterScopeName").value.trim();
+    if (cn) overrides.cluster_name = cn;
+    // 节点范围（dedicated 排查范围约束；Serverless 3 集群节点由拓扑派生，
+    // 面板已隐藏但仍防御性忽略）
+    if (clusterTypeSelectEl.value === "dedicated") {
+      const ns = document.getElementById("paramNodeScope").value.trim();
+      if (ns) {
+        overrides.node_scope = ns.split(/[,，;；\s]+/).filter(Boolean);
+      }
+    }
   }
 
   return overrides;
@@ -829,17 +858,24 @@ formEl.addEventListener("submit", async (e) => {
         message: prompt,
         session_id: sessionId,
         scene_id: sceneSelectEl.value || null,
-        cluster_type: sceneSelectEl.value === "single_pod" ? clusterTypeSelectEl.value : null,
+        cluster_type: ["single_pod", "single_cluster"].includes(sceneSelectEl.value)
+          ? clusterTypeSelectEl.value
+          : null,
         entity_type: (() => {
           const s = sceneSelectEl.value;
           if (s === "single_host") return "host";
-          if (s === "single_pod") return "kubernetes";
+          if (s === "single_pod" || s === "single_cluster") return "kubernetes";
           return "";
         })(),
-        entity_name: (() => {
+        // 语义化实体标识（OTel 类型专属实体识别属性风格）：
+        // 主机场景发 host_name，集群场景发 cluster_name；不再发泛化 entity_name
+        host_name: (() => (sceneSelectEl.value === "single_host"
+          ? document.getElementById("paramHostname").value.trim()
+          : ""))(),
+        cluster_name: (() => {
           const s = sceneSelectEl.value;
           if (s === "single_pod") return document.getElementById("paramClusterName").value.trim();
-          if (s === "single_host") return document.getElementById("paramHostname").value.trim();
+          if (s === "single_cluster") return document.getElementById("paramClusterScopeName").value.trim();
           return "";
         })(),
         param_overrides: buildParamOverrides(),

@@ -12,7 +12,33 @@ class ChatRequest(BaseModel):
     )
     entity_name: str = Field(
         default="",
-        description="Entity identifier: hostname or cluster name. Empty means auto-detect.",
+        description=(
+            "Legacy generic entity identifier (deprecated alias): hostname or "
+            "cluster name.  Prefer the semantic fields host_name / cluster_name "
+            "below — entity_name is still accepted for backward compatibility "
+            "(legacy clients / auto-detect path) and is derived from the "
+            "semantic fields when provided."
+        ),
+    )
+    host_name: str = Field(
+        default="",
+        description=(
+            "Semantic entity identifier for host-type scenes (single_host): "
+            "the hostname under diagnosis.  Mutually exclusive with "
+            "cluster_name; mirrors OpenTelemetry's type-specific entity "
+            "identification attributes (host.name) instead of a generic "
+            "entity name."
+        ),
+    )
+    cluster_name: str = Field(
+        default="",
+        description=(
+            "Semantic entity identifier for cluster-type scenes "
+            "(single_pod / single_cluster): the cluster under diagnosis.  "
+            "Mutually exclusive with host_name; mirrors OpenTelemetry's "
+            "type-specific entity identification attributes "
+            "(k8s.cluster.name)."
+        ),
     )
     scene_id: str | None = Field(
         default=None,

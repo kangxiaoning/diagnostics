@@ -39,7 +39,7 @@
               <option value="">-- 请选择 --</option>
               <option value="single_host">🖥 单主机诊断</option>
               <option value="single_pod">📦 单 Pod 诊断</option>
-              <option value="single_cluster" disabled>单集群诊断（未开放）</option>
+              <option value="single_cluster">🌐 单集群诊断</option>
               <option value="multi_cluster" disabled>多集群诊断（未开放）</option>
               <option value="multi_host" disabled>多主机诊断（未开放）</option>
             </select>
@@ -80,6 +80,16 @@
           <div class="param-fields hidden" id="paramFieldsHost">
             <div class="param-row">
               <input id="paramHostname" class="param-input" type="text" placeholder="主机标识 (hostname)" />
+            </div>
+          </div>
+          <div class="param-fields hidden" id="paramFieldsCluster">
+            <div class="param-row">
+              <input id="paramClusterScopeName" class="param-input" type="text"
+                placeholder="集群名称 (cluster_name) *" required />
+            </div>
+            <div class="param-row" id="nodeScopeRow">
+              <input id="paramNodeScope" class="param-input" type="text"
+                placeholder="节点范围 (node_scope)，留空 = 全集群；多个节点用逗号分隔" />
             </div>
           </div>
           <div class="param-fields hidden" id="paramFieldsCommon">

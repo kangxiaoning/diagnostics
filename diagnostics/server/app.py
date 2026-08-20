@@ -130,18 +130,52 @@ def create_app(settings: Settings | None = None, agent: Any | None = None) -> Fa
     return app
 
 
-def _auto_set_scenario(message: str, cluster_type: str = "") -> None:
+def _normalize_semantic_entity(request: Any) -> str | None:
+    """Normalize the semantic entity identifier fields on a ChatRequest.
+
+    The semantic fields (host_name / cluster_name) carry the entity's
+    type-specific identity (OpenTelemetry-style entity identification
+    attributes, e.g. host.name / k8s.cluster.name) and take precedence over
+    the legacy generic entity_name.  On success they are normalized into
+    entity_name (internal discriminated-union key) and injected into
+    param_overrides (tool-param channel) when absent; a human-readable
+    error message is returned on conflict.
+    """
+    if request.host_name and request.cluster_name:
+        return "host_name 与 cluster_name 语义互斥，不可同时提供"
+    semantic = request.host_name or request.cluster_name
+    if not semantic:
+        return None
+    if request.entity_name and request.entity_name != semantic:
+        return ("entity_name 与语义字段（host_name/cluster_name）不一致，"
+                "请仅使用语义字段")
+    if request.host_name and request.entity_type == "kubernetes":
+        return "host_name 与 entity_type=kubernetes 语义不符（主机标识请用 host_name + host 场景）"
+    if request.cluster_name and request.entity_type == "host":
+        return "cluster_name 与 entity_type=host 语义不符（集群标识请用 cluster_name + 集群场景）"
+    request.entity_name = semantic
+    if request.param_overrides is None:
+        request.param_overrides = {}
+    request.param_overrides.setdefault(
+        "hostname" if request.host_name else "cluster_name", semantic)
+    return None
+
+
+def _auto_set_scenario(message: str, cluster_type: str = "", scene_id: str = "") -> None:
     """Match user message to mock scenario using declarative routing.
 
     Delegates to scenarios.match_scenario() which auto-sorts keyword rules
     by specificity (more keywords = higher priority).  cluster_type is
     forwarded so routing is domain-scoped (Serverless requests only match
-    serverless scenarios), preventing cross-domain misrouting.  Adding or
-    removing scenarios only requires editing scenarios.py — no changes here.
+    serverless scenarios), preventing cross-domain misrouting.  scene_id is
+    forwarded so scene-scoped scenarios (e.g. single_cluster) only match
+    their own domain — a cluster-wide message must not misroute to a
+    single-pod scenario.  Adding or removing scenarios only requires
+    editing scenarios.py — no changes here.
     """
     from diagnostics.tools.mock.scenarios import match_scenario, set_scenario
 
-    matched = match_scenario(message, cluster_type)
+    matched = match_scenario(message, cluster_type, scene_id)
     if matched:
         try:
             set_scenario(matched)
@@ -214,6 +248,13 @@ def _build_augmented_message(
     _pod = (param_overrides or {}).get("pod_name", "")
     if _pod:
         lines.append(f"- Pod: {_pod}")
+    # single_cluster 场景的节点范围（空=全集群，场景 spec §6.2）：透传给
+    # argus 专家作排查范围约束
+    _node_scope = (param_overrides or {}).get("node_scope") or []
+    if isinstance(_node_scope, (list, tuple)) and _node_scope:
+        lines.append("- 节点范围（排查以该清单为界）: " + ", ".join(str(n) for n in _node_scope))
+    elif isinstance(_node_scope, str) and _node_scope.strip():
+        lines.append(f"- 节点范围（排查以该清单为界）: {_node_scope.strip()}")
     if start_time and end_time:
         lines.append(f"- 故障时间: {start_time} ~ {end_time}")
     elif start_time:
@@ -403,7 +444,13 @@ async def _chat_event_stream(
 
     # ── Auto-match mock scenario from user message (dev mode only) ──
     if os.getenv("DIAGNOSTICS_MODE", "mock") == "mock":
-        _auto_set_scenario(request.message, request.cluster_type)
+        _auto_set_scenario(request.message, request.cluster_type, request.scene_id or "")
+
+    # ── Semantic entity identifier normalization ──
+    _sem_err = _normalize_semantic_entity(request)
+    if _sem_err:
+        yield sse("error", {"message": _sem_err})
+        return
 
     # ── Scene resolution (scene framework) ──
     # When the frontend selects a scene (scene_id), resolve the SceneProfile,
@@ -437,7 +484,8 @@ async def _chat_event_stream(
         # Derive entity_type / entity_name from the scene profile
         if not request.entity_type and scene_profile.entity_type:
             request.entity_type = scene_profile.entity_type
-        if not request.entity_name and scene_profile.scene_id == "single_pod":
+        if (not request.entity_name
+                and scene_profile.scene_id in ("single_pod", "single_cluster")):
             request.entity_name = _po.get("cluster_name", "") or request.entity_name
 
     # ── Pre-resolve hostname for container scenarios ──
