@@ -139,7 +139,12 @@ class DeepExpertFindings(BaseModel):
     """Structured return for deep diagnostic subagents."""
 
     verdict: Literal["confirmed", "refuted", "inconclusive"] = Field(
-        description="假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）"
+        description=(
+            "假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）。"
+            "verdict 须与证据主体方向一致：confirmed 的支持证据（key_evidence）为主体，"
+            "refuted 的负证据（negative_evidence）为主体；两者矛盾时按证据主体修正 verdict"
+            "（曾实证：verdict=refuted 但 key_evidence 全支持向，致假设被误证伪）"
+        )
     )
     key_evidence: list[str] = Field(
         default_factory=list,
@@ -151,7 +156,11 @@ class DeepExpertFindings(BaseModel):
     )
     root_cause: str = Field(
         default="",
-        description="根因判断：如已定位根因则陈述，否则说明还需什么数据",
+        description=(
+            "根因判断：confirmed/inconclusive 且已定位根因时陈述根因结论；"
+            "refuted 时陈述假设被排除的原因及建议转向方向（此时假设本身不是根因）；"
+            "证据不足时说明还需什么数据。方向须与 verdict 一致"
+        ),
     )
     confidence: str = Field(
         default="",
@@ -239,11 +248,13 @@ _EXPERT_RETURN_SUFFIX = (
     "这是交付验证结论的标准方式，Coordinator 据此落账；字段按下方说明填写，负证据不得省略。\n"
     "- 兜底方式：若 `DeepExpertFindings` 不在工具列表（未注入结构化 schema），"
     "则按下方文本格式直接输出结论。\n"
-    "- 假设验证: {confirmed|refuted|inconclusive}\n"
+    "- 假设验证: {confirmed|refuted|inconclusive}——verdict 须与证据主体方向一致："
+    "confirmed 以关键证据为主体，refuted 以负证据为主体，矛盾时按证据主体修正 verdict\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
     "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
     "必须如实列出，与阳性证据同等重要，不得省略\n"
-    "- 根因判断: 如已定位根因则陈述，否则说明还需什么数据\n"
+    "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向"
+    "（此时假设本身不是根因）；证据不足时说明还需什么数据\n"
     "- 置信度: {高|中|低} + 百分比"
 )
 

@@ -47,6 +47,7 @@ from diagnostics.agent.ledger import (
     _phase_guidance,
     _required_argus,
     activate_hypothesis,
+    expert_verdict_conflict,
     add_evidence_to_active,
     add_hypotheses,
     backtrack,
@@ -4141,6 +4142,29 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _structured_expert = _parse_expert_json(output)
                     if _structured_expert is not None:
                         summary = _format_expert_summary(output)
+                        # ── Verdict-evidence direction observation
+                        # (v3.16.0, design document §8 G21 sibling):
+                        # schema-valid but content-mismatched returns — a
+                        # refuted verdict whose positive evidence outweighs
+                        # its negative evidence (and vice versa) — are a
+                        # known failure class.  Observation only, never
+                        # blocks: downstream analysis correlates this tag
+                        # with trace records.
+                        _v = _structured_expert.get("verdict")
+                        if _v in ("confirmed", "refuted"):
+                            _ke = len(_structured_expert.get("key_evidence") or [])
+                            _ne = len(_structured_expert.get("negative_evidence") or [])
+                            _mismatch = (_v == "refuted" and _ke > _ne) or (
+                                _v == "confirmed" and _ne > _ke
+                            )
+                            if _mismatch:
+                                logger.warning(
+                                    "suspect-verdict-mismatch: expert=%s verdict=%s "
+                                    "key_evidence=%d negative_evidence=%d root_cause=%.120s",
+                                    tool_args.get("subagent_type", "?"), _v,
+                                    _ke, _ne,
+                                    str(_structured_expert.get("root_cause") or ""),
+                                )
 
                 if summary:
                     # Diagnostic data arrived — counts as verify-phase
@@ -5521,6 +5545,83 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
                         f"可再次 record_finding refuted（通道自动开放）。"
                     )
+            # ── G21: expert-verdict conflict arbitration (reactive
+            # backstop, design document §8, v3.16.0; 2026-08-21 scenario
+            # 40 follow-up) ── When the SAME hypothesis already holds a
+            # structured deep-expert return with an OPPOSING terminal
+            # verdict, a new terminal record_finding would let the later
+            # expert silently overwrite the earlier one (recency bias;
+            # AGM belief revision requires an explicit retraction
+            # reason).  Soft gate: three arbitration routes + an
+            # explicit-overrule channel (statement_update carries the
+            # retraction reason); bounded-block degrade symmetric with
+            # C2/G17-E2 (_E2_BLOCK_LIMIT).
+            if verdict in ("confirmed", "refuted"):
+                _g21_conflict = expert_verdict_conflict(
+                    ledger, hypothesis_id, verdict)
+                if _g21_conflict:
+                    _g21_node = ledger["hypotheses"][hypothesis_id]
+                    if statement_update:
+                        # Explicit-overrule channel: belief revision WITH
+                        # a stated reason — allowed, counter reset.
+                        _g21_node["_g21_block_count"] = 0
+                        logger.info(
+                            "record_finding G21 explicit overrule on %s "
+                            "(new=%s, prior %s=%s, statement_update "
+                            "carries retraction reason, round=%d)",
+                            fmt_hid(hypothesis_id), verdict,
+                            _g21_conflict["expert"],
+                            _g21_conflict["prev_verdict"],
+                            self._model_call_count,
+                        )
+                    else:
+                        _g21_node["_g21_block_count"] = (
+                            _g21_node.get("_g21_block_count", 0) + 1
+                        )
+                        if _g21_node["_g21_block_count"] > _E2_BLOCK_LIMIT:
+                            logger.warning(
+                                "record_finding G21 degraded after %d "
+                                "blocks on %s (round=%d) — passing with "
+                                "disclosure",
+                                _g21_node["_g21_block_count"],
+                                fmt_hid(hypothesis_id),
+                                self._model_call_count,
+                            )
+                            return (
+                                f"⚠ {verdict} 判定已通过（G21 专家结论冲突仲裁"
+                                f"连续 {_g21_node['_g21_block_count']} 次拦截后"
+                                f"降级放行）：{fmt_hid(hypothesis_id)} 存在未仲裁的"
+                                f"专家结论冲突（{_g21_conflict['expert']} 判定 "
+                                f"{_g21_conflict['prev_verdict']} 与本次判定相反），"
+                                f"本判定未经冲突仲裁，系统在报告中披露。"
+                            )
+                        logger.warning(
+                            "record_finding blocked by G21: %s verdict=%s "
+                            "opposes prior %s verdict=%s (round=%d)",
+                            fmt_hid(hypothesis_id), verdict,
+                            _g21_conflict["expert"],
+                            _g21_conflict["prev_verdict"],
+                            self._model_call_count,
+                        )
+                        return (
+                            f"⛔ 假设 {fmt_hid(hypothesis_id)} 已有专家终局结论与"
+                            f"本次判定相反（专家结论冲突仲裁）："
+                            f"{_g21_conflict['expert']} 此前判定 "
+                            f"{_g21_conflict['prev_verdict']}"
+                            f"（证据摘要：{_g21_conflict['summary']}…），"
+                            f"而本次拟判 {verdict}。两个深度专家对同一假设给出"
+                            f"相反终局结论属跨专家证据矛盾，直接落账将以新结论"
+                            f"静默覆盖旧结论。请先仲裁：\n"
+                            f"1. 复检矛盾数据源：委派第三方视角专家（或同一专家"
+                            f"复核具体矛盾点，如两侧对同一物理量的观测差异）确认"
+                            f"哪侧证据可靠；\n"
+                            f"2. 以冲突披露收口：若无法仲裁，改判 inconclusive 并"
+                            f"在 new_insights 披露两侧矛盾证据，报告将如实呈现"
+                            f"未解冲突；\n"
+                            f"3. 明示推翻理由：若确有把握推翻既有结论，携带 "
+                            f"statement_update（含推翻理由，如\"新证据为直接测量，"
+                            f"旧证据为间接观测\"）重新落账，通道立即开放。"
+                        )
             # ── G18: ceremonial-repeat guard (design document §8,
             # v3.11.0) ──
             # A record_finding that (a) repeats the CURRENT status
@@ -5587,6 +5688,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 )
             except ValueError as e:
                 return f"记录失败: {e}"
+
+            # G21 arbitration counter resets on every successful verdict
+            # (design document §8, v3.16.0): a completed verdict means the
+            # conflict was resolved (or explicitly overruled).
+            _g21_done = ledger.get("hypotheses", {}).get(hypothesis_id)
+            if isinstance(_g21_done, dict) and "_g21_block_count" in _g21_done:
+                _g21_done["_g21_block_count"] = 0
 
             # Check exit conditions
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)

@@ -2814,6 +2814,41 @@ def _argus_conflict_signal(ledger: DiagnosisLedger, hid: str) -> str | None:
     return None
 
 
+def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
+                            new_verdict: str) -> dict | None:
+    """Detect a terminal expert-verdict conflict on hypothesis *hid*
+    (design document §8 G21, v3.16.0).
+
+    Fires when the hypothesis already holds a structured deep-expert
+    return whose verdict is a TERMINAL value (confirmed / refuted) that
+    OPPOSES *new_verdict* — two deep experts measured the same claim in
+    opposite directions.  Letting the later verdict silently overwrite
+    the earlier is a recency bias; belief revision requires an explicit
+    retraction reason (AGM).  Non-terminal returns (inconclusive) never
+    fire; argus-layer internal conflicts are already covered by
+    G17-E2/G20 and stay out of scope here.
+
+    Returns a dict describing the opposing evidence (expert name /
+    verdict / summary excerpt) for the arbitration message, or None.
+    """
+    if new_verdict not in ("confirmed", "refuted"):
+        return None
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    for ev in reversed(node.get("evidence", [])):
+        source = str(ev.get("source", ""))
+        if not source.startswith("expert:"):
+            continue
+        structured = ev.get("structured") or {}
+        prev = structured.get("verdict")
+        if prev in ("confirmed", "refuted") and prev != new_verdict:
+            return {
+                "expert": source[len("expert:"):],
+                "prev_verdict": prev,
+                "summary": (ev.get("summary") or "")[:200],
+            }
+    return None
+
+
 def _parallel_candidates(
     ledger: DiagnosisLedger, hid: str, node: HypothesisNode,
 ) -> list[str]:
@@ -3192,6 +3227,34 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                         f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
                         f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"证据不足可再委派（价值仍≥κ）{anti_fab}。"
+                    )
+                # ── G21 proactive override (design document §8/§9,
+                # v3.16.0; 2026-08-21 scenario 40 follow-up) ── deep
+                # experts returned OPPOSING terminal verdicts on the
+                # SAME hypothesis: the harvest-nudge above would drive a
+                # verdict that silently picks one side.  Override with
+                # the single arbitration action (WIRE: exactly one
+                # recommended action; AGM: retracting an entrenched
+                # belief requires an explicit reason).  Mutually
+                # exclusive with the C1 argus-conflict override below
+                # (C1 requires ALL expert evidence argus-class; this one
+                # requires >=2 deep terminal returns).
+                _terminal_vs = {
+                    (e.get("structured") or {}).get("verdict")
+                    for e in node.get("evidence", [])
+                    if str(e.get("source", "")).startswith("expert:")
+                }
+                if {"confirmed", "refuted"} <= _terminal_vs:
+                    directive = (
+                        f"⚠ {fmt_hid(active_id)} 的专家结论方向冲突：多个深度"
+                        f"专家对同一假设给出相反终局结论（confirmed 与 "
+                        f"refuted 并存，证据见上方）——落账任一终局判定等于"
+                        f"单方面采信一侧。当前唯一推荐动作：先仲裁——复检矛盾"
+                        f"数据源（委派第三方视角专家复核两侧对同一物理量的"
+                        f"观测差异），或改判 inconclusive 并在 new_insights "
+                        f"披露两侧矛盾；确有把握推翻某侧结论时，携带 "
+                        f"statement_update（推翻理由）落账，通道立即开放、"
+                        f"不会被拦截。"
                     )
                 # Evidence-scope calibration (design document §9,
                 # v3.13.0): when every expert conclusion so far is
