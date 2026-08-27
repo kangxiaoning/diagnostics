@@ -540,6 +540,15 @@ async def _chat_event_stream(
                 pod_name=(request.param_overrides or {}).get("pod_name", ""),
             )
             if _topology_data:
+                # Scope stamp (private key, "_not_found" convention): lets
+                # the report-time mapping renderer dispatch between the
+                # Pod-anchored and the cluster-level RelationGraph form —
+                # single_cluster sessions carry no pod/workload anchor.
+                _topology_data["_query_anchor"] = {
+                    "namespace": (request.param_overrides or {}).get("namespace", ""),
+                    "workload_name": (request.param_overrides or {}).get("workload_name", ""),
+                    "pod_name": (request.param_overrides or {}).get("pod_name", ""),
+                }
                 _topology_summary = _render_topology_summary(_topology_data)
                 if _topology_summary:
                     augmented_message = augmented_message + "\n\n" + _topology_summary
@@ -819,6 +828,27 @@ async def _chat_event_stream(
                             latest_ledger,
                         )
                     )
+                    # Persist the in-memory stub-report flag back to the
+                    # on-disk trace ledger (2026-08-21): without this the
+                    # ledger.json keeps its pre-disconnect snapshot, and
+                    # post-hoc analysis misreads the exit path (observed:
+                    # stub report written at timeout, but no
+                    # _report_auto_generated flag on disk).
+                    try:
+                        from diagnostics.agent.ledger import ledger_to_json
+                        ledger_file = (
+                            ROOT_DIR / "agent_data" / "traces"
+                            / f"{session_id}-ledger.json"
+                        )
+                        if ledger_file.exists():
+                            ledger_file.write_text(
+                                ledger_to_json(latest_ledger),
+                                encoding="utf-8",
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[session=%s] ledger re-persist after stub "
+                            "report failed", session_id)
                 except Exception:
                     report_text_str = ""  # best-effort; result.json still saved
             _save_result(report_path, tree,
