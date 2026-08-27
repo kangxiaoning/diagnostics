@@ -77,7 +77,7 @@ from diagnostics.agent.ledger import (
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from deepagents.middleware._utils import append_to_system_message
 
-from diagnostics.agent.topology_render import build_argus_compact_view, build_host_views, expert_view, render_json_block
+from diagnostics.agent.topology_render import build_argus_context_view, build_host_views, expert_view, render_json_block
 
 logger = logging.getLogger(__name__)
 
@@ -1038,10 +1038,13 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
         entity_hints.append(f"  - cluster_name: **{entity_name}**")
         entity_hints.append("  - 实体类型: kubernetes")
     # Argus monitor_name anchor — queried from user input BEFORE agent
-    # creation and stored in param_overrides (dedicated/host scenes);
-    # Serverless scenes get it from topology mapping instead (§2b below).
+    # creation and stored in param_overrides (dedicated/host scenes only).
+    # Serverless sessions (topology mapping present): per-role monitor_name
+    # is single-sourced from the topology contract block (§2b below) — a
+    # session-global value here would be a second, conflicting source.
     _monitor_name = (ledger.get("param_overrides") or {}).get("monitor_name", "")
-    if _monitor_name and subagent_type in (*_host_experts, *_k8s_experts):
+    if (_monitor_name and subagent_type in (*_host_experts, *_k8s_experts)
+            and not (ledger.get("topology") or {}).get("mapping")):
         entity_hints.append(f"  - monitor_name: **{_monitor_name}**")
 
     if entity_hints:
@@ -1063,16 +1066,12 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     _topology = ledger.get("topology") or {}
     _mapping = _topology.get("mapping", {})
     _sls_argus = ("serverless-argus-expert", "kmc-argus-expert", "sci-argus-expert")
+    _argus_experts = (*_sls_argus, "host-argus-expert")
     _sls_deep = ("serverless-expert", "kmc-expert", "sci-expert")
     _view_key = {
         "serverless-expert": "serverless_views",
         "kmc-expert": "kmc_views",
         "sci-expert": "sci_views",
-    }
-    _argus_view_key = {
-        "serverless-argus-expert": "serverless_views",
-        "kmc-argus-expert": "kmc_views",
-        "sci-argus-expert": "sci_views",
     }
     _monitor_key = {
         "serverless-argus-expert": "serverless_monitor_name",
@@ -1084,48 +1083,45 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
         "kmc-expert": "kmc_cluster",
         "sci-expert": "sci_cluster",
     }
+    _is_argus = subagent_type in _argus_experts
     _anchor: list[str] = []
     if _mapping:
-        if subagent_type in _sls_argus:
-            _anchor.append(f"  - monitor_name: **{_mapping.get(_monitor_key[subagent_type], '')}**")
+        # Argus experts: per-role parameters are single-sourced in the
+        # unified JSON contract block below (design document §7.3) — the
+        # former text anchors were dropped to eliminate duplicated sources
+        # (the LLM arbitrated between them and picked the wrong one).
+        if subagent_type in _sls_argus and not _mapping.get(_monitor_key[subagent_type]):
+            # Per-role monitor key absent (e.g. production topology query
+            # returned a mapping without *_monitor_name) — surface it; the
+            # contract block carries null (never fabricated).
+            logger.warning(
+                "Monitor anchor missing for %s: topology.mapping has no %r",
+                subagent_type, _monitor_key[subagent_type],
+            )
         if subagent_type in _sls_deep:
             _anchor.append(f"  - cluster_name: **{_mapping.get(_cluster_key[subagent_type], '')}**")
-        # host experts: physical-node dimension — inject host_views so
-        # host-argus can query host-level metrics by hostname and host-expert
-        # can investigate node pressure (design document §8.1⑥ / §7.3).
-        if subagent_type in _host_experts:
+        # host-expert (deep): physical-node dimension with split keys —
+        # host_name is the tool parameter, node_name only for network
+        # orientation (design document §8.1⑥ / §7.3).  host-argus-expert
+        # receives the JSON hosts list in the unified contract block.
+        if subagent_type == "host-expert":
             _host_views = build_host_views(_topology)
             if _host_views:
-                if subagent_type == "host-argus-expert":
-                    # hostname 参数契约是主机名（监控端点语义，design document §8.1⑥）。
-                    # 只注入主机名清单——双值并置（host_name@node_name）会让模型自行
-                    # 选字段而误填节点 IP（2026-08-06 观测：8 次 query_argus_* 的
-                    # hostname 全为 10.30.x 节点 IP）。此清单是 query_argus_* 的
-                    # hostname 参数唯一取值来源，无噪音。
-                    _hostnames = [r["host_name"] or r["node_name"] for r in _host_views]
-                    _anchor.append(
-                        "  - 可查询主机名（query_argus_* 的 hostname 参数仅取自此列表，"
-                        "值为主机名，禁止使用节点 IP）: "
-                        + ", ".join(_hostnames)
+                import json as _json
+                _nodes = "; ".join(
+                    _json.dumps(
+                        {k: r.get(k) for k in ("host_name", "node_name", "cluster", "roles")},
+                        ensure_ascii=False, separators=(",", ":"),
                     )
-                else:
-                    # 深度主机专家（host-expert / gpu-expert）可能需要 IP 作网络定位
-                    # 参考：host_name / node_name 分键，注明各自用途，避免模型混淆。
-                    import json as _json
-                    _nodes = "; ".join(
-                        _json.dumps(
-                            {k: r.get(k) for k in ("host_name", "node_name", "cluster", "roles")},
-                            ensure_ascii=False, separators=(",", ":"),
-                        )
-                        for r in _host_views
-                    )
-                    _anchor.append(
-                        "  - 物理节点（hostname 参数用 host_name；node_name 仅网络定位参考）: "
-                        + _nodes
-                    )
+                    for r in _host_views
+                )
+                _anchor.append(
+                    "  - 物理节点（hostname 参数用 host_name；node_name 仅网络定位参考）: "
+                    + _nodes
+                )
         _k8s_n = _mapping.get("k8s_name", "")
         _mid = _mapping.get("master_id", "")
-        if _k8s_n and _mid:
+        if _k8s_n and _mid and not _is_argus:
             _anchor.append(
                 f"  - 命名规则: 控制面 ns=`{_k8s_n}-{_mid}`；工作负载 ns=`burst-ns-{_mid}`；"
                 "SCI Pod=`burst-<serverless_ns>-<serverless_pod_name>`"
@@ -1135,6 +1131,13 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
             "## Serverless 拓扑锚点"
             "（工具参数必须使用以下值；命名规则用于解析 SCI Pod/命名空间）:\n"
             + "\n".join(_anchor) + "\n"
+        )
+    elif subagent_type in _sls_argus and not _mapping:
+        logger.warning(
+            "Monitor anchor missing for %s: topology.mapping absent — "
+            "argus expert has no legal monitor_name source; check the "
+            "topology query result fields (*_monitor_name).",
+            subagent_type,
         )
 
     # Deep experts: full-view JSON injection (design document §7.3) — the
@@ -1150,28 +1153,45 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
                 )
             )
 
-    # Argus experts: compact+落点 view injection (§5A.5/5A.6/5A.7) — the argus
-    # expert resolves namespace/workload/pod/node tool parameters directly from
-    # the slice; shared etcd comes as an etcd_views block for serverless-argus.
-    if subagent_type in _sls_argus:
-        _aview_name = _argus_view_key[subagent_type]
-        if _topology.get(_aview_name):
-            lines.append(
-                render_json_block(
-                    f"Serverless 拓扑视图（{_aview_name}）",
-                    build_argus_compact_view(_topology, _aview_name),
-                )
+    # Argus experts: unified JSON parameter contract (design document §7.3) —
+    # single source of truth for tool params (monitor_name / cluster_name /
+    # hostname / time window each appear exactly once) + deterministic
+    # diagnostic-target extraction with explicit absence markers (§9-4).
+    # Replaces the former text anchors + compact-only view + Layer-3 echo.
+    if _is_argus and _mapping:
+        lines.append(
+            render_json_block(
+                "Argus 诊断上下文（工具参数契约）",
+                build_argus_context_view(
+                    _topology,
+                    subagent_type,
+                    param_overrides=ledger.get("param_overrides") or {},
+                    start_time=ledger.get("start_time", ""),
+                    end_time=ledger.get("end_time", ""),
+                ),
             )
+        )
 
     # ── Layer 3: Frontend param_overrides (JSON) ──
     param_overrides = ledger.get("param_overrides", {})
     start_time = ledger.get("start_time", "")
     end_time = ledger.get("end_time", "")
-    if param_overrides or start_time or end_time:
+    # Argus experts with topology: every parameter is single-sourced in the
+    # unified contract block above — echoing raw param_overrides here would
+    # re-introduce a second (potentially conflicting) source.
+    if _is_argus and _topology.get("mapping"):
+        pass
+    elif param_overrides or start_time or end_time:
         try:
             # Exclude fields already covered in Layer 2 to avoid
             # triplicated parameters (user message → Layer 2 → JSON).
             _redundant = {"hostname", "cluster_name", "fault_time_range"}
+            # Serverless sessions: argus monitor_name is a per-role fact
+            # resolved from the topology mapping (§Layer 2b) — a single
+            # session-global value here would leak one monitor name to every
+            # argus expert. Topology presence ⇒ anchors are authoritative.
+            if _topology.get("mapping"):
+                _redundant.add("monitor_name")
             clean = {k: v for k, v in param_overrides.items() if k not in _redundant}
             # Add time window from ledger if present
             if start_time:

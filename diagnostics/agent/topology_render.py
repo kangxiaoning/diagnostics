@@ -334,6 +334,186 @@ def _build_host_nodes(topology: dict) -> list[dict]:
     return out
 
 
+# ── Argus unified context contract (design document §7.3) ──
+# One JSON block per argus expert: every tool-parameter value (monitor_name /
+# cluster_name / hostname / time window) appears exactly once (single source
+# of truth); the diagnostic target is extracted deterministically from
+# param_overrides + naming rules; absence is explicit (§9-4), never fabricated.
+_ARGUS_MONITOR_KEY = {
+    "serverless-argus-expert": "serverless_monitor_name",
+    "kmc-argus-expert": "kmc_monitor_name",
+    "sci-argus-expert": "sci_monitor_name",
+}
+_ARGUS_CLUSTER_KEY = {
+    "serverless-argus-expert": "serverless_cluster",
+    "kmc-argus-expert": "kmc_cluster",
+    "sci-argus-expert": "sci_cluster",
+}
+_ARGUS_VIEW_KEY = {
+    "serverless-argus-expert": "serverless_views",
+    "kmc-argus-expert": "kmc_views",
+    "sci-argus-expert": "sci_views",
+}
+
+
+def _derive_sci_pod(target: dict) -> str:
+    """SCI Pod 名确定性派生：burst-<serverless_ns>-<serverless_pod_name>。"""
+    ns, pod = target.get("namespace", ""), target.get("pod_name", "")
+    return f"burst-{ns}-{pod}" if ns and pod else ""
+
+
+def _match_logical_resource(topology: dict, target: dict) -> dict | None:
+    """serverless_views 中精确匹配诊断目标（kind 可选过滤）。"""
+    ns, wl = target.get("namespace", ""), target.get("workload_name", "")
+    if not (ns and wl):
+        return None
+    kind = target.get("kind", "")
+    for v in topology.get("serverless_views") or []:
+        r = v.get("resource") or {}
+        if r.get("namespace") == ns and r.get("name") == wl \
+                and (not kind or r.get("kind") == kind):
+            return v
+    return None
+
+
+def _target_node_names(topology: dict, target: dict, derived: str) -> set[str]:
+    """诊断目标的物理落点节点 IP 集合（serverless_views 落点 + SCI 派生 Pod）。"""
+    nodes: set[str] = set()
+    item = _match_logical_resource(topology, target)
+    if item:
+        for p in item.get("physical_pods") or []:
+            if p.get("node_name"):
+                nodes.add(p["node_name"])
+    if derived:
+        for v in topology.get("sci_views") or []:
+            sp = v.get("sci_pod") or {}
+            if sp.get("name") == derived and sp.get("node_name"):
+                nodes.add(sp["node_name"])
+    return nodes
+
+
+def build_argus_context_view(topology: dict, expert: str,
+                             param_overrides: dict | None = None,
+                             start_time: str = "", end_time: str = "") -> dict:
+    """Unified JSON parameter-contract block for one argus expert (§7.3).
+
+    Single source of truth — each tool-parameter value appears exactly once
+    in the expert's context, so the LLM never arbitrates between duplicated
+    sources (empirically it picks the wrong one).  The diagnostic target is
+    resolved deterministically; absence markers are explicit (§9-4).
+    """
+    mapping = _strip_none(topology.get("mapping") or {})
+    po = param_overrides or {}
+    block: dict[str, Any] = {"expert": expert}
+
+    # ── diagnostic target (from user input, verbatim) ──
+    target = {k: v for k, v in (
+        ("kind", po.get("workload_type", "")),
+        ("namespace", po.get("namespace", "")),
+        ("workload_name", po.get("workload_name", "")),
+        ("pod_name", po.get("pod_name", "")),
+    ) if v}
+    derived = _derive_sci_pod(target)
+    if derived:
+        target["derived_sci_pod"] = derived
+    if target:
+        block["diagnostic_target"] = target
+
+    # ── naming rules (deterministic derivation basis, JSON form) ──
+    k8s_name, master_id = mapping.get("k8s_name", ""), mapping.get("master_id", "")
+    if k8s_name and master_id:
+        block["naming_rules"] = {
+            "control_plane_ns": f"{k8s_name}-{master_id}",
+            "workload_ns": f"burst-ns-{master_id}",
+            "sci_pod": "burst-<serverless_ns>-<serverless_pod_name>",
+        }
+
+    # ── host-argus: hostname dimension (no monitor_name; §8.1⑥) ──
+    if expert == "host-argus-expert":
+        block["tool_params"] = {"start_time": start_time, "end_time": end_time}
+        # host_name only — node_name (node IP) deliberately excluded: dual
+        # values made the model fill node IPs as the hostname parameter.
+        hosts = [
+            {k: r[k] for k in ("host_name", "cluster", "roles") if r.get(k)}
+            for r in build_host_views(topology)
+            if r.get("host_name")
+        ]
+        if hosts:
+            block["hosts"] = hosts
+        if target:
+            land_nodes = _target_node_names(topology, target, derived)
+            land_hosts = [
+                r["host_name"] for r in build_host_views(topology)
+                if r.get("node_name") in land_nodes and r.get("host_name")
+            ]
+            if land_hosts:
+                block["target_landing_hosts"] = sorted(land_hosts)
+            elif land_nodes:
+                block["boundary"] = {"target_host_not_located": True}
+        if topology.get("_not_found"):
+            block.setdefault("boundary", {})["not_found"] = topology["_not_found"]
+        return block
+
+    view_key = _ARGUS_VIEW_KEY.get(expert)
+    if view_key is None:
+        return block
+
+    # ── tool params (sole occurrence in the whole context) ──
+    block["tool_params"] = {
+        "monitor_name": mapping.get(_ARGUS_MONITOR_KEY[expert]),
+        "cluster_name": mapping.get(_ARGUS_CLUSTER_KEY[expert]),
+        "start_time": start_time,
+        "end_time": end_time,
+    }
+
+    # ── target matching + landings per view semantics ──
+    boundary: dict[str, Any] = {}
+    if target:
+        if view_key in ("serverless_views", "kmc_views"):
+            item = _match_logical_resource(topology, target)
+            if item is not None:
+                pct = item.get("physical_cluster_type") or ""
+                block["diagnostic_target"]["physical_cluster_type"] = pct
+                if view_key == "serverless_views" or pct == "KMC":
+                    landings = [l for l in (_pod_landing(p) for p in (item.get("physical_pods") or [])) if l]
+                    if landings:
+                        block["landings"] = landings
+                # kmc-argus + SCI-hosted target → landings 为空属正常（目标不在 KMC）
+            else:
+                boundary["target_not_in_topology"] = True
+        else:  # sci_views
+            if derived:
+                landings = []
+                for v in topology.get("sci_views") or []:
+                    sp = v.get("sci_pod") or {}
+                    if sp.get("name") == derived:
+                        land = _pod_landing(sp)
+                        if land:
+                            landings.append(land)
+                if landings:
+                    block["landings"] = landings
+                else:
+                    # 物理侧缺席可能是故障本体（VK→SCI 同步断链，§9-4）——
+                    # 显式标记而非静默缺省，专家不得捏造该 Pod 的指标。
+                    boundary["target_sci_pod_absent"] = True
+            elif target.get("namespace") or target.get("workload_name"):
+                boundary["target_sci_pod_underivable"] = True
+    if topology.get("_not_found"):
+        boundary["not_found"] = topology["_not_found"]
+    if boundary:
+        block["boundary"] = boundary
+
+    # ── inventory: full compact slice (SSOT for ad-hoc queries) ──
+    # mapping dropped here — monitor/cluster names are single-sourced in
+    # tool_params; k8s_name/master_id are covered by naming_rules.
+    inv = build_argus_compact_view(topology, view_key)
+    inv.pop("mapping", None)
+    if any(inv.get(k) for k in inv):
+        block["inventory"] = inv
+
+    return block
+
+
 def render_json_block(title: str, payload: dict) -> str:
     """Serialize a payload as a JSON code block under a section title.
 
