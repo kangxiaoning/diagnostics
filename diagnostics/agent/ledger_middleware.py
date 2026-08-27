@@ -5823,6 +5823,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "报告证据链须如实引用这些证据（不得遗漏）；"
                         "系统将同时自动注入「已采集未落账证据」附录。"
                     )
+                # Multi-root honesty footer (design document §8 forward-guidance,
+                # v3.17.0): a report may narrate causes that never went through
+                # the hypothesis channel — presenting them as co-equal verified
+                # root causes forks the ledger from the report (2026-08-27
+                # scenario stress_cpu_and_tc_loss: second cause existed only in
+                # report prose, root_causes stayed 1).  Positive recipe within
+                # the content-quality contract: label such causes with their
+                # evidence tier instead of blocking the close-out.
+                exit_hint += (
+                    "\nℹ 报告分级要求：对任何未经过假设提出与验证流程的独立成因观测，"
+                    "请在报告中标注其证据层级（如【观测级·未建假设】），"
+                    "与已确认根因分层呈现。"
+                )
                 # ── Do NOT auto-generate report here ──
                 # The safety valve in _build_safety_warnings fires on the
                 # next round when ledger["report"] is still empty, giving
@@ -5867,13 +5880,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Selective injection: silence when no other undecided
             # hypothesis exists, and never compete with an exit/retry
             # directive (exit_hint already names the next action).
+            _others = [
+                n for _hid, n in ledger.get("hypotheses", {}).items()
+                if _hid != hypothesis_id
+                and n.get("status") in ("pending", "inconclusive")
+            ]
             _impact_hint = ""
+            # NOTE (design document §8/§11, v3.17.0): a post-confirmation
+            # "propose an independent second-root" invitation was evaluated
+            # and REJECTED — can_append_hypothesis deliberately refuses once
+            # any confirmed exists (T10′), so the invite would be unreachable
+            # dead guidance.  Pre-confirmation evidence-driven appends remain
+            # covered by the impact hint below; causes never hypothesized are
+            # handled by the natural-exit report-tier footer above.  See §11
+            # trade-off row v3.17.0.
             if not exit_hint:
-                _others = [
-                    n for _hid, n in ledger.get("hypotheses", {}).items()
-                    if _hid != hypothesis_id
-                    and n.get("status") in ("pending", "inconclusive")
-                ]
                 if _others:
                     _items = "、".join(
                         f"{fmt_hid(n['id'])}（p={n.get('probability')}%"
