@@ -403,7 +403,7 @@ def _build_subagents(
                 "- 识别每个维度的突变时间点（指标显著变化的分钟）\n"
                 "- 分析跨维度时序关联——同一分钟的异常可能共享根因\n"
                 "- 区分控制面问题(API/etcd/DNS) vs 节点资源问题(NotReady/Evictions) vs 工作负载问题(Restarts/Pending)\n"
-                "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
+                "- 按严重程度排序（🔴严重/⚠中等/✅正常）；集群概览返回的异常对象清单自带 severity 与 start_ts 排序锚点时，排序与时间线以锚点为准\n"
                 "- 如需节点级CPU/内存/磁盘/网络时序，告知Coordinator另行委派host-argus-expert\n"
                 + _ARGUS_EXPERT_RETURN_SUFFIX
             ),

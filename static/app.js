@@ -2,6 +2,8 @@
 const messagesEl = document.getElementById("messages");
 const formEl = document.getElementById("chatForm");
 const inputEl = document.getElementById("promptInput");
+// 默认故障描述引导（applySceneFields 在切场景时恢复/切换场景化提示）
+const DEFAULT_PROMPT_PLACEHOLDER = inputEl.placeholder;
 const actionBtn = document.getElementById("actionBtn");
 const statusLabel = document.getElementById("statusLabel");
 const graphCanvas = document.getElementById("graphCanvas");
@@ -40,12 +42,14 @@ function applySceneFields() {
     hide(paramFieldsCluster);
     show(paramFieldsCommon);
     show(clusterTypeRow); // 集群类型：专有集群 / Serverless
+    inputEl.placeholder = DEFAULT_PROMPT_PLACEHOLDER;
   } else if (scene === "single_host") {
     hide(paramFieldsContainer);
     hide(clusterTypeRow); // 单主机诊断仅需主机名与时间范围，不选择集群类型
     hide(paramFieldsCluster);
     show(paramFieldsHost);
     show(paramFieldsCommon);
+    inputEl.placeholder = DEFAULT_PROMPT_PLACEHOLDER;
   } else if (scene === "single_cluster") {
     hide(paramFieldsContainer);
     hide(paramFieldsHost);
@@ -54,7 +58,9 @@ function applySceneFields() {
     show(clusterTypeRow); // 集群类型：专有集群 / Serverless
     // 节点范围仅 dedicated 有意义（Serverless 3 集群节点由拓扑派生）
     if (clusterTypeSelectEl.value === "dedicated") show(nodeScopeRow);
+    inputEl.placeholder = "描述集群级症状：影响了哪些节点/工作负载、波及范围（单个应用还是多个应用同时异常）、起始时间\n例如：prod-cluster-01 从 15:10 起多个节点 NotReady，web-frontend/api-gateway 等多个应用的 Pod 被驱逐";
   } else {
+    inputEl.placeholder = DEFAULT_PROMPT_PLACEHOLDER;
     hide(paramFieldsContainer);
     hide(paramFieldsHost);
     hide(paramFieldsCluster);
