@@ -420,13 +420,23 @@ def build_argus_context_view(topology: dict, expert: str,
         block["diagnostic_target"] = target
 
     # ── naming rules (deterministic derivation basis, JSON form) ──
+    # Per-role slices: each rule is injected only where a consumer exists.
+    # sci_pod is consumed solely by the sci expert (query_argus_sci_pod
+    # takes the physical burst-pod name; the view carries logical names) —
+    # zero-consumer template text in other experts' blocks is a pure
+    # misdirection surface (§7.3 minimal sufficient context).
     k8s_name, master_id = mapping.get("k8s_name", ""), mapping.get("master_id", "")
     if k8s_name and master_id:
-        block["naming_rules"] = {
-            "control_plane_ns": f"{k8s_name}-{master_id}",
-            "workload_ns": f"burst-ns-{master_id}",
-            "sci_pod": "burst-<serverless_ns>-<serverless_pod_name>",
-        }
+        rules: dict[str, str] = {}
+        if expert == "kmc-argus-expert":
+            rules["control_plane_ns"] = f"{k8s_name}-{master_id}"
+        elif expert == "serverless-argus-expert":
+            rules["workload_ns"] = f"burst-ns-{master_id}"
+        elif expert == "sci-argus-expert":
+            rules["workload_ns"] = f"burst-ns-{master_id}"
+            rules["sci_pod"] = "burst-<serverless_ns>-<serverless_pod_name>"
+        if rules:
+            block["naming_rules"] = rules
 
     # ── host-argus: hostname dimension (no monitor_name; §8.1⑥) ──
     if expert == "host-argus-expert":

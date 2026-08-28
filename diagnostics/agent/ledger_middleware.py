@@ -293,15 +293,28 @@ _REFUTED_PATTERNS = re.compile(
 
 
 def _parse_expert_json(text: str) -> dict | None:
-    """Parse a structured expert return (deepagents response_format JSON).
+    """Parse a structured expert return (prompt-contract JSON).
 
     Returns the parsed dict, or None when *text* is not a structured
     JSON object (degraded text-format path).  Guards against non-dict
     JSON (lists/strings) and partial/truncated payloads.
+
+    Markdown code fences (```json ... ```) are peeled before parsing —
+    a common LLM packaging habit (langchain_core's parse_json_markdown
+    does the same).  Only a well-formed single-fence wrapping is
+    peeled; anything else still returns None.  Strict json.loads is
+    kept deliberately: truncated payloads must take the text fallback
+    (a half payload could carry a verdict while losing its evidence).
     """
     if not text:
         return None
     stripped = text.strip()
+    if stripped.startswith("```"):
+        # Peel opening fence token (```json / ```, same-line or own-line)
+        # and closing fence; mirrors langchain_core's fence stripping
+        # (_json_strip_chars covers trailing backticks).
+        inner = re.sub(r"^```[a-zA-Z0-9]*", "", stripped)
+        stripped = inner.strip(" \n\r\t`").strip()
     if not (stripped.startswith("{") and stripped.endswith("}")):
         return None
     try:
@@ -374,7 +387,7 @@ def _infer_verdict_from_text(text: str) -> str | None:
     Used by verify-stall detection to make reliable auto-decisions
     instead of blindly defaulting to inconclusive.
 
-    Structured returns (deepagents response_format JSON) are checked
+    Structured returns (prompt-contract JSON) are checked
     first via the ``verdict`` field; the text-signal regexes are the
     degraded path for text-format expert returns.
     """
@@ -494,7 +507,7 @@ def _classify_argus_data(ledger: dict) -> str:
     saw_all_normal = False
     for r in expert_rounds:
         kf = r.get("key_findings", "")
-        # Structured argus returns (deepagents response_format JSON):
+        # Structured argus returns (prompt-contract JSON):
         # classification fields take precedence over text patterns.
         data = _parse_expert_json(kf)
         if data is not None:
@@ -1002,6 +1015,42 @@ def _is_substantial_report_text(text: str) -> bool:
     return any(marker in text for marker in _REPORT_MARKERS)
 
 
+# Embedded coordinator topology block marker.  The augmented first message
+# carries the global three-view inventory; experts receive their own
+# per-role slices, so the global echo is stripped both at ledger-write time
+# and at stable-ctx injection time (self-heals ledgers persisted before the
+# write-time strip existed).
+_TOPOLOGY_ECHO_RE = re.compile(
+    r"\n## 环境拓扑（Serverless RelationGraph）\n\n```json\n.*?\n```\n?",
+    re.DOTALL,
+)
+
+
+def _strip_topology_echo(user_message: str) -> str:
+    """Strip the embedded global topology block from the augmented message.
+
+    Message length is bounded at the API boundary (request schema max_length);
+    the former write-time character cut sliced a JSON block mid-string,
+    corrupting the markdown fence and the embedded structure — removed in
+    favor of data completeness.  The topology itself is stored whole in
+    ledger["topology"]; per-role slices are injected by the dedicated
+    context layers, so this echo is pure duplication (design document §7.3
+    single source of truth).
+
+    Fallback: legacy ledgers may hold a write-time truncated remnant (no
+    closing fence).  Cut from the heading only when a ```json remnant
+    follows, so a user message that merely mentions the heading is left
+    untouched.
+    """
+    if "## 环境拓扑" not in user_message:
+        return user_message
+    stripped = _TOPOLOGY_ECHO_RE.sub("\n", user_message)
+    head, sep, rest = stripped.partition("## 环境拓扑")
+    if sep and "```json" in rest:
+        stripped = head.rstrip()
+    return stripped
+
+
 def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     """Stable context layers — unchanged within a session (design §5.2/§7.3).
 
@@ -1017,6 +1066,10 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     # parameter values in it are superseded by the pre-resolved layers, so the
     # subagent must not copy entity names / time windows from here.
     user_message = ledger.get("user_message", "")
+    if user_message:
+        # Fallback strip: self-heals ledgers persisted before the write-time
+        # strip existed (their stored message may hold a truncated remnant).
+        user_message = _strip_topology_echo(user_message)
     if user_message:
         lines.append("## 诊断会话基线（仅作症状背景，参数以下方预解析值为准）\n")
         lines.append(f"用户原始输入: {user_message}\n")
@@ -1716,10 +1769,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # subagent context anchors (design document §5.2/§7.2).
         ledger["topology"] = dict(self._topology)
         ledger["_topology_unavailable"] = self._topology_unavailable
-        # Extract the original user message from state (first HumanMessage)
+        # Extract the original user message from state (first HumanMessage).
+        # Stored whole — length is bounded at the API boundary; character
+        # truncation here sliced an embedded JSON block mid-string.
         for msg in (state.get("messages") or []):
             if hasattr(msg, "type") and msg.type == "human":
-                ledger["user_message"] = str(getattr(msg, "content", ""))[:2000]
+                ledger["user_message"] = _strip_topology_echo(str(getattr(msg, "content", "")))
                 break
         self._current_ledger = ledger
         logger.info(
@@ -2314,8 +2369,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             self._verify_stall_count += 1
 
                             # Extract expert output text for signal analysis.
-                            # Structured returns (deepagents response_format
-                            # JSON) are preferred — the verdict field is
+                            # Structured returns (prompt-contract JSON)
+                            # are preferred — the verdict field is
                             # authoritative and survives formatting.
                             expert_text = ""
                             for ev in node.get("evidence", []):
@@ -4153,8 +4208,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if tool_name not in _LEDGER_TOOLS:
                 source = f"expert:{tool_args.get('subagent_type', '?')}" if tool_name == "task" else f"tool:{tool_name}"
                 summary = output or ""
-                # Structured expert returns (deepagents response_format
-                # JSON) are formatted into readable evidence text; the
+                # Structured expert returns (prompt-contract JSON) are
+                # formatted into readable evidence text; the
                 # raw JSON is preserved on the evidence entry under
                 # ``structured`` for exact downstream parsing.
                 _structured_expert = None
