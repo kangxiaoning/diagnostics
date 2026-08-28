@@ -686,7 +686,9 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                         events.append(AgentEvent("tool_args_available", {
                                             "id": tc_id, "name": tc_name, "args": tc_args,
                                         }))
-                # Also check for structured_response in updates
+                # Also check for structured_response in updates (channel
+                # inactive since expert response_format removal — see
+                # design document §11; kept for forward compatibility)
                 if isinstance(value, dict) and "structured_response" in value:
                     sr = value["structured_response"]
                     logger.info("[round=%d] Structured response received", state.round_number)

@@ -843,7 +843,7 @@ def add_evidence_to_active(
     """Add evidence to the current active hypothesis (auto from tool calls).
 
     *structured* (optional) preserves the raw structured expert return
-    (deepagents response_format JSON) on the evidence entry for exact
+    (prompt-contract JSON) on the evidence entry for exact
     downstream parsing (verdict inference / argus classification).
     """
     if not ledger["active_path"]:

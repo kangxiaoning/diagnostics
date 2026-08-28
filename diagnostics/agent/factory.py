@@ -122,16 +122,24 @@ _REPORT_DIRS = [
 for _d in _REPORT_DIRS:
     _d.mkdir(parents=True, exist_ok=True)
 
-# ── Expert structured-return schemas (deepagents response_format) ──────
-# Deepagents 0.6.10 SubAgent.response_format: when a subagent produces a
-# `structured_response` conforming to the schema, it is JSON-serialized and
-# returned as the ToolMessage content to the Coordinator, replacing the
-# default last-message text extraction (design document §8 G13 context,
-# 2026-08-11: expert summaries truncated by max_tokens lost decisive
-# evidence — structured JSON is compact and parseable even when short).
-# When the model cannot produce a structured response, deepagents falls
-# back to the last non-empty AIMessage text, so the text return contract
-# (_EXPERT_RETURN_SUFFIX) stays as the degraded path.
+# ── Expert structured-return contracts (prompt-level JSON) ─────────────
+# Expert returns follow a prompt-level JSON contract shaped by the
+# schemas below: the expert's final message is a JSON object, carried by
+# deepagents' last-non-empty-AIMessage extraction into the task
+# ToolMessage content, then parsed by ledger_middleware (structured
+# fields first, Chinese-label text patterns as the degraded path).
+# (design document §8 G13 context, 2026-08-11: expert summaries truncated
+# by max_tokens lost decisive evidence — compact JSON stays parseable
+# even when short.)
+# 2026-08-27: the framework-level response_format mechanism was removed
+# (design document §11) — it forced tool_choice="required" on every
+# expert model call, and "required" is the least portable field across
+# OpenAI-compatible backends (vLLM supported it only since 0.8.3 via
+# guided decoding; SGLang bypasses native tool-call parsers for it and
+# silently falls back to plain text on parse failure), plus it
+# contradicts guard receipts mandating text wrap-up (G19/dedup hard
+# blocks).  The Pydantic classes remain as the SSOT for field names
+# referenced by the return-contract prompts.
 
 # Deep diagnostic experts (host-expert / k8s-expert / serverless-expert /
 # kmc-expert / sci-expert): verdict + evidence + root cause.
@@ -243,19 +251,18 @@ _EXPERT_RETURN_SUFFIX = (
     "- 收益递减时立即停止：当连续 2 次工具调用未获得新证据时，直接返回已有结论\n"
     "- 关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
     "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
-    "- 交付方式：当你看到工具列表中带有 `DeepExpertFindings`（结构化结论工具）时，"
-    "证据收齐后调用它返回结构化 JSON（verdict/key_evidence/negative_evidence/root_cause/confidence），"
-    "这是交付验证结论的标准方式，Coordinator 据此落账；字段按下方说明填写，负证据不得省略。\n"
-    "- 兜底方式：若 `DeepExpertFindings` 不在工具列表（未注入结构化 schema），"
-    "则按下方文本格式直接输出结论。\n"
-    "- 假设验证: {confirmed|refuted|inconclusive}——verdict 须与证据主体方向一致："
-    "confirmed 以关键证据为主体，refuted 以负证据为主体，矛盾时按证据主体修正 verdict\n"
-    "- 关键证据: 1~3条，每条标注数据来源\n"
-    "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
+    "- 交付方式：证据收齐后，你的最终回复就是一个 JSON 对象"
+    "（verdict/key_evidence/negative_evidence/root_cause/confidence），"
+    "这是交付验证结论的标准方式，Coordinator 据此解析落账；"
+    "回复正文以 `{` 开头、以 `}` 结束——JSON 对象本身即全部回复内容。\n"
+    "- verdict: confirmed / refuted / inconclusive——verdict 须与证据主体方向一致："
+    "confirmed 以 key_evidence 为主体，refuted 以 negative_evidence 为主体，矛盾时按证据主体修正 verdict\n"
+    "- key_evidence: 关键证据 1~3 条，每条标注数据来源\n"
+    "- negative_evidence: 负证据必报：与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
     "必须如实列出，与阳性证据同等重要，不得省略\n"
-    "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向"
+    "- root_cause: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向"
     "（此时假设本身不是根因）；证据不足时说明还需什么数据\n"
-    "- 置信度: {高|中|低} + 百分比"
+    "- confidence: 高/中/低 + 百分比"
 )
 
 # Return format suffix for Argus time-series analysis experts.
@@ -275,23 +282,22 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     # deterministic marker the coordinator-side classifier matches —
     # contractual protocol, not keyword enumeration (§11 S1 否决理由).
     "- 参数缺失澄清标记: 若因缺少必要参数（如 hostname）无法执行任何查询，"
-    f"回复必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数——"
+    f"clarification 字段必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数——"
     "系统依此标记识别缺口并转交 Coordinator 处理；禁止省略前缀，禁止臆造参数。\n"
     "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
-    "- 交付方式：当你看到工具列表中带有 `ArgusExpertFindings`（结构化结论工具）时，"
-    "指标收齐后调用它返回结构化 JSON（clarification/mutation_points/anomaly_ranking/negative_evidence/"
+    "- 交付方式：指标收齐后，你的最终回复就是一个 JSON 对象"
+    "（clarification/mutation_points/anomaly_ranking/negative_evidence/"
     "concurrent_anomalies/cross_domain/preliminary_judgment/confidence），"
-    "这是交付时序结论的标准方式，Coordinator 据此分类；字段按下方说明填写，负证据不得省略。\n"
-    "- 兜底方式：若 `ArgusExpertFindings` 不在工具列表（未注入结构化 schema），"
-    "则按下方文本格式直接输出结论。\n"
-    "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
-    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总"
+    "这是交付时序结论的标准方式，Coordinator 据此解析分类；"
+    "回复正文以 `{` 开头、以 `}` 结束——JSON 对象本身即全部回复内容。\n"
+    "- mutation_points: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
+    "- anomaly_ranking（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总"
     "（如「其余 N 个节点/指标均正常、无突变」）\n"
-    "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
-    "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
-    "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
-    "- 初步判断: 基于指标关联的根因推断（一句话）\n"
-    "- 置信度: {高|中|低} + 百分比"
+    "- negative_evidence: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
+    "- concurrent_anomalies: 同一时间点发生的多个异常（暗示共同根因）\n"
+    "- cross_domain: 不同子系统指标之间的时序因果推断\n"
+    "- preliminary_judgment: 基于指标关联的根因推断（一句话）\n"
+    "- confidence: 高/中/低 + 百分比"
 )
 
 
@@ -738,17 +744,6 @@ def _build_subagents(
         if entity_type == "host":
             _K8S_EXPERTS = {"k8s-argus-expert", "k8s-expert"}
             subagents = [s for s in subagents if s["name"] not in _K8S_EXPERTS]
-
-    # Structured return contracts (deepagents response_format): argus
-    # experts return metrics findings; deep experts return verdict +
-    # evidence.  Coordinator-side parsing (ledger_middleware) reads these
-    # fields; the text return contract remains the degraded fallback.
-    for _sa in subagents:
-        _sa["response_format"] = (
-            ArgusExpertFindings
-            if _sa["name"].endswith("-argus-expert")
-            else DeepExpertFindings
-        )
 
     return subagents
 

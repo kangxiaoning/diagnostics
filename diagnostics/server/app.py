@@ -590,7 +590,9 @@ async def _chat_event_stream(
     report_text: list[str] = []   # only answering-phase text → .md file
     tree = TreeBuilder()
     latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
-    final_root_cause: str | None = None           # authoritative from structured_response
+    final_root_cause: str | None = None           # from structured_response (channel
+    # inactive since the expert response_format mechanism was removed —
+    # see design document §11; kept for forward compatibility)
 
     logger.info("[session=%s] Chat stream started, message=%r",
                 session_id, request.message[:120])

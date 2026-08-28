@@ -23,7 +23,7 @@ class Settings:
     # former 8192 cap let a subagent's final summary be truncated at
     # finish=length (content=0B) — losing all decisive evidence
     # (2026-08-11, scenario 38).  Structured expert returns
-    # (response_format JSON) are compact, so the larger cap primarily
+    # (prompt-contract JSON) are compact, so the larger cap primarily
     # protects the reasoning stream + full report.  Honored by ollama
     # via OllamaChatOpenAI's top-level max_tokens passthrough.
     max_tokens: int = 16384
