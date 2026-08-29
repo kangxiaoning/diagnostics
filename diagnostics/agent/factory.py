@@ -278,6 +278,21 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "  - 定位对象（委派描述指定的目标实体及其落点、或已观测到异常的指标）→ 完整采集其关键指标维度；\n"
     "  - 排除对象（其余节点/组件，仅用于确认「该方向正常」）→ 以确认「无异常突变」为目标，"
     "用尽量少的概览性查询覆盖关键维度即可，确认无突变即止，无需逐对象逐指标展开。\n"
+    # Progressive-discovery query contract (design document §9, v3.21.1):
+    # overview-first drill-down — quality-neutral by construction: mutation
+    # signals and the negative-evidence obligation are unchanged, the
+    # full-scan fallback clause preserves today's behaviour whenever the
+    # overview lacks object-level attribution.  Motivation (2026-08-29
+    # batch capture analysis): sci-argus fanned out 20+ tool calls (14
+    # per-pod queries + an 11-call zero-increment rescan), host-argus 10,
+    # vs 4-5 for the clean experts; round-1 delegation wall time is
+    # dominated by these redundant in-flight calls.
+    "- 渐进式发现（概览→下钻）：先查概览类工具（*_cluster / *_overview）获取维度级突变信号，"
+    "再仅对「概览标记突变的维度」与「委派指定的目标对象」下钻做对象级归因；"
+    "概览无突变信号的关键维度各查一次确认即止；"
+    "概览不含对象级明细且委派未指明对象时，按完整维度扫描定位异常对象。\n"
+    "- 已查过的「工具+参数」组合直接复用其返回做分析（重查只返回缓存结果、零新信息），"
+    "后续查询只投向尚未覆盖的维度或对象。\n"
     # Clarification contract (design document §8 G2 / §9, v3.11.1):
     # deterministic marker the coordinator-side classifier matches —
     # contractual protocol, not keyword enumeration (§11 S1 否决理由).
