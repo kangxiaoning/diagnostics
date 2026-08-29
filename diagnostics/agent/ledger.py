@@ -1428,6 +1428,38 @@ _ARGUS_CHANNEL_NOTE_SLS = (
     + _ARGUS_CHANNEL_NOTE_SUFFIX
 )
 
+# ── Serverless 委派映射：层归属 + 观测域/证据通道（design document §9,
+# v3.20.0; 2026-08-28 scenario 39 post-mortem) ─────────────────────────
+# Structural-ownership routing alone is insufficient: a component's
+# TOPOLOGICAL owner is not always the owner of its EVIDENCE CHANNEL.
+# Empirically: virtualNode is a KMC control-plane component, so the
+# topo-derived map routes "VK sync-link anomaly" to kmc-expert — yet
+# kmc-expert's toolset (get_kmc_deployments/pods/pod_logs/etcd_status/
+# apigateway/group1/ipam/vpc_cni) has NO logical-layer event channel,
+# while the decisive evidence (SyncFailed events, vk_sync_failure_count)
+# lives in get_serverless_events — serverless-expert only.  The expert
+# then reported "no vk_sync_failure_count spike observed", i.e. an
+# INABILITY TO SEE rendered as a positive negative finding
+# (argument from absence in its least detectable form); the correctly
+# directed H1 was refuted, cascading into 5 refutations and a 3600s
+# timeout without convergence.
+# The remedy is a POSITIVE routing recipe (§9 P5): name each expert's
+# observation domain so the coordinator checks evidence-channel coverage
+# BEFORE delegating.  Single source of truth: the expert toolsets in the
+# mock tool registry — test_sls_expert_domain_map.py asserts this text
+# stays consistent with the actual tool bindings (doc-drift guard).
+_SLS_EXPERT_DOMAIN_MAP = (
+    "- Serverless 场景委派映射（层归属 + 观测域）：委派前先明确期望从该专家"
+    "获得哪条证据，并确认该证据在其观测域内——若不在，改派观测域覆盖该证据的专家\n"
+    "  · 逻辑集群：Deployment/Pod 状态与日志、**逻辑层事件**（VK 同步状态、"
+    "Pod 生命周期事件、同步失败计数）→ serverless-expert\n"
+    "  · KMC 控制面组件与共享组件链路：控制面 Deployment/Pod 与日志、共享 etcd、"
+    "API Gateway / Group1 / IPAM / VPC-CNI → kmc-expert"
+    "（无逻辑层事件通道：查证 VK 同步状态/同步失败计数须走 serverless-expert）\n"
+    "  · SCI 数据面：burst Pod 与日志、节点/kubelet、VPC-CNI、IP 分配 → sci-expert\n"
+    "  · 物理节点/主机：CPU/内存/磁盘/网络 → host-expert\n"
+)
+
 
 # ── Argus 参数澄清契约（design document §8 G2 / §9, v3.11.1）─────────
 # 契约化标记（非关键词枚举）：argus 专家返回契约要求参数澄清回执以该
@@ -1562,7 +1594,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
             "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
             "- ⚠ 字段契约：每条假设必须含 statement/probability/rationale 三字段，"
-            "statement 必填且为一句完整根因表述——缺失会导致调用失败（预算不返还）\n"
+            "statement 必填且为一句完整根因表述——缺失会导致调用失败"
+            "（失败不消耗提出预算，修正后重新提交即可）\n"
             "- ⚠ 同源合并：若多个候选描述的是同一故障的机制/因果链上下游"
             "（如\"内存超限 OOMKilled\"与\"memory limit 配置过低\"互为表里），"
             "应合并为一条假设；仅当证据显示独立故障源并存时才提出多条\n"
@@ -1584,14 +1617,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # CURRENT scene's verification experts are shown (same principle as
         # UNDERSTAND: no other-scene delegation rules in view).
         if ledger.get("topology") or ledger.get("_topology_unavailable"):
-            expert_map = (
-                "- Serverless 场景委派映射：主机/SCI/KMC 节点假设 → "
-                "task(subagent_type=\"host-expert\")；逻辑集群假设 → "
-                "task(subagent_type=\"serverless-expert\")；KMC 控制面假设 → "
-                "task(subagent_type=\"kmc-expert\")；SCI 数据面假设 → "
-                "task(subagent_type=\"sci-expert\")\n"
-                + _ARGUS_CHANNEL_NOTE_SLS
-            )
+            expert_map = _SLS_EXPERT_DOMAIN_MAP + _ARGUS_CHANNEL_NOTE_SLS
         elif ledger.get("entity_type", "") == "host":
             expert_map = (
                 "- 主机假设（CPU/内存/磁盘/网络/GPU）→ "
@@ -1635,6 +1661,16 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "- ⚠ 若现有监控证据已明确证伪该假设，可直接 record_finding 判"
                 " refuted/inconclusive（confirmed 须以专家验证结论为依据，"
                 "未委派直接 confirmed 会被系统拦截）\n"
+                # P2 (design document §9 v3.20.1): the refuted coverage
+                # criterion formulated as a SUCCESS CRITERION, i.e. stated
+                # BEFORE the action — left-shifting what G22 backstops
+                # reactively.  Positive form on purpose: prohibition-style
+                # copy backfires under motivated violation (§11 v2.9.2),
+                # whereas a success criterion is the model's own target.
+                "- 判 refuted 的三要素齐备才可落账：①所依据的证据通道"
+                "（指标 / 日志 / 事件）②查询时段覆盖故障时段 ③该通道属"
+                "假设所涉实体的观测域；任一项不齐备则判 inconclusive，"
+                "并在 rationale 中写清缺哪一项、为何不可取得\n"
             )
         elif _has_expert_ev:
             _record_hint = ""
@@ -2847,6 +2883,96 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
                 "summary": (ev.get("summary") or "")[:200],
             }
     return None
+
+
+def single_channel_refute_signal(ledger: DiagnosisLedger, hid: str) -> dict | None:
+    """Detect a SINGLE-CHANNEL refutation on hypothesis *hid*
+    (design document §8 G22, v3.20.0, judgement narrowed v3.20.1).
+
+    A refutation is single-channel when the hypothesis' expert-layer
+    evidence comes from EXACTLY ONE distinct deep expert, in a scene that
+    actually assembled two or more deep experts.  That is the structural
+    precondition of *argument from absence* in its least detectable form:
+    an expert that CANNOT observe a given evidence channel tends to
+    phrase its blindness as a positive negative finding ("no spike
+    observed", "logs all normal") — and a topologically-correct routing
+    can send the hypothesis to exactly that expert.
+
+    Empirical driver (2026-08-28 scenario 39, session a8fa9526): H1
+    (VK sync-link anomaly) was routed to kmc-expert by the topology-
+    derived map (virtualNode IS a KMC control-plane component), but the
+    decisive evidence — SyncFailed events and vk_sync_failure_count
+    1→6 in 15:00~15:05 — lives in get_serverless_events, i.e.
+    serverless-expert only.  kmc-expert reported "no vk_sync_failure_count
+    spike observed" and refuted a CORRECTLY directed hypothesis,
+    cascading into five refutations and a 3600s timeout without
+    convergence.  The same session's morning run (directed at
+    serverless-expert) confirmed H1 in 8 rounds.
+
+    Structural ownership ≠ evidence-channel ownership; this signal does
+    not attempt to judge which channel is correct (that needs semantics),
+    it only flags the precondition and hands the LLM the ledger's fault
+    window so it can self-check coverage.  Multi-deep-expert scenes only
+    (a scene with a single deep expert has no alternative channel to
+    route to — blocking there would be pure ceremony).
+
+    WHY EXACTLY ONE, NOT "AT MOST ONE" (v3.20.1, 2026-08-28 scenario 39
+    session 7ce7bb66 post-mortem): the ZERO-deep-expert case is a path
+    the PROACTIVE layer explicitly authorises — ledger.py §9 verify 档1
+    grants "若现有监控证据已明确证伪…可直接 record_finding 判 refuted"
+    and 档2/3 actively ENCOURAGES reusing evidence gathered while
+    verifying OTHER hypotheses.  Blocking it pitted the gate against the
+    guidance (the same layer-coherence anti-pattern recorded in §11
+    v3.8.0, which previously produced a four-block loop).  Measured
+    cost in that session: both G22 triggers fired on hypotheses holding
+    ZERO expert evidence — H2 (serverless-expert had already shown the
+    sync failure was an API-Server watch timeout, not a tunnel fault)
+    and H3 (four argus returns showed etcd fully healthy — argus IS the
+    authoritative channel for an infrastructure-health hypothesis) — i.e.
+    a 100% false-positive rate against the <2% target that production
+    guardrail practice sets, and two legitimate refutations were
+    demoted to inconclusive (over-abstention).  The original defect's
+    H1 carried exactly ONE deep channel (expert:kmc-expert + a
+    coordinator entry), so this narrowing keeps the defect covered.
+
+    Returns a dict (expert name / deep-expert candidates) or None.
+    """
+    nodes = ledger.get("hypotheses", {})
+    if hid not in nodes:
+        # Unknown hypothesis: nothing to judge.  The gate caller already
+        # guards on membership; keeping the pure function self-explanatory
+        # avoids a silent "fires" reading for a non-existent node.
+        return None
+    node = nodes[hid] or {}
+    experts = ledger.get("scene_experts") or []
+    deep = [e for e in experts if not str(e).endswith("-argus-expert")]
+    if len(deep) < 2:
+        return None
+    seen: list[str] = []
+    for ev in node.get("evidence", []):
+        source = str(ev.get("source", ""))
+        if not source.startswith("expert:"):
+            continue
+        name = source[len("expert:"):]
+        # an argus expert is a monitoring channel, not a deep-evidence
+        # channel: it cannot observe event/log state either.
+        if name.endswith("-argus-expert"):
+            continue
+        if name not in seen:
+            seen.append(name)
+    # EXACTLY one deep channel (v3.20.1): zero deep channels is the
+    # proactive layer's own authorised path (monitoring-evidence refute +
+    # cross-hypothesis evidence reuse) — never block it.  Two or more
+    # means coverage exists.
+    if len(seen) != 1:
+        return None
+    return {
+        "expert": seen[0] if seen else None,
+        "deep_experts": deep,
+        "fault_window": (
+            f"{ledger.get('start_time', '?')} ~ {ledger.get('end_time', '?')}"
+        ),
+    }
 
 
 def _parallel_candidates(

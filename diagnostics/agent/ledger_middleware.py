@@ -75,6 +75,7 @@ from diagnostics.agent.ledger import (
     unrecorded_evidence_hypotheses,
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
+from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
 from deepagents.middleware._utils import append_to_system_message
 
 from diagnostics.agent.topology_render import build_argus_context_view, build_host_views, expert_view, render_json_block
@@ -155,6 +156,59 @@ _HOST_ARGUS_TOOLS: frozenset[str] = frozenset({
     "query_argus_cpu", "query_argus_memory",
     "query_argus_disk", "query_argus_network",
 })
+
+# ── propose_hypotheses validation-feedback enhancement ──
+# The framework (ToolNode) rejects schema-invalid args with a bare
+# "Error invoking tool ... Field required ... Please fix the error and
+# try again" ToolMessage.  Industry practice for validation-feedback
+# loops (instructor-style retry, OpenAI structured-outputs ecosystem) is
+# a SELF-CONTAINED receipt: restate the minimal field contract with a
+# valid example and name any non-contract fields so the model can fold
+# their content into a legal field instead of losing it.
+# Observed recurrence: the model omitted `statement` (and invented
+# side-fields like `rationale2`) in at least four sessions — each cost
+# one extra recovery round.  Unknown extra fields are silently dropped
+# by Pydantic extra="ignore"; we keep ignore semantics (a benign extra
+# field must NOT turn a complete call into a failed retry) and only
+# surface them via the error receipt (failure path) or a warning log
+# (success path, observability only).
+_HYPOTHESIS_CONTRACT_FIELDS: frozenset[str] = frozenset(
+    {"statement", "probability", "rationale"}
+)
+
+
+def _unknown_hypothesis_fields(tool_args: dict) -> list[str]:
+    """Names of non-contract fields inside propose_hypotheses args."""
+    unknown: list[str] = []
+    for i, h in enumerate((tool_args or {}).get("hypotheses") or []):
+        if isinstance(h, dict):
+            for k in h:
+                if k not in _HYPOTHESIS_CONTRACT_FIELDS:
+                    entry = f"hypotheses[{i}].{k}"
+                    if entry not in unknown:
+                        unknown.append(entry)
+    return unknown
+
+
+def _enhance_propose_error_receipt(content: str, unknown: list[str]) -> str:
+    """Append a self-contained field contract to a framework validation
+    error for propose_hypotheses (content starts with 'Error invoking tool')."""
+    extra = ""
+    if unknown:
+        extra = (
+            "\n- 未知字段已忽略："
+            + "、".join(unknown)
+            + "——若为补充依据，请并入对应假设的 rationale，勿另立字段"
+        )
+    return (
+        content.rstrip()
+        + "\n\n## 字段契约（重试前请逐条核对）\n"
+        "每条假设必须且仅含以下三个字段：\n"
+        '  {"statement": "一句完整根因表述（必填，如『X 导致 Y』）", '
+        '"probability": 0-100 的整数, "rationale": "假设依据"}\n'
+        "失败通常是漏填了某条假设的 statement，或把第二层依据写成了"
+        "非规范字段。" + extra
+    )
 
 
 def _looks_like_ipv4(value: str) -> bool:
@@ -257,6 +311,41 @@ _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interv
 # limit is only reached on refusal).  Symmetric with C2 — both conflict
 # guards share the same bound.
 _E2_BLOCK_LIMIT = 4
+# ── G22 single-channel refute bound (v3.20.0, design document §8 G22) ──
+# Deliberately MUCH tighter than _E2_BLOCK_LIMIT: G22 is a coverage
+# SELF-CHECK prompt, not an evidence-conflict constraint (C2/G17-E2/G21
+# block because the evidence is demonstrably conflicted; G22 blocks only
+# because coverage is unverified).  One block is enough to make the model
+# re-examine channel coverage; blocking four times would cost four rounds
+# for a purely advisory signal.
+_G22_BLOCK_LIMIT = 1
+
+
+def _refute_root_candidate(hypothesis: dict) -> str:
+    """Latest POSITIVE root-cause candidate from expert evidence (design
+    document §9 v3.21.0 — refute-receipt candidate naming).
+
+    A refuted verdict can arrive together with an expert-asserted
+    alternative candidate (structured.root_cause) — empirically the TRUE
+    root cause surfaced exactly this way while the coordinator moved on
+    to verify the remaining (wrong-direction) hypotheses and never
+    appended a hypothesis covering the surfaced candidate (2026-08-29
+    scenario 35: kmc-expert refuted H1 AND reported the Group1 tunnel
+    failure — the scenario's expected root cause — yet all 3 hypotheses
+    stayed pending until the session deadline).  Returns the truncated
+    candidate text ("" when none); coverage judgement stays with the LLM
+    (mechanical semantic matching was rejected — §11 G22 row precedent).
+    """
+    for ev in reversed(hypothesis.get("evidence") or []):
+        if not str(ev.get("source", "")).startswith("expert:"):
+            continue
+        structured = ev.get("structured") or {}
+        rc = str(structured.get("root_cause") or "").strip()
+        if rc:
+            return rc[:120] + ("…" if len(rc) > 120 else "")
+    return ""
+
+
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
 
@@ -4151,6 +4240,36 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         result = await handler(request)
 
+        # ── propose_hypotheses validation-feedback enhancement ──
+        # Failure path: append the self-contained field contract (with
+        # named unknown fields) to the framework's bare validation error
+        # so a single retry suffices.  Success path: log dropped extra
+        # fields (observability only — never reject a complete call).
+        if tool_name == "propose_hypotheses" and isinstance(result, ToolMessage):
+            _content = (
+                result.content
+                if isinstance(result.content, str)
+                else str(result.content)
+            )
+            _unknown = _unknown_hypothesis_fields(tool_args)
+            if _content.startswith("Error invoking tool"):
+                result.content = _enhance_propose_error_receipt(
+                    _content, _unknown
+                )
+                logger.warning(
+                    "propose_hypotheses schema validation failed "
+                    "(round=%d, unknown_fields=%s) — enhanced receipt "
+                    "returned to LLM",
+                    self._model_call_count, _unknown or "none",
+                )
+            elif _unknown:
+                logger.warning(
+                    "propose_hypotheses unknown hypothesis fields dropped "
+                    "(round=%d): %s — content ignored by schema "
+                    "(extra=ignore), call proceeded",
+                    self._model_call_count, _unknown,
+                )
+
         # ── Offload to shared backend for cross-round access ──
         # Writes the full tool result to the filesystem so the LLM
         # can use read_file / grep to retrieve data from previous
@@ -5220,7 +5339,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             description=(
                 "提出诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
                 "每个假设必须包含 statement（必填，一句完整根因表述）、probability(0-100)、"
-                "rationale 三个字段，缺一不可；statement 缺失会导致调用失败（预算不返还）。"
+                "rationale 三个字段，缺一不可；statement 缺失会导致调用失败"
+                "（失败不消耗提出预算，修正后重新提交即可）。"
                 "若多个候选描述的是同一故障的机制/因果链上下游（如\"内存超限 OOMKilled\""
                 "与\"memory limit 配置过低\"互为表里），应合并为一条假设；"
                 "仅当证据显示独立故障源并存时才提出多条。"
@@ -5620,6 +5740,86 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
                         f"可再次 record_finding refuted（通道自动开放）。"
                     )
+            # ── G22: single-channel refute coverage gate (reactive
+            # backstop, design document §8 G22, v3.20.0; 2026-08-28
+            # scenario 39, session a8fa9526) ── Structural ownership ≠
+            # evidence-channel ownership: an expert that CANNOT observe a
+            # channel reports its blindness as a positive negative finding
+            # ("no spike observed"), which reads exactly like "checked,
+            # it is fine".  Refuting on such a single channel is argument
+            # from absence wearing a disguise.  The judgment of WHICH
+            # channel is authoritative is semantic and stays with the LLM;
+            # this gate only flags the structural precondition and hands
+            # over the ledger's fault window so coverage can be self-
+            # checked.  Proactive layer (P7) is the observation-domain
+            # routing map injected into VERIFY (ledger.py §9); this is the
+            # compliance-residual backstop.  Bounded-block degrade
+            # symmetric with C2/G17-E2/G21.  Mutually exclusive with
+            # G20/C2 (argus-conflict) and G21 (two opposing deep
+            # verdicts): those need ≥2 returns, this fires on exactly 1.
+            # v3.20.1: the judgement is EXACTLY one deep channel, not
+            # "at most one" — zero deep channels is the proactive layer's
+            # own authorised path (ledger.py §9 verify 档1 grants direct
+            # refute on monitoring evidence; 档2/3 encourages reusing
+            # evidence gathered for OTHER hypotheses).  Blocking it
+            # pitted the gate against the guidance and measured a 100%
+            # false-positive rate (both triggers in session 7ce7bb66
+            # fired on legitimately refuted hypotheses), which is the
+            # layer-coherence anti-pattern already recorded in §11
+            # v3.8.0.  Zero-channel cases are now left to the proactive
+            # success criterion (P2) injected in the same hint.
+            if (verdict == "refuted"
+                    and hypothesis_id in ledger.get("hypotheses", {})
+                    and not _argus_conflict_signal(ledger, hypothesis_id)
+                    and not expert_verdict_conflict(
+                        ledger, hypothesis_id, verdict)):
+                _g22 = single_channel_refute_signal(ledger, hypothesis_id)
+                if _g22:
+                    _g22_node = ledger["hypotheses"][hypothesis_id]
+                    _g22_node["_g22_block_count"] = (
+                        _g22_node.get("_g22_block_count", 0) + 1
+                    )
+                    if _g22_node["_g22_block_count"] > _G22_BLOCK_LIMIT:
+                        # _g22_block_count includes THIS passing attempt —
+                        # actual prior blocks = count - 1 (wording fix
+                        # v3.21.0: log previously read "after 2 blocks"
+                        # for 1 block + 1 pass, confusing post-hoc audit).
+                        _g22_blocks = _g22_node["_g22_block_count"] - 1
+                        logger.warning(
+                            "record_finding G22 degraded after %d block(s) on "
+                            "%s (round=%d) — passing with disclosure",
+                            _g22_blocks, fmt_hid(hypothesis_id),
+                            self._model_call_count,
+                        )
+                        return (
+                            f"⚠ refuted 判定已通过（G22 单通道覆盖性门控拦截 "
+                            f"{_g22_blocks} 次后降级放行）："
+                            f"{fmt_hid(hypothesis_id)} 仅由单一专家通道证伪，"
+                            f"未做跨通道覆盖复核，系统在报告中披露此局限。"
+                        )
+                    logger.warning(
+                        "record_finding blocked by G22: refuted on %s from a "
+                        "single evidence channel (%s, round=%d)",
+                        fmt_hid(hypothesis_id), _g22.get("expert") or "none",
+                        self._model_call_count,
+                    )
+                    _deep = [e for e in (_g22.get("deep_experts") or [])
+                             if e != _g22.get("expert")]
+                    return (
+                        f"⛔ refuted 判定仅来自单一证据通道（覆盖性门控）："
+                        f"{fmt_hid(hypothesis_id)} 的专家证据只来自 "
+                        f"{_g22.get('expert')}。"
+                        f"组件的拓扑归属不等于其证据通道归属——某专家看不到某类证据时，"
+                        f"常把『查不到』表述为『未发现异常』，"
+                        f"据此证伪方向正确的假设属于以证据缺失作反证。"
+                        f"请确认该专家的观测域是否覆盖本假设所涉证据通道"
+                        f"（故障时段 {_g22.get('fault_window')}）："
+                        f"① 若不覆盖 → 改派观测域覆盖该证据的专家"
+                        f"（可选：{'、'.join(_deep[:3])}）；"
+                        f"② 若该证据确实无法取得 → 判 inconclusive 并披露；"
+                        f"③ 若确认该通道已完整覆盖本假设 → 再次 record_finding "
+                        f"refuted 即放行（通道自动开放）。"
+                    )
             # ── G21: expert-verdict conflict arbitration (reactive
             # backstop, design document §8, v3.16.0; 2026-08-21 scenario
             # 40 follow-up) ── When the SAME hypothesis already holds a
@@ -5988,9 +6188,27 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             f"（总数 {len(ledger.get('hypotheses', {}))}"
                             f"/{MAX_TOTAL_HYPOTHESES}，不占换批预算）。"
                         )
+            # ── Refute-receipt candidate naming (design document §9,
+            # v3.21.0): when the refuting expert ALSO asserted a positive
+            # root-cause candidate, NAME it — the generic "append a new
+            # direction" invite alone proved insufficient (2026-08-29
+            # scenario 35: the surfaced candidate was the scenario's
+            # expected root cause, yet no hypothesis ever covered it).
+            # Hint-only by design: coverage judgement stays with the LLM.
+            _candidate_hint = ""
+            if verdict == "refuted" and not exit_hint:
+                _cand = _refute_root_candidate(
+                    hypotheses_dict.get(hypothesis_id, {}))
+                if _cand and can_append_hypothesis(ledger):
+                    _candidate_hint = (
+                        f"\nℹ 本次证伪证据中专家给出了根因候选：「{_cand}」——"
+                        "对照活跃假设，若均未覆盖该机制，可用 "
+                        "propose_hypotheses 追加 1 个假设覆盖（T10′，"
+                        "不占换批预算）；已覆盖则忽略。"
+                    )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
-                f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_g18_warn}"
+                f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_candidate_hint}{_g18_warn}"
             )
 
         return StructuredTool.from_function(
