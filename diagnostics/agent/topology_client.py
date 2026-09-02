@@ -208,81 +208,106 @@ def query_dedicated_environment(
           // semantics): all components/nodes reach kube-apiserver via
           // the EXTERNAL ELB's VIP; the ELB itself is outside the
           // cluster (not a diagnostic object) — only the access locator
-          // {vip, port} is carried; backends = the kube-apiserver
-          // component landings (derived — never duplicated here):
+          // {vip, port} is carried; backends derive from the
+          // kube-apiserver component (never duplicated here):
           "apiserver_endpoint": {"vip": "<vip>", "port": 6443},
           "components": [
-            // container control-plane component = K8s STATIC POD (kubelet-
-            // managed, mirror pod "<name>-<hostname>") — workload_type=
-            // "StaticPod" + namespace + pods:
+            // container control-plane component = K8s STATIC POD —
+            // replicas = one pod per hosts entry (mirror-pod naming),
+            // full landing triple (uniform pod shape):
             {"name": "kube-apiserver", "workload_type": "StaticPod",
              "workload_name": "kube-apiserver", "namespace": "kube-system",
              "pods": [{"pod_name": "<pod>", "nodename": "<node-ip>",
                        "hostname": "<ecs>"}]},
-            // binary (systemd) component — workload_type="systemd" + hosts:
-            // external-etcd topology: hosts point at dedicated etcd machines
+            // binary (systemd) component — replicas = one process per
+            // hosts entry (host-layer replica; unit derives as
+            // "<workload_name>.service" inside tools):
             {"name": "etcd", "workload_type": "systemd",
              "workload_name": "etcd",
-             "hosts": ["<ecs-hostname>"]}
+             "processes": [{"process_name": "<proc>",
+                            "hostname": "<ecs>"}]}
           ]
         },
         "platform_components": [
-          // always API-managed container workloads — workload_type is the
-          // K8s kind, workload_name the workload identity:
+          // always API-managed container workloads with per-pod landings
+          // (replicas scatter — irreducible; DaemonSet → one per node):
           {"name": "vpc-cni-agent", "workload_type": "DaemonSet",
            "workload_name": "vpc-cni-agent", "namespace": "kube-system",
            "pods": [{"pod_name": "<pod>", "nodename": "<node-ip>",
                      "hostname": "<ecs>"}]}
-        ],
-        "nodes": [{"nodename": "<node-ip>", "hostname": "<worker-ecs>"}]
+        ]
       },
+      // ECS↔physical topology (cloud layer, sibling of the kubernetes
+      // view — worker nodes are ECS too, so the association is not
+      // control-plane specific; scope = the diagnostic-object ECS,
+      // currently the co-located control-plane ECS (typically 3);
+      // worker ECS can join later with the same entry shape):
       "ecs_to_physical_host": [
-        {"ecs_hostname": "<master-ecs>", "physical_hostname": "<physical-host>"}
+        {"nodename": "<node-ip>", "hostname": "<ecs>",
+         "physical_host": "<physical-host>"}
       ]
     }
 
     Field semantics / construction rules:
-    - Component entries are FLAT (K8s containers-list convention): `name`
-      carries the component's identity — the component name already
-      conveys its role (kube-apiserver/etcd/vpc-cni/...), so no
-      role/category/scope fields.  Every component carries
-      `workload_type` + `workload_name`.
+    - Top level = cluster identity + the kubernetes view + the
+      ECS↔physical topology.  There is NO separate nodes inventory:
+      the environment is the diagnostic-object SUBGRAPH (a cluster may
+      have hundreds of nodes — only the nodes carrying queried
+      components / workloads matter); worker nodes are DERIVED by
+      consumers from the platform_components / workload_pods landings.
+    - ecs_to_physical_host is the ECS-layer inventory/topology
+      (production invariant: every control-plane component co-locates
+      on these ECS — typically 3): nodename (K8s Node object name,
+      k8s-tool parameter — the ONLY master-nodename source in the
+      systemd form, where process replicas carry no nodename) +
+      hostname (OS hostname, host-tool parameter) + physical_host
+      (physical-host association).  It sits BESIDE the kubernetes view
+      (cloud layer — worker nodes are ECS too, so the association is
+      not control-plane specific); worker physical hosts stay
+      tool-resolvable, and the same entry shape can carry worker ECS
+      when diagnosis needs them.  The distinct physical-host set
+      derives from this list (single source of truth).
+    - Control-plane components carry IDENTITY + REPLICAS — the
+      multi-replica nature is first-class in the structure: "StaticPod"
+      → `pods` (one pod per hosts entry named
+      "<workload_name>-<hostname>", K8s mirror-pod naming; full landing
+      triple {pod_name, nodename, hostname} — uniform pod shape across
+      the whole structure); "systemd" → `processes` (one process per
+      hosts entry {process_name, hostname} — host-layer replicas, no
+      nodename: processes are not K8s objects; the systemd unit derives
+      as       "<workload_name>.service" inside tools).  Replica landings
+      REFERENCE the ecs_to_physical_host entries — physical_host is
+      never duplicated into replicas; replica count ==
+      len(ecs_to_physical_host) (co-location invariant).
     - CONTROL-PLANE components are EXPLICITLY discriminated by
       `workload_type` (the K8s KEP-1027 union-discriminator pattern):
-      "StaticPod" = container form (payload `namespace` + `pods`);
-      "systemd" = binary form (payload `hosts`, the ECS list running the
-      systemd unit — a host-level service, no namespace; the unit name
-      derives as `<workload_name>.service` inside tools).  Consumers
-      dispatch deterministically on the value (switch), never probe
-      keys.  Field and shape MUST agree — an unknown workload_type value
-      is a contract violation (fail loudly), never silently fall through
-      to shape guessing.
+      "StaticPod" = container form (pods payload); "systemd" = binary
+      form (processes payload).  Consumers dispatch deterministically
+      on the value (switch), never probe keys; an unknown workload_type
+      value is a contract violation (fail loudly).
     - PLATFORM components are ALWAYS containerized (API-managed
       workloads): `workload_type` carries the K8s kind ("Deployment" /
       "DaemonSet" / ...) and `workload_name` the workload identity;
-      payload is always `namespace` + `pods` (DaemonSet → one landing
-      per node).
+      payload is always `namespace` + `pods` (per-pod landings —
+      replicas scatter across different nodes, irreducible).
     - Official terminology mapping (K8s documentation):
         * control-plane "StaticPod" IS the K8s "static pod / self-hosted
           control plane" — managed directly by the node-local kubelet
           (starts before the API server is available; NOT managed by the
           control plane: no rollout/rollback/scale; deleting the mirror
           pod via kubectl is a no-op); mirror pods live in kube-system
-          named "<component>-<node hostname>".
+          named "<component>-<node hostname>" (the derivation rule).
         * "systemd" is a systemd host service — the Kubespray
           etcd_deployment_type="host" pattern; static-pod apiserver +
           systemd etcd is Kubespray's DEFAULT, so mixed forms within one
           cluster are mainstream (per-component granularity is required).
-        * etcd topology (production fact): dedicated clusters run THREE
-          control-plane ECS, and etcd is STACKED — co-located with the
-          other control-plane components on the same 3 ECS.  In both
-          forms etcd's landing list references exactly those 3
-          control-plane ECS (StaticPod → pods on the 3 ECS; systemd →
-          `hosts` = the same 3 ECS hostnames).  The external-etcd
-          variant (dedicated etcd machines) is not the production form —
-          if it ever appears, systemd `hosts` carry the dedicated etcd
-          machines instead.
-        * apiserver access topology (production fact): the 3
+        * etcd topology (production fact): etcd is STACKED — co-located
+          with the other control-plane components on the same
+          control-plane ECS (both forms).  The external-etcd variant
+          (dedicated etcd machines) is not the production form — this
+          structure cannot express it (co-location invariant; fail
+          loudly if it ever appears).
+        * apiserver access topology (production fact): the
           kube-apiserver replicas sit behind an EXTERNAL ELB; every
           other component and node talks to the apiserver through the
           ELB VIP.  `control_plane.apiserver_endpoint` = {vip, port}
@@ -291,24 +316,12 @@ def query_dedicated_environment(
           The ELB itself lives OUTSIDE the cluster boundary — it is NOT
           a diagnostic object of this environment (no elb identity), the
           endpoint is purely the access locator (VIP-path errors:
-          connect timeout / TLS reset to the VIP); the backend instances
-          are the kube-apiserver component landings — single source of
-          truth, consumers derive them from the component entry, the
-          endpoint block never duplicates them.
-    - Every Pod landing carries BOTH `nodename` (the K8s Node object
-      name — an IP in IP-named clusters, the k8s-tool parameter) and
-      `hostname` (the OS hostname — the host-tool parameter); the two
-      naming spaces follow the official Node status.addresses
-      InternalIP/Hostname split.
-    - ecs_to_physical_host is the control-plane topology: each
-      control-plane ECS (ecs_hostname — THE host-tool parameter)
-      associated with its physical host.  The distinct physical-host set
-      derives from this association (single source of truth — no separate
-      physical_hosts list; which ECS a physical host affects is derived
-      by scanning this topology).  Both the ECS and its physical host are
-      diagnostic targets.
-    - nodes is the worker-node inventory ({nodename, hostname} — tool
-      parameters for the data-plane / user-input node scope).
+          connect timeout / TLS reset to the VIP).
+    - Every Pod landing (platform pods / workload_pods) carries BOTH
+      `nodename` (the K8s Node object name — an IP in IP-named clusters,
+      the k8s-tool parameter) and `hostname` (the OS hostname — the
+      host-tool parameter); the two naming spaces follow the official
+      Node status.addresses InternalIP/Hostname split.
     - workload_pods is present only for single_pod scenes: EVERY replica
       of the target workload with its landing (multi-replica workloads
       spread across nodes); single_cluster carries no workload_pods.
@@ -325,27 +338,26 @@ def query_dedicated_environment(
       resolved inside tools, never carried by the environment.
 
     Replacement acceptance checklist:
-    - Returned dict uses exactly the key names / nesting above; every list
-      key is a list (possibly empty); workload_pods omitted for
-      single_cluster; cluster carries exactly {name, k8s_version,
-      monitor_name} and monitor_name is the REAL argus monitor identifier
-      (never a placeholder).
-    - Component entries are FLAT (`name` at entry level, K8s
-      containers-list convention — no envelope, no role/category/
-      deployment_form/scope fields); every component carries
-      `workload_type` + `workload_name`; control-plane components carry
-      exactly one placement shape agreeing with workload_type —
-      `namespace`+`pods` for "StaticPod", `hosts` for "systemd";
-      platform components always carry `namespace`+`pods`;
-      control_plane carries `apiserver_endpoint` = {vip, port} (real
-      VIP of the external ELB, never a placeholder; NO elb identity —
-      the ELB is outside the cluster) and never duplicates the
-      kube-apiserver backend landings inside it.
-    - Every pod landing (component pods / workload_pods) carries BOTH
+    - Returned dict uses exactly the key names / nesting above; top
+      level is exactly {cluster, kubernetes, ecs_to_physical_host} (NO
+      nodes inventory); every list key is a list (possibly empty);
+      workload_pods omitted for single_cluster; cluster carries exactly
+      {name, k8s_version, monitor_name} and monitor_name is the REAL
+      argus monitor identifier (never a placeholder);
+      ecs_to_physical_host entries carry exactly {nodename, hostname,
+      physical_host}.
+    - control_plane carries exactly {apiserver_endpoint, components}:
+      apiserver_endpoint = {vip, port} (real VIP of the external ELB,
+      never a placeholder; NO elb identity).
+    - Control-plane component entries carry identity + replicas:
+      "StaticPod" → {name, workload_type, workload_name, namespace,
+      pods} with one pod per hosts entry (full landing triple);
+      "systemd" → {name, workload_type, workload_name, processes} with
+      one process per hosts entry ({process_name, hostname}); NEVER
+      both payloads, NEVER physical_host inside replicas; platform
+      components always carry `namespace`+`pods` with per-pod landings.
+    - Every pod landing (platform pods / workload_pods) carries BOTH
       `nodename` and `hostname`.
-    - ecs_to_physical_host[].physical_hostname values are consistent —
-      the distinct set IS the physical-host inventory (the forward
-      association is the single source of truth).
     - Target-not-found returns "_not_found"; query failure returns None —
       never raise.
     """

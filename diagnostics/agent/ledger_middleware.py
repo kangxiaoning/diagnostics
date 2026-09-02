@@ -1883,25 +1883,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if _hn and _nn and _nn != _hn:
                         mapping[_nn] = _hn
 
+                # ecs_to_physical_host 顶层块（云层 ECS 清单，唯一声明处）
+                # ——IP→hostname 映射 + hostname/physical_host 直通白名单；
+                # 控制面组件副本（StaticPod pods / systemd processes）落点
+                # 同此清单。
+                for _rec in (_topo.get("ecs_to_physical_host") or []):
+                    _map_landing(_rec)
+                    _ph = (_rec.get("physical_host") or "").strip()
+                    if _ph:
+                        mapping.setdefault(_ph, _ph)
                 for _comp in ((_k8s_view.get("control_plane") or {}).get("components") or []):
                     for _p in (_comp.get("pods") or []):
                         _map_landing(_p)
-                    for _h in (_comp.get("hosts") or []):
-                        _h = _h.strip()
-                        if _h:
-                            mapping.setdefault(_h, _h)
+                    for _pr in (_comp.get("processes") or []):
+                        _map_landing(_pr)
                 for _comp in (_k8s_view.get("platform_components") or []):
                     for _p in (_comp.get("pods") or []):
                         _map_landing(_p)
                 for _p in (_k8s_view.get("workload_pods") or []):
                     _map_landing(_p)
-                for _rec in (_k8s_view.get("nodes") or []):
-                    _map_landing(_rec)
-                for _rec in (_topo.get("ecs_to_physical_host") or []):
-                    for _k in ("ecs_hostname", "physical_hostname"):
-                        _v = (_rec.get(_k) or "").strip()
-                        if _v:
-                            mapping.setdefault(_v, _v)
             self._node_ip_to_host = mapping
         return mapping.get(value, "")
 

@@ -769,7 +769,7 @@ def topology_kind(topology: dict | None, unavailable: bool = False) -> str:
     mapping = t.get("mapping") or {}
     if mapping.get("serverless_cluster") or t.get("serverless_views"):
         return "serverless"
-    if t.get("cluster") or t.get("kubernetes") or t.get("ecs_to_physical_host"):
+    if t.get("cluster") or t.get("kubernetes"):
         return "dedicated"
     if t or unavailable:
         return "serverless"  # legacy: only serverless scenes had topology
@@ -777,55 +777,85 @@ def topology_kind(topology: dict | None, unavailable: bool = False) -> str:
 
 
 def dedicated_physical_hosts(env: dict) -> list[str]:
-    """Distinct physical-host set derived from the control-plane topology.
+    """Distinct physical-host set derived from ecs_to_physical_host.
 
-    The forward association (ecs_to_physical_host[].physical_hostname) is
-    the single source of truth — no separate inventory in the environment.
+    The entries[].physical_host forward association is the single source
+    of truth — no separate inventory in the environment.
     """
     seen: dict[str, None] = {}
-    for h in env.get("ecs_to_physical_host", []) or []:
-        phy = (h.get("physical_hostname") or "").strip()
+    for h in dedicated_control_plane_hosts(env):
+        phy = (h.get("physical_host") or "").strip()
         if phy:
             seen.setdefault(phy, None)
     return list(seen)
 
 
-def _dedicated_nodes(env: dict) -> list[dict]:
-    """Worker-node inventory [{nodename, hostname}] from the kubernetes view."""
-    return ((env.get("kubernetes") or {}).get("nodes")) or []
+def dedicated_control_plane_hosts(env: dict) -> list[dict]:
+    """THE control-plane ECS inventory [{nodename, hostname, physical_host}].
+
+    Top-level ecs_to_physical_host block (cloud layer, sibling of the
+    kubernetes view); scope = the co-located control-plane ECS.
+    """
+    return env.get("ecs_to_physical_host") or []
+
+
+def _dedicated_worker_nodes(env: dict) -> list[dict]:
+    """Derived worker-node set [{nodename, hostname}] from pod landings.
+
+    The environment is the diagnostic-object subgraph — no separate nodes
+    inventory; workers are derived from platform_components /
+    workload_pods landings (control-plane hosts excluded).
+    """
+    cp_hostnames = {
+        (h.get("hostname") or "").strip()
+        for h in dedicated_control_plane_hosts(env)
+    }
+    seen: dict[str, dict] = {}
+    k8s = env.get("kubernetes") or {}
+    landings: list[dict] = []
+    for comp in (k8s.get("platform_components") or []):
+        landings.extend(comp.get("pods") or [])
+    landings.extend(k8s.get("workload_pods") or [])
+    for p in landings:
+        hn = (p.get("hostname") or "").strip()
+        if hn and hn not in cp_hostnames and hn not in seen:
+            seen[hn] = {"nodename": p.get("nodename", ""), "hostname": hn}
+    return list(seen.values())
 
 
 def build_dedicated_coordinator_inventory(env: dict) -> dict:
     """Coordinator identity-level inventory of a DedicatedEnvironment.
 
-    Full placement kept (component pods/host landings, workload replicas,
-    control-plane topology, worker-node inventory) — the Coordinator
-    routes delegations by WHERE a component or the target workload lives
-    (compactness, same trim-only principle as §5A.1).
+    Full projection (cluster + the whole kubernetes view + the
+    ecs_to_physical_host topology — control-plane endpoint/component
+    replicas, platform landings, workload replicas, ECS↔physical
+    mapping) — the Coordinator routes delegations by WHERE a component
+    or the target workload lives (compactness, same trim-only principle
+    as §5A.1).
     """
     inventory: dict[str, Any] = {"cluster": _strip_none(env.get("cluster") or {})}
     inventory["kubernetes"] = env.get("kubernetes") or {}
-    inventory["ecs_to_physical_host"] = env.get("ecs_to_physical_host", []) or []
+    inventory["ecs_to_physical_host"] = env.get("ecs_to_physical_host") or []
     if env.get("_not_found"):
         inventory["_not_found"] = env["_not_found"]
     return inventory
 
 
 def build_dedicated_host_views(env: dict) -> dict:
-    """Host-expert slice: control-plane topology + derived physical hosts.
+    """Host-expert slice: ECS↔physical topology + derived sets.
 
-    Both the control-plane ECS and its physical host are diagnostic
-    targets — the slice carries the topology (ecs_hostname ↔
-    physical_hostname) plus the derived distinct physical-host set, the
-    worker-node inventory (data-plane host-tool parameters), and the
-    target workload's replica landings (single_pod).  Which ECS a
-    physical host affects is derived by scanning the topology (the
-    forward association is the single source of truth).
+    Both the ECS and its physical host are diagnostic targets — the
+    slice carries ecs_to_physical_host (hostname ↔ physical_host, plus
+    nodename) plus the derived distinct physical-host set, the derived
+    worker-node set (data-plane host-tool parameters), and the target
+    workload's replica landings (single_pod).  Which ECS a physical
+    host affects is derived by scanning the topology (the forward
+    association is the single source of truth).
     """
     views: dict[str, Any] = {
-        "ecs_to_physical_host": env.get("ecs_to_physical_host", []) or [],
+        "ecs_to_physical_host": dedicated_control_plane_hosts(env),
         "physical_hosts": dedicated_physical_hosts(env),
-        "nodes": _dedicated_nodes(env),
+        "nodes": _dedicated_worker_nodes(env),
     }
     workload_pods = (env.get("kubernetes") or {}).get("workload_pods")
     if workload_pods:
@@ -834,17 +864,28 @@ def build_dedicated_host_views(env: dict) -> dict:
 
 
 def build_dedicated_k8s_context(env: dict) -> dict:
-    """K8s-expert slice: cluster + full kubernetes view (no physical-host data).
+    """K8s-expert slice: cluster + kubernetes view + trimmed master nodes.
 
-    The k8s experts resolve workload/pod/namespace/nodename tool
-    parameters from the component entries and workload_pods (container
-    components carry pods; binary components are host services — their
-    hosts are host-tool territory); workload_pods (single_pod) carries
-    every replica landing of the target workload.
+    Control-plane components carry their replicas directly (StaticPod
+    pods / systemd processes — multi-replica is first-class in the
+    structure).  Master nodenames (needed for k8s node operations —
+    the systemd form's process replicas carry no nodename) come from a
+    TRIMMED projection of ecs_to_physical_host ({nodename, hostname}
+    only — physical_host stays host-expert territory);
+    workload_pods (single_pod) carries every replica landing of the
+    target workload.
     """
+    k8s = env.get("kubernetes") or {}
+    cp = dict(k8s.get("control_plane") or {})
+    cp["hosts"] = [
+        {"nodename": h.get("nodename", ""), "hostname": h.get("hostname", "")}
+        for h in dedicated_control_plane_hosts(env)
+    ]
+    k8s_view = dict(k8s)
+    k8s_view["control_plane"] = cp
     ctx: dict[str, Any] = {
         "cluster": _strip_none(env.get("cluster") or {}),
-        "kubernetes": env.get("kubernetes") or {},
+        "kubernetes": k8s_view,
     }
     if env.get("_not_found"):
         ctx["_not_found"] = env["_not_found"]
