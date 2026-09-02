@@ -738,3 +738,122 @@ def report_mapping_table(topology: dict) -> str:
 def expert_view(topology: dict, view_key: str) -> dict:
     """Full view payload for a deep expert (Pod details kept)."""
     return {"mapping": _strip_none(topology.get("mapping") or {}), view_key: topology.get(view_key, []) or []}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Dedicated-cluster environment (DedicatedEnvironment) rendering
+# ═══════════════════════════════════════════════════════════════════
+# The dedicated-cluster environment shares the ledger["topology"] slot with
+# the Serverless RelationGraph; consumers dispatch by topology_kind().
+
+
+def topology_kind(topology: dict | None, unavailable: bool = False) -> str:
+    """Environment discriminator: "serverless" | "dedicated" | "".
+
+    Both environment models share one ledger slot, so every dispatch point
+    (coverage gate, phase guidance, per-role injection, report mapping)
+    must key on the KIND, not on mere presence.  Resolution order:
+    1. explicit ``_env_kind`` session stamp (private key, same convention
+       as ``_query_anchor`` — also stamped on query failure so the
+       degraded path keeps its scene identity);
+    2. shape inference (serverless mapping carries ``serverless_cluster``,
+       dedicated mapping carries ``cluster_name`` / ``components``);
+    3. legacy fallback — before the dedicated environment existed, only
+       serverless scenes queried topology, so an unmarked topology or
+       unavailability marker implies serverless.
+    """
+    t = topology or {}
+    kind = t.get("_env_kind")
+    if kind in ("serverless", "dedicated"):
+        return kind
+    mapping = t.get("mapping") or {}
+    if mapping.get("serverless_cluster") or t.get("serverless_views"):
+        return "serverless"
+    if t.get("cluster") or t.get("kubernetes") or t.get("ecs_to_physical_host"):
+        return "dedicated"
+    if t or unavailable:
+        return "serverless"  # legacy: only serverless scenes had topology
+    return ""
+
+
+def dedicated_physical_hosts(env: dict) -> list[str]:
+    """Distinct physical-host set derived from the control-plane topology.
+
+    The forward association (ecs_to_physical_host[].physical_hostname) is
+    the single source of truth — no separate inventory in the environment.
+    """
+    seen: dict[str, None] = {}
+    for h in env.get("ecs_to_physical_host", []) or []:
+        phy = (h.get("physical_hostname") or "").strip()
+        if phy:
+            seen.setdefault(phy, None)
+    return list(seen)
+
+
+def _dedicated_nodes(env: dict) -> list[dict]:
+    """Worker-node inventory [{nodename, hostname}] from the kubernetes view."""
+    return ((env.get("kubernetes") or {}).get("nodes")) or []
+
+
+def build_dedicated_coordinator_inventory(env: dict) -> dict:
+    """Coordinator identity-level inventory of a DedicatedEnvironment.
+
+    Full placement kept (component pods/host landings, workload replicas,
+    control-plane topology, worker-node inventory) — the Coordinator
+    routes delegations by WHERE a component or the target workload lives
+    (compactness, same trim-only principle as §5A.1).
+    """
+    inventory: dict[str, Any] = {"cluster": _strip_none(env.get("cluster") or {})}
+    inventory["kubernetes"] = env.get("kubernetes") or {}
+    inventory["ecs_to_physical_host"] = env.get("ecs_to_physical_host", []) or []
+    if env.get("_not_found"):
+        inventory["_not_found"] = env["_not_found"]
+    return inventory
+
+
+def build_dedicated_host_views(env: dict) -> dict:
+    """Host-expert slice: control-plane topology + derived physical hosts.
+
+    Both the control-plane ECS and its physical host are diagnostic
+    targets — the slice carries the topology (ecs_hostname ↔
+    physical_hostname) plus the derived distinct physical-host set, the
+    worker-node inventory (data-plane host-tool parameters), and the
+    target workload's replica landings (single_pod).  Which ECS a
+    physical host affects is derived by scanning the topology (the
+    forward association is the single source of truth).
+    """
+    views: dict[str, Any] = {
+        "ecs_to_physical_host": env.get("ecs_to_physical_host", []) or [],
+        "physical_hosts": dedicated_physical_hosts(env),
+        "nodes": _dedicated_nodes(env),
+    }
+    workload_pods = (env.get("kubernetes") or {}).get("workload_pods")
+    if workload_pods:
+        views["workload_pods"] = workload_pods
+    return views
+
+
+def build_dedicated_k8s_context(env: dict) -> dict:
+    """K8s-expert slice: cluster + full kubernetes view (no physical-host data).
+
+    The k8s experts resolve workload/pod/namespace/nodename tool
+    parameters from the component entries and workload_pods (container
+    components carry pods; binary components are host services — their
+    hosts are host-tool territory); workload_pods (single_pod) carries
+    every replica landing of the target workload.
+    """
+    ctx: dict[str, Any] = {
+        "cluster": _strip_none(env.get("cluster") or {}),
+        "kubernetes": env.get("kubernetes") or {},
+    }
+    if env.get("_not_found"):
+        ctx["_not_found"] = env["_not_found"]
+    return ctx
+
+
+def dedicated_coordinator_block(env: dict) -> str:
+    """Render the Coordinator's dedicated-environment block."""
+    return render_json_block(
+        "环境拓扑（专有集群 DedicatedEnvironment）",
+        build_dedicated_coordinator_inventory(env),
+    )

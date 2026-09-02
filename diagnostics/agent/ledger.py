@@ -979,6 +979,22 @@ def _argus_target_resolved(ledger: DiagnosisLedger) -> bool:
     return bool(ledger.get("entity_name") or ledger.get("hostname"))
 
 
+def _is_serverless_topology(ledger: DiagnosisLedger) -> bool:
+    """Whether the session's environment is the Serverless RelationGraph.
+
+    The dedicated-cluster environment (DedicatedEnvironment) shares the
+    ledger["topology"] slot — dispatch must key on the environment KIND,
+    not on mere presence (design document — dedicated environment spec).
+    Only a serverless environment engages the four-view coverage rules.
+    """
+    from diagnostics.agent.topology_render import topology_kind
+
+    return topology_kind(
+        ledger.get("topology"),
+        unavailable=bool(ledger.get("_topology_unavailable")),
+    ) == "serverless"
+
+
 def _required_argus(ledger: DiagnosisLedger) -> set[str]:
     """Required Argus experts for the UNDERSTAND coverage gate (D1).
 
@@ -986,7 +1002,7 @@ def _required_argus(ledger: DiagnosisLedger) -> set[str]:
     Serverless four-view, host single, dedicated container dual.  Used by the
     proactive UNDERSTAND coverage-status hint (design document §5).
     """
-    if ledger.get("topology") or ledger.get("_topology_unavailable"):
+    if _is_serverless_topology(ledger):
         return {
             "serverless-argus-expert", "kmc-argus-expert",
             "sci-argus-expert", "host-argus-expert",
@@ -1037,9 +1053,10 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
         return (ledger.get("current_round", 0)
                 >= _NO_DELEGATION_FALLBACK_ROUND)
     # Serverless scene (k8s-on-k8s): topology-aware coverage gate (D1/D2,
-    # see design document §7.2).  Topology injection marks the scene; on
+    # see design document §7.2).  A serverless environment marks the scene
+    # (kind-aware — a dedicated environment keeps the dual gate below); on
     # topology failure (_topology_unavailable) degrade to argus-only.
-    if ledger.get("topology") or ledger.get("_topology_unavailable"):
+    if _is_serverless_topology(ledger):
         return _serverless_coverage_ready(ledger)
     if ledger.get("entity_type", "") == "host":
         return "host-argus-expert" in experts_delegated
@@ -1511,7 +1528,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # load and scene misclassification); the set is sourced from
         # _required_argus — the same single source of truth as the D1
         # coverage gate and the reactive coverage valve (§8).
-        if ledger.get("topology") or ledger.get("_topology_unavailable"):
+        if _is_serverless_topology(ledger):
             delegation_rules = (
                 "- 单轮并行委派四个 Argus 专家（Serverless 四视角：逻辑/控制面/"
                 "数据面/物理主机）：\n"
@@ -1616,7 +1633,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # Scene-aware expert map (design document §9, 2026-08-05): only the
         # CURRENT scene's verification experts are shown (same principle as
         # UNDERSTAND: no other-scene delegation rules in view).
-        if ledger.get("topology") or ledger.get("_topology_unavailable"):
+        if _is_serverless_topology(ledger):
             expert_map = _SLS_EXPERT_DOMAIN_MAP + _ARGUS_CHANNEL_NOTE_SLS
         elif ledger.get("entity_type", "") == "host":
             expert_map = (
@@ -2509,9 +2526,12 @@ def render_derived_report_appendix(ledger: DiagnosisLedger) -> str:
             + "\n".join(lines)
         )
 
-    # 2. Serverless topology mapping (scene-conditional).
+    # 2. Serverless topology mapping (scene-conditional).  Only the
+    # Serverless RelationGraph renders a mapping table — the dedicated
+    # environment is injected as diagnosis context only (design document —
+    # dedicated environment spec).
     topology = ledger.get("topology")
-    if topology:
+    if topology and _is_serverless_topology(ledger):
         from diagnostics.agent.topology_render import report_mapping_table
         table = report_mapping_table(topology)
         if table:

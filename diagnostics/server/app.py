@@ -17,8 +17,15 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from diagnostics.agent import build_agent
 from diagnostics.agent.streaming import stream_agent_events
-from diagnostics.agent.topology_client import query_environment_topology
-from diagnostics.agent.topology_render import coordinator_block
+from diagnostics.agent.topology_client import (
+    query_dedicated_environment,
+    query_environment_topology,
+)
+from diagnostics.agent.topology_render import (
+    coordinator_block,
+    dedicated_coordinator_block,
+    topology_kind,
+)
 from diagnostics.config import ROOT_DIR, STATIC_DIR, Settings
 from diagnostics.server.schemas import ChatRequest
 from diagnostics.server.sessions import SessionStore
@@ -200,13 +207,17 @@ def _field_present(name: str, param_overrides: dict, message: str, entity_name: 
 
 
 def _render_topology_summary(topology: dict) -> str:
-    """Render a RelationGraph into the Coordinator's compact topology block.
+    """Render an environment topology into the Coordinator's compact block.
 
-    The Coordinator needs a global resource inventory (three views, Pod-level
-    placement stripped) plus the cluster mapping to route delegations without
-    guessing cluster/namespace names (design document §7.3).  Serialized JSON
-    keeps the authoritative structure as the single source of truth.
+    The Coordinator needs a global resource inventory (identity-level
+    placement) plus the cluster mapping to route delegations without
+    guessing cluster/namespace names (design document §7.3).  Serialized
+    JSON keeps the authoritative structure as the single source of truth.
+    Dispatches by environment kind: Serverless RelationGraph vs dedicated
+    DedicatedEnvironment (design document — dedicated environment spec).
     """
+    if topology_kind(topology) == "dedicated":
+        return dedicated_coordinator_block(topology)
     return coordinator_block(topology)
 
 
@@ -524,42 +535,65 @@ async def _chat_event_stream(
         end_time,
     )
 
-    # ── Environment topology injection (Serverless scene) ──
-    # Query RelationGraph at session init (mirror of hostname pre-resolution)
-    # and render the topology anchor into the augmented message so the
-    # Coordinator can locate resources without guessing cluster/namespace names.
-    # On failure degrade to input-only diagnosis (design document §9-3).
+    # ── Environment topology injection (Serverless / dedicated scenes) ──
+    # Query the environment at session init (mirror of hostname
+    # pre-resolution) and render the anchor into the augmented message so
+    # the Coordinator can locate resources without guessing cluster/
+    # namespace names.  Query dispatches by cluster_type: Serverless →
+    # RelationGraph; dedicated → DedicatedEnvironment (design document —
+    # dedicated environment spec).  On failure degrade to input-only
+    # diagnosis (design document §9-3).
     _topology_data: dict | None = None
     _topology_unavailable = False
     if scene_profile is not None and scene_profile.topology_query:
         try:
-            _topology_data = query_environment_topology(
-                cluster_name=(request.param_overrides or {}).get("cluster_name", request.entity_name),
-                namespace=(request.param_overrides or {}).get("namespace", ""),
-                workload_name=(request.param_overrides or {}).get("workload_name", ""),
-                pod_name=(request.param_overrides or {}).get("pod_name", ""),
-            )
+            _po = request.param_overrides or {}
+            if scene_profile.cluster_type == "dedicated":
+                _topology_data = query_dedicated_environment(
+                    cluster_name=_po.get("cluster_name", request.entity_name),
+                    namespace=_po.get("namespace", ""),
+                    workload_type=_po.get("workload_type", ""),
+                    workload_name=_po.get("workload_name", ""),
+                    pod_name=_po.get("pod_name", ""),
+                    scene=scene_profile.scene_id,
+                )
+            else:
+                _topology_data = query_environment_topology(
+                    cluster_name=_po.get("cluster_name", request.entity_name),
+                    namespace=_po.get("namespace", ""),
+                    workload_name=_po.get("workload_name", ""),
+                    pod_name=_po.get("pod_name", ""),
+                )
             if _topology_data:
-                # Scope stamp (private key, "_not_found" convention): lets
-                # the report-time mapping renderer dispatch between the
-                # Pod-anchored and the cluster-level RelationGraph form —
-                # single_cluster sessions carry no pod/workload anchor.
-                _topology_data["_query_anchor"] = {
-                    "namespace": (request.param_overrides or {}).get("namespace", ""),
-                    "workload_name": (request.param_overrides or {}).get("workload_name", ""),
-                    "pod_name": (request.param_overrides or {}).get("pod_name", ""),
-                }
+                # Environment-kind stamp (private key, "_not_found"
+                # convention): every downstream dispatch (coverage gate,
+                # phase guidance, per-role injection, report mapping) keys
+                # on the KIND — both environment models share the
+                # ledger["topology"] slot.  Stamped on failure too so the
+                # degraded path keeps its scene identity.
+                _topology_data["_env_kind"] = scene_profile.cluster_type
+                if scene_profile.cluster_type == "serverless":
+                    # Scope stamp (private key): lets the report-time
+                    # mapping renderer dispatch between the Pod-anchored
+                    # and the cluster-level RelationGraph form —
+                    # single_cluster sessions carry no pod/workload anchor.
+                    _topology_data["_query_anchor"] = {
+                        "namespace": _po.get("namespace", ""),
+                        "workload_name": _po.get("workload_name", ""),
+                        "pod_name": _po.get("pod_name", ""),
+                    }
                 _topology_summary = _render_topology_summary(_topology_data)
                 if _topology_summary:
                     augmented_message = augmented_message + "\n\n" + _topology_summary
             else:
-                # Query returned None (mock unavailable) — same degrade path.
-                _topology_data = None
+                # Query returned None (mock unavailable) — degrade, keeping
+                # the scene identity for kind-aware dispatch.
+                _topology_data = {"_env_kind": scene_profile.cluster_type}
                 _topology_unavailable = True
         except Exception:
             # 降级（design document §9-3/D2）：拓扑失败不阻塞诊断，标记不可用
             logger.exception("topology query failed; degrade to input-only diagnosis")
-            _topology_data = None
+            _topology_data = {"_env_kind": scene_profile.cluster_type}
             _topology_unavailable = True
 
     # ── Generate report/ledger paths and build agent with formatted prompt ──

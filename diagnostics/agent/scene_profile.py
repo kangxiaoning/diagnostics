@@ -58,6 +58,21 @@ _SINGLE_POD_FIELDS = (
     InputField("description", "异常描述", required=False),
 )
 
+# 专有集群单 Pod：cluster_name/namespace/workload_type/workload_name/
+# pod_name 全部必填——DedicatedEnvironment 查询的负载锚定契约（design
+# document — dedicated environment spec）。serverless 单 Pod 的
+# workload_type/workload_name 保持可选（拓扑命名规则可推导，沿用上方
+# _SINGLE_POD_FIELDS）。
+_DEDICATED_SINGLE_POD_FIELDS = (
+    InputField("cluster_name", "集群名称"),
+    InputField("namespace", "命名空间"),
+    InputField("workload_type", "负载类型"),
+    InputField("workload_name", "负载名称"),
+    InputField("pod_name", "Pod 名称"),
+    InputField("time_range", "时间范围", type="time_range"),
+    InputField("description", "异常描述", required=False),
+)
+
 # 场景 3-5 预留（注册但 disabled，前端不可选）
 _SINGLE_CLUSTER_FIELDS = (
     InputField("cluster_name", "集群名称"),
@@ -123,9 +138,15 @@ SCENE_REGISTRY: dict[tuple[str, str], SceneProfile] = {
         label="单 Pod",
         cluster_type="dedicated",
         entity_type="kubernetes",
-        input_fields=_SINGLE_POD_FIELDS,
+        input_fields=_DEDICATED_SINGLE_POD_FIELDS,
         experts=("host-argus-expert", "k8s-argus-expert", "host-expert", "k8s-expert"),
         understand_argus=("host-argus-expert", "k8s-argus-expert"),
+        # DedicatedEnvironment injection (design document — dedicated
+        # environment spec): control-plane/core components, node→ECS→
+        # physical-host chain, user-Pod anchor.  The coverage gate and the
+        # delegation guidance stay dual-argus — dispatch is by environment
+        # kind, not by topology presence.
+        topology_query=True,
     ),
     ("single_pod", "serverless"): SceneProfile(
         scene_id="single_pod",
@@ -155,6 +176,10 @@ SCENE_REGISTRY: dict[tuple[str, str], SceneProfile] = {
         input_fields=_SINGLE_CLUSTER_FIELDS,
         experts=("host-argus-expert", "k8s-argus-expert", "host-expert", "k8s-expert"),
         understand_argus=("host-argus-expert", "k8s-argus-expert"),
+        # DedicatedEnvironment injection (cluster-level form: components +
+        # node→ECS→physical-host chain, no pod anchor) — same dispatch
+        # rule as single_pod+dedicated (environment kind, not presence).
+        topology_query=True,
         system_prompt_ref="single_cluster",
     ),
     ("single_cluster", "serverless"): SceneProfile(

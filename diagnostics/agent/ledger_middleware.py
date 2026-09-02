@@ -78,7 +78,15 @@ from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
 from deepagents.middleware._utils import append_to_system_message
 
-from diagnostics.agent.topology_render import build_argus_context_view, build_host_views, expert_view, render_json_block
+from diagnostics.agent.topology_render import (
+    build_argus_context_view,
+    build_dedicated_host_views,
+    build_dedicated_k8s_context,
+    build_host_views,
+    expert_view,
+    render_json_block,
+    topology_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1110,7 +1118,7 @@ def _is_substantial_report_text(text: str) -> bool:
 # and at stable-ctx injection time (self-heals ledgers persisted before the
 # write-time strip existed).
 _TOPOLOGY_ECHO_RE = re.compile(
-    r"\n## 环境拓扑（Serverless RelationGraph）\n\n```json\n.*?\n```\n?",
+    r"\n## 环境拓扑（[^）]+）\n\n```json\n.*?\n```\n?",
     re.DOTALL,
 )
 
@@ -1179,14 +1187,22 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     if subagent_type in _k8s_experts and entity_name and entity_type == "kubernetes":
         entity_hints.append(f"  - cluster_name: **{entity_name}**")
         entity_hints.append("  - 实体类型: kubernetes")
-    # Argus monitor_name anchor — queried from user input BEFORE agent
-    # creation and stored in param_overrides (dedicated/host scenes only).
-    # Serverless sessions (topology mapping present): per-role monitor_name
-    # is single-sourced from the topology contract block (§2b below) — a
+    # Argus monitor_name anchor — single-source resolution.  Dedicated
+    # environments carry the CMDB-provided monitor identifier in
+    # cluster.monitor_name (design document — dedicated environment spec):
+    # authoritative when present; the param-resolved value (pre-resolved
+    # from user input BEFORE agent creation) survives only as the
+    # degraded-path fallback (environment query failed).  Serverless
+    # sessions (topology mapping present): per-role monitor_name is
+    # single-sourced from the topology contract block (§2b below) — a
     # session-global value here would be a second, conflicting source.
-    _monitor_name = (ledger.get("param_overrides") or {}).get("monitor_name", "")
+    _topo_env = ledger.get("topology") or {}
+    _monitor_name = (
+        (_topo_env.get("cluster") or {}).get("monitor_name", "")
+        or (ledger.get("param_overrides") or {}).get("monitor_name", "")
+    )
     if (_monitor_name and subagent_type in (*_host_experts, *_k8s_experts)
-            and not (ledger.get("topology") or {}).get("mapping")):
+            and not (_topo_env.get("mapping") or {}).get("serverless_cluster")):
         entity_hints.append(f"  - monitor_name: **{_monitor_name}**")
 
     if entity_hints:
@@ -1226,8 +1242,14 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
         "sci-expert": "sci_cluster",
     }
     _is_argus = subagent_type in _argus_experts
+    # Environment-kind dispatch (design document — dedicated environment
+    # spec): the dedicated environment shares the ledger["topology"] slot,
+    # so every serverless branch below keys on the KIND, not on presence.
+    _topo_kind = topology_kind(
+        _topology, unavailable=bool(ledger.get("_topology_unavailable")),
+    )
     _anchor: list[str] = []
-    if _mapping:
+    if _mapping and _topo_kind == "serverless":
         # Argus experts: per-role parameters are single-sourced in the
         # unified JSON contract block below (design document §7.3) — the
         # former text anchors were dropped to eliminate duplicated sources
@@ -1300,7 +1322,7 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     # hostname / time window each appear exactly once) + deterministic
     # diagnostic-target extraction with explicit absence markers (§9-4).
     # Replaces the former text anchors + compact-only view + Layer-3 echo.
-    if _is_argus and _mapping:
+    if _is_argus and _mapping and _topo_kind == "serverless":
         lines.append(
             render_json_block(
                 "Argus 诊断上下文（工具参数契约）",
@@ -1314,6 +1336,29 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
             )
         )
 
+    # Dedicated-cluster environment (design document — dedicated
+    # environment spec): per-role projection — k8s experts get
+    # cluster + the full kubernetes view (component landings, workload
+    # replicas, node inventory — namespace/pod/nodename tool parameters);
+    # host experts get the control-plane topology + derived physical
+    # hosts + node inventory + workload landings (ECS and its physical
+    # host are both diagnostic targets).
+    if _topo_kind == "dedicated" and _topology.get("cluster"):
+        if subagent_type in _k8s_experts:
+            lines.append(
+                render_json_block(
+                    "专有集群环境视图（cluster / kubernetes）",
+                    build_dedicated_k8s_context(_topology),
+                )
+            )
+        elif subagent_type in _host_experts:
+            _dhost: dict = build_dedicated_host_views(_topology)
+            if _topology.get("_not_found"):
+                _dhost["_not_found"] = _topology["_not_found"]
+            lines.append(
+                render_json_block("专有集群主机视图（ECS + 物理机）", _dhost)
+            )
+
     # ── Layer 3: Frontend param_overrides (JSON) ──
     param_overrides = ledger.get("param_overrides", {})
     start_time = ledger.get("start_time", "")
@@ -1321,7 +1366,7 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
     # Argus experts with topology: every parameter is single-sourced in the
     # unified contract block above — echoing raw param_overrides here would
     # re-introduce a second (potentially conflicting) source.
-    if _is_argus and _topology.get("mapping"):
+    if _is_argus and _topo_kind == "serverless" and _topology.get("mapping"):
         pass
     elif param_overrides or start_time or end_time:
         try:
@@ -1331,8 +1376,14 @@ def _build_stable_ctx(ledger: dict, subagent_type: str = "") -> str:
             # Serverless sessions: argus monitor_name is a per-role fact
             # resolved from the topology mapping (§Layer 2b) — a single
             # session-global value here would leak one monitor name to every
-            # argus expert. Topology presence ⇒ anchors are authoritative.
-            if _topology.get("mapping"):
+            # argus expert. Serverless topology ⇒ anchors are authoritative.
+            # Dedicated environments single-source monitor_name in
+            # cluster.monitor_name (CMDB-provided, Layer 1 anchor) — the
+            # param-resolved value is stripped here to avoid a second,
+            # potentially conflicting source; it survives only on the
+            # degraded path (no environment / no cluster.monitor_name).
+            if ((_topology.get("mapping") or {}).get("serverless_cluster")
+                    or (_topology.get("cluster") or {}).get("monitor_name")):
                 _redundant.add("monitor_name")
             clean = {k: v for k, v in param_overrides.items() if k not in _redundant}
             # Add time window from ledger if present
@@ -1816,6 +1867,41 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     mapping.setdefault(_hn, _hn)
                 if _hn and _nn and _nn != _hn:
                     mapping[_nn] = _hn
+            # Dedicated environment: node-IP → hostname mapping from every
+            # pod landing + the node inventory (IP-named clusters — the
+            # k8s tools report the nodename, the host tools take the
+            # hostname); ECS / physical-host names pass through (they are
+            # host-tool parameters already).
+            if topology_kind(_topo) == "dedicated":
+                _k8s_view = _topo.get("kubernetes") or {}
+
+                def _map_landing(_p: dict) -> None:
+                    _hn = (_p.get("hostname") or "").strip()
+                    _nn = (_p.get("nodename") or "").strip()
+                    if _hn:
+                        mapping.setdefault(_hn, _hn)
+                    if _hn and _nn and _nn != _hn:
+                        mapping[_nn] = _hn
+
+                for _comp in ((_k8s_view.get("control_plane") or {}).get("components") or []):
+                    for _p in (_comp.get("pods") or []):
+                        _map_landing(_p)
+                    for _h in (_comp.get("hosts") or []):
+                        _h = _h.strip()
+                        if _h:
+                            mapping.setdefault(_h, _h)
+                for _comp in (_k8s_view.get("platform_components") or []):
+                    for _p in (_comp.get("pods") or []):
+                        _map_landing(_p)
+                for _p in (_k8s_view.get("workload_pods") or []):
+                    _map_landing(_p)
+                for _rec in (_k8s_view.get("nodes") or []):
+                    _map_landing(_rec)
+                for _rec in (_topo.get("ecs_to_physical_host") or []):
+                    for _k in ("ecs_hostname", "physical_hostname"):
+                        _v = (_rec.get(_k) or "").strip()
+                        if _v:
+                            mapping.setdefault(_v, _v)
             self._node_ip_to_host = mapping
         return mapping.get(value, "")
 
