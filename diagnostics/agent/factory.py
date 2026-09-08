@@ -813,6 +813,12 @@ def build_agent(
         api_key=settings.api_key,
         temperature=settings.temperature,
         max_tokens=settings.max_tokens,
+        # Aggregate token usage across streamed chunks.  langchain only
+        # defaults this on for the official base URL, so a local or
+        # self-hosted endpoint reports zero usage and output-budget
+        # pressure stays invisible.  Backend-agnostic: providers that do
+        # not emit a final usage chunk simply keep reporting zero.
+        stream_usage=True,
         model_kwargs={"tool_choice": "auto"},
     )
 
@@ -894,6 +900,10 @@ def build_agent(
     novelty_gate = ExpertNoveltyGateMiddleware(expert_sessions)
     guidance = ExpertGuidanceMiddleware(expert_sessions)
     guidance.bind_dedup(dedup_subagent)
+    # Lets the guidance middleware reach the Coordinator's ledger: a
+    # delegation is a subgraph with no shared state keys, so a lost
+    # channel can only be reported through this reference.
+    guidance.bind_coordinator(ledger_middleware)
 
     # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent

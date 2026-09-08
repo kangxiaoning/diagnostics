@@ -54,6 +54,23 @@ from diagnostics.agent.model_usage import extract_usage, first_truncated
 logger = logging.getLogger(__name__)
 
 
+def _last_ai_text_chars(state: Any) -> int:
+    """Length of the last assistant text left in the delegation.
+
+    Zero means the turn was cut off inside the reasoning stream (no
+    visible output at all); a non-zero value means some text exists but
+    was never submitted as a structured conclusion.
+    """
+    messages = state.get("messages", []) if isinstance(state, dict) else []
+    for msg in reversed(list(messages)):
+        if isinstance(msg, HumanMessage):
+            continue
+        content = getattr(msg, "content", "") or ""
+        if isinstance(content, str) and content.strip():
+            return len(content.strip())
+    return 0
+
+
 def _channels(tool_names: list[str]) -> list[str]:
     """Observability channel labels derived from the bound toolset.
 
@@ -93,9 +110,24 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         # injected block can report this delegation's dedup-hit count
         # (display-only — dedup remains the single bookkeeper).
         self._dedup: Any | None = None
+        # Back-reference to the Coordinator's ledger middleware.  A
+        # delegation runs as a subgraph whose state schema shares no keys
+        # with the parent (LangGraph semantics: parent keys are not
+        # accessible inside the subgraph), so the shared diagnosis ledger
+        # — the only place a lost channel can be reported to the
+        # Coordinator — is reachable only through this reference.
+        self._coordinator: Any | None = None
 
     def bind_dedup(self, dedup: Any) -> None:
         self._dedup = dedup
+
+    def bind_coordinator(self, coordinator: Any) -> None:
+        self._coordinator = coordinator
+
+    def _shared_ledger(self) -> dict | None:
+        """The Coordinator's live ledger, or None when unavailable."""
+        ledger = getattr(self._coordinator, "_current_ledger", None)
+        return ledger if isinstance(ledger, dict) else None
 
     @staticmethod
     def _key_from_state(state: Any) -> str:
@@ -308,17 +340,30 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 # looping.
                 self._report_truncated_delegation(state, key)
                 return None
+            # The resubmission must name the conclusion TOOL: the
+            # structured return only materialises when the model emits a
+            # conclusion-tool call (the model node parses that call
+            # directly), so "write a brief conclusion" is not enough — a
+            # plain-text answer leaves structured_response unset and the
+            # delegation ends with a fallback fragment.  The tool name is
+            # taken from this delegation's bound toolset, so renamed or
+            # additional conclusion tools need no code change.
+            conclusion_tools = [t for t in (s.get("tools") or [])
+                                if t.endswith("Findings")]
+            tool_hint = " / ".join(conclusion_tools) or "结论工具"
             guidance = (
                 "[系统提示·输出被截断] 上一次输出达到长度上限，结构化结论未生成——"
                 f"已采集的 {len(s['calls'])} 项取证数据仍在上下文中，无需重新查询。"
-                "请立即提交**精简结论**：只填写 verdict / key_evidence / "
-                "negative_evidence 三个字段，每字段不超过 40 字，其余字段留空。"
+                f"请立即**调用结论工具 {tool_hint}** 提交精简结论：只填写 "
+                "verdict / key_evidence / negative_evidence 三个字段，每字段不超过 "
+                "40 字，其余字段留空；不要用纯文本作答（纯文本不会被记为结论）。"
             )
             self._ledger.mark_conclusion_hinted(key, guidance)
             logger.warning(
                 "G28 conclusion checkpoint: delegation %s bounced once "
-                "for a minimal resubmission (%d executed calls retained)",
-                key, len(s["calls"]),
+                "for a minimal resubmission (%d executed calls retained, "
+                "conclusion tool %s)",
+                key, len(s["calls"]), tool_hint,
             )
             return {"jump_to": "model"}
         except Exception:
@@ -336,8 +381,17 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 "channels": _channels(s.get("tools") or []),
                 "truncations": self._ledger.truncation_count(key),
                 "calls": len(s["calls"]),
+                # Fact, not a verdict: how much non-structured text the
+                # last turn left behind.  Mirrors the vendor handling of
+                # incomplete responses, which distinguishes "ran out of
+                # tokens during reasoning" from "partial output" — the
+                # Coordinator is told a fragment exists, but it is never
+                # promoted to evidence here.
+                "fallback_chars": _last_ai_text_chars(state),
             }
             ledger = state.get("_diagnosis_ledger") if isinstance(state, dict) else None
+            if not isinstance(ledger, dict):
+                ledger = self._shared_ledger()
             if isinstance(ledger, dict):
                 entry["round"] = ledger.get("current_round", 0)
                 # Ledger data (not a private marker): the Coordinator
@@ -346,9 +400,10 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 ledger.setdefault("truncated_delegations", []).append(entry)
             logger.error(
                 "G28 delegation %s produced no conclusion after %d "
-                "truncated turns (channels=%s) — marked as a lost channel",
+                "truncated turns (channels=%s, fallback_chars=%d) — "
+                "marked as a lost channel",
                 key, entry["truncations"],
-                ",".join(entry["channels"]) or "?",
+                ",".join(entry["channels"]) or "?", entry["fallback_chars"],
             )
         except Exception:
             return None

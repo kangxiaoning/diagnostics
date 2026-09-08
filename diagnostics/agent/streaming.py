@@ -686,8 +686,13 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                                         events.append(AgentEvent("tool_args_available", {
                                             "id": tc_id, "name": tc_name, "args": tc_args,
                                         }))
-                # Also check for structured_response in updates
-                if isinstance(value, dict) and "structured_response" in value:
+                # Also check for structured_response in updates.
+                # The key alone is not enough: a guard that clears the
+                # structured response (design document §8 G27/G28) emits
+                # the key with a None value, and reporting that as
+                # "received" is exactly the false positive the guard is
+                # trying to remove.
+                if isinstance(value, dict) and value.get("structured_response") is not None:
                     sr = value["structured_response"]
                     logger.info("[round=%d] Structured response received", state.round_number)
                     events.append(AgentEvent("structured_response", _serialize_sr(sr)))

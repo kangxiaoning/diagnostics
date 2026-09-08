@@ -1367,10 +1367,17 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
         lines.append("## 委派通道无结论（输出被截断）")
         for item in truncated[-5:]:
             channels = "、".join(item.get("channels") or []) or "未知通道"
+            # fallback_chars separates "cut off inside reasoning" (0) from
+            # "left some text but never submitted a conclusion" — the
+            # text is reported as a fact and never promoted to evidence.
+            extra = (
+                f"；留有 {item.get('fallback_chars')} 字非结构化文本（未采信为结论）"
+                if item.get("fallback_chars") else ""
+            )
             lines.append(
                 f"- 第{item.get('round', 0)}轮 [{channels}]: 输出达到长度上限被截断 "
                 f"{item.get('truncations', 1)} 次（已采集 {item.get('calls', 0)} 项数据），"
-                "未返回结构化结论——该方向视为未取证，不等于「已检查且正常」"
+                f"未返回结构化结论{extra}——该方向视为未取证，不等于「已检查且正常」"
             )
         lines.append("- 下一步：缩小查询范围后重新委派该通道，或改用其他取证通道补证")
         lines.append("")

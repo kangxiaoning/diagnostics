@@ -1744,6 +1744,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # no-op for subagents (their rounds are not ledger rounds), so
         # the inherited _model_call_count never advances.
         self._subagent_call_seq: int = 0
+        # Set by for_subagent(): a delegation runs as a subgraph whose
+        # state shares no keys with the parent, so the Coordinator's live
+        # ledger (and therefore the real round number) is only reachable
+        # through this back-reference.
+        self._coordinator: Any | None = None
         # Stall guidance pending transfer: set by post-response stall
         # detection (awrap_model_call) when it wants to force the loop
         # onward; consumed by after_model, which moves it into the
@@ -1851,6 +1856,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # from the correct baseline.  before_model() is a no-op for
         # subagents, so this value won't be mutated.
         instance._model_call_count = coordinator._model_call_count
+        instance._coordinator = coordinator
         return instance
 
     def _resolve_host_name(self, value: str) -> str:
@@ -2067,11 +2073,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # Coordinator's real round plus a per-instance call
                     # sequence instead.
                     self._subagent_call_seq += 1
-                    _sub_state = getattr(request, "state", None) or {}
-                    _sub_ledger = (
-                        _sub_state.get("_diagnosis_ledger")
-                        if isinstance(_sub_state, dict) else None
-                    )
+                    # The delegation's own state has no parent keys
+                    # (subgraph state isolation), so the round number
+                    # comes from the Coordinator's live ledger via the
+                    # back-reference set in for_subagent().
+                    _sub_ledger = self._current_ledger
+                    if not isinstance(_sub_ledger, dict):
+                        _coord = getattr(self, "_coordinator", None)
+                        _sub_ledger = getattr(_coord, "_current_ledger", None)
                     _in_tok, _out_tok, _rsn_tok = extract_usage(_sub_msg)
                     logger.warning(
                         "Subagent model output truncated "
@@ -2079,7 +2088,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "subagent_call=%d, out=%s, reasoning=%s, "
                         "duration=%.1fs) — structured return may be "
                         "incomplete; check delegation",
-                        (_sub_ledger or {}).get("current_round", 0),
+                        (_sub_ledger or {}).get("current_round", 0)
+                        if isinstance(_sub_ledger, dict) else 0,
                         self._subagent_call_seq, _out_tok or "?",
                         _rsn_tok or "?",
                         round(_time_sub.monotonic() - _sub_started, 1),
