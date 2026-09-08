@@ -162,6 +162,16 @@ class DeepExpertFindings(BaseModel):
             "证据不足时说明还需什么数据。方向须与 verdict 一致"
         ),
     )
+    verdict_target: Literal["assigned_hypothesis", "alternative_root_cause"] = Field(
+        default="assigned_hypothesis",
+        description=(
+            "结论对象（v3.23.0）：assigned_hypothesis（默认——verdict 针对被指派"
+            "假设本身）/ alternative_root_cause（被指派假设不成立，但你另发现了"
+            "真正根因——此时 verdict=confirmed 表达'根因已确认'而非'假设成立'，"
+            "root_cause 填你发现的真正根因）。如实声明：Coordinator 凭此走"
+            "'排除假设 + 收录新根因'通道，refuted 不会被结论冲突门控误拦"
+        ),
+    )
     confidence: str = Field(
         default="",
         description="置信度：高/中/低 + 百分比（如 中 70%）",
@@ -252,6 +262,9 @@ _EXPERT_RETURN_SUFFIX = (
     "必须如实列出，与阳性证据同等重要，不得省略\n"
     "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向"
     "（此时假设本身不是根因）；证据不足时说明还需什么数据\n"
+    "- 结论对象: 若被指派假设不成立、但你另发现了真正根因，填 verdict_target="
+    "alternative_root_cause（verdict=confirmed 此时表达'根因已确认'而非'假设成立'，"
+    "root_cause 填真正根因）——如实声明可让 Coordinator 正确走'排除假设+收录新根因'通道\n"
     "- 置信度: {高|中|低} + 百分比"
 )
 
