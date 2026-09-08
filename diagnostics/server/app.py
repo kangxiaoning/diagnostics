@@ -242,34 +242,34 @@ def _build_augmented_message(
     lines: list[str] = ["## 诊断参数\n"]
 
     if entity_name and entity_type == "kubernetes":
-        lines.append(f"- 集群: {entity_name}")
+        lines.append(f"- cluster_name: {entity_name}")
     elif entity_name and entity_type == "host" and not hostname:
-        lines.append(f"- 主机名: {entity_name}")
+        lines.append(f"- hostname: {entity_name}")
     if hostname:
-        lines.append(f"- 主机名: {hostname}")
+        lines.append(f"- hostname: {hostname}")
     _ns = (param_overrides or {}).get("namespace", "")
     if _ns:
-        lines.append(f"- 命名空间: {_ns}")
+        lines.append(f"- namespace: {_ns}")
     _wl_type = (param_overrides or {}).get("workload_type", "")
     _wl_name = (param_overrides or {}).get("workload_name", "")
     if _wl_type and _wl_name:
-        lines.append(f"- 工作负载: {_wl_type}/{_wl_name}")
+        lines.append(f"- workload: {_wl_type}/{_wl_name}")
     elif _wl_name:
-        lines.append(f"- 工作负载: {_wl_name}")
+        lines.append(f"- workload_name: {_wl_name}")
     _pod = (param_overrides or {}).get("pod_name", "")
     if _pod:
-        lines.append(f"- Pod: {_pod}")
+        lines.append(f"- pod_name: {_pod}")
     # single_cluster 场景的节点范围（空=全集群，场景 spec §6.2）：透传给
     # argus 专家作排查范围约束
     _node_scope = (param_overrides or {}).get("node_scope") or []
     if isinstance(_node_scope, (list, tuple)) and _node_scope:
-        lines.append("- 节点范围（排查以该清单为界）: " + ", ".join(str(n) for n in _node_scope))
+        lines.append("- node_scope（排查以该清单为界）: " + ", ".join(str(n) for n in _node_scope))
     elif isinstance(_node_scope, str) and _node_scope.strip():
-        lines.append(f"- 节点范围（排查以该清单为界）: {_node_scope.strip()}")
+        lines.append(f"- node_scope（排查以该清单为界）: {_node_scope.strip()}")
     if start_time and end_time:
-        lines.append(f"- 故障时间: {start_time} ~ {end_time}")
+        lines.append(f"- fault_time_range: {start_time} ~ {end_time}")
     elif start_time:
-        lines.append(f"- 故障时间起点: {start_time}")
+        lines.append(f"- fault_time_start: {start_time}")
 
     lines.append("\n---\n")
     lines.append(f"用户问题: {user_message}")
