@@ -76,8 +76,19 @@ _ZERO_YIELD_RE = re.compile(
 )
 _ZERO_YIELD_MAX_LEN = 300
 
-# Tools that never carry diagnostic information (planner scaffolding).
-_IGNORED_TOOLS = frozenset({"write_todos", "read_todos"})
+# Tools that never carry diagnostic information (planner scaffolding), plus
+# the structured-return conclusion tools: they are the wrap-up path, not
+# evidence-gathering, so G19 must never block them.  Blocking them past the
+# hard threshold would deadlock the agent — the structured-output binding
+# forces a tool call on EVERY model turn (langchain has no reset-tool-choice
+# mechanism, unlike the reference SDK's reset_tool_choice), and the conclusion
+# tool is the only call that ends the loop with a structured_response
+# (verified 2026-09-08: a conclusion-tool call ends the agent loop in exactly
+# two model turns).
+_IGNORED_TOOLS = frozenset({
+    "write_todos", "read_todos",
+    "DeepExpertFindings", "ArgusExpertFindings",
+})
 
 # Per-instance delegation-key ledger bound.
 _MAX_TRACKED_DELEGATIONS = 64
