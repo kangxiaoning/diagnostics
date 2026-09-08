@@ -1190,8 +1190,8 @@ diagnostics/
 | 约束 | 说明 | 涉及组件 | 违反后果 |
 |------|------|----------|---------|
 | **函数名一致** | mock 和 live 工具必须用 `@tool` 注册**相同名称** | ledger(P1) | `frozenset` 硬编码工具名不匹配 → P1 阻塞失效 |
-| **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty` | dedup | 缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
-| **错误格式** | 网络超时类错误需含 `timeout` / `connection refused` | dedup | `_TOOL_FAILURE_PATTERNS` 不匹配 → 熔断器不触发 |
+| **空结果格式** | 返回"无数据"时字符串需含 `not found` / `no data` / `empty`，或返回纯空数组 `[]`（Argus 无数据契约，按空结果处理不缓存） | dedup | 缓存空结果 → 后续调用永远返回空 → 诊断死循环 |
+| **错误格式** | 传输/服务层失败需含 `timeout` / `connection refused` / `查询失败` / `执行失败`（生产契约：Argus 异常→"Argus查询失败"、OSP 异常→"脚本执行失败"、api server 失败→"k8s脚本执行失败"）；业务确定性错误（如 `not found`）不属此类 | dedup | `_TOOL_FAILURE_PATTERNS` 不匹配 → 失败被当成功缓存、熔断器不触发 |
 
 ### 工具参数签名对照
 
