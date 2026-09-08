@@ -18,6 +18,9 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, StateBacken
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
+from diagnostics.agent.expert_guidance_middleware import ExpertGuidanceMiddleware
+from diagnostics.agent.expert_novelty_gate import ExpertNoveltyGateMiddleware
+from diagnostics.agent.expert_session_ledger import ExpertSessionLedger
 from diagnostics.agent.expert_stall_watchdog import ExpertStallWatchdogMiddleware
 from diagnostics.agent.file_tool_governance import ExpertFileToolGovernanceMiddleware
 from diagnostics.agent.ledger import (
@@ -246,11 +249,14 @@ _EXPERT_RETURN_SUFFIX = (
     "- grep 检索多个关键字时必须用一条正则一次完成（如 `OOM|panic|killed`），"
     "禁止对同一路径逐关键字多次 grep（同路径第 2 次起系统将提示，第 3 次起"
     "双倍计入读取预算）。\n"
-    "\n**工具调用预算与停止条件（严格遵守）**:\n"
+    "\n**工具调用预算与停止条件**:\n"
     "- 系统对工具调用总量设有预算（执行若干次后系统提醒，达到上限将强制收尾）"
     "——请在预算内优先完成关键取证，收益递减时立即收尾\n"
-    "- 收益递减时立即停止：当连续 2 次工具调用未获得新证据时，直接返回已有结论\n"
-    "- 关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
+    "- 系统对低信息增量调用设有检测：同一工具连续返回与已有结果高度相似的数据时，"
+    "将被提示收尾直至拦截——取证遇阻时优先换**新维度**（不同工具/不同观测视角），"
+    "而非换措辞重试同类查询\n"
+    "- 系统每轮会注入你的取证进展（已覆盖维度/连续无数据方向/剩余预算）——"
+    "据此规划下一步：关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
     "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
     "- 交付方式：当你看到工具列表中带有 `DeepExpertFindings`（结构化结论工具）时，"
     "证据收齐后调用它返回结构化 JSON（verdict/key_evidence/negative_evidence/root_cause/confidence），"
@@ -876,11 +882,27 @@ def build_agent(
     # (outer-layer rejections have their own escalation ladders).
     stall_watchdog = ExpertStallWatchdogMiddleware()
 
+    # Expert session ledger (design document §9, v3.24.0): per-delegation
+    # deterministic progress state — ONE store consumed by both the
+    # proactive guidance injection and the reactive novelty gate (G26),
+    # so book keeping happens once and every consumer reads the same
+    # truth.  Stack order: the gate sits OUTSIDE the guidance recorder
+    # so gate-blocked calls never pollute dimension coverage; both sit
+    # after dedup/governance/G19 so they only observe genuinely-executed
+    # calls (outer-layer rejections have their own escalation ladders).
+    expert_sessions = ExpertSessionLedger()
+    novelty_gate = ExpertNoveltyGateMiddleware(expert_sessions)
+    guidance = ExpertGuidanceMiddleware(expert_sessions)
+    guidance.bind_dedup(dedup_subagent)
+
     # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
     # Governance runs before ledger so denied calls skip ledger bookkeeping.
-    _subagent_middleware = [dedup_subagent, governance_subagent, stall_watchdog, subagent_ledger]
+    _subagent_middleware = [
+        dedup_subagent, governance_subagent, stall_watchdog,
+        novelty_gate, guidance, subagent_ledger,
+    ]
     for sa in subagent_configs:
         sa["middleware"] = list(_subagent_middleware)
 
