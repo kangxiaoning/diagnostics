@@ -758,19 +758,12 @@ def _build_subagents(
     # experts return metrics findings; deep experts return verdict +
     # evidence.  Coordinator-side parsing (ledger_middleware) reads these
     # fields; the text return contract remains the degraded fallback.
-    # ON by default — no configuration is needed after porting.  Set
-    # DIAGNOSTICS_EXPERT_RESPONSE_FORMAT=off only to downgrade to the
-    # prompt-level JSON contract on backends that cannot honor
-    # tool_choice="required" (langchain's ToolStrategy forces it on every
-    # expert model turn; e.g. DeepSeek's hosted API rejects it while thinking
-    # mode is on — verified 2026-09-08).
-    if os.getenv("DIAGNOSTICS_EXPERT_RESPONSE_FORMAT", "on").strip().lower() != "off":
-        for _sa in subagents:
-            _sa["response_format"] = (
-                ArgusExpertFindings
-                if _sa["name"].endswith("-argus-expert")
-                else DeepExpertFindings
-            )
+    for _sa in subagents:
+        _sa["response_format"] = (
+            ArgusExpertFindings
+            if _sa["name"].endswith("-argus-expert")
+            else DeepExpertFindings
+        )
 
     return subagents
 
