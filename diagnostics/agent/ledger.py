@@ -1355,6 +1355,26 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                 lines.append(f"- 已委派专家: {', '.join(sorted(delegated))}")
             lines.append("")
 
+    # ── Truncated delegations (design document §8 G28) ──
+    # An expert whose final output hit the output-length cap never
+    # produced a structured conclusion — the Coordinator received a
+    # fallback text instead.  Rendered explicitly so a lost channel can
+    # never be read as "this direction was checked and looked clean",
+    # which is how a truncated k8s-argus-expert return (a stray
+    # "缺少主机名" fragment) was interpreted on 2026-09-08.
+    truncated = ledger.get("truncated_delegations") or []
+    if truncated:
+        lines.append("## 委派通道无结论（输出被截断）")
+        for item in truncated[-5:]:
+            channels = "、".join(item.get("channels") or []) or "未知通道"
+            lines.append(
+                f"- 第{item.get('round', 0)}轮 [{channels}]: 输出达到长度上限被截断 "
+                f"{item.get('truncations', 1)} 次（已采集 {item.get('calls', 0)} 项数据），"
+                "未返回结构化结论——该方向视为未取证，不等于「已检查且正常」"
+            )
+        lines.append("- 下一步：缩小查询范围后重新委派该通道，或改用其他取证通道补证")
+        lines.append("")
+
     # Current step guidance
     guidance = _phase_guidance(phase, ledger, report_path)
     if guidance:

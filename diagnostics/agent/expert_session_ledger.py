@@ -154,6 +154,10 @@ _MAX_FINGERPRINTS_PER_TOOL = 8
 # injected state must never bury the one action that matters; Anthropic
 # context engineering — smallest set of high-signal tokens).
 _GUIDANCE_MAX_CHARS = 400
+# Truncation records kept per delegation (G28).  The bounded resubmit
+# allows at most two truncated turns, so 4 is headroom for diagnostics
+# without unbounded growth.
+_MAX_TRUNCATIONS_PER_DELEGATION = 4
 
 
 def _env_int(name: str, default: int) -> int:
@@ -196,6 +200,12 @@ class ExpertSessionLedger:
                 "tools": [],            # last tool names seen (model request)
                 "conclusion_hinted": False,  # G27 one-time bounce latch
                 "pending_guidance": "",      # G27 guidance awaiting injection
+                # G28: output-length truncations observed for this
+                # delegation.  A truncated turn never produces a
+                # structured conclusion — the ToolMessage the Coordinator
+                # receives is a fallback text, not evidence.
+                "truncations": [],           # [{out, reasoning, duration_s, channels}]
+                "truncation_reported": False,  # degraded path surfaced once
             }
             self._sessions[key] = s
         self._sessions.move_to_end(key)
@@ -272,6 +282,31 @@ class ExpertSessionLedger:
         g = s["pending_guidance"]
         s["pending_guidance"] = ""
         return g
+
+    # ── output-truncation state (G28) ──
+    # Bookkept per delegation key: the middleware instance is a factory
+    # singleton shared by every expert, so a global counter would cross
+    # attribute one delegation's truncation to another (the parallel
+    # delegation case that G19/G26 already guard against).
+
+    def record_truncation(self, key: str, info: dict[str, Any]) -> int:
+        """Record one length-truncated model turn; returns the count."""
+        s = self.session(key)
+        s["truncations"].append(info)
+        del s["truncations"][:-_MAX_TRUNCATIONS_PER_DELEGATION]
+        return len(s["truncations"])
+
+    def truncation_count(self, key: str) -> int:
+        return len(self.session(key)["truncations"])
+
+    def truncations(self, key: str) -> list[dict[str, Any]]:
+        return list(self.session(key)["truncations"])
+
+    def truncation_reported(self, key: str) -> bool:
+        return self.session(key)["truncation_reported"]
+
+    def mark_truncation_reported(self, key: str) -> None:
+        self.session(key)["truncation_reported"] = True
 
     # ── derived views ──
 

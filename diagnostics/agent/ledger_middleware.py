@@ -78,6 +78,11 @@ from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
 from deepagents.middleware._utils import append_to_system_message
 
+from diagnostics.agent.model_usage import (
+    extract_usage,
+    finish_reason_of,
+    first_truncated,
+)
 from diagnostics.agent.topology_render import (
     build_argus_context_view,
     build_dedicated_host_views,
@@ -1735,6 +1740,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         )
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
+        # Subagent-only call counter for log triage: before_model is a
+        # no-op for subagents (their rounds are not ledger rounds), so
+        # the inherited _model_call_count never advances.
+        self._subagent_call_seq: int = 0
         # Stall guidance pending transfer: set by post-response stall
         # detection (awrap_model_call) when it wants to force the loop
         # onward; consumed by after_model, which moves it into the
@@ -2038,30 +2047,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Subagent: skip ledger context injection and safety warnings.
         # The Coordinator already passes relevant context via task() description.
         if self._is_subagent:
+            import time as _time_sub
+            _sub_started = _time_sub.monotonic()
             _resp = await handler(request)
-            # ── Truncation observability (design document §8 G13 context,
-            # 2026-08-11 scenario 38) ──
-            # reasoning-stream truncation (finish_reason=length) silently
-            # drops the subagent's structured return (content=0B → the
-            # decisive evidence never reaches the Coordinator).  Warn so
-            # the post-hoc analysis can distinguish "expert found nothing"
-            # from "expert output was cut off".
+            # ── Truncation observability (design document §8 G28; first
+            # added 2026-08-11 for scenario 38) ──
+            # A length-truncated turn silently drops the subagent's
+            # structured return (content=0B → the decisive evidence never
+            # reaches the Coordinator).  Warn so the post-hoc analysis can
+            # distinguish "expert found nothing" from "expert output was
+            # cut off".  Recovery itself lives in the expert guidance
+            # middleware, which owns the per-delegation latch.
             try:
-                _rlist = (
-                    _resp.result
-                    if isinstance(_resp.result, list)
-                    else [_resp.result]
-                )
-                for _m in _rlist:
-                    _rm = getattr(_m, "response_metadata", None) or {}
-                    if _rm.get("finish_reason") == "length":
-                        logger.warning(
-                            "Subagent model output truncated "
-                            "(finish_reason=length, round %d) — structured "
-                            "return may be incomplete; check delegation",
-                            self._model_call_count,
-                        )
-                        break
+                _sub_msg = first_truncated(_resp)
+                if _sub_msg is not None:
+                    # before_model is a no-op for subagents, so
+                    # _model_call_count stays at the value inherited at
+                    # build time and is useless for triage; report the
+                    # Coordinator's real round plus a per-instance call
+                    # sequence instead.
+                    self._subagent_call_seq += 1
+                    _sub_state = getattr(request, "state", None) or {}
+                    _sub_ledger = (
+                        _sub_state.get("_diagnosis_ledger")
+                        if isinstance(_sub_state, dict) else None
+                    )
+                    _in_tok, _out_tok, _rsn_tok = extract_usage(_sub_msg)
+                    logger.warning(
+                        "Subagent model output truncated "
+                        "(finish_reason=length, coordinator_round=%d, "
+                        "subagent_call=%d, out=%s, reasoning=%s, "
+                        "duration=%.1fs) — structured return may be "
+                        "incomplete; check delegation",
+                        (_sub_ledger or {}).get("current_round", 0),
+                        self._subagent_call_seq, _out_tok or "?",
+                        _rsn_tok or "?",
+                        round(_time_sub.monotonic() - _sub_started, 1),
+                    )
             except Exception:
                 pass  # observability only — never crash the subagent
             return _resp
@@ -2259,26 +2281,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _tokens_in = 0
             _tokens_out = 0
             _tokens_reason = 0
+            _finish_reason = ""
             try:
-                result_list = (
-                    response.result
-                    if isinstance(response.result, list)
-                    else [response.result]
-                )
-                for _m in result_list:
-                    _um = getattr(_m, "usage_metadata", None) or {}
-                    _tokens_in += int(_um.get("input_tokens", 0))
-                    _tokens_out += int(_um.get("output_tokens", 0))
-                    _rm = getattr(_m, "response_metadata", None) or {}
-                    _tok = _rm.get("token_usage", {}) or {}
-                    _tokens_in += int(_tok.get("prompt_tokens", 0))
-                    _tokens_out += int(_tok.get("completion_tokens", 0))
-                    # reasoning tokens (OpenAI o1-style models)
-                    _tokens_reason += int(
-                        _um.get("output_token_details", {}).get(
-                            "reasoning_tokens", 0,
-                        )
-                    )
+                for _m in (response.result if isinstance(response.result, list)
+                           else [response.result]):
+                    _in, _out, _rsn = extract_usage(_m)
+                    _tokens_in += _in
+                    _tokens_out += _out
+                    _tokens_reason += _rsn
+                    if not _finish_reason:
+                        _finish_reason = finish_reason_of(_m)
             except Exception:
                 pass  # non-critical; skip token extraction on failure
             self._round_metrics.append({
@@ -2288,6 +2300,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "input_tokens": _tokens_in,
                 "output_tokens": _tokens_out,
                 "reasoning_tokens": _tokens_reason,
+                "finish_reason": _finish_reason,
             })
             # Sync metrics to ledger for persistence
             if self._current_ledger:
@@ -2308,11 +2321,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         for r in self._round_metrics
                     ),
                 }
-            if _tokens_in or _tokens_out:
-                logger.debug(
-                    "Round %d metrics: %.1fs, in=%d out=%d reason=%d",
-                    self._model_call_count, _duration,
-                    _tokens_in, _tokens_out, _tokens_reason,
+            # Always logged: zeros are themselves the signal (the backend
+            # reported no usage, so output-budget pressure is invisible).
+            logger.debug(
+                "Round %d metrics: %.1fs, in=%d out=%d reason=%d finish=%s",
+                self._model_call_count, _duration,
+                _tokens_in, _tokens_out, _tokens_reason,
+                _finish_reason or "?",
+            )
+            # ── Coordinator-side truncation observability (§8 G28) ──
+            # The report turn is the longest generation in a session; a
+            # length-truncated response silently yields a half report
+            # with no error anywhere — the same failure class as the
+            # subagent case, previously unobserved on this path.
+            if _finish_reason == "length":
+                logger.warning(
+                    "Coordinator model output truncated "
+                    "(finish_reason=length, round %d, phase=%s, out=%s, "
+                    "duration=%.1fs) — response incomplete",
+                    self._model_call_count, _phase(ledger),
+                    _tokens_out or "?", _duration,
                 )
         else:
             # ── G7 fallback: every attempt failed ──

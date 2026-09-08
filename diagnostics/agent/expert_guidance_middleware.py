@@ -49,8 +49,26 @@ from diagnostics.agent.expert_stall_watchdog import (
     _total_hard,
     _total_soft,
 )
+from diagnostics.agent.model_usage import extract_usage, first_truncated
 
 logger = logging.getLogger(__name__)
+
+
+def _channels(tool_names: list[str]) -> list[str]:
+    """Observability channel labels derived from the bound toolset.
+
+    The subagent's own name is not visible inside the middleware, but
+    every Argus expert binds ``query_argus_<domain>_*`` tools, so the
+    domain identifies the channel for logs and for the Coordinator-facing
+    degradation note.
+    """
+    domains: list[str] = []
+    for name in tool_names or []:
+        parts = name.split("_")
+        if len(parts) >= 3 and parts[0] == "query" and parts[1] == "argus":
+            if parts[2] not in domains:
+                domains.append(parts[2])
+    return domains or [n for n in (tool_names or [])[:3]]
 
 
 # Tools that never carry diagnostic information into the ledger:
@@ -150,7 +168,22 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                         request.system_message, "\n".join(parts)))
         except Exception:
             pass  # guidance must never become a failure source
-        return await handler(request)
+        import time as _time
+        _started = _time.monotonic()
+        response = await handler(request)
+        # ── G28: record length-truncated turns ──
+        # The recovery decision runs in after_model, which has no
+        # ModelRequest and therefore no access to the response: the
+        # truncation must be detected here and bookkept per delegation
+        # key (the instance is shared across experts).
+        try:
+            self._record_truncation(
+                self._delegation_key(request), response,
+                round(_time.monotonic() - _started, 1),
+            )
+        except Exception:
+            pass  # recovery bookkeeping must never break the model call
+        return response
 
     # ── consumer C: coverage-aware conclusion checkpoint (G27) ──
     # The structured-return conclusion tools never pass through
@@ -174,7 +207,12 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         try:
             sr = state.get("structured_response") if isinstance(state, dict) else None
             if sr is None:
-                return None
+                # ── G28: length-truncated turn ──
+                # No structured conclusion was parsed — most likely the
+                # response hit the output cap.  Bounce once for a minimal
+                # resubmission instead of letting the delegation end with
+                # a fallback text the Coordinator cannot classify.
+                return self._truncation_recovery(state)
             key = self._key_from_state(state)
             s = self._ledger.session(key)
             # Pass-through conditions (any one skips the checkpoint):
@@ -214,3 +252,103 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             return {"jump_to": "model", "structured_response": None}
         except Exception:
             return None  # the checkpoint must never break the wrap-up path
+
+    # ── G28: output-length truncation recovery ──────────────────────────
+    # A length-truncated turn produces no structured_response, so the
+    # model node's structured-output path silently falls back to the last
+    # non-empty message text — a fragment that the Coordinator reads as
+    # the expert's conclusion (observed 2026-09-08: a truncated
+    # k8s-argus-expert came back as "【需要参数】缺少主机名", i.e. the
+    # opposite of what it had actually found).  Two deterministic stages:
+    #   1. one bounded resubmit — same evidence, minimal field set;
+    #   2. still truncated → mark the delegation as "no conclusion" in
+    #      the shared ledger so the Coordinator sees a lost channel, not
+    #      a clean "nothing found".
+    # Both stages reuse G27's one-time latch (conclusion_hinted), so a
+    # delegation costs at most one extra model turn in total and the
+    # loop provably terminates (0 extra tool calls).
+
+    def _record_truncation(self, key: str, response: Any,
+                           duration_s: float) -> None:
+        """Bookkeep one length-truncated turn (observability + recovery)."""
+        message = first_truncated(response)
+        if message is None:
+            return
+        _in_tok, out_tok, reason_tok = extract_usage(message)
+        channels = _channels(self._ledger.session(key).get("tools") or [])
+        count = self._ledger.record_truncation(key, {
+            "out": out_tok,
+            "reasoning": reason_tok,
+            "duration_s": duration_s,
+            "channels": channels,
+        })
+        logger.warning(
+            "G28 expert output truncated (finish_reason=length, "
+            "delegation %s, occurrence %d, out=%s, reasoning=%s, "
+            "duration=%.1fs, channels=%s) — no structured conclusion; "
+            "requesting a minimal resubmission",
+            key, count, out_tok or "?", reason_tok or "?",
+            duration_s, ",".join(channels) or "?",
+        )
+
+    def _truncation_recovery(self, state: Any) -> dict | None:
+        """Bounce a truncated delegation once; degrade on the second miss."""
+        try:
+            key = self._key_from_state(state)
+            if not self._ledger.truncation_count(key):
+                return None
+            s = self._ledger.session(key)
+            # Nothing was ever collected: a resubmit would add a turn
+            # without evidence (same pass-through rule as G27).
+            if not s["calls"]:
+                return None
+            if self._ledger.conclusion_hinted(key):
+                # The one bounce was already spent (by G27 or by G28);
+                # the second truncation is terminal — degrade instead of
+                # looping.
+                self._report_truncated_delegation(state, key)
+                return None
+            guidance = (
+                "[系统提示·输出被截断] 上一次输出达到长度上限，结构化结论未生成——"
+                f"已采集的 {len(s['calls'])} 项取证数据仍在上下文中，无需重新查询。"
+                "请立即提交**精简结论**：只填写 verdict / key_evidence / "
+                "negative_evidence 三个字段，每字段不超过 40 字，其余字段留空。"
+            )
+            self._ledger.mark_conclusion_hinted(key, guidance)
+            logger.warning(
+                "G28 conclusion checkpoint: delegation %s bounced once "
+                "for a minimal resubmission (%d executed calls retained)",
+                key, len(s["calls"]),
+            )
+            return {"jump_to": "model"}
+        except Exception:
+            return None  # the recovery must never break the wrap-up path
+
+    def _report_truncated_delegation(self, state: Any, key: str) -> None:
+        """Surface a lost channel to the Coordinator (once per delegation)."""
+        try:
+            if self._ledger.truncation_reported(key):
+                return
+            self._ledger.mark_truncation_reported(key)
+            s = self._ledger.session(key)
+            entry = {
+                "delegation": key,
+                "channels": _channels(s.get("tools") or []),
+                "truncations": self._ledger.truncation_count(key),
+                "calls": len(s["calls"]),
+            }
+            ledger = state.get("_diagnosis_ledger") if isinstance(state, dict) else None
+            if isinstance(ledger, dict):
+                entry["round"] = ledger.get("current_round", 0)
+                # Ledger data (not a private marker): the Coordinator
+                # renders it, so "channel lost" can never be read as
+                # "channel found nothing".
+                ledger.setdefault("truncated_delegations", []).append(entry)
+            logger.error(
+                "G28 delegation %s produced no conclusion after %d "
+                "truncated turns (channels=%s) — marked as a lost channel",
+                key, entry["truncations"],
+                ",".join(entry["channels"]) or "?",
+            )
+        except Exception:
+            return None
