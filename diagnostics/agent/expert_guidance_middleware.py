@@ -36,6 +36,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 from deepagents.middleware._utils import append_to_system_message
 
+from diagnostics.agent.delegation_key import delegation_key
 from diagnostics.agent.expert_novelty_gate import (
     _hard_threshold as _g26_hard,
 )
@@ -131,17 +132,12 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
 
     @staticmethod
     def _key_from_state(state: Any) -> str:
-        """Same derivation as G19/G11/G24: each delegation is a fresh
-        agent invocation whose first HumanMessage carries the task
-        description — hashing it separates concurrent/stale delegations
-        deterministically (the middleware instance is a factory
-        singleton shared across all delegations)."""
-        messages = state.get("messages", []) if isinstance(state, dict) else []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                return f"del:{hash(content[:800])}"
-        return "del:unknown"
+        """Same derivation as G11/G19/G24/G26 (shared helper): each
+        delegation is a fresh agent invocation whose first HumanMessage
+        carries the task description — keying on it separates
+        concurrent/stale delegations deterministically (the middleware
+        instance is a factory singleton shared across all delegations)."""
+        return delegation_key(state)
 
     @classmethod
     def _delegation_key(cls, request: Any) -> str:

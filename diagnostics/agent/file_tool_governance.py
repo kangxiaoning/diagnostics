@@ -43,7 +43,6 @@ internals.  Maps are LRU-bounded.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -55,6 +54,8 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
+
+from diagnostics.agent.delegation_key import delegation_key_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -150,21 +151,15 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
 
     @staticmethod
     def _delegation_key(request: ToolCallRequest) -> str:
-        """Hash of the delegation's initial HumanMessage (= task description).
+        """Shared derivation (G19/G24/G26/guidance): keyed on the
+        delegation's initial HumanMessage (= task description).
 
         Each task() invocation seeds the subagent state with exactly one
         HumanMessage holding the (unique) delegation instruction, so its
-        hash isolates concurrent delegations.  Fallback "_unknown" shares
-        one bucket — conservative but safe.
+        content isolates concurrent delegations.  Fallback "del:unknown"
+        shares one bucket — conservative but safe.
         """
-        try:
-            for msg in (request.state or {}).get("messages") or []:
-                if getattr(msg, "type", None) == "human":
-                    text = str(getattr(msg, "content", ""))
-                    return hashlib.sha1(text.encode()).hexdigest()[:16]
-        except Exception:
-            pass
-        return "_unknown"
+        return delegation_key_from_request(request)
 
     @staticmethod
     def _bucket(od: OrderedDict, key: str, default: Any) -> Any:

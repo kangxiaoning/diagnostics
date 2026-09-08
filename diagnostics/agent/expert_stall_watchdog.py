@@ -43,7 +43,9 @@ from collections import OrderedDict
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
+
+from diagnostics.agent.delegation_key import delegation_key_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -149,17 +151,11 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
 
     @staticmethod
     def _delegation_key(request: Any) -> str:
-        """Same derivation as the file-governance middleware: each expert
-        delegation is its own agent invocation whose first HumanMessage
-        carries the task description, so hashing the first HumanMessage
+        """Same derivation as G11/G24/G26/guidance (shared helper): each
+        expert delegation is its own agent invocation whose first
+        HumanMessage carries the task description, so keying on it
         separates concurrent/stale delegations deterministically."""
-        state = getattr(request, "state", None) or {}
-        messages = state.get("messages", []) if isinstance(state, dict) else []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                return f"del:{hash(content[:800])}"
-        return "del:unknown"
+        return delegation_key_from_request(request)
 
     def _get_streak(self, key: str) -> int:
         streak = self._streaks.get(key, 0)

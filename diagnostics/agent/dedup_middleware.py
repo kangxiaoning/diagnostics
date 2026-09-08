@@ -11,7 +11,8 @@ This middleware:
    hits escalate deterministically in EVERY agent context — 1st hit returns
    data + three-way guidance, 2nd hit is hard-blocked; counters are shared
    across instances but isolated per context (Coordinator session / expert
-   delegation by first-HumanMessage hash, same derivation as G19/G11)
+   delegation by the delegation's first HumanMessage — shared derivation
+   with G11/G19/G26 and the guidance injector)
 6. Proactive reminder (G24 L1): once a hit occurred in this context, a
    one-line system reminder is injected into subsequent model calls
 
@@ -33,12 +34,14 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from deepagents.backends.protocol import BackendProtocol, ReadResult
 from deepagents.middleware._utils import append_to_system_message
+
+from diagnostics.agent.delegation_key import delegation_key_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -287,22 +290,19 @@ class ToolDedupMiddleware(AgentMiddleware):
         """Context key for repeat-hit counters (G24).
 
         Coordinator → fixed key (its context IS the whole session, so
-        cross-round accumulation is correct).  Expert instances → first
-        HumanMessage hash, same derivation as G19/G11: subagent middleware
+        cross-round accumulation is correct).  Expert instances → the
+        delegation's first HumanMessage (shared derivation with
+        G11/G19/G26 and the guidance injector): subagent middleware
         instances are shared across all delegations, and each delegation
         is a fresh agent invocation whose first HumanMessage carries the
-        task description — hashing it separates concurrent/stale
+        task description — keying on it separates concurrent/stale
         delegations deterministically.
         """
         if not self._is_subagent:
             return "coordinator"
-        state = getattr(request, "state", None) or {}
-        messages = state.get("messages", []) if isinstance(state, dict) else []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                return f"del:{hash(content[:800])}"
-        return "del:unknown"
+        # Shared derivation (G11/G19/G26/guidance): the guidance middleware
+        # reads these counters with the same key, so it must not diverge.
+        return delegation_key_from_request(request)
 
     def _dedup_hit_result(
         self,

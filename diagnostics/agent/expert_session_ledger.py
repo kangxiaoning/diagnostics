@@ -196,7 +196,7 @@ class ExpertSessionLedger:
                 "covered": set(),       # dims with ≥1 yielding call
                 "dim_streaks": {},      # dim → consecutive zero-yield count
                 "novelty_streak": 0,    # G26 consecutive low-gain count
-                "fps": {},              # G26: tool → [(struct_hash, tokens)]
+                "fps": {},              # G26: tool → [(struct_digest, tokens)]
                 "tools": [],            # last tool names seen (model request)
                 "conclusion_hinted": False,  # G27 one-time bounce latch
                 "pending_guidance": "",      # G27 guidance awaiting injection
@@ -243,10 +243,10 @@ class ExpertSessionLedger:
     def reset_novelty(self, key: str) -> None:
         self.session(key)["novelty_streak"] = 0
 
-    def fingerprints(self, key: str, tool: str) -> list[tuple[int, frozenset]]:
+    def fingerprints(self, key: str, tool: str) -> list[tuple[bytes, frozenset]]:
         return self.session(key)["fps"].get(tool, [])
 
-    def add_fingerprint(self, key: str, tool: str, struct_hash: int,
+    def add_fingerprint(self, key: str, tool: str, struct_hash: bytes,
                         tokens: frozenset) -> None:
         fps = self.session(key)["fps"].setdefault(tool, [])
         fps.append((struct_hash, tokens))

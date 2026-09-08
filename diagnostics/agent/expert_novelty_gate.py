@@ -48,14 +48,16 @@ whose yield no longer covers its cost should be abandoned.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 
+from diagnostics.agent.delegation_key import delegation_key_from_request
 from diagnostics.agent.expert_session_ledger import ExpertSessionLedger
 from diagnostics.agent.expert_stall_watchdog import _is_zero_yield
 
@@ -97,12 +99,18 @@ _WS_RE = re.compile(r"\s+")
 _FP_INPUT_CAP = 60000
 
 
-def _struct_hash(text: str) -> int:
-    """Digit/whitespace-normalised template hash (same shape ⇒ same
-    hash, regardless of the concrete values)."""
+def _struct_hash(text: str) -> bytes:
+    """Digit/whitespace-normalised template digest (same shape ⇒ same
+    digest, regardless of the concrete values).
+
+    A stable digest rather than the built-in ``hash()``, which is salted
+    per process: a fingerprint must mean the same thing in every run,
+    for the same reason the delegation key is stable (delegation_key.py).
+    """
     norm = _DIGIT_RUN_RE.sub("N", text[:_FP_INPUT_CAP])
     norm = _WS_RE.sub(" ", norm)
-    return hash(norm)
+    return hashlib.blake2b(norm.encode("utf-8", "replace"),
+                           digest_size=8).digest()
 
 
 def _tokens(text: str) -> frozenset:
@@ -139,14 +147,8 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
 
     @staticmethod
     def _delegation_key(request: Any) -> str:
-        """Same derivation as G19/G11/G24 (first-HumanMessage hash)."""
-        state = getattr(request, "state", None) or {}
-        messages = state.get("messages", []) if isinstance(state, dict) else []
-        for msg in messages:
-            if isinstance(msg, HumanMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                return f"del:{hash(content[:800])}"
-        return "del:unknown"
+        """Same derivation as G11/G19/G24/guidance (shared helper)."""
+        return delegation_key_from_request(request)
 
     async def awrap_tool_call(self, request, handler):
         tool_call = getattr(request, "tool_call", None) or {}
@@ -156,18 +158,23 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
 
         key = self._delegation_key(request)
         streak = self._ledger.novelty_streak(key)
+        soft, hard = _soft_threshold(), _hard_threshold()
+        sim_threshold = _similarity_threshold()
 
-        if streak >= _hard_threshold():
-            tool_call_id = tool_call.get("id") or f"nov_{abs(hash(key))}"
+        if streak >= hard:
+            # Fallback id reuses the key's stable digest — readable and
+            # process-independent (the built-in hash() is salted).
+            tool_call_id = tool_call.get("id") or f"nov_{key.split(':')[1]}"
             logger.warning(
-                "G26 hard block: expert delegation %s tool %s — %d "
-                "consecutive low-gain calls; mandatory wrap-up",
-                key, tool_name, streak,
+                "G26 hard block: delegation %s tool %s — %d consecutive "
+                "low-gain calls (soft=%d/hard=%d); mandatory wrap-up",
+                key, tool_name, streak, soft, hard,
             )
             return ToolMessage(
                 content=(
                     f"⛔ 系统强制收尾（低信息增量防护）：已连续 {streak} 次调用"
-                    "返回与已有结果高度相似的数据（同形态、内容重合≥90%）——"
+                    f"返回与已有结果高度相似的数据（同形态、内容重合≥"
+                    f"{int(sim_threshold * 100)}%）——"
                     "继续同类调用的边际信息已低于成本。\n"
                     "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
                     "（如实说明数据缺口与置信度），结束本次委派。"
@@ -189,11 +196,18 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
 
         struct_hash = _struct_hash(content)
         tokens = _tokens(content)
-        sim_threshold = _similarity_threshold()
-        low_gain = any(
-            h == struct_hash and _jaccard(tokens, t) >= sim_threshold
-            for h, t in self._ledger.fingerprints(key, tool_name)
-        )
+        # Track the best match (not just "any") so the log line can name
+        # the similarity actually measured — a bare hit/miss gives an
+        # operator no way to tell a true repeat from a threshold artifact.
+        best_sim, best_idx = 0.0, -1
+        for idx, (h, t) in enumerate(
+                self._ledger.fingerprints(key, tool_name)):
+            if h != struct_hash:
+                continue
+            sim = _jaccard(tokens, t)
+            if sim > best_sim:
+                best_sim, best_idx = sim, idx
+        low_gain = best_sim >= sim_threshold
         self._ledger.add_fingerprint(key, tool_name, struct_hash, tokens)
 
         if not low_gain:
@@ -202,10 +216,11 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
             return result
 
         streak = self._ledger.bump_novelty(key)
-        if streak == _soft_threshold():
+        if streak == soft:
             guidance = (
                 f"\n\n[系统提示·低信息增量防护] 最近 {streak} 次调用返回的数据"
-                "与已有结果高度相似（同形态、内容重合≥90%），未带来新证据。\n"
+                f"与已有结果高度相似（同形态、内容重合≥{int(sim_threshold * 100)}%"
+                "），未带来新证据。\n"
                 "请盘点已采集证据：足够置信判断则立即输出结论；仍有明确缺口则换"
                 "一个**新维度**（不同工具/不同观测视角）取证，而非换措辞重试同类"
                 "查询。持续低增量调用将被系统强制收尾。"
@@ -217,11 +232,16 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
                 status=getattr(result, "status", "success"),
             )
             logger.warning(
-                "G26 soft warning: expert delegation %s — %d consecutive "
-                "low-gain calls", key, streak,
+                "G26 soft warning: delegation %s tool %s — %d consecutive "
+                "low-gain calls (soft=%d/hard=%d, sim=%.2f >= %.2f, fp#%d)",
+                key, tool_name, streak, soft, hard,
+                best_sim, sim_threshold, best_idx,
             )
         else:
             logger.info(
-                "G26 streak: delegation %s low-gain streak=%d", key, streak,
+                "G26 streak: delegation %s tool %s low-gain streak=%d "
+                "(soft=%d/hard=%d, sim=%.2f >= %.2f, fp#%d)",
+                key, tool_name, streak, soft, hard,
+                best_sim, sim_threshold, best_idx,
             )
         return result
