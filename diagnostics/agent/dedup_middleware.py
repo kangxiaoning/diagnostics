@@ -79,7 +79,13 @@ _TOOL_FAILURE_PATTERNS = re.compile(
     r"timeout|timed out|connection refused|connection reset|"
     r"network (is )?unreachable|no route to host|"
     r"OSP.*(?:fail|error|timeout)|remote.*(?:fail|error|timeout)|"
-    r"channel closed|broken pipe",
+    r"channel closed|broken pipe|"
+    # Production tool-contract failure markers (v3.22.2): Argus service
+    # errors ("Argus查询失败"), OSP script dispatch errors ("脚本执行失败"),
+    # kube-apiserver call errors ("k8s脚本执行失败").  These are
+    # closed-vocabulary service-contract markers, not open-ended keyword
+    # semantics (the S1 rejection does not apply to closed contracts).
+    r"查询失败|执行失败",
     re.IGNORECASE,
 )
 
@@ -89,7 +95,10 @@ _TOOL_FAILURE_PATTERNS = re.compile(
 # data, preventing recovery.
 
 _EMPTY_PATTERNS = re.compile(
-    r"not found|no data|no results|error|空",
+    # The anchored "^\\[\\]$" matches a bare empty JSON array — the Argus
+    # "service healthy, no data" contract (v3.22.2).  Anchors keep real
+    # payloads that merely contain "[]" from matching.
+    r"not found|no data|no results|error|空|^\s*\[\s*\]\s*$",
     re.IGNORECASE,
 )
 
@@ -231,20 +240,40 @@ class ToolDedupMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
         cache_key: str,
+        fail_base: int = 0,
     ) -> ToolMessage | Command:
-        """Execute tool call and populate cache for both memory and backend."""
+        """Execute tool call and populate cache for both memory and backend.
+
+        fail_base: consecutive-failure count carried over from a previous
+        execution of the same cache key (real-retry path) — a retry that
+        fails again accumulates to fail_base+1; a retry that recovers
+        resets to 0.
+        """
         result = await handler(request)
 
         if isinstance(result, ToolMessage):
             content = result.content if isinstance(result.content, str) else str(result.content)
 
-            if not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
+            # Failure classification order (v3.22.2): transport/service
+            # failure FIRST — a short network error (e.g. "error:
+            # connection timeout", <50 chars) must reach the circuit
+            # breaker instead of being swallowed by the empty-result
+            # guard below.  The old order made the breaker unreachable
+            # for short error messages: they were never cached, so every
+            # identical re-issue executed for real, unthrottled.
+            if _is_tool_failure(content):
+                self._tool_call_cache[cache_key] = (result, fail_base + 1)
+            elif not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
+                # Non-failure empty/no-data result: never cached, so the
+                # agent may retry or widen the query (caching it would
+                # lock every later identical call onto the same void).
                 logger.debug("Skipped caching empty/error result: %s", cache_key)
             else:
-                fail_count = 1 if _is_tool_failure(content) else 0
-                self._tool_call_cache[cache_key] = (result, fail_count)
+                self._tool_call_cache[cache_key] = (result, 0)
 
-            # Persist to shared_backend for cross-agent dedup
+            # Persist to shared_backend for cross-agent dedup (failures
+            # included: other agents hitting the same key should see the
+            # cached failure instead of hammering a dead service).
             if self._backend and content and not (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
                 backend_key = f"{_DEDUP_CACHE_PREFIX}/{cache_key}"
                 try:
@@ -446,19 +475,30 @@ class ToolDedupMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                     name=cached_msg.name,
                 )
-            # Allow one retry with a warning, increment counter
-            logger.info("失败重试: %s (第%d次)", cache_key, fail_count + 1)
-            self._tool_call_cache[cache_key] = (cached_msg, fail_count + 1)
-            return ToolMessage(
-                content=(
-                    f"{cached_msg.content}\n\n"
-                    f"⚠ [系统提示] {tool_name} 上次调用返回异常，"
-                    f"当前为第{fail_count + 1}次重试。"
-                    f"若累计失败{_TOOL_FAILURE_BREAKER}次将被熔断。"
-                ),
-                tool_call_id=tool_call_id,
-                name=cached_msg.name,
-            )
+            # Real retry (v3.22.2): actually re-execute once instead of
+            # replaying the cached failure — transient faults (brief
+            # service flap) recover on the second execution, persistent
+            # faults accumulate to the breaker.  The old "warn without
+            # executing" path never gave transient faults a real chance
+            # despite the comment claiming "allow one retry".
+            logger.info("失败重试(真实执行): %s", cache_key)
+            result = await self._execute_and_cache(
+                request, handler, cache_key, fail_base=fail_count)
+            if isinstance(result, ToolMessage):
+                new_content = (result.content if isinstance(result.content, str)
+                               else str(result.content))
+                if _is_tool_failure(new_content):
+                    return ToolMessage(
+                        content=(
+                            f"{new_content}\n\n"
+                            f"⚠ [系统提示] {tool_name} 第{fail_count + 1}次调用仍失败，"
+                            f"后续同参数调用将被熔断（禁止重试）；"
+                            "如需数据请调整查询参数，或基于已有证据继续诊断。"
+                        ),
+                        tool_call_id=tool_call_id,
+                        name=result.name or tool_name,
+                    )
+            return result
 
         # ── P1: In-flight dedup — concurrent duplicate → skip ──
         # When the LLM generates multiple identical tool calls in a single
