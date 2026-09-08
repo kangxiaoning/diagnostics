@@ -64,6 +64,20 @@ def _hard_threshold() -> int:
     return _env_int("DIAGNOSTICS_EXPERT_STALL_HARD", 10)
 
 
+# Total-call budget per delegation (design document §8 G19-ext, v3.22.2).
+# G19's streak resets on ANY yielding call, so a productive-but-unbounded
+# investigation (every call yields something) escapes it entirely; this
+# budget caps total executed calls regardless of yield — soft nudge first,
+# hard refusal at the cap.  Conclusion tools stay exempt (see
+# _IGNORED_TOOLS) so the required-tool-choice loop can still terminate.
+def _total_soft() -> int:
+    return _env_int("DIAGNOSTICS_EXPERT_CALLS_SOFT", 12)
+
+
+def _total_hard() -> int:
+    return _env_int("DIAGNOSTICS_EXPERT_CALLS_HARD", 20)
+
+
 # Zero-yield content patterns — matched ONLY on short results (a long
 # payload mentioning "not found" inside real diagnostic data must not
 # count as zero-yield).  Mirrors the dedup middleware's conservative
@@ -71,7 +85,13 @@ def _hard_threshold() -> int:
 _ZERO_YIELD_RE = re.compile(
     r"无监控数据|无数据|暂无数据|查无|未查询到|没有查询到|查询失败|无法查询|"
     r"无可用|不可用|不存在|无匹配|没有数据|"
-    r"not found|no data|no results|no metrics|no matching|unavailable",
+    # "执行失败": production OSP/kube-apiserver script-dispatch failure
+    # contract ("脚本执行失败" / "k8s脚本执行失败", v3.22.2);
+    # anchored "^\\[\\]$": bare empty JSON array — Argus "healthy but no
+    # data" contract (v3.22.2).
+    r"执行失败|"
+    r"not found|no data|no results|no metrics|no matching|unavailable|"
+    r"^\s*\[\s*\]\s*$",
     re.IGNORECASE,
 )
 _ZERO_YIELD_MAX_LEN = 300
@@ -121,6 +141,8 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
     def __init__(self) -> None:
         # delegation-key → consecutive zero-yield streak
         self._streaks: OrderedDict[str, int] = OrderedDict()
+        # delegation-key → total executed tool calls (budget, v3.22.2)
+        self._total_calls: OrderedDict[str, int] = OrderedDict()
         self._blocked_announced: set[str] = set()
 
     # ── helpers ──────────────────────────────────────────────────
@@ -151,6 +173,18 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
         while len(self._streaks) > _MAX_TRACKED_DELEGATIONS:
             self._streaks.popitem(last=False)
 
+    def _get_total(self, key: str) -> int:
+        total = self._total_calls.get(key, 0)
+        if key in self._total_calls:
+            self._total_calls.move_to_end(key)
+        return total
+
+    def _set_total(self, key: str, value: int) -> None:
+        self._total_calls[key] = value
+        self._total_calls.move_to_end(key)
+        while len(self._total_calls) > _MAX_TRACKED_DELEGATIONS:
+            self._total_calls.popitem(last=False)
+
     # ── interception ─────────────────────────────────────────────
 
     async def awrap_tool_call(self, request, handler):
@@ -179,10 +213,53 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
                 tool_call_id=tool_call_id,
             )
 
+        # Total-call budget (v3.22.2): counts every executed call in this
+        # delegation regardless of yield — complementary to the streak,
+        # which resets on yield and therefore cannot catch a
+        # productive-but-unbounded investigation.  Hard refusal at the
+        # cap; conclusion tools stay exempt so the loop can terminate.
+        total = self._get_total(key) + 1
+        self._set_total(key, total)
+        if total >= _total_hard():
+            tool_call_id = tool_call.get("id") or f"budget_{abs(hash(key))}"
+            logger.warning(
+                "G19-ext budget hard block: expert delegation %s tool %s — "
+                "%d total calls; mandatory wrap-up",
+                key, tool_name, total,
+            )
+            return ToolMessage(
+                content=(
+                    f"⛔ 系统强制收尾（调用总量预算）：本次委派已执行 {total} 次工具调用，"
+                    "达到总量上限——继续取证的边际收益已不抵成本。\n"
+                    "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
+                    "（如实说明数据缺口与置信度），结束本次委派。"
+                ),
+                tool_call_id=tool_call_id,
+            )
+
         result = await handler(request)
 
         if not isinstance(result, ToolMessage):
             return result
+
+        if total == _total_soft():
+            content = result.content if isinstance(result.content, str) else str(result.content)
+            result = ToolMessage(
+                content=(
+                    content
+                    + f"\n\n[系统提示·调用总量预算] 本次委派已执行 {total} 次工具调用。"
+                    "请盘点已采集的证据：关键证据已足够则立即输出结论；"
+                    "仍有明确缺口则优先完成最关键的 1-2 项取证后收尾。"
+                    f"调用达到 {_total_hard()} 次将被系统强制收尾。"
+                ),
+                tool_call_id=result.tool_call_id,
+                name=getattr(result, "name", None),
+                status=getattr(result, "status", "success"),
+            )
+            logger.info(
+                "G19-ext budget soft nudge: delegation %s — %d total calls",
+                key, total,
+            )
 
         if _is_zero_yield(result):
             streak += 1
