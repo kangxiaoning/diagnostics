@@ -1730,7 +1730,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             for h in pending:
                 _tag = fmt_hid(h)
                 if _economically_dead(ledger, h):
-                    _tag += "（增益<κ，委派已被门控——请 record_finding 终结或搁置）"
+                    _tag += "（增益低于阈值，委派已被门控——请 record_finding 终结或搁置）"
                 _tags.append(_tag)
             pending_hint = (
                 f"\n- ⚠ 仍有待验证的假设: "
@@ -2292,7 +2292,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
                     for hid, node in survivors):
                 return True, (
                     f"假设穷尽: {MAX_ROOT_PROPOSE_BATCHES} 批假设预算用尽，"
-                    "残余未决假设的验证增益均低于成本（κ），未确认根因"
+                    "残余未决假设的验证增益均低于成本，未确认根因"
                 ), None
 
     # ── S1: confidence sufficient ──
@@ -2325,7 +2325,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     if best_v >= KAPPA_STOP:
         return False, (
             f"已有确认根因 {fmt_hid(confirmed_ids[0])}，但最高动作价值 "
-            f"{best_v:.3f} ≥ κ={KAPPA_STOP}（{best_d}），仍有可行动验证"
+            f"{best_v:.3f} ≥ 阈值 {KAPPA_STOP}（{best_d}），仍有可行动验证"
             f"（残余不确定性 R={r:.2f}），继续验证以避免漏掉竞争性根因"
         ), confirmed_ids[0]
 
@@ -2333,7 +2333,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     return True, (
         f"根因确认: {fmt_hid(best['id'])} {best['statement']} "
         f"(p={best['probability']}%) | 退出判据满足: 已确认根因且"
-        f"无可行动验证（最高动作价值 {best_v:.3f}<κ={KAPPA_STOP}，{best_d}；"
+        f"无可行动验证（最高动作价值 {best_v:.3f}<阈值 {KAPPA_STOP}，{best_d}；"
         f"残余不确定性 R={r:.2f} 源于经济上已死的未决假设，"
         f"报告中标注为未验证）"
     ), confirmed_ids[0]
@@ -2695,7 +2695,7 @@ def render_exit_directive(ledger: DiagnosisLedger, phase: DiagnosisPhase) -> str
         # S1 not satisfied — honest-negative-exit guidance.
         header = (
             f"⚠ 尚无确认根因（无 p≥80 的 confirmed 假设）。"
-            f"残余未决假设 {hid}（{stmt}，p={p}%，验证价值 {dv}≥κ={KAPPA_STOP}）仍可行动。"
+            f"残余未决假设 {hid}（{stmt}，p={p}%，验证价值 {dv}≥阈值 {KAPPA_STOP}）仍可行动。"
         )
         if phase == "evaluate":
             actions = (
@@ -2714,12 +2714,23 @@ def render_exit_directive(ledger: DiagnosisLedger, phase: DiagnosisPhase) -> str
                 f"  ② 现有证据已明确排除 → record_finding 判 {hid} refuted；无法定论判 inconclusive\n"
                 "⛔ 不要直接 write_file——无确认根因时会被拦截。"
             )
+        elif phase == "hypothesize":
+            # v3.23.0 (C'): the retry-batch wait state owes a propose —
+            # name it explicitly (generic "verify/close/shelve first" did
+            # not fit a phase where only propose_hypotheses is legal).
+            actions = (
+                "请选择（HYPOTHESIZE 可用动作）：\n"
+                "  ① propose_hypotheses 提出新批次假设——若根因方向已明，"
+                "直接收录为新假设（证据在手可随后 record_finding confirmed "
+                "落账，p≥80 后 write_file 通道自动开放）\n"
+                "⛔ 不要直接 write_file——无确认根因时会被拦截。"
+            )
         else:
             actions = f"请先验证、终结或搁置 {hid}，再考虑生成报告。"
         return header + "\n" + actions
     header = (
         f"⚠ 已确认根因，但竞争假设 {hid}"
-        f"（{stmt}，p={p}%，验证价值 {dv}≥κ={KAPPA_STOP}）尚未验证。"
+        f"（{stmt}，p={p}%，验证价值 {dv}≥阈值 {KAPPA_STOP}）尚未验证。"
     )
     if phase == "evaluate":
         actions = (
@@ -2897,6 +2908,19 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
         structured = ev.get("structured") or {}
         prev = structured.get("verdict")
         if prev in ("confirmed", "refuted") and prev != new_verdict:
+            # v3.23.0 (A3): a prior confirmed return SELF-DECLARED as
+            # "alternative_root_cause" means the expert actually REFUTED
+            # the assigned hypothesis and confirmed a DIFFERENT root
+            # cause — its direction AGREES with new_verdict=refuted;
+            # not a conflict (2026-09-08 session 898d4699: k8s-expert
+            # confirmed the probe-port mismatch while refuting the
+            # assigned CNI hypothesis; the coordinator's refute was
+            # legitimate yet G21 blocked it, cascading into a 13-round
+            # stall).
+            if (prev == "confirmed" and new_verdict == "refuted"
+                    and structured.get("verdict_target")
+                    == "alternative_root_cause"):
+                continue
             return {
                 "expert": source[len("expert:"):],
                 "prev_verdict": prev,
@@ -3329,7 +3353,7 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
             # Priority 1 — delegation on the focus hypothesis is about to
             # be hard-blocked by G5; steer to a record_finding verdict.
             directive = (
-                f"⚠ {fmt_hid(active_id)} 委派价值 {dv:.3f}<κ={KAPPA_STOP}"
+                f"⚠ {fmt_hid(active_id)} 委派价值 {dv:.3f}<阈值 {KAPPA_STOP}"
                 f"（价值随委派次数指数衰减，再委派无新信息增益）——"
                 f"再委派将被门控拦截，请 record_finding 依据已有证据终结 "
                 f"{fmt_hid(active_id)}{anti_fab}。"
@@ -3372,7 +3396,7 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                     directive = (
                         f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
                         f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
-                        f"证据不足可再委派（价值仍≥κ）{anti_fab}。"
+                        f"证据不足可再委派（价值仍高于阈值）{anti_fab}。"
                     )
                 # ── G21 proactive override (design document §8/§9,
                 # v3.16.0; 2026-08-21 scenario 40 follow-up) ── deep
@@ -3385,12 +3409,48 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                 # exclusive with the C1 argus-conflict override below
                 # (C1 requires ALL expert evidence argus-class; this one
                 # requires >=2 deep terminal returns).
+                # ── Alternative-root-cause directive (v3.23.0, A2) ──
+                # The expert REFUTED the assigned hypothesis and
+                # confirmed a DIFFERENT root cause (self-declared via
+                # verdict_target).  Neither the harvest-nudge (implies
+                # recording the expert's verdict ON this hypothesis) nor
+                # the conflict arbitration below (no genuine conflict —
+                # the expert's confirmed is not ABOUT this hypothesis)
+                # fits; the single recommended sequence is refute +
+                # append (T10′).  Fires BEFORE the conflict check so an
+                # alternative-confirmed paired with another expert's
+                # refuted (both falsifying the hypothesis — agreeing
+                # directions) is not misread as a conflict.
+                _alt_rc = next(
+                    (str((e.get("structured") or {}).get("root_cause")
+                         or "").strip()
+                     for e in reversed(node.get("evidence", []))
+                     if str(e.get("source", "")).startswith("expert:")
+                     and (e.get("structured") or {}).get("verdict")
+                     == "confirmed"
+                     and (e.get("structured") or {}).get("verdict_target")
+                     == "alternative_root_cause"),
+                    "",
+                )
+                if _alt_rc:
+                    directive = (
+                        f"⚠ {fmt_hid(active_id)} 的验证专家证伪了该假设并另"
+                        f"确证根因：「{_alt_rc[:120]}」。正确动作序列："
+                        f"① record_finding({fmt_hid(active_id)}, refuted) "
+                        f"排除当前假设（专家已自报结论对象为他因，冲突门控"
+                        f"不会拦截）；② propose_hypotheses 追加 1 个假设"
+                        f"收录该根因（追加假设通道，不占换批预算）——证据"
+                        f"已在手，追加后即可 record_finding confirmed 落账，"
+                        f"落账成功（p≥80）后 write_file 通道自动开放。"
+                    )
                 _terminal_vs = {
                     (e.get("structured") or {}).get("verdict")
                     for e in node.get("evidence", [])
                     if str(e.get("source", "")).startswith("expert:")
+                    and (e.get("structured") or {}).get("verdict_target")
+                    != "alternative_root_cause"
                 }
-                if {"confirmed", "refuted"} <= _terminal_vs:
+                if not _alt_rc and {"confirmed", "refuted"} <= _terminal_vs:
                     directive = (
                         f"⚠ {fmt_hid(active_id)} 的专家结论方向冲突：多个深度"
                         f"专家对同一假设给出相反终局结论（confirmed 与 "

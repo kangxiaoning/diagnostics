@@ -3742,8 +3742,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 _n["selected"] = False
                                 _n["deferred_reason"] = (
                                     "[系统] 报告收口：根因已确认，该竞争假设"
-                                    "未完成验证，已在报告中披露（design "
-                                    "document §6.3 E2′ 放行+披露，v3.6.0）"
+                                    "未完成验证，已在报告中披露（系统放行"
+                                    "并披露收口）"
                                 )
                                 _disclosed.append(fmt_hid(_h))
                         if _disclosure and isinstance(
@@ -3828,7 +3828,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         "[系统] 确定性收口：连续 "
                                         f"{self._exit_block_count} 次尝试生成报告，"
                                         "诊断未确认根因，该假设搁置并在报告中披露"
-                                        "（design document §6.3 通用出口，v3.8.0）"
+                                        "（系统通用阴性出口）"
                                     )
                                     _shelved.append(fmt_hid(_h))
                             _disc = _rud3(ledger)
@@ -3873,6 +3873,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     f"{fmt_hid(_rh)}, ...) 落账，"
                                     "系统确认后自动进入 REPORT。"
                                 )
+                            # v3.23.0 (C'): phase-aware correct route —
+                            # a bare "blocked" receipt without the next
+                            # action bred the 2026-09-08 retry pattern
+                            # (write_file retried while the owed action
+                            # was propose_hypotheses).
+                            _phase_route = ""
+                            if _phase(ledger) == "hypothesize":
+                                _phase_route = (
+                                    "\n正确动作：propose_hypotheses 提出新批次"
+                                    "假设（若根因方向已明，直接收录为新假设——"
+                                    "证据在手可随后 record_finding confirmed "
+                                    "落账，落账成功（p≥80）后本通道自动开放）。"
+                                )
                             logger.warning(
                                 "write_file blocked by exit-condition gate "
                                 "(L%d): %s (phase=%s, round=%d, path=%s)",
@@ -3891,7 +3904,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                         "（REPORT 仅在根因确认、假设穷尽或"
                                         "证据饱和时开放）"
                                     )
-                                ) + _r2_suffix,
+                                ) + _r2_suffix + _phase_route,
                                 tool_call_id=tool_call_id,
                             )
                 # write_file passed the gate (natural exit, forced terminal,
@@ -4025,10 +4038,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "%s blocked by phase allowlist in %s (round=%d)",
                         tool_name, _phase_now, self._model_call_count,
                     )
+                    # v3.23.0 (B1): name the correct action explicitly —
+                    # a bare allowlist implies "what exists" but not
+                    # "what to do" (2026-09-08 session 898d4699: the
+                    # model retried record_finding for 12 rounds in
+                    # hypothesize instead of proposing the new batch).
+                    _suffix = ""
+                    if _phase_now == "hypothesize":
+                        _suffix = (
+                            "正确动作：propose_hypotheses 提出新批次假设"
+                            "（若根因方向已明，直接收录为新假设——证据在手"
+                            "可随后 record_finding confirmed 落账，落账成功"
+                            "（p≥80）后 write_file 通道自动开放）。"
+                        )
                     return ToolMessage(
                         content=(
                             f"⛔ {tool_name} 在 {_phase_now.upper()} 阶段不可用"
                             f"（当前阶段允许: {_gate_hint(_phase_now)}）。"
+                            f"{_suffix}"
                         ),
                         tool_call_id=tool_call_id,
                     )
@@ -4200,7 +4227,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             return ToolMessage(
                                 content=(
                                     f"⛔ 委派被信息增益门控拦截：假设 {fmt_hid(_gate_hid)} "
-                                    f"当前验证动作价值 {_v:.3f} < κ={KAPPA_STOP}"
+                                    f"当前验证动作价值 {_v:.3f} < 阈值 {KAPPA_STOP}"
                                     f"（已委派 {_gate_node.get('_delegate_count', 0)} 次、"
                                     f"inconclusive {_gate_node.get('_inconclusive_count', 0)} 次，"
                                     "重复验证的期望信息增益低于成本）。\n"
@@ -4422,6 +4449,37 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _structured_expert = _parse_expert_json(output)
                     if _structured_expert is not None:
                         summary = _format_expert_summary(output)
+                        # ── Alternative-root-cause receipt guidance
+                        # (v3.23.0, A1, design document §9): the expert
+                        # self-declared "I refuted the assigned hypothesis
+                        # and confirmed a DIFFERENT root cause".  Append
+                        # the correct action sequence DETERMINISTICALLY
+                        # to the coordinator-visible receipt — hint-only
+                        # proved insufficient (2026-08-29 scenario 35);
+                        # unguided this cascaded into a 13-round stall
+                        # (2026-09-08 session 898d4699).
+                        if (_structured_expert.get("verdict") == "confirmed"
+                                and _structured_expert.get("verdict_target")
+                                == "alternative_root_cause"):
+                            _alt_rc = str(
+                                _structured_expert.get("root_cause")
+                                or "")[:120]
+                            summary += (
+                                f"\n⚠️ 结论对象声明：专家证伪了被指派的假设，"
+                                f"并另确证根因「{_alt_rc}」。正确动作序列："
+                                f"① record_finding(被验证假设, refuted) 排除"
+                                f"（专家已自报他因，冲突门控不会拦截）；"
+                                f"② propose_hypotheses 追加 1 个假设收录该"
+                                f"根因（追加假设通道，不占换批预算）——证据"
+                                f"已在手，追加后即可 record_finding confirmed "
+                                f"落账（p≥80 后 write_file 通道自动开放）。"
+                            )
+                            logger.info(
+                                "alternative-root-cause return: expert=%s "
+                                "root_cause=%.120s (round=%d)",
+                                tool_args.get("subagent_type", "?"),
+                                _alt_rc, self._model_call_count,
+                            )
                         # ── Verdict-evidence direction observation
                         # (v3.16.0, design document §8 G21 sibling):
                         # schema-valid but content-mismatched returns — a
@@ -5600,16 +5658,33 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
             # Capture old statement for root_causes sync
             old_statement = ""
+            # v3.23.0 bugfix: bounded-degrade passes (G17-E2/C2/G21/G22)
+            # must REALLY ledger the finding — previously they returned a
+            # "passed with disclosure" message WITHOUT ledgering, so the
+            # model believed the verdict had landed while the hypothesis
+            # stayed pending and every retry re-hit the same fake pass
+            # (2026-09-08 session dc242215: G22 counter reached 6 with
+            # H1 still pending → write_file blocked → retry loop).
+            # Degraded branches now only PREPARE this disclosure hint and
+            # fall through to the normal ledgering path.
+            _degraded_hint = ""
             if statement_update and hypothesis_id in ledger.get("hypotheses", {}):
                 hnode = ledger["hypotheses"][hypothesis_id]
                 # Defect C: refuted hypotheses must not have their statement
                 # modified — the original hypothesis statement should be
                 # preserved for historical accuracy.
                 if hnode.get("status") == "refuted":
+                    logger.warning(
+                        "record_finding blocked by terminal-guard (Defect C): "
+                        "statement_update on refuted %s (round=%d)",
+                        fmt_hid(hypothesis_id), self._model_call_count,
+                    )
                     return (
                         f"⚠️ 假设 {fmt_hid(hypothesis_id)} 已被证伪(status=refuted)，"
                         "禁止修改假设表述(statement_update)。"
-                        "请使用新的证据描述发现，不要修改已排除假设的原始表述。"
+                        "正确动作：若该假设的表述中已包含你认为正确的根因方向，"
+                        "请用 propose_hypotheses 提出新假设收录（refuted 终态"
+                        "不可翻案；新假设可复用该表述与已有证据直接落账）。"
                     )
                 old_statement = hnode.get("statement", "")
 
@@ -5640,13 +5715,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "继续验证（confirmed 结论不可直接翻转）。"
                     )
                 if _terminal == "refuted":
+                    logger.warning(
+                        "record_finding blocked by terminal-guard (Defect D): "
+                        "%s already refuted, attempted verdict=%s (round=%d)",
+                        fmt_hid(hypothesis_id), verdict, self._model_call_count,
+                    )
+                    _open_any = any(
+                        h.get("status") in ("pending", "inconclusive")
+                        and not h.get("deferred")
+                        for h in ledger.get("hypotheses", {}).values()
+                    )
+                    if _open_any:
+                        _route = (
+                            "该假设的验证已关闭，请基于其他未决假设继续诊断；"
+                            "全部假设终态后系统会自动进入 REPORT。"
+                        )
+                    else:
+                        _route = (
+                            "当前无未决假设——正确动作：propose_hypotheses "
+                            "提出新批次假设（若你已确证根因方向，直接将其作为"
+                            "新假设提出，证据已在手可立即 record_finding "
+                            "confirmed 落账）；无 confirmed 根因时 write_file "
+                            "会被出口门控拦截，请勿直接写报告。"
+                        )
                     return (
                         f"⚠️ 假设 {fmt_hid(hypothesis_id)} 已处于终态"
                         f"(status=refuted, "
                         f"p={_hnode.get('probability')}%)，"
-                        "不允许重复记录验证结论。"
-                        "该假设的验证已关闭，请基于其他未决假设继续诊断；"
-                        "全部假设终态后系统会自动进入 REPORT。"
+                        "不允许重复记录验证结论（refuted 终态不可翻案）。"
+                        + _route
                     )
 
             # ── G17: confirmed requires expert-verification evidence ──
@@ -5718,34 +5815,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 fmt_hid(hypothesis_id),
                                 self._model_call_count,
                             )
-                            return (
-                                f"⚠ confirmed 判定已通过（G17-E2 冲突门控"
-                                f"连续 {_g17_node['_g17e2_block_count']} 次拦截后"
-                                f"降级放行）：{fmt_hid(hypothesis_id)} 的 argus "
-                                f"证据仍存在指标层冲突（集群/节点/工作负载级异常"
-                                f"与目标实体正常并存），本判定未经深度专家日志/事件"
-                                f"确认，系统在报告中披露此冲突。"
+                            _degraded_hint = (
+                                f"\n⚠ 本 confirmed 判定经指标冲突证据标准门控连续 "
+                                f"{_g17_node['_g17e2_block_count']} 次拦截后降级"
+                                f"放行：argus 证据仍存在指标层冲突（集群/节点/"
+                                f"工作负载级异常与目标实体正常并存），未经深度"
+                                f"专家日志/事件确认——系统在报告中披露此冲突。"
                             )
-                        logger.warning(
-                            "record_finding blocked by G17-E2: confirmed on "
-                            "%s with conflicted argus evidence (round=%d)",
-                            fmt_hid(hypothesis_id),
-                            self._model_call_count,
-                        )
-                        _g17_node["_g17_blocked_round"] = self._model_call_count
-                        return (
-                            f"⛔ confirmed 判定与现有监控证据冲突（证据标准门控）："
-                            f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
-                            f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
-                            f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该冲突"
-                            f"证据不满足 confirmed 的确证层标准。"
-                            f"请先委派深度专家"
-                            f"{('（' + '、'.join(_deep_avail[:3]) + '）') if _deep_avail else ''}"
-                            f"查目标实体日志/事件确认后再 record_finding confirmed；"
-                            "深度专家证据到位后 confirmed 通道自动开放，不会再被拦截。"
-                            "若现有监控证据已明确证伪，可直接判 refuted；"
-                            "证据不足请判 inconclusive。"
-                        )
+                            _g17_node["_degraded_gate"] = "指标冲突证据标准门控"
+                        else:
+                            logger.warning(
+                                "record_finding blocked by G17-E2: confirmed on "
+                                "%s with conflicted argus evidence (round=%d)",
+                                fmt_hid(hypothesis_id),
+                                self._model_call_count,
+                            )
+                            _g17_node["_g17_blocked_round"] = self._model_call_count
+                            return (
+                                f"⛔ confirmed 判定与现有监控证据冲突（证据标准门控）："
+                                f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
+                                f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
+                                f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该冲突"
+                                f"证据不满足 confirmed 的确证层标准。"
+                                f"请先委派深度专家"
+                                f"{('（' + '、'.join(_deep_avail[:3]) + '）') if _deep_avail else ''}"
+                                f"查目标实体日志/事件确认后再 record_finding confirmed；"
+                                "深度专家证据到位后 confirmed 通道自动开放，不会再被拦截。"
+                                "若现有监控证据已明确证伪，可直接判 refuted；"
+                                "证据不足请判 inconclusive。"
+                            )
                     if not _has_expert and _experts:
                         logger.warning(
                             "record_finding blocked by G17: confirmed on "
@@ -5803,29 +5901,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             fmt_hid(hypothesis_id),
                             self._model_call_count,
                         )
-                        return (
-                            f"⚠ refuted 判定已通过（C2 冲突门控连续 "
-                            f"{_c2_node['_c2_block_count']} 次拦截后降级放行）："
-                            f"{fmt_hid(hypothesis_id)} 的 argus 证据仍存在指标层"
-                            f"冲突（集群/节点/工作负载级异常与目标实体正常并存），"
-                            f"本判定未经深度专家日志/事件确认，系统在报告中披露。"
+                        _degraded_hint = (
+                            f"\n⚠ 本 refuted 判定经指标冲突证伪门控连续 "
+                            f"{_c2_node['_c2_block_count']} 次拦截后降级放行："
+                            f"argus 证据仍存在指标层冲突（集群/节点/工作负载级"
+                            f"异常与目标实体正常并存），未经深度专家日志/事件"
+                            f"确认——系统在报告中披露。"
                         )
-                    logger.warning(
-                        "record_finding blocked by C2: refuted on %s with "
-                        "conflicted argus evidence (round=%d)",
-                        fmt_hid(hypothesis_id),
-                        self._model_call_count,
-                    )
-                    _c2_node["_c2_blocked_round"] = self._model_call_count
-                    return (
-                        f"⛔ refuted 判定与现有监控证据冲突（证据充分性门控）："
-                        f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
-                        f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
-                        f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该负证据"
-                        f"不足以证伪事件类假设。请先委派深度专家（查目标实体日志/"
-                        f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
-                        f"可再次 record_finding refuted（通道自动开放）。"
-                    )
+                        _c2_node["_degraded_gate"] = "指标冲突证伪门控"
+                    else:
+                        logger.warning(
+                            "record_finding blocked by C2: refuted on %s with "
+                            "conflicted argus evidence (round=%d)",
+                            fmt_hid(hypothesis_id),
+                            self._model_call_count,
+                        )
+                        _c2_node["_c2_blocked_round"] = self._model_call_count
+                        return (
+                            f"⛔ refuted 判定与现有监控证据冲突（证据充分性门控）："
+                            f"{fmt_hid(hypothesis_id)} 的 argus 指标层证据同时报告"
+                            f"（集群/节点/工作负载级）异常与目标实体正常——指标层无法"
+                            f"覆盖 Pod 事件状态（OOMKilled 在指标中不可见），该负证据"
+                            f"不足以证伪事件类假设。请先委派深度专家（查目标实体日志/"
+                            f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
+                            f"可再次 record_finding refuted（通道自动开放）。"
+                        )
             # ── G22: single-channel refute coverage gate (reactive
             # backstop, design document §8 G22, v3.20.0; 2026-08-28
             # scenario 39, session a8fa9526) ── Structural ownership ≠
@@ -5877,35 +5977,36 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             _g22_blocks, fmt_hid(hypothesis_id),
                             self._model_call_count,
                         )
-                        return (
-                            f"⚠ refuted 判定已通过（G22 单通道覆盖性门控拦截 "
-                            f"{_g22_blocks} 次后降级放行）："
-                            f"{fmt_hid(hypothesis_id)} 仅由单一专家通道证伪，"
-                            f"未做跨通道覆盖复核，系统在报告中披露此局限。"
+                        _degraded_hint = (
+                            f"\n⚠ 本 refuted 判定经单通道覆盖性门控拦截 "
+                            f"{_g22_blocks} 次后降级放行：仅由单一专家通道证伪，"
+                            f"未做跨通道覆盖复核——系统在报告中披露此局限。"
                         )
-                    logger.warning(
-                        "record_finding blocked by G22: refuted on %s from a "
-                        "single evidence channel (%s, round=%d)",
-                        fmt_hid(hypothesis_id), _g22.get("expert") or "none",
-                        self._model_call_count,
-                    )
-                    _deep = [e for e in (_g22.get("deep_experts") or [])
-                             if e != _g22.get("expert")]
-                    return (
-                        f"⛔ refuted 判定仅来自单一证据通道（覆盖性门控）："
-                        f"{fmt_hid(hypothesis_id)} 的专家证据只来自 "
-                        f"{_g22.get('expert')}。"
-                        f"组件的拓扑归属不等于其证据通道归属——某专家看不到某类证据时，"
-                        f"常把『查不到』表述为『未发现异常』，"
-                        f"据此证伪方向正确的假设属于以证据缺失作反证。"
-                        f"请确认该专家的观测域是否覆盖本假设所涉证据通道"
-                        f"（故障时段 {_g22.get('fault_window')}）："
-                        f"① 若不覆盖 → 改派观测域覆盖该证据的专家"
-                        f"（可选：{'、'.join(_deep[:3])}）；"
-                        f"② 若该证据确实无法取得 → 判 inconclusive 并披露；"
-                        f"③ 若确认该通道已完整覆盖本假设 → 再次 record_finding "
-                        f"refuted 即放行（通道自动开放）。"
-                    )
+                        _g22_node["_degraded_gate"] = "单通道覆盖性门控"
+                    else:
+                        logger.warning(
+                            "record_finding blocked by G22: refuted on %s from a "
+                            "single evidence channel (%s, round=%d)",
+                            fmt_hid(hypothesis_id), _g22.get("expert") or "none",
+                            self._model_call_count,
+                        )
+                        _deep = [e for e in (_g22.get("deep_experts") or [])
+                                 if e != _g22.get("expert")]
+                        return (
+                            f"⛔ refuted 判定仅来自单一证据通道（覆盖性门控）："
+                            f"{fmt_hid(hypothesis_id)} 的专家证据只来自 "
+                            f"{_g22.get('expert')}。"
+                            f"组件的拓扑归属不等于其证据通道归属——某专家看不到某类证据时，"
+                            f"常把『查不到』表述为『未发现异常』，"
+                            f"据此证伪方向正确的假设属于以证据缺失作反证。"
+                            f"请确认该专家的观测域是否覆盖本假设所涉证据通道"
+                            f"（故障时段 {_g22.get('fault_window')}）："
+                            f"① 若不覆盖 → 改派观测域覆盖该证据的专家"
+                            f"（可选：{'、'.join(_deep[:3])}）；"
+                            f"② 若该证据确实无法取得 → 判 inconclusive 并披露；"
+                            f"③ 若确认该通道已完整覆盖本假设 → 再次 record_finding "
+                            f"refuted 即放行（通道自动开放）。"
+                        )
             # ── G21: expert-verdict conflict arbitration (reactive
             # backstop, design document §8, v3.16.0; 2026-08-21 scenario
             # 40 follow-up) ── When the SAME hypothesis already holds a
@@ -5948,41 +6049,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 fmt_hid(hypothesis_id),
                                 self._model_call_count,
                             )
-                            return (
-                                f"⚠ {verdict} 判定已通过（G21 专家结论冲突仲裁"
+                            _degraded_hint = (
+                                f"\n⚠ 本 {verdict} 判定经专家结论冲突仲裁"
                                 f"连续 {_g21_node['_g21_block_count']} 次拦截后"
-                                f"降级放行）：{fmt_hid(hypothesis_id)} 存在未仲裁的"
-                                f"专家结论冲突（{_g21_conflict['expert']} 判定 "
+                                f"降级放行：存在未仲裁的专家结论冲突"
+                                f"（{_g21_conflict['expert']} 判定 "
                                 f"{_g21_conflict['prev_verdict']} 与本次判定相反），"
-                                f"本判定未经冲突仲裁，系统在报告中披露。"
+                                f"未经冲突仲裁——系统在报告中披露。"
                             )
-                        logger.warning(
-                            "record_finding blocked by G21: %s verdict=%s "
-                            "opposes prior %s verdict=%s (round=%d)",
-                            fmt_hid(hypothesis_id), verdict,
-                            _g21_conflict["expert"],
-                            _g21_conflict["prev_verdict"],
-                            self._model_call_count,
-                        )
-                        return (
-                            f"⛔ 假设 {fmt_hid(hypothesis_id)} 已有专家终局结论与"
-                            f"本次判定相反（专家结论冲突仲裁）："
-                            f"{_g21_conflict['expert']} 此前判定 "
-                            f"{_g21_conflict['prev_verdict']}"
-                            f"（证据摘要：{_g21_conflict['summary']}…），"
-                            f"而本次拟判 {verdict}。两个深度专家对同一假设给出"
-                            f"相反终局结论属跨专家证据矛盾，直接落账将以新结论"
-                            f"静默覆盖旧结论。请先仲裁：\n"
-                            f"1. 复检矛盾数据源：委派第三方视角专家（或同一专家"
-                            f"复核具体矛盾点，如两侧对同一物理量的观测差异）确认"
-                            f"哪侧证据可靠；\n"
-                            f"2. 以冲突披露收口：若无法仲裁，改判 inconclusive 并"
-                            f"在 new_insights 披露两侧矛盾证据，报告将如实呈现"
-                            f"未解冲突；\n"
-                            f"3. 明示推翻理由：若确有把握推翻既有结论，携带 "
-                            f"statement_update（含推翻理由，如\"新证据为直接测量，"
-                            f"旧证据为间接观测\"）重新落账，通道立即开放。"
-                        )
+                            _g21_node["_degraded_gate"] = "专家结论冲突仲裁"
+                        else:
+                            logger.warning(
+                                "record_finding blocked by G21: %s verdict=%s "
+                                "opposes prior %s verdict=%s (round=%d)",
+                                fmt_hid(hypothesis_id), verdict,
+                                _g21_conflict["expert"],
+                                _g21_conflict["prev_verdict"],
+                                self._model_call_count,
+                            )
+                            return (
+                                f"⛔ 假设 {fmt_hid(hypothesis_id)} 已有专家终局结论与"
+                                f"本次判定相反（专家结论冲突仲裁）："
+                                f"{_g21_conflict['expert']} 此前判定 "
+                                f"{_g21_conflict['prev_verdict']}"
+                                f"（证据摘要：{_g21_conflict['summary']}…），"
+                                f"而本次拟判 {verdict}。两个深度专家对同一假设给出"
+                                f"相反终局结论属跨专家证据矛盾，直接落账将以新结论"
+                                f"静默覆盖旧结论。请先仲裁：\n"
+                                f"1. 复检矛盾数据源：委派第三方视角专家（或同一专家"
+                                f"复核具体矛盾点，如两侧对同一物理量的观测差异）确认"
+                                f"哪侧证据可靠；\n"
+                                f"2. 以冲突披露收口：若无法仲裁，改判 inconclusive 并"
+                                f"在 new_insights 披露两侧矛盾证据，报告将如实呈现"
+                                f"未解冲突；\n"
+                                f"3. 明示推翻理由：若确有把握推翻既有结论，携带 "
+                                f"statement_update（含推翻理由，如\"新证据为直接测量，"
+                                f"旧证据为间接观测\"）重新落账，通道立即开放。"
+                            )
             # ── G18: ceremonial-repeat guard (design document §8,
             # v3.11.0) ──
             # A record_finding that (a) repeats the CURRENT status
@@ -6289,12 +6392,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _candidate_hint = (
                         f"\nℹ 本次证伪证据中专家给出了根因候选：「{_cand}」——"
                         "对照活跃假设，若均未覆盖该机制，可用 "
-                        "propose_hypotheses 追加 1 个假设覆盖（T10′，"
+                        "propose_hypotheses 追加 1 个假设覆盖（追加通道，"
                         "不占换批预算）；已覆盖则忽略。"
                     )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
                 f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_candidate_hint}{_g18_warn}"
+                f"{_degraded_hint}"
             )
 
         return StructuredTool.from_function(

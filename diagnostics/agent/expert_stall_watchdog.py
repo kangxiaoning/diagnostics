@@ -205,7 +205,7 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
             )
             return ToolMessage(
                 content=(
-                    f"⛔ 系统强制收尾（零产出停滞防护 G19）：已连续 {streak} 次工具调用"
+                    f"⛔ 系统强制收尾（零产出停滞防护）：已连续 {streak} 次工具调用"
                     "未获得任何有效数据——该方向的数据不可用，继续调用不会改善结果。\n"
                     "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
                     "（如实说明数据缺口与置信度），结束本次委派。"
@@ -266,7 +266,7 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
             self._set_streak(key, streak)
             if streak == _soft_threshold():
                 guidance = (
-                    f"\n\n[系统提示·零产出停滞防护 G19] 你已连续 {streak} 次工具调用"
+                    f"\n\n[系统提示·零产出停滞防护] 你已连续 {streak} 次工具调用"
                     "未获得有效数据。该方向大概率数据不可用——不要再逐对象穷举或"
                     "换路径重试同类查询；立即盘点已采集的信息并输出最终结论"
                     "（如实说明数据缺口）。继续零产出调用将被系统强制拦截。"
