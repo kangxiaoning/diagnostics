@@ -323,52 +323,40 @@ class ArgusExpertFindings(BaseModel):
 # NOTE: each subagent's own "返回不超过150字" line is removed; this suffix
 # provides the canonical return format so there is no duplication.
 _EXPERT_RETURN_SUFFIX = (
-    "\n\n**工具使用边界（严格遵守）**:\n"
-    "- `read_file`/`grep`/`glob`/`ls` 只能访问 `/agent_data/skills/**`（技能文件），"
-    "禁止访问 `/agent_data/reports/**`、`/agent_data/traces/**`（历史诊断数据，与你的任务无关）。\n"
-    "- 禁止访问 `/proc/**`、`/sys/**`、`/var/log/**`、`/etc/**` 等被诊断主机路径。\n"
-    "- 远程主机/集群数据必须通过本 subagent 配备的专用诊断工具获取，不能用本地文件工具代替。\n"
-    "- 你只负责取证与分析——假设与结论的台账登记由 Coordinator 统一完成，你只需按下方格式返回结构化结论。\n"
+    # Streamlined (design document §9, v3.32.0): removed reactive-
+    # interception notices ("system will count/warn/block/force-wrap") —
+    # those behaviours are already guaranteed by code guardrails
+    # (dedup/G26/G19-ext/file-governance/response_format), and previewing
+    # them wastes tokens and drifts from the code.  Kept: action
+    # guidance, content contracts, field-shape recipes.  Word limit
+    # removed (LLM cannot count — convergence anchor instead).
+    "\n\n**工具使用边界**:\n"
+    "- 文件工具（read_file/grep/glob/ls）仅限访问 `/agent_data/skills/**`（技能文件）。\n"
+    "- 远程主机/集群数据必须用本 subagent 的专用诊断工具获取。\n"
+    "- 你只负责取证与分析——假设与结论的台账登记由 Coordinator 统一完成，"
+    "你只需按下方格式返回结构化结论。\n"
+    "\n**取证策略**:\n"
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
-    "（多个资源异常则需全部核查），不对正常的节点/Pod/资源逐一调用同名查询工具。"
-    "若多个工具返回同一资源的数据且结论一致，取最早返回的结果即可，无需重复验证。\n"
-    "- 禁止重复调用：同一工具+同一参数只调用一次——系统已自动去重，"
-    "重复调用将被计数、警告直至拦截；同一指标同一时间窗口禁止按设备/参数"
-    "拆分多次查询（一次调用拿全量，再从中筛选）。\n"
-    "- grep 检索多个关键字时必须用一条正则一次完成（如 `OOM|panic|killed`），"
-    "禁止对同一路径逐关键字多次 grep（同路径第 2 次起系统将提示，第 3 次起"
-    "双倍计入读取预算）。\n"
-    "\n**工具调用预算与停止条件**:\n"
-    "- 系统对工具调用总量设有预算（执行若干次后系统提醒，达到上限将强制收尾）"
-    "——请在预算内优先完成关键取证，收益递减时立即收尾\n"
-    "- 系统对低信息增量调用设有检测：同一工具连续返回与已有结果高度相似的数据时，"
-    "将被提示收尾直至拦截——取证遇阻时优先换**新维度**（不同工具/不同观测视角），"
-    "而非换措辞重试同类查询\n"
-    "- 系统每轮会注入你的取证进展（已覆盖维度/连续无数据方向/剩余预算）——"
-    "据此规划下一步：关键证据已足够做出置信度判断时，立即返回结论，不要继续搜索\n"
-    "\n**返回格式（信息密集，通常 300-600 字。证据充足时立即返回，不要过度展开）**:\n"
-    "- 交付方式：当你看到工具列表中带有 `DeepExpertFindings`（结构化结论工具）时，"
-    "证据收齐后调用它返回结构化 JSON（verdict/key_evidence/negative_evidence/root_cause/confidence），"
-    "这是交付验证结论的标准方式，Coordinator 据此落账；字段按下方说明填写，负证据不得省略。\n"
+    "（多个异常则全部核查）；同一指标同一时间窗口一次调用拿全量再筛选，不拆分多次查询；"
+    "grep 多关键字用一条正则一次完成。\n"
+    "- 收益递减时立即收尾：关键证据已足够做出置信度判断时立即返回；"
+    "取证遇阻时优先换**新维度**（不同工具/不同观测视角），而非换措辞重试同类查询。\n"
+    "\n**返回格式（信息完整、证据充分即收束）**:\n"
+    "- 交付方式：证据收齐后调用 `DeepExpertFindings`（结构化结论工具）返回结构化 JSON"
+    "（verdict/key_evidence/negative_evidence/root_cause/confidence），Coordinator 据此落账；"
+    "聚焦支撑结论的关键证据，不展开无关细节、不复述工具原始输出。\n"
     "- 假设验证: {confirmed|refuted|inconclusive}——verdict 须与证据主体方向一致："
     "confirmed 以关键证据为主体，refuted 以负证据为主体，矛盾时按证据主体修正 verdict\n"
     "- 关键证据: 1~3条，每条标注数据来源\n"
     "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
     "必须如实列出，与阳性证据同等重要，不得省略\n"
-    "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向"
-    "（此时假设本身不是根因）；证据不足时说明还需什么数据\n"
+    "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向；"
+    "证据不足时说明还需什么数据\n"
     "- 结论对象: 若被指派假设不成立、但你另发现了真正根因，填 verdict_target="
-    "alternative_root_cause（verdict=confirmed 此时表达'根因已确认'而非'假设成立'，"
-    "root_cause 填真正根因）——如实声明可让 Coordinator 正确走'排除假设+收录新根因'通道\n"
+    "alternative_root_cause（verdict=confirmed 表达'根因已确认'，root_cause 填真正根因）\n"
     "- 置信度: {高|中|低} + 百分比\n"
-    # Field-shape recipe (design document §9, v3.26.0): a positive example
-    # of the wire shape instead of a prose-only description — the observed
-    # failure mode was a whole paragraph submitted where an array was
-    # declared.  Shown as the correct form to copy, not as a prohibition
-    # (positive-recipe discipline, design document §9).
     "- 多值字段形态：key_evidence / negative_evidence / coverage_gaps 均为字符串数组，"
-    "每项一条独立短句，如 key_evidence 形态 [\"事件：15:03 OOMKilled\"]、"
-    "negative_evidence 形态 [\"节点内存稳定 62%\", \"目标 Pod 不存在\"]\n"
+    "每项一条独立短句，如 key_evidence 形态 [\"事件：15:03 OOMKilled\"]\n"
     "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
     "『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）后即可收尾"
 )
@@ -378,62 +366,43 @@ _EXPERT_RETURN_SUFFIX = (
 # 1min-granularity monitoring metrics, returning structured time-series
 # correlation findings so Coordinator can form well-grounded hypotheses.
 _ARGUS_EXPERT_RETURN_SUFFIX = (
-    "\n\n**工具使用边界（严格遵守）**:\n"
+    # Streamlined (design document §9, v3.32.0) — same discipline as
+    # _EXPERT_RETURN_SUFFIX: reactive-interception notices and the word
+    # limit removed; action guidance, content contracts, the progressive-
+    # discovery query contract, the clarification marker and field-shape
+    # recipes kept.
+    "\n\n**工具使用边界**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 你只负责指标采集与关联分析——假设与结论的台账登记由 Coordinator 统一完成。\n"
-    "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回，不要逐个时间点细查。\n"
-    "- 区分采集目的，合理分配采集深度：\n"
-    "  - 定位对象（委派描述指定的目标实体及其落点、或已观测到异常的指标）→ 完整采集其关键指标维度；\n"
-    "  - 排除对象（其余节点/组件，仅用于确认「该方向正常」）→ 以确认「无异常突变」为目标，"
-    "用尽量少的概览性查询覆盖关键维度即可，确认无突变即止，无需逐对象逐指标展开。\n"
-    # Progressive-discovery query contract (design document §9, v3.21.1):
-    # overview-first drill-down — quality-neutral by construction: mutation
-    # signals and the negative-evidence obligation are unchanged, the
-    # full-scan fallback clause preserves today's behaviour whenever the
-    # overview lacks object-level attribution.  Motivation (2026-08-29
-    # batch capture analysis): sci-argus fanned out 20+ tool calls (14
-    # per-pod queries + an 11-call zero-increment rescan), host-argus 10,
-    # vs 4-5 for the clean experts; round-1 delegation wall time is
-    # dominated by these redundant in-flight calls.
+    "\n**取证策略**:\n"
+    "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回。\n"
+    "- 区分采集目的：定位对象（委派指定的目标实体或已观测异常的指标）→ 完整采集其关键指标维度；"
+    "排除对象（其余节点/组件，仅确认「该方向正常」）→ 概览性查询确认无突变即止。\n"
     "- 渐进式发现（概览→下钻）：先查概览类工具（*_cluster / *_overview）获取维度级突变信号，"
     "再仅对「概览标记突变的维度」与「委派指定的目标对象」下钻做对象级归因；"
-    "概览无突变信号的关键维度各查一次确认即止；"
+    "概览无突变的关键维度各查一次确认即止；"
     "概览不含对象级明细且委派未指明对象时，按完整维度扫描定位异常对象。\n"
     "- 已查过的「工具+参数」组合直接复用其返回做分析（重查只返回缓存结果、零新信息），"
     "后续查询只投向尚未覆盖的维度或对象。\n"
-    # Clarification contract (design document §8 G2 / §9, v3.11.1):
-    # deterministic marker the coordinator-side classifier matches —
-    # contractual protocol, not keyword enumeration (§11 S1 否决理由).
-    "- 参数缺失澄清标记: 若因缺少必要参数（如 hostname）无法执行任何查询，"
-    f"回复必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数——"
-    "系统依此标记识别缺口并转交 Coordinator 处理；禁止省略前缀，禁止臆造参数。\n"
-    "\n**返回格式（信息密集，通常 200-400 字。指标覆盖完整后立即返回，不要展开分析报告）**:\n"
-    "- 交付方式：当你看到工具列表中带有 `ArgusExpertFindings`（结构化结论工具）时，"
-    "指标收齐后调用它返回结构化 JSON（clarification/mutation_points/anomaly_ranking/negative_evidence/"
-    "concurrent_anomalies/cross_domain/preliminary_judgment/confidence），"
-    "这是交付时序结论的标准方式，Coordinator 据此分类；字段按下方说明填写，负证据不得省略。\n"
+    "- 参数缺失澄清标记: 若因缺少必要参数无法执行任何查询，"
+    f"回复必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数，禁止臆造参数。\n"
+    "\n**返回格式（信息完整、指标覆盖完整即收束）**:\n"
+    "- 交付方式：指标收齐后调用 `ArgusExpertFindings`（结构化结论工具）返回结构化 JSON"
+    "（clarification/mutation_points/anomaly_ranking/negative_evidence/concurrent_anomalies/"
+    "cross_domain/preliminary_judgment/confidence），Coordinator 据此分类；"
+    "聚焦关键指标，不复述工具原始输出。\n"
     "- 突变时间点: 指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
-    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总"
-    "（如「其余 N 个节点/指标均正常、无突变」）\n"
+    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总\n"
     "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
     "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
     "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
     "- 初步判断: 基于指标关联的根因推断（一句话）\n"
     "- 置信度: {高|中|低} + 百分比\n"
-    # Field-shape recipe (design document §9, v3.26.0): show the wire shape
-    # to copy.  Every observed parse failure submitted one whole paragraph
-    # where an array was declared, so the recipe states the array form with
-    # a concrete example rather than describing it in prose (positive
-    # recipe — no prohibition, design document §9).
     "- 多值字段形态：mutation_points / anomaly_ranking / negative_evidence / "
     "concurrent_anomalies / cross_domain 均为字符串数组，每项一条独立短句，"
-    "如 mutation_points 形态 [\"15:03 CPU 36→95%\"]、"
-    "negative_evidence 形态 [\"内存稳定 62%\", \"磁盘 util 无异常\"]\n"
-    # Coverage-gap channel (design document §9, v3.26.0): the G27
-    # checkpoint already promised "declare the gap and resubmit" but could
-    # not see the declaration; the field makes the promise checkable.
+    "如 mutation_points 形态 [\"15:03 CPU 36→95%\"]\n"
     "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
-    "『维度名：原因』（如 [\"KMC Pod指标：目标命名空间无 Pod\"]）后即可收尾，无需补采"
+    "『维度名：原因』后即可收尾，无需补采"
 )
 
 
