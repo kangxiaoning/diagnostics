@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from collections.abc import Sequence
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from deepagents import (
     GeneralPurposeSubagentProfile,
@@ -126,6 +127,46 @@ for _d in _REPORT_DIRS:
     _d.mkdir(parents=True, exist_ok=True)
 
 # ── Expert structured-return schemas (deepagents response_format) ──────
+# Conclusion-field contract repair (design document §9, v3.26.0).
+#
+# Empirical basis (2026-09-09, session 59e7da10 round-1 latency analysis
+# + 10 local traces): 8/10 sessions hit a structured-conclusion parse
+# failure (~15% of conclusions), and every single error was
+# `type=list_type` — a plain string submitted where a list[str] was
+# declared.  The default handling re-generates the whole turn (measured
+# 175-237s per retry under a contended local runner), i.e. the most
+# expensive repair shape known (bounded-repair literature: narrow the
+# task, never re-run the full generation).
+#
+# The failure is semantically lossless — one statement vs one statement
+# in a one-element list — so it is repaired deterministically BEFORE
+# validation instead of by another model turn.  Backend-agnostic by
+# construction: this runs on the wire payload, not on any provider
+# feature (schema-constrained decoding is unavailable on several
+# backends, e.g. ollama without the xgrammar library).
+_BULLET_RE = re.compile(r"^\s*(?:[-*•·]|\d+[.、)]|[（(]\d+[)）])\s*")
+
+
+def _coerce_list_value(value: Any) -> Any:
+    """Normalize a stray scalar into ``list[str]`` (deterministic repair).
+
+    A multi-line string is split per line (list markers stripped) — the
+    shape models actually emit when they mean "several items".  A
+    single-line string is kept whole: splitting on punctuation would
+    fragment one statement into meaningless halves.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        items = [_BULLET_RE.sub("", ln).strip() for ln in text.splitlines()]
+        items = [ln for ln in items if ln]
+        return items or [text]
+    if value is None:
+        return []
+    return value
+
+
 # Deepagents 0.6.10 SubAgent.response_format: when a subagent produces a
 # `structured_response` conforming to the schema, it is JSON-serialized and
 # returned as the ToolMessage content to the Coordinator, replacing the
@@ -179,6 +220,24 @@ class DeepExpertFindings(BaseModel):
         default="",
         description="置信度：高/中/低 + 百分比（如 中 70%）",
     )
+    coverage_gaps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "未取证维度声明：与本次任务无关、或数据不可用而无法取证的维度，"
+            "逐条写明『维度名：原因』（如『节点指标：目标节点无监控数据』）。"
+            "已声明的维度视为已交代，不会因缺数据被要求补采"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _repair_list_fields(cls, data: Any) -> Any:
+        """Deterministic wire repair: str → list[str] (see module note)."""
+        if isinstance(data, dict):
+            for name in ("key_evidence", "negative_evidence", "coverage_gaps"):
+                if name in data:
+                    data[name] = _coerce_list_value(data[name])
+        return data
 
 
 # Argus time-series analysis experts (host-argus-expert / k8s-argus-expert /
@@ -197,25 +256,30 @@ class ArgusExpertFindings(BaseModel):
             f"以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数；否则为空字符串。"
         ),
     )
+    # 多值字段统一形态契约：字符串数组，每项一条完整短句（P1 前置形态
+    # 示例 + P0 确定性归一化双保险；实证见模块顶部注释）。
     mutation_points: list[str] = Field(
         default_factory=list,
-        description="突变时间点：指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）",
+        description="突变时间点（数组，每项一条）：指标显著变化的时间点及变化值，"
+                    "如 [\"15:03 CPU 36→95%\"]",
     )
     anomaly_ranking: list[str] = Field(
         default_factory=list,
-        description="异常排序（按严重程度）：🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总（如「其余 N 个节点/指标均正常、无突变」）",
+        description="异常排序（数组，按严重程度每项一条）：🔴严重 / ⚠中等 逐条列出具体数值；"
+                    "✅正常项合并为一条汇总，如 [\"🔴严重：CPU 95%\", \"✅正常：其余 10 个节点无突变\"]",
     )
     negative_evidence: list[str] = Field(
         default_factory=list,
-        description="负证据必报：关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要",
+        description="负证据必报（数组，每项一条）：关键指标正常/无异常必须明确报告（排除依据），"
+                    "与异常发现同等重要",
     )
     concurrent_anomalies: list[str] = Field(
         default_factory=list,
-        description="并发异常：同一时间点发生的多个异常（暗示共同根因）",
+        description="并发异常（数组，每项一条）：同一时间点发生的多个异常（暗示共同根因）",
     )
     cross_domain: list[str] = Field(
         default_factory=list,
-        description="跨域关联：不同子系统指标之间的时序因果推断",
+        description="跨域关联（数组，每项一条）：不同子系统指标之间的时序因果推断",
     )
     preliminary_judgment: str = Field(
         default="",
@@ -225,6 +289,25 @@ class ArgusExpertFindings(BaseModel):
         default="",
         description="置信度：高/中/低 + 百分比（如 中 70%）",
     )
+    coverage_gaps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "未取证维度声明（数组，每项一条）：与本次任务无关、或数据不可用而无法取证的"
+            "维度，逐条写明『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）。"
+            "已声明的维度视为已交代，不会因缺数据被要求补采"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _repair_list_fields(cls, data: Any) -> Any:
+        """Deterministic wire repair: str → list[str] (see module note)."""
+        if isinstance(data, dict):
+            for name in ("mutation_points", "anomaly_ranking", "negative_evidence",
+                         "concurrent_anomalies", "cross_domain", "coverage_gaps"):
+                if name in data:
+                    data[name] = _coerce_list_value(data[name])
+        return data
 
 
 # Common return format suffix for all subagents — enables Coordinator to
@@ -271,7 +354,17 @@ _EXPERT_RETURN_SUFFIX = (
     "- 结论对象: 若被指派假设不成立、但你另发现了真正根因，填 verdict_target="
     "alternative_root_cause（verdict=confirmed 此时表达'根因已确认'而非'假设成立'，"
     "root_cause 填真正根因）——如实声明可让 Coordinator 正确走'排除假设+收录新根因'通道\n"
-    "- 置信度: {高|中|低} + 百分比"
+    "- 置信度: {高|中|低} + 百分比\n"
+    # Field-shape recipe (design document §9, v3.26.0): a positive example
+    # of the wire shape instead of a prose-only description — the observed
+    # failure mode was a whole paragraph submitted where an array was
+    # declared.  Shown as the correct form to copy, not as a prohibition
+    # (positive-recipe discipline, design document §9).
+    "- 多值字段形态：key_evidence / negative_evidence / coverage_gaps 均为字符串数组，"
+    "每项一条独立短句，如 key_evidence 形态 [\"事件：15:03 OOMKilled\"]、"
+    "negative_evidence 形态 [\"节点内存稳定 62%\", \"目标 Pod 不存在\"]\n"
+    "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
+    "『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）后即可收尾"
 )
 
 # Return format suffix for Argus time-series analysis experts.
@@ -313,14 +406,28 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "指标收齐后调用它返回结构化 JSON（clarification/mutation_points/anomaly_ranking/negative_evidence/"
     "concurrent_anomalies/cross_domain/preliminary_judgment/confidence），"
     "这是交付时序结论的标准方式，Coordinator 据此分类；字段按下方说明填写，负证据不得省略。\n"
-    "- 突变时间点: 列出指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
+    "- 突变时间点: 指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
     "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总"
     "（如「其余 N 个节点/指标均正常、无突变」）\n"
     "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
     "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
     "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
     "- 初步判断: 基于指标关联的根因推断（一句话）\n"
-    "- 置信度: {高|中|低} + 百分比"
+    "- 置信度: {高|中|低} + 百分比\n"
+    # Field-shape recipe (design document §9, v3.26.0): show the wire shape
+    # to copy.  Every observed parse failure submitted one whole paragraph
+    # where an array was declared, so the recipe states the array form with
+    # a concrete example rather than describing it in prose (positive
+    # recipe — no prohibition, design document §9).
+    "- 多值字段形态：mutation_points / anomaly_ranking / negative_evidence / "
+    "concurrent_anomalies / cross_domain 均为字符串数组，每项一条独立短句，"
+    "如 mutation_points 形态 [\"15:03 CPU 36→95%\"]、"
+    "negative_evidence 形态 [\"内存稳定 62%\", \"磁盘 util 无异常\"]\n"
+    # Coverage-gap channel (design document §9, v3.26.0): the G27
+    # checkpoint already promised "declare the gap and resubmit" but could
+    # not see the declaration; the field makes the promise checkable.
+    "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
+    "『维度名：原因』（如 [\"KMC Pod指标：目标命名空间无 Pod\"]）后即可收尾，无需补采"
 )
 
 

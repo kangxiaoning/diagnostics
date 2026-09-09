@@ -32,7 +32,7 @@ import logging
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from deepagents.middleware._utils import append_to_system_message
 
@@ -100,6 +100,45 @@ _SKIP_TOOLS = frozenset({
     "task", "list_diagnostic_capabilities",
     "DeepExpertFindings", "ArgusExpertFindings",
 })
+
+
+def _declared_gaps(sr: Any) -> list[str]:
+    """Gap declarations carried by the conclusion itself.
+
+    G27's receipt has always said "declare the gap and resubmit", but the
+    checkpoint could only compare the tool-derived expectation against
+    the executed calls — a declared gap was invisible, so the expert had
+    to spend one more collection turn even when the dimension was
+    genuinely unavailable (2026-09-09 session 59e7da10: kmc-argus cost a
+    139.5s collection turn + a 58.4s conclusion turn for a dimension it
+    had already called out).  The conclusion schema now carries
+    `coverage_gaps`, which makes the promise machine-checkable.
+    """
+    raw = getattr(sr, "coverage_gaps", None) if sr is not None else None
+    if raw is None and isinstance(sr, dict):
+        raw = sr.get("coverage_gaps")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _gap_declared(dim: str, declared: list[str]) -> bool:
+    """Whether *dim* is covered by one of the declarations.
+
+    Two-directional substring match: the declaration usually embeds the
+    dimension name with a reason suffix ("KMC Pod指标：无 Pod"), but the
+    model may also abbreviate it ("Pod指标").  The short-token guard
+    stops a vague declaration such as "指标" from silently clearing every
+    dimension and disabling the checkpoint.
+    """
+    for g in declared:
+        if dim in g:
+            return True
+        if len(g) >= 4 and g in dim:
+            return True
+    return False
 
 
 class ExpertGuidanceMiddleware(AgentMiddleware):
@@ -194,6 +233,17 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 request = request.override(
                     system_message=append_to_system_message(
                         request.system_message, "\n".join(parts)))
+            # Decision-point restatement of the conclusion contract: the
+            # progress block lives in the system message (far from the
+            # generated token, behind every tool result), so the two
+            # clauses the concluding turn must honour are repeated as the
+            # last message in the context (design document §9, v3.26.0).
+            reminder = self._ledger.closing_reminder(key, tool_names)
+            if reminder:
+                messages = list(getattr(request, "messages", []) or [])
+                if messages:
+                    request = request.override(
+                        messages=[*messages, SystemMessage(content=reminder)])
         except Exception:
             pass  # guidance must never become a failure source
         import time as _time
@@ -263,14 +313,18 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             if clarification:
                 return None
             uncovered = expected_dimensions(s["tools"]) - s["covered"]
+            declared = _declared_gaps(sr)
+            if declared and uncovered:
+                uncovered = {
+                    d for d in uncovered if not _gap_declared(d, declared)}
             if not uncovered:
                 return None
             dims = "、".join(sorted(uncovered))
             guidance = (
                 "[系统提示·结论完整性校验] 结论已收到。系统台账显示以下维度"
-                f"尚无取证数据：{dims}——请补取相关维度数据后重新提交结论；"
-                "若某维度与本次任务无关或其数据不可用，在结论的 "
-                "negative_evidence 中如实声明该缺口后重新提交。"
+                f"尚无取证数据：{dims}——请补取其中与本次任务相关的维度后重新提交结论；"
+                "与任务无关或数据不可用的维度，在结论 coverage_gaps 中逐条写明"
+                "『维度名：原因』后再提交（已声明的维度视为已交代，无需补采）。"
             )
             self._ledger.mark_conclusion_hinted(key, guidance)
             logger.info(

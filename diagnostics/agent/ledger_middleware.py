@@ -467,6 +467,11 @@ def _format_expert_summary(output: str) -> str:
         ("负证据", "negative_evidence"),
         ("并发异常", "concurrent_anomalies"),
         ("跨域关联", "cross_domain"),
+        # Declared collection gaps (design document §9, v3.26.0): the
+        # expert states which dimensions it could not evidence and why.
+        # Surfaced to the Coordinator so an absent dimension reads as a
+        # declared blind spot rather than as missing diligence.
+        ("取证缺口", "coverage_gaps"),
     ):
         items = data.get(key) or []
         if items:

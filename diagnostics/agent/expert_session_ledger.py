@@ -154,6 +154,16 @@ _MAX_FINGERPRINTS_PER_TOOL = 8
 # injected state must never bury the one action that matters; Anthropic
 # context engineering — smallest set of high-signal tokens).
 _GUIDANCE_MAX_CHARS = 400
+# Conclusion contract restated at the decision point (design document
+# §9, v3.26.0).  Two clauses only: the array field shape (the sole
+# observed parse-failure mode) and the gap-declaration channel — the
+# smallest high-signal token set that prevents the two failures that
+# cost a full regeneration turn each.
+_CLOSING_CONTRACT = (
+    "收尾契约：调用结论工具提交——多值字段填字符串数组（每项一条短句）；"
+    "未取证维度在 coverage_gaps 写明『维度名：原因』即视为已交代。"
+)
+
 # Truncation records kept per delegation (G28).  The bounded resubmit
 # allows at most two truncated turns, so 4 is headroom for diagnostics
 # without unbounded growth.
@@ -339,8 +349,32 @@ class ExpertSessionLedger:
         uncovered = expected - s["covered"]
         if uncovered:
             return ("未覆盖维度：" + "、".join(sorted(uncovered))
-                    + "——优先投向与任务相关的未覆盖维度；与任务无关则直接收尾")
+                    + "——优先投向与任务相关的未覆盖维度；与任务无关或数据不可用"
+                    "则在结论 coverage_gaps 中声明后收尾")
         return "各方向均有数据——证据足够置信判断时调用结论工具收尾，不要继续搜索"
+
+    def closing_reminder(self, key: str, tool_names: list[str]) -> str | None:
+        """Decision-point restatement of the conclusion contract.
+
+        The progress block is appended to the system message, i.e. it sits
+        at the far end of the context from the token being generated, with
+        every tool result in between — precisely the region a transformer
+        uses least (Liu et al., TACL 2023, "Lost in the Middle").  The
+        contract therefore gets a second, minimal copy next to the
+        decision point, carrying only what the concluding turn must get
+        right: the array field shape and the gap-declaration channel.
+
+        Returns None before the first executed call (selective injection,
+        same discipline as the progress block).
+        """
+        s = self._sessions.get(key)
+        if s is None or not s["calls"]:
+            return None
+        uncovered = expected_dimensions(tool_names) - s["covered"]
+        if uncovered:
+            return ("未覆盖维度：" + "、".join(sorted(uncovered))
+                    + "——相关维度补采 1-2 次；" + _CLOSING_CONTRACT)
+        return _CLOSING_CONTRACT
 
     def render(self, key: str, tool_names: list[str], dedup_hits: int,
                budget_soft: int, budget_hard: int) -> str:
