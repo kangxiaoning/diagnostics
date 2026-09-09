@@ -61,6 +61,7 @@ from diagnostics.agent.ledger import (
     finalize_pending_for_report,
     fmt_hid,
     is_confirmed_root,
+    _round_findings_text,
     ledger_to_json,
     new_evidence,
     new_ledger,
@@ -275,6 +276,43 @@ _PHASE_TOOL_BLOCKED_MARK = "【当前阶段不可用】"
 # Idempotency guard: strip a previously injected marker before re-adding.
 _PHASE_TOOL_MARK_RE = re.compile(
     r"^(【当前阶段动作】|【当前阶段不可用】(（[^）]*）)?)")
+
+
+def _phase_rejection_suffix(phase: str) -> str:
+    """Corrective-action suffix for phase-allowlist rejections.
+
+    v3.23.0 (B1): a bare allowlist names what exists, not what to do —
+    the model retried record_finding for 12 rounds in hypothesize
+    (2026-09-08 session 898d4699).  v3.34.0 extends the pattern to all
+    phases: in verify the wandering repeated (2026-09-09 session
+    2026474a — propose blocked, then write_file blocked, then the
+    verify valve fired, 3 rounds lost, because a G22-blocked verdict
+    held the phase hostage and no rejection receipt named the unblock
+    sequence).  Error responses are recovery instructions for the model
+    (§12 Tool-Design — actionable errors): name the legal next action
+    and the phase-transition causal chain per phase.
+    """
+    if phase == "hypothesize":
+        return (
+            "正确动作：propose_hypotheses 提出新批次假设"
+            "（若根因方向已明，直接收录为新假设——证据在手"
+            "可随后 record_finding confirmed 落账，落账成功"
+            "（p≥80）后 write_file 通道自动开放）。"
+        )
+    if phase == "verify":
+        return (
+            "正确动作：先调用 record_finding 落账活动假设的验证结论"
+            "（被覆盖性/冲突类门控拦截的判定按其拦截回执三选一处置："
+            "确认覆盖后重提交 / 判 inconclusive / 改派第二通道专家），"
+            "落账成功后相位自动进入 EVALUATE——届时 propose_hypotheses 合法。"
+        )
+    if phase == "evaluate":
+        return (
+            "正确动作：record_finding（落账判定）/ select_path（切换焦点）"
+            "/ backtrack（回溯）/ propose_hypotheses（换批或证据驱动追加）"
+            "按 EVALUATE 菜单执行。"
+        )
+    return ""
 
 
 def _phase_scoped_tools(tools: object, phase: str) -> list | None:
@@ -537,9 +575,19 @@ def _format_expert_summary(output: str) -> str:
         return output or ""
     lines: list[str] = []
 
-    # Argus experts: clarification marker leads (contract §8 G2 / §9).
+    # Argus experts: a PURE clarification return leads with the ask
+    # (contract §8 G2 / §9).  A partial success — real data collected
+    # AND residual params requested — leads with the DATA and appends
+    # the ask last (v3.33.0): collected evidence must not be visually
+    # vetoed by the residual request (observed 2026-09-09 ef166483).
     clarification = data.get("clarification") or ""
-    if clarification:
+    _has_data = bool(
+        data.get("mutation_points") or data.get("anomaly_ranking")
+        or data.get("negative_evidence")
+        or data.get("preliminary_judgment")
+        or data.get("concurrent_anomalies")
+        or data.get("cross_domain"))
+    if clarification and not _has_data:
         lines.append(clarification)
 
     verdict = data.get("verdict")
@@ -569,6 +617,8 @@ def _format_expert_summary(output: str) -> str:
         value = data.get(key) or ""
         if value:
             lines.append(f"{label}: {value}")
+    if clarification and _has_data:
+        lines.append(f"参数缺口: {clarification}")
     return "\n".join(lines)
 
 
@@ -698,15 +748,16 @@ def _classify_argus_data(ledger: dict) -> str:
     saw_failure = False
     saw_all_normal = False
     for r in expert_rounds:
-        kf = r.get("key_findings", "")
+        kf = _round_findings_text(r)
         # Structured argus returns (prompt-contract JSON):
         # classification fields take precedence over text patterns.
+        # v3.33.0 partial-success: data fields beat clarification — a
+        # structured return that collected real metrics AND requests
+        # missing params for further dimensions counts as DATA, not as
+        # param_missing (the collected evidence must not be vetoed by
+        # the residual ask; observed 2026-09-09 session ef166483).
         data = _parse_expert_json(kf)
         if data is not None:
-            clarification = data.get("clarification") or ""
-            if any(p in clarification for p in _ARGUS_PARAM_MISSING_PATTERNS):
-                saw_param_missing = True
-                continue
             # Structured data present (mutation points / ranking /
             # negative evidence / judgment) → real diagnostic data.
             if (data.get("mutation_points") or data.get("anomaly_ranking")
@@ -4193,14 +4244,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # "what to do" (2026-09-08 session 898d4699: the
                     # model retried record_finding for 12 rounds in
                     # hypothesize instead of proposing the new batch).
-                    _suffix = ""
-                    if _phase_now == "hypothesize":
-                        _suffix = (
-                            "正确动作：propose_hypotheses 提出新批次假设"
-                            "（若根因方向已明，直接收录为新假设——证据在手"
-                            "可随后 record_finding confirmed 落账，落账成功"
-                            "（p≥80）后 write_file 通道自动开放）。"
-                        )
+                    # v3.34.0: per-phase suffix via SSOT helper (verify
+                    # wandering observed in session 2026474a).
+                    _suffix = _phase_rejection_suffix(_phase_now)
                     return ToolMessage(
                         content=(
                             f"⛔ {tool_name} 在 {_phase_now.upper()} 阶段不可用"
@@ -4701,16 +4747,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Normal outputs are truncated (kept as a concise "key finding"),
             # but failing tool calls (LangChain ToolNode errors) keep their
             # full message so the root cause is traceable in post-hoc review.
+            # key_findings_full keeps the untruncated copy for downstream
+            # signal detectors (design document §9) — the 200-char display
+            # cut must not clip the evidence those detectors classify.
             key_findings = ""
+            key_findings_full = ""
             if output:
-                key_findings = output.replace("\n", " ").strip()
-                is_error = key_findings.startswith("Error invoking tool") or \
-                    "Error:" in key_findings
+                normalized = output.replace("\n", " ").strip()
+                key_findings_full = normalized[:4000]
+                is_error = normalized.startswith("Error invoking tool") or \
+                    "Error:" in normalized
                 if is_error:
-                    if len(key_findings) > 2000:
-                        key_findings = key_findings[:2000] + " …(truncated)"
-                elif len(key_findings) > 200:
-                    key_findings = key_findings[:200] + " …(truncated)"
+                    if len(normalized) > 2000:
+                        key_findings = normalized[:2000] + " …(truncated)"
+                    else:
+                        key_findings = normalized
+                elif len(normalized) > 200:
+                    key_findings = normalized[:200] + " …(truncated)"
+                else:
+                    key_findings = normalized
 
             # Track delegated experts for coverage detection
             delegated = None
@@ -4735,6 +4790,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 tools_called=[tool_name],
                 action_summary=tool_args.get("description", "") if tool_name == "task" else tool_name,
                 key_findings=key_findings,
+                key_findings_full=key_findings_full,
                 _seq=invocation_seq,
                 delegated_experts=delegated,
                 delegated_for=delegated_for,

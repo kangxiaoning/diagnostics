@@ -25,7 +25,9 @@ PHASE_SPEC: dict[str, dict] = {
             "先委派、后读技能：Argus 委派已发出后，才可按需 read_file 加载 "
             "SKILL.md / AGENTS.md 深化理解（首轮先读技能会延误数据采集）",
         ],
-        "exit": "必需 Argus 专家数据齐备后，系统自动进入 HYPOTHESIZE。",
+        "exit": "首批 Argus 专家委派完成后（含返回参数澄清的情形），系统自动进入 "
+                "HYPOTHESIZE——未返回数据的维度证据缺口直接写成假设"
+                "（probability 体现不确定性），不要试图先补齐数据。",
     },
     "hypothesize": {
         "title": "阶段 2: HYPOTHESIZE（形成假设）",
@@ -322,7 +324,7 @@ UNDERSTAND (委派当前场景的 Argus 专家并行采集):
   → task(subagent_type="host-argus-expert", description="查询并分析 prod-cluster 集群 Argus 指标时序（2026-07-01 15:00:00 ~ 15:10:00）：重点关注 query_argus_k8s_workload 的 Pod 重启、query_argus_k8s_node 的节点 NotReady，以及 query_argus_k8s_cluster 的 API 延迟")
   → task(subagent_type="host-argus-expert", description="查询并分析 worker-3 主机 CPU/内存 Argus 指标时序（同上时间窗），关注节点资源压力时间点")
   （其余 Argus 专家按相同格式并行委派）
-  (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
+  (Argus 专家委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[
@@ -358,7 +360,7 @@ UNDERSTAND (委派当前场景的 Argus 专家并行采集):
   → task(subagent_type="serverless-argus-expert", description="查询并分析 my-sls-cluster 逻辑集群 Argus 指标时序（2026-07-01 15:00:00 ~ 15:10:00），重点关注 API 延迟突增、Deployment 状态更新延迟")
   → task(subagent_type="host-argus-expert", description="查询并分析 kmc-node-02 主机 CPU/内存 Argus 指标时序（同上时间窗），关注节点资源压力时间点")
   （其余 Argus 专家按相同格式并行委派）
-  (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
+  (Argus 专家委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[
@@ -406,7 +408,7 @@ _HOST_EXAMPLE = """<example>
 UNDERSTAND (委派当前场景的 Argus 专家):
   当前场景 Argus 专家：host-argus-expert
   → task(subagent_type="host-argus-expert", description="查询并分析 prod-web-01 主机 CPU/内存/磁盘/网络 Argus 指标时序（2026-07-01 15:00:00 ~ 15:10:00），重点关注 CPU 打满时间点与跨子系统关联")
-  (收到 Argus 专家分析摘要后，系统自动进入 HYPOTHESIZE)
+  (Argus 专家委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[
@@ -444,7 +446,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   当前场景 Argus 专家：serverless-argus-expert、kmc-argus-expert、sci-argus-expert、host-argus-expert
   → task(subagent_type="serverless-argus-expert", description="查询并分析主机网络/CPU Argus指标时序，重点关注丢包/重传突变和sys%变化")
   → read_file("/agent_data/skills/conntrack-diagnosis/SKILL.md")
-  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
+  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；Argus 委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
@@ -471,7 +473,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   当前场景 Argus 专家：host-argus-expert、k8s-argus-expert
   → task(subagent_type="host-argus-expert", description="查询并分析主机网络/CPU Argus指标时序，重点关注丢包/重传突变和sys%变化")
   → read_file("/agent_data/skills/conntrack-diagnosis/SKILL.md")
-  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
+  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；Argus 委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])
@@ -498,7 +500,7 @@ UNDERSTAND (技能驱动 — 委派 Argus 专家 + 加载技能):
   当前场景 Argus 专家：host-argus-expert
   → task(subagent_type="host-argus-expert", description="查询并分析主机网络/CPU Argus指标时序，重点关注丢包/重传突变和sys%变化")
   → read_file("/agent_data/skills/conntrack-diagnosis/SKILL.md")
-  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；系统自动进入 HYPOTHESIZE)
+  (收到摘要: 丢包+重传同时暴增, sys%高→softirq；Argus 委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
 
 HYPOTHESIZE:
   → propose_hypotheses(hypotheses=[{{statement: "conntrack表满(技能预定义)", probability: 70, rationale: "技能症状匹配"}}])

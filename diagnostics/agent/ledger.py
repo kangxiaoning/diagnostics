@@ -1583,16 +1583,57 @@ ARGUS_PARAM_MISSING_PATTERNS = (
 )
 
 
+def _round_findings_text(rnd: dict) -> str:
+    """Full expert-return text for one round.
+
+    Prefers the untruncated ``key_findings_full`` (design document §9);
+    falls back to the display-truncated ``key_findings`` for historical
+    ledgers written before the full field existed.
+    """
+    return str(rnd.get("key_findings_full") or rnd.get("key_findings", ""))
+
+
+def _argus_return_has_data(kf_text: str) -> bool | None:
+    """Structured-return data probe (partial-success semantics).
+
+    Returns True when the text parses as the argus structured contract
+    AND carries real diagnostic data (mutation points / ranking /
+    negative evidence / judgment / concurrent / cross-domain) — a
+    partial success that ALSO requests missing parameters still counts
+    as data (v3.33.0: clarification must not veto collected evidence).
+    Returns False when structured with no data fields, None when the
+    text is not structured JSON (text-format fallback decides).
+    """
+    try:
+        data = json.loads(kf_text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return bool(
+        data.get("mutation_points") or data.get("anomaly_ranking")
+        or data.get("negative_evidence")
+        or data.get("preliminary_judgment")
+        or data.get("concurrent_anomalies")
+        or data.get("cross_domain"))
+
+
 def argus_param_clarification_pending(
         ledger: DiagnosisLedger) -> list[str]:
     """已委派但返回参数澄清（未返回监控数据）的 argus 专家名单
     （design document §9, v3.11.1）。同一专家后续返回实质数据则解除
-    pending 状态。供 HYPOTHESIZE 数据缺口补救指引的选择性注入。"""
+    pending 状态。供 HYPOTHESIZE 数据缺口补救指引的选择性注入。
+    v3.33.0：读未截断全文；结构化部分成功（有数据字段 + clarification
+    并存）按数据对待，不再标记 pending。"""
     pending: list[str] = []
     for rnd in ledger.get("rounds", []):
-        kf = str(rnd.get("key_findings", ""))
+        kf = _round_findings_text(rnd)
         for expert in rnd.get("delegated_experts", []):
             if not str(expert).endswith("argus-expert"):
+                continue
+            if _argus_return_has_data(kf) is False:
+                if expert in pending:
+                    pending.remove(expert)
                 continue
             if any(p in kf for p in ARGUS_PARAM_MISSING_PATTERNS):
                 if expert not in pending:
@@ -1602,8 +1643,9 @@ def argus_param_clarification_pending(
     return pending
 
 
-# key_findings 是专家结构化返回的 JSON 文本（换行已在落账时归一化为
-# 空格、并按长度截断），故按 JSON 数组边界切分为片段后再做行级分类。
+# argus 专家返回是结构化 JSON 文本（换行已在落账时归一化为空格）；
+# 按未截断全文（key_findings_full，v3.33.0）读取，历史台账回退到截断版
+# key_findings。JSON 数组边界切分为片段后做行级分类。
 _ARGUS_SEGMENT_SPLIT = re.compile(r'(?:"\s*,\s*"?|\[|\]|\{|\})')
 
 
@@ -1636,7 +1678,7 @@ def argus_conflict_pending(ledger: DiagnosisLedger) -> list[str]:
                    for e in rnd.get("delegated_experts", [])):
             continue
         segments = [s.strip() for s in _ARGUS_SEGMENT_SPLIT.split(
-            str(rnd.get("key_findings", ""))) if s.strip()]
+            _round_findings_text(rnd)) if s.strip()]
         if not segments:
             continue
         has_anomaly = any(
@@ -1645,7 +1687,16 @@ def argus_conflict_pending(ledger: DiagnosisLedger) -> list[str]:
         if not has_anomaly:
             continue
         for seg in segments:
-            if _ARGUS_ANOMALY_LINE.search(seg):
+            # Severity labels from the structured contract are
+            # authoritative (same anchor principle as the C1 ranking
+            # anchors): a leading ✅ marks a normal finding even when the
+            # text mentions an anomaly keyword ("OOMKilled 计数为 0" —
+            # the plain-keyword path misread negated mentions as
+            # anomalies, v3.33.0), and 🔴/⚠ mark anomalies outright.
+            if seg.startswith("✅"):
+                pass  # authoritative normal label — keep as candidate
+            elif (seg.startswith(("🔴", "⚠"))
+                  or _ARGUS_ANOMALY_LINE.search(seg)):
                 continue
             if _ARGUS_TARGET_NORMAL.search(seg):
                 snippet = seg[:40]
@@ -2141,6 +2192,7 @@ def record_round(
     tools_called: list[str],
     action_summary: str = "",
     key_findings: str = "",
+    key_findings_full: str = "",
     next_plan: str = "",
     _seq: int = 0,
     delegated_experts: list[str] | None = None,
@@ -2172,6 +2224,14 @@ def record_round(
         entry["delegated_experts"] = delegated_experts
     if delegated_for:
         entry["delegated_for"] = delegated_for
+    if key_findings_full:
+        # Untruncated expert return (design document §9): signal
+        # detectors (argus conflict / param-clarification) must read the
+        # FULL text — key_findings is display-truncated at 200 chars and
+        # evidence beyond the cut was invisible to them (observed
+        # 2026-09-09 session 9906c211: the target-normal segment lived
+        # past the cut, so the conflict hint never fired).
+        entry["key_findings_full"] = key_findings_full
     ledger["rounds"].append(entry)
 
 
@@ -3339,6 +3399,30 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
                 "record_finding", "critical",
                 f"G17 此前拦截了 {fmt_hid(hid)} 的 confirmed 判定，"
                 f"专家证据现已到位——confirmed 通道已开放，不会再被拦截",
+            )
+        # v3.34.0: blocked-verdict disclosure (design document §9) — a
+        # prior reactive-gate block (G22 single-channel refute / G21
+        # verdict conflict / C2 metric-conflict refute) left the verdict
+        # unrecorded while this hint kept demanding "record_finding".
+        # The two systems contradicted each other and the LLM wandered
+        # into illegal channels (observed 2026-09-09 session 2026474a:
+        # propose blocked in verify, write_file blocked by L1, verify
+        # valve fired — 3 rounds lost).  Symmetric to the G17
+        # reassurance branch above: disclose the block, mirror the
+        # receipt's three options, and state the phase-transition causal
+        # chain (verdict recorded → EVALUATE → propose legal there).
+        if any(node.get(k, 0)
+               for k in ("_g22_block_count", "_c2_block_count",
+                         "_g21_block_count", "_g17e2_block_count")):
+            return ActionHint(
+                "record_finding", "critical",
+                f"{fmt_hid(hid)} 的判定此前被覆盖性/冲突类门控拦截"
+                "——按拦截回执三选一处置："
+                "①确认专家观测域已完整覆盖后重提交原判定"
+                "（通道已开放，降级放行并披露）；"
+                "②判 inconclusive 并披露证据缺口；"
+                "③改派第二证据通道专家。"
+                "落账成功后相位自动进入 EVALUATE——新方向假设届时提出",
             )
         if stall >= 2:
             return ActionHint(
