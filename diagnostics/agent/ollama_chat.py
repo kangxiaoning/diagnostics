@@ -23,6 +23,16 @@ from langchain_openai import ChatOpenAI
 _THINKING_MODE = os.getenv("DIAGNOSTICS_THINKING", "").strip().lower()
 _REASONING_EFFORT = os.getenv("DIAGNOSTICS_REASONING_EFFORT", "").strip().lower()
 
+# ── Optional model residency (design document §12) ──────────────────
+# A cold runner pays the full model load before the first token: measured
+# 29s for a 35B MoE on this host (2026-09-09 session 59e7da10 — 3.5% of
+# round-1 wall time, every first request of a working day).  Backends
+# that expose a keep-alive/TTL knob take it in extra_body
+# (e.g. keep_alive="-1" pins the model).  Off by default: the field is
+# unknown to plain OpenAI-compatible servers, so it is only emitted when
+# the operator opts in — same discipline as the thinking switch above.
+_KEEP_ALIVE = os.getenv("DIAGNOSTICS_KEEP_ALIVE", "").strip()
+
 
 class OllamaChatOpenAI(ChatOpenAI):
     """Emit legacy top-level ``max_tokens`` alongside ``max_completion_tokens``.
@@ -52,5 +62,9 @@ class OllamaChatOpenAI(ChatOpenAI):
             extra_body["thinking"] = {"type": _THINKING_MODE}
             if _THINKING_MODE == "enabled" and _REASONING_EFFORT:
                 extra_body["reasoning_effort"] = _REASONING_EFFORT
+            payload["extra_body"] = extra_body
+        if _KEEP_ALIVE:
+            extra_body = payload.get("extra_body") or {}
+            extra_body["keep_alive"] = _KEEP_ALIVE
             payload["extra_body"] = extra_body
         return payload
