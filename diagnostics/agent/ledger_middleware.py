@@ -74,6 +74,10 @@ from diagnostics.agent.ledger import (
     select_path,
     unrecorded_evidence_hypotheses,
 )
+from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，design document §7；与前置引导同源于 ledger.py)
+    _PHASE_ALLOWED_HINT,
+    _PHASE_ALLOWLIST,
+)
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
 from deepagents.middleware._utils import append_to_system_message
@@ -243,46 +247,85 @@ _READONLY_SCOPES: frozenset[str] = frozenset({
     "read_file", "ls", "grep", "glob", "write_todos",
 })
 
-_PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
-    # UNDERSTAND collects data only — proposing hypotheses before the
-    # coverage gate opens would skip HYPOTHESIZE entirely.
-    "understand": frozenset({"task"}),
-    # HYPOTHESIZE only proposes; no findings/paths/delegations yet
-    # (§7 whitelist: propose_hypotheses + read_file).  Letting task()
-    # through here would pull VERIFY behaviour forward and expose the
-    # G5 delegation-value gate outside its designed phase.
-    "hypothesize": frozenset({"propose_hypotheses"}),
-    # VERIFY delegates + records findings; no proposes/paths.
-    "verify": frozenset({"task", "record_finding"}),
-    # EVALUATE picks direction; recording a finding is ALSO legal here
-    # (v2.8.1: record_finding is an evidence-ledgering EVENT, not a phase
-    # milestone — Statecharts shared-event semantics, valid in VERIFY as
-    # the T3 transition and in EVALUATE as an internal self-transition).
-    # Semantic guards stay in the tool handler (Defect D anti-flip, refuted
-    # frozen, ID validation), so allowing it here opens no abuse surface.
-    # task (auto-heal T5') is also legal here (§7).
-    # write_file is deliberately NOT in the allowlist — the dedicated
-    # write_file gate (check_exit_conditions / _forced_terminal / report)
-    # is the correct guard for "may I write the report now"; gating it by
-    # phase would kill the legitimate escape hatch where exit conditions
-    # are met while the derived phase still reads "evaluate".
-    "evaluate": frozenset({"select_path", "propose_hypotheses", "backtrack",
-                           "record_finding", "task"}),
-    # REPORT only writes the report; diagnosis tools are locked out.
-    "report": frozenset(),
-}
-
-_PHASE_ALLOWED_HINT: dict[str, str] = {
-    "understand": "task(*-argus-expert), read_file",
-    "hypothesize": "propose_hypotheses",
-    "verify": "task(*-expert), record_finding",
-    "evaluate": "select_path / propose_hypotheses / backtrack / record_finding / task",
-    "report": "write_file",
-}
+# ── Phase tool gate (design document §7) ─────────────────────────────
+# The allowlist and its human-facing hint now live in ledger.py (P6
+# single source) so the reactive gate here and the proactive "本步要求"
+# both are imported from ledger.py at the top of this module.
 
 
 def _gate_hint(phase: str) -> str:
     return _PHASE_ALLOWED_HINT.get(phase, phase)
+
+
+# ── Phase-scoped tool surface (design document §7 / P7, v3.27.0) ─────
+# Tool definitions ARE prompt text: a tool that is always present in the
+# tool list reads as "always available", and that standing invitation is
+# what made the LLM delegate a deep expert while in HYPOTHESIZE
+# (2026-09-09 session 294ed89a; the same pattern had already survived two
+# prompt rewrites, v3.9.3 and v3.14.4).  Annotating each tool definition
+# with its availability for the CURRENT phase delivers the constraint at
+# the decision point — where the action is actually chosen — instead of
+# only in the rejection receipt (Tool Masking, §12: keep tool guidance on
+# the tool surface).  Purely additive: the reactive allowlist gate is
+# untouched and stays the deterministic backstop, so the worst case of a
+# mis-read here is lost clarity, never a wrong state transition.
+_PHASE_TOOL_OK_MARK = "【当前阶段动作】"
+_PHASE_TOOL_BLOCKED_MARK = "【当前阶段不可用】"
+# Idempotency guard: strip a previously injected marker before re-adding.
+_PHASE_TOOL_MARK_RE = re.compile(
+    r"^(【当前阶段动作】|【当前阶段不可用】(（[^）]*）)?)")
+
+
+def _phase_scoped_tools(tools: object, phase: str) -> list | None:
+    """Return *tools* with per-tool phase availability in the description.
+
+    Available tools are positively marked; unavailable ones carry the
+    current phase's action list (StateWright: name what IS available).
+    ``write_file`` and the read-only scaffold are exempt — they are
+    governed by their own gates, exactly as in the reactive allowlist.
+
+    Returns None when the surface cannot be rewritten safely (unknown
+    tool shape / immutable tool object) — guidance must never become a
+    failure source (design document §8).
+    """
+    if not tools or not isinstance(tools, (list, tuple)):
+        return None
+    allowed = _PHASE_ALLOWLIST.get(phase, frozenset())
+    hint = _gate_hint(phase)
+    out: list = []
+    changed = False
+    for tool in tools:
+        try:
+            if isinstance(tool, dict):
+                name = tool.get("name")
+            else:
+                name = getattr(tool, "name", None)
+            if not name or name == "write_file" or name in _READONLY_SCOPES:
+                out.append(tool)
+                continue
+            if name in allowed:
+                prefix = _PHASE_TOOL_OK_MARK
+            else:
+                prefix = f"{_PHASE_TOOL_BLOCKED_MARK}（当前阶段动作：{hint}）"
+            if isinstance(tool, dict):
+                desc = str(tool.get("description") or "")
+                new_tool = dict(tool)
+                new_tool["description"] = (
+                    prefix + _PHASE_TOOL_MARK_RE.sub("", desc, count=1))
+                out.append(new_tool)
+                changed = True
+                continue
+            if not hasattr(tool, "model_copy"):
+                out.append(tool)
+                continue
+            desc = str(getattr(tool, "description", "") or "")
+            out.append(tool.model_copy(update={
+                "description": prefix + _PHASE_TOOL_MARK_RE.sub("", desc, count=1),
+            }))
+            changed = True
+        except Exception:  # noqa: BLE001 — guidance must never raise
+            out.append(tool)
+    return out if changed else None
 
 # Tools that are scaffolding (not diagnostic). "task" is included because
 # expert delegation results are recorded by the Coordinator via record_finding.
@@ -2238,8 +2281,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         # ── Timeout protection: prevent single LLM call from hanging forever ──
         # REPORT phase generates a long markdown report — use a longer timeout.
-        _call_request = request.override(system_message=append_to_system_message(
-            request.system_message, combined_block)) if combined_block else request
+        # ── Phase-scoped tool surface (proactive half of the §7 gate) ──
+        # Annotate the tool definitions themselves so the phase constraint
+        # is present at the decision point (see _phase_scoped_tools).
+        _phase_tools = _phase_scoped_tools(
+            getattr(request, "tools", None), _phase(ledger))
+        _overrides: dict[str, object] = {}
+        if combined_block:
+            _overrides["system_message"] = append_to_system_message(
+                request.system_message, combined_block)
+        if _phase_tools is not None:
+            _overrides["tools"] = _phase_tools
+        _call_request = request.override(**_overrides) if _overrides else request
         _effective_timeout = (
             _REPORT_PHASE_TIMEOUT
             if _phase(ledger) == "report"

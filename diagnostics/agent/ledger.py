@@ -1505,6 +1505,55 @@ _SLS_EXPERT_DOMAIN_MAP = (
 )
 
 
+# ── 相位工具门控 SSOT（design document §7；P6/P7，v3.27.0）──────────
+# 反应式门控（ledger_middleware 的相位白名单）与前置引导（每轮「本步
+# 要求」首行的可用动作清单）必须消费同一张表。历史问题：相位可用性
+# 只出现在拦截回执里，模型可见工具集却恒定不变（工具定义本身也是
+# prompt），二者信号强度不对称 —— LLM 在 HYPOTHESIZE 相位委派深度
+# 专家被门控拦截（2026-09-09 session 294ed89a，且 v3.9.3 / v3.14.4
+# 两轮 prompt 修复后仍在 round-2 复发）。把白名单与提示放同一处由
+# 两侧共同消费，是 P6 单源要求。
+_PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
+    # UNDERSTAND collects data only — proposing hypotheses before the
+    # coverage gate opens would skip HYPOTHESIZE entirely.
+    "understand": frozenset({"task"}),
+    # HYPOTHESIZE only proposes; no findings/paths/delegations yet
+    # (§7 whitelist: propose_hypotheses + read_file).  Letting task()
+    # through here would pull VERIFY behaviour forward and expose the
+    # G5 delegation-value gate outside its designed phase.
+    "hypothesize": frozenset({"propose_hypotheses"}),
+    # VERIFY delegates + records findings; no proposes/paths.
+    "verify": frozenset({"task", "record_finding"}),
+    # EVALUATE picks direction; recording a finding is ALSO legal here
+    # (v2.8.1: record_finding is an evidence-ledgering EVENT, not a phase
+    # milestone — Statecharts shared-event semantics, valid in VERIFY as
+    # the T3 transition and in EVALUATE as an internal self-transition).
+    # Semantic guards stay in the tool handler (Defect D anti-flip, refuted
+    # frozen, ID validation), so allowing it here opens no abuse surface.
+    # task (auto-heal T5') is also legal here (§7).
+    # write_file is deliberately NOT in the allowlist — the dedicated
+    # write_file gate (check_exit_conditions / _forced_terminal / report)
+    # is the correct guard for "may I write the report now"; gating it by
+    # phase would kill the legitimate escape hatch where exit conditions
+    # are met while the derived phase still reads "evaluate".
+    "evaluate": frozenset({"select_path", "propose_hypotheses", "backtrack",
+                           "record_finding", "task"}),
+    # REPORT only writes the report; diagnosis tools are locked out.
+    "report": frozenset(),
+}
+
+# Human-facing rendering of the same allowlist — consumed by the
+# proactive "本步要求" first line AND by the reactive gate rejection
+# message (StateWright: name the currently available actions).
+_PHASE_ALLOWED_HINT: dict[str, str] = {
+    "understand": "task(*-argus-expert)、read_file",
+    "hypothesize": "propose_hypotheses",
+    "verify": "task(*-expert)、record_finding",
+    "evaluate": "select_path / propose_hypotheses / backtrack / record_finding / task",
+    "report": "write_file",
+}
+
+
 # ── Argus 参数澄清契约（design document §8 G2 / §9, v3.11.1）─────────
 # 契约化标记（非关键词枚举）：argus 专家返回契约要求参数澄清回执以该
 # 标记开头，给协调者侧分类器一个确定性信号（规避关键词穷举隐患——
@@ -1535,6 +1584,60 @@ def argus_param_clarification_pending(
             elif kf.strip() and expert in pending:
                 pending.remove(expert)
     return pending
+
+
+# key_findings 是专家结构化返回的 JSON 文本（换行已在落账时归一化为
+# 空格、并按长度截断），故按 JSON 数组边界切分为片段后再做行级分类。
+_ARGUS_SEGMENT_SPLIT = re.compile(r'(?:"\s*,\s*"?|\[|\]|\{|\})')
+
+
+def argus_conflict_pending(ledger: DiagnosisLedger) -> list[str]:
+    """首批 HYPOTHESIZE 的「监控数据自相矛盾」信号（design document
+    §9, v3.27.0）。
+
+    v3.11.1 的数据缺口补救指引只覆盖「argus 返回参数澄清」一种缺口。
+    实证到的第三子型是 **数据已到达但自相矛盾**：监控筛查层一边报告
+    集群/节点/工作负载级异常，一边报告目标实体正常。该形态下 LLM 的
+    动机是"数据相互矛盾→再查一次确认"，于是回到取证动作（委派深度
+    专家）而被相位门控拦截（2026-09-09 session 294ed89a：集群层
+    OOMKilled 计数 0→1、重启计数 0→1→3，而工作负载/目标 Pod 重启计数
+    报告为 0；round-2 委派 sci-expert 被拦，round-3 才提出假设）。
+    矛盾是筛查层的真实属性（指标层看不见 Pod 事件状态），因此此处不
+    修补数据，而是给该动机一条**合法出口**：把矛盾写成假设。
+
+    判据与 G20/C2 的同源（同组正则、同款片段级分类）：异常片段须命中
+    严重级别/趋势模式**且**落在集群-节点-工作负载层；目标正常片段须
+    命中正常模式且不属异常片段——避免"重启计数 0→1→3"同时命中两侧
+    而产生的自冲突误报。
+
+    返回命中的目标正常片段（最多 2 条、逐条截断），供指引点名；无
+    冲突返回空列表（选择性注入：沉默是一等公民，Proactive Memory
+    Agent §12）。
+    """
+    hits: list[str] = []
+    for rnd in ledger.get("rounds", []):
+        if not any(str(e).endswith("argus-expert")
+                   for e in rnd.get("delegated_experts", [])):
+            continue
+        segments = [s.strip() for s in _ARGUS_SEGMENT_SPLIT.split(
+            str(rnd.get("key_findings", ""))) if s.strip()]
+        if not segments:
+            continue
+        has_anomaly = any(
+            _ARGUS_ANOMALY_LINE.search(seg) and _ARGUS_CLUSTER_SCOPE.search(seg)
+            for seg in segments)
+        if not has_anomaly:
+            continue
+        for seg in segments:
+            if _ARGUS_ANOMALY_LINE.search(seg):
+                continue
+            if _ARGUS_TARGET_NORMAL.search(seg):
+                snippet = seg[:40]
+                if snippet not in hits:
+                    hits.append(snippet)
+                if len(hits) >= 2:
+                    return hits
+    return hits
 
 
 def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
@@ -1592,6 +1695,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             )
         return (
             "你当前处于 UNDERSTAND 阶段。\n"
+            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('understand')}\n"
             f"- {duty}\n"
             + coverage_hint
             + delegation_rules
@@ -1631,8 +1735,30 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                     "方式定向补查（委派描述须带完整实体与参数）。"
                     "本阶段职责不变：提出假设。"
                 )
+        # v3.27.0: data-conflict remedy hint (design document §9) — the
+        # third motivation subtype, observed 2026-09-09 (session 294ed89a):
+        # the argus screening layer returned CONTRADICTORY readings
+        # (cluster/node/workload anomaly while the target entity reads
+        # normal).  The LLM's reaction is to re-collect — a legitimate
+        # intent on an illegal channel in HYPOTHESIZE, and the reason the
+        # phase gate keeps firing round after round despite v3.9.3 /
+        # v3.14.4.  Name the legal exit instead: the contradiction IS the
+        # hypothesis; VERIFY settles it with log/event evidence.
+        conflict_hint = ""
+        if not ledger.get("hypotheses"):
+            _conflicts = argus_conflict_pending(ledger)
+            if _conflicts:
+                conflict_hint = (
+                    f"\n- ⚠ 监控读数自相矛盾：{'；'.join(_conflicts)}。\n"
+                    "  指标层看不见 Pod 事件状态（OOMKilled 不体现在指标曲线里），"
+                    "这类矛盾应**直接写成假设**（例如“读数归属于另一副本 / "
+                    "目标实体并非故障对象”），probability 体现不确定性；"
+                    "VERIFY 阶段委派深度专家查日志与事件定向裁决。"
+                    "本阶段职责不变：提出假设，无需先补查。"
+                )
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
+            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('hypothesize')}\n"
             f"- {duty}\n"
             f"- 提出预算：全程最多 {MAX_PROPOSE_CALLS} 次"
             f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
@@ -1650,6 +1776,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- 完成后必须调用 propose_hypotheses 提出假设（{exit_txt}）"
             + retry_hint
             + gap_hint
+            + conflict_hint
         )
     if phase == "verify":
         active_id = ledger["active_path"][-1] if ledger["active_path"] else "?"
@@ -1725,6 +1852,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
+            + f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('verify')}\n"
             + f"- {duty}\n"
             + expert_map
             + "- 委派时明确\"验证假设"
@@ -1855,7 +1983,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         return (
             "你当前处于 EVALUATE 阶段。\n"
             + exit_banner +
-            _report_banner +
+            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('evaluate')}\n"
+            + _report_banner +
             f"- {duty}\n"
             + _eval_rec +
             "- 下一步路径菜单：\n"
@@ -1956,6 +2085,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             )
         return (
             "你当前处于 REPORT 阶段。\n"
+            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('report')}\n"
             f"⛔ {path_hint}。\n"
             "⛔ 报告正文全部经 write_file 写入文件；写盘后再向用户输出总结。\n"
             f"- {duty}"
