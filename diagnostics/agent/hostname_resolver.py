@@ -97,11 +97,24 @@ def _resolve_mock(param_overrides: dict) -> dict:
             )
 
     if not pods:
-        logger.warning(
-            "Hostname resolver: no pods found for key=%r "
-            "(cluster=%r namespace=%r workload=%r)",
-            lookup_key, cluster_name, namespace, workload_name,
-        )
+        # Serverless / virtual-node clusters have no Pod→host mapping by
+        # design (the workload runs on a virtual node, so a mock mapping
+        # simply does not exist).  Emitting a WARNING there is alert
+        # fatigue: an expected path must not occupy the operator-actionable
+        # level (2026-09-09 scenario-38 — one WARNING every session for a
+        # scenario where the resolver has a static-node fallback anyway).
+        _virtual = (str(param_overrides.get("cluster_type") or "") == "serverless"
+                    or "sls" in cluster_name or "serverless" in cluster_name)
+        if _virtual:
+            logger.debug(
+                "Hostname resolver: serverless/virtual-node cluster %r has "
+                "no Pod→host mapping, using fallback", cluster_name)
+        else:
+            logger.info(
+                "Hostname resolver: no pods found for key=%r "
+                "(cluster=%r namespace=%r workload=%r)",
+                lookup_key, cluster_name, namespace, workload_name,
+            )
         return param_overrides
 
     # ── Select hostname ──
