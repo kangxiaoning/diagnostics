@@ -1722,8 +1722,20 @@ class DeprioritizedSpec(BaseModel):
 
 
 class ProposeHypothesesInput(BaseModel):
+    # Few-shot shape recipe (design document §9, v3.31.0): nested object-
+    # array parameters are a known function-calling weak spot — the model
+    # serialised the array as a string `"[...]"` (15.4% failure rate,
+    # 2026-09-09 scenario-38 replay, arguments captured from the raw
+    # response).  State the array shape with a concrete positive example
+    # instead of relying on the type annotation alone (positive recipe,
+    # not a "don't use a string" prohibition).
     hypotheses: list[HypothesisSpec] = Field(
-        description="假设列表（最多3个，按概率降序）",
+        description=(
+            "假设列表（最多3个，按概率降序）。对象数组——直接传 JSON 数组，"
+            "每项是 {statement, probability, rationale} 对象。"
+            "形态示例：[{\"statement\": \"内存 limit 不足导致 OOMKilled\", "
+            "\"probability\": 70, \"rationale\": \"argus 显示 15:03 OOM 计数 0→1\"}]"
+        ),
     )
     focus_summary: str = Field(
         default="",
@@ -5615,6 +5627,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             name="propose_hypotheses",
             description=(
                 "提出诊断假设（HYPOTHESIZE阶段必须调用）。每次最多3个假设，按概率降序。"
+                # Few-shot shape recipe (design document §9, v3.31.0) —
+                # see ProposeHypothesesInput note: nested object-array
+                # params get serialised as strings; show the correct shape.
+                "hypotheses 为对象数组（直接传 JSON 数组，每项是 {statement, probability, "
+                "rationale} 对象），形态示例：[{\"statement\": \"内存 limit 不足导致 "
+                "OOMKilled\", \"probability\": 70, \"rationale\": \"argus 显示 15:03 OOM "
+                "计数 0→1\"}]。"
                 "每个假设必须包含 statement（必填，一句完整根因表述）、probability(0-100)、"
                 "rationale 三个字段，缺一不可；statement 缺失会导致调用失败"
                 "（失败不消耗提出预算，修正后重新提交即可）。"
