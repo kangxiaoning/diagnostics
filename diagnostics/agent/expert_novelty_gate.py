@@ -135,6 +135,37 @@ _SKIP_TOOLS = frozenset({
 })
 
 
+# Args fields that identify the observability OBJECT (not the query
+# range).  Window/monitor/cluster params are excluded on purpose: the
+# gate should catch a same-object re-issue in disguise (rephrased window
+# or params), while a different object is a fresh measurement.
+_ENTITY_ARG_KEYS = ("pod_name", "node_name", "workload_name",
+                    "hostname", "hostnames", "pod_ip")
+
+
+def _entity_of(tool_call: dict) -> str:
+    """Observability-object identity from tool args (design document §8 G26, v3.30.0).
+
+    Empirical basis (2026-09-09 scenario-38 ×3): the delegation brief
+    named 5 control-plane components and the expert drilled each of them
+    per the progressive-discovery contract — every drill-down was a
+    different object with an identically-shaped healthy payload, and the
+    old content-only fingerprint hard-blocked 6 of them (55% of all
+    reactive interventions).  Alertmanager groups by entity label and
+    BARAQ states dedup must never hide distinct behaviors: a different
+    object with a similar payload is a distinct observation, not a
+    repeat.  Empty string (no object field, e.g. an overview query) keeps
+    the legacy single-bucket behaviour so genuine repeats are still
+    caught.
+    """
+    args = tool_call.get("args") or {}
+    if not isinstance(args, dict):
+        return ""
+    parts = [str(args[k]) for k in _ENTITY_ARG_KEYS
+             if args.get(k) not in (None, "", [], {})]
+    return "|".join(sorted(parts))
+
+
 class ExpertNoveltyGateMiddleware(AgentMiddleware):
     """Subagent-only low-information-gain gate (G26).
 
@@ -194,21 +225,26 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
                 or _is_zero_yield(result)):
             return result
 
+        entity = _entity_of(tool_call)
         struct_hash = _struct_hash(content)
         tokens = _tokens(content)
         # Track the best match (not just "any") so the log line can name
         # the similarity actually measured — a bare hit/miss gives an
         # operator no way to tell a true repeat from a threshold artifact.
+        # Comparison is confined to the SAME observability object: a
+        # different object with an identically-shaped payload is a fresh
+        # measurement, not a low-gain repeat (design document §8 G26).
         best_sim, best_idx = 0.0, -1
         for idx, (h, t) in enumerate(
-                self._ledger.fingerprints(key, tool_name)):
+                self._ledger.fingerprints(key, tool_name, entity)):
             if h != struct_hash:
                 continue
             sim = _jaccard(tokens, t)
             if sim > best_sim:
                 best_sim, best_idx = sim, idx
         low_gain = best_sim >= sim_threshold
-        self._ledger.add_fingerprint(key, tool_name, struct_hash, tokens)
+        self._ledger.add_fingerprint(
+            key, tool_name, entity, struct_hash, tokens)
 
         if not low_gain:
             if streak:

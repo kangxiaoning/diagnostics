@@ -253,12 +253,18 @@ class ExpertSessionLedger:
     def reset_novelty(self, key: str) -> None:
         self.session(key)["novelty_streak"] = 0
 
-    def fingerprints(self, key: str, tool: str) -> list[tuple[bytes, frozenset]]:
-        return self.session(key)["fps"].get(tool, [])
+    def fingerprints(self, key: str, tool: str,
+                     entity: str = "") -> list[tuple[bytes, frozenset]]:
+        """Fingerprints already seen for THIS tool + observability object.
 
-    def add_fingerprint(self, key: str, tool: str, struct_hash: bytes,
-                        tokens: frozenset) -> None:
-        fps = self.session(key)["fps"].setdefault(tool, [])
+        Bucketed by entity (design document §8 G26, v3.30.0): a fresh
+        object must not inherit another object's similarity verdict.
+        """
+        return self.session(key)["fps"].get(tool, {}).get(entity, [])
+
+    def add_fingerprint(self, key: str, tool: str, entity: str,
+                        struct_hash: bytes, tokens: frozenset) -> None:
+        fps = self.session(key)["fps"].setdefault(tool, {}).setdefault(entity, [])
         fps.append((struct_hash, tokens))
         del fps[:-_MAX_FINGERPRINTS_PER_TOOL]
 
