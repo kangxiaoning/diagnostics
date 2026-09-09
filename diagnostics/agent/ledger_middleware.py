@@ -452,6 +452,33 @@ _REFUTED_PATTERNS = re.compile(
 )
 
 
+def _is_verdict_evidence_mismatch(structured: dict) -> bool:
+    """Whether a conclusion's verdict direction contradicts its evidence.
+
+    A ``refuted`` verdict whose positive evidence outweighs its negative
+    evidence (and vice versa) is a known failure class.  Observation only
+    — never blocks.
+
+    Excluded: ``verdict_target == "alternative_root_cause"`` — the expert
+    refuted the assigned hypothesis while confirming a DIFFERENT root
+    cause (design document §9 v3.23.0 calls this a standard and ideal
+    outcome, §12 Counterfactual-MA).  There the conclusion legitimately
+    carries the confirming evidence for the true cause in ``key_evidence``,
+    so the direction mix is expected, not a mismatch (2026-09-09 scenario-38
+    round-2 empirical false positive).
+    """
+    verdict = structured.get("verdict")
+    if verdict not in ("confirmed", "refuted"):
+        return False
+    if (structured.get("verdict_target")
+            or "assigned_hypothesis") == "alternative_root_cause":
+        return False
+    ke = len(structured.get("key_evidence") or [])
+    ne = len(structured.get("negative_evidence") or [])
+    return (verdict == "refuted" and ke > ne) or (
+        verdict == "confirmed" and ne > ke)
+
+
 def _parse_expert_json(text: str) -> dict | None:
     """Parse a structured expert return (prompt-contract JSON).
 
@@ -4599,21 +4626,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # known failure class.  Observation only, never
                         # blocks: downstream analysis correlates this tag
                         # with trace records.
-                        _v = _structured_expert.get("verdict")
-                        if _v in ("confirmed", "refuted"):
-                            _ke = len(_structured_expert.get("key_evidence") or [])
-                            _ne = len(_structured_expert.get("negative_evidence") or [])
-                            _mismatch = (_v == "refuted" and _ke > _ne) or (
-                                _v == "confirmed" and _ne > _ke
+                        if _is_verdict_evidence_mismatch(_structured_expert):
+                            logger.warning(
+                                "suspect-verdict-mismatch: expert=%s verdict=%s "
+                                "key_evidence=%d negative_evidence=%d root_cause=%.120s",
+                                tool_args.get("subagent_type", "?"),
+                                _structured_expert.get("verdict"),
+                                len(_structured_expert.get("key_evidence") or []),
+                                len(_structured_expert.get("negative_evidence") or []),
+                                str(_structured_expert.get("root_cause") or ""),
                             )
-                            if _mismatch:
-                                logger.warning(
-                                    "suspect-verdict-mismatch: expert=%s verdict=%s "
-                                    "key_evidence=%d negative_evidence=%d root_cause=%.120s",
-                                    tool_args.get("subagent_type", "?"), _v,
-                                    _ke, _ne,
-                                    str(_structured_expert.get("root_cause") or ""),
-                                )
 
                 if summary:
                     # Diagnostic data arrived — counts as verify-phase
