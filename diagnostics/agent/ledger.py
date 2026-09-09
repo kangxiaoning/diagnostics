@@ -1542,6 +1542,22 @@ _PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
     "report": frozenset(),
 }
 
+# 相位硬过滤（Poka-yoke 控制法，design document §7, v3.29.0）：列出
+# 的工具在对应相位**从模型可见工具集中移除**，而非仅标注不可用。
+# 升级依据：标注层（v3.27.0）实证到顶——2026-09-09 session 9906c211
+# 抓包证实 task 的「当前阶段不可用」标注 100% 送达，LLM 仍在 round-2
+# 委派（2 天内第 5 次同型拦截）；§11 v3.27.0 行预定的升级条件
+# 「待拦截率数据」由此满足。仅用于"相位归属明确、模型另有正解工具"
+# 的工具：HYPOTHESIZE 的唯一动作是 propose_hypotheses，task 可见即
+# 诱导。幻觉兜底：模型仍可能从 system prompt 得知 task 而幻觉调用，
+# 此时 ToolNode 静态注册表照常找到 task，反应式相位门控（§7）以同样
+# 的引导回执拦截——最坏情况 = 标注方案的今天，无新增失败模式。
+# 判断质量类护栏（G17/G22 等）永不入此表：模型必须看见工具才能理解
+# 职责，Verifier 语义要求"可尝试、系统校验"。
+_PHASE_HARD_FILTER: dict[str, frozenset[str]] = {
+    "hypothesize": frozenset({"task"}),
+}
+
 # Human-facing rendering of the same allowlist — consumed by the
 # proactive "本步要求" first line AND by the reactive gate rejection
 # message (StateWright: name the currently available actions).
@@ -1842,6 +1858,15 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "（指标 / 日志 / 事件）②查询时段覆盖故障时段 ③该通道属"
                 "假设所涉实体的观测域；任一项不齐备则判 inconclusive，"
                 "并在 rationale 中写清缺哪一项、为何不可取得\n"
+                # v3.29.0: disclose G22's block-once semantics at the
+                # decision point — "可直接判 refuted" above otherwise
+                # over-promises: a single-channel refute is bounced once
+                # for a coverage self-check before it can land (observed
+                # 2026-09-09 session 9906c211 round-5).  Fact statement,
+                # not a prohibition (positive/negative split discipline).
+                "- 仅单一通道支撑的 refuted，首次落账会经一次覆盖性自检"
+                "（系统拦截并要求确认覆盖）：确认三要素齐备后重发即放行，"
+                "或补第二通道交叉验证后一次通过\n"
             )
         elif _has_expert_ev:
             _record_hint = ""

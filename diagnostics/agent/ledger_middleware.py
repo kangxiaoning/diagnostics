@@ -77,6 +77,7 @@ from diagnostics.agent.ledger import (
 from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，design document §7；与前置引导同源于 ledger.py)
     _PHASE_ALLOWED_HINT,
     _PHASE_ALLOWLIST,
+    _PHASE_HARD_FILTER,
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
@@ -281,6 +282,13 @@ def _phase_scoped_tools(tools: object, phase: str) -> list | None:
 
     Available tools are positively marked; unavailable ones carry the
     current phase's action list (StateWright: name what IS available).
+    Tools listed in ``_PHASE_HARD_FILTER`` for *phase* are REMOVED from
+    the model-visible set entirely (Poka-yoke control method, design
+    document §7 v3.29.0): annotation proved insufficient — the marker
+    was delivered verbatim and the call still happened (2026-09-09
+    session 9906c211).  The reactive allowlist gate stays as backstop,
+    so a hallucinated call to a filtered tool lands on the same
+    instructive receipt as before — no new failure mode.
     ``write_file`` and the read-only scaffold are exempt — they are
     governed by their own gates, exactly as in the reactive allowlist.
 
@@ -291,6 +299,7 @@ def _phase_scoped_tools(tools: object, phase: str) -> list | None:
     if not tools or not isinstance(tools, (list, tuple)):
         return None
     allowed = _PHASE_ALLOWLIST.get(phase, frozenset())
+    hard_filtered = _PHASE_HARD_FILTER.get(phase, frozenset())
     hint = _gate_hint(phase)
     out: list = []
     changed = False
@@ -300,6 +309,12 @@ def _phase_scoped_tools(tools: object, phase: str) -> list | None:
                 name = tool.get("name")
             else:
                 name = getattr(tool, "name", None)
+            if name and name in hard_filtered:
+                # Poka-yoke: drop from the model's view (defence in
+                # depth — the reactive gate still backstops a
+                # hallucinated call via the ToolNode registry).
+                changed = True
+                continue
             if not name or name == "write_file" or name in _READONLY_SCOPES:
                 out.append(tool)
                 continue
