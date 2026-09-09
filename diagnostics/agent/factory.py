@@ -211,8 +211,10 @@ class DeepExpertFindings(BaseModel):
         description=(
             "结论对象（v3.23.0）：assigned_hypothesis（默认——verdict 针对被指派"
             "假设本身）/ alternative_root_cause（被指派假设不成立，但你另发现了"
-            "真正根因——此时 verdict=confirmed 表达'根因已确认'而非'假设成立'，"
-            "root_cause 填你发现的真正根因）。如实声明：Coordinator 凭此走"
+            "真正根因或真正故障对象时**必须**填此项 + verdict=confirmed"
+            "（表达'根因已确认'而非'假设成立'），root_cause 填你发现的真正根因；"
+            "此时 key_evidence 承载'确证真正根因的正向证据'——方向混合是预期，"
+            "不要误用 refuted + assigned_hypothesis）。如实声明：Coordinator 凭此走"
             "'排除假设 + 收录新根因'通道，refuted 不会被结论冲突门控误拦"
         ),
     )
@@ -225,7 +227,9 @@ class DeepExpertFindings(BaseModel):
         description=(
             "未取证维度声明：与本次任务无关、或数据不可用而无法取证的维度，"
             "逐条写明『维度名：原因』（如『节点指标：目标节点无监控数据』）。"
-            "已声明的维度视为已交代，不会因缺数据被要求补采"
+            "已声明的维度视为已交代，不会因缺数据被要求补采。"
+            "若因系统强制收尾未取证，写明『维度名：系统强制收尾未取证』——"
+            "不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
         ),
     )
 
@@ -294,7 +298,9 @@ class ArgusExpertFindings(BaseModel):
         description=(
             "未取证维度声明（数组，每项一条）：与本次任务无关、或数据不可用而无法取证的"
             "维度，逐条写明『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）。"
-            "已声明的维度视为已交代，不会因缺数据被要求补采"
+            "已声明的维度视为已交代，不会因缺数据被要求补采。"
+            "若因系统强制收尾未取证，写明『维度名：系统强制收尾未取证』——"
+            "不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
         ),
     )
 

@@ -73,6 +73,15 @@ PHASE_SPEC: dict[str, dict] = {
             "若不成立预期看到什么；专家返回后据此对照判定：结论符合成立预期 → confirmed"
             "（需专家证据），符合不成立预期 → refuted，既不支持也不排除 → inconclusive。"
             "预期观测仅供你自己判定用，不要写入委派 description（保持委派中立）",
+            # G22 proactive recipe (design document §9, v3.30.0): single-
+            # channel falsification is unreliable (triangulation), so a
+            # refutable hypothesis should fan out to a second evidence
+            # channel up front instead of being bounced by the coverage
+            # gate after a one-channel refuted.  Positive recipe (suggest
+            # the right shape), not a prohibition.
+            "若预期本假设可能不成立（证伪类验证）：证伪需多证据通道交叉佐证——"
+            "建议同轮并行委派互补视角专家覆盖第二证据通道（仍指向同一假设、"
+            "description 含「验证假设Hx」），避免单一通道证伪被覆盖性门控驳回后返工",
         ],
         "exit": "record_finding 完成后进入 EVALUATE。",
     },
