@@ -364,25 +364,43 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             "duration_s": duration_s,
             "channels": channels,
         })
+        # The recovery decision runs later in after_model (bounce once
+        # when evidence exists, degrade otherwise) — the wording here
+        # must not pre-empt that decision.
         logger.warning(
             "G28 expert output truncated (finish_reason=length, "
             "delegation %s, occurrence %d, out=%s, reasoning=%s, "
             "duration=%.1fs, channels=%s) — no structured conclusion; "
-            "requesting a minimal resubmission",
+            "recovery follows in after_model (bounce once with "
+            "evidence, degrade otherwise)",
             key, count, out_tok or "?", reason_tok or "?",
             duration_s, ",".join(channels) or "?",
         )
 
     def _truncation_recovery(self, state: Any) -> dict | None:
-        """Bounce a truncated delegation once; degrade on the second miss."""
+        """Bounce a truncated delegation once; degrade otherwise.
+
+        Degradation covers both terminal cases: the second truncated
+        miss (the one bounce was already spent) and a first-turn
+        truncation with zero forensics (nothing to conclude from, so
+        the bounce is skipped — but the lost channel must still be
+        surfaced to the Coordinator).
+        """
         try:
             key = self._key_from_state(state)
             if not self._ledger.truncation_count(key):
                 return None
             s = self._ledger.session(key)
-            # Nothing was ever collected: a resubmit would add a turn
-            # without evidence (same pass-through rule as G27).
+            # Nothing was ever collected: the truncation hit the FIRST
+            # model turn (reasoning exhausted the output budget before
+            # any tool call — observed 2026-09-09).  A conclusion-
+            # oriented resubmit would be pointless without evidence,
+            # but ending silently would hand the Coordinator an empty
+            # result it cannot tell apart from "checked, nothing
+            # found" — the pseudo-signal G28 exists to eliminate
+            # (design document §8 G28).  Degrade instead of bouncing.
             if not s["calls"]:
+                self._report_truncated_delegation(state, key)
                 return None
             if self._ledger.conclusion_hinted(key):
                 # The one bounce was already spent (by G27 or by G28);
