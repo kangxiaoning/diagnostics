@@ -6076,6 +6076,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "专家证据到位后 confirmed 通道自动开放，不会再被拦截。"
                             "若现有监控证据已明确证伪，可直接判 refuted；"
                             "证据不足请判 inconclusive。"
+                            # v3.34.1: attribution boundary clarification —
+                            # the natural misread here is "the expert DID
+                            # confirm this mechanism while refuting ANOTHER
+                            # hypothesis" (observed 2026-09-09 session
+                            # f636dd31: both the model and the human read
+                            # "without expert evidence" as contradicting the
+                            # sci-expert's return).  Evidence is attributed
+                            # per hypothesis; borrowed conclusions don't
+                            # satisfy the confirmed standard.
+                            "（注：专家在验证其他假设时发现的相关事实记在该"
+                            "假设名下，不计入本假设的专家验证证据——confirmed "
+                            "须以针对本假设的委派验证结论为依据。）"
                         )
 
             # ── C2: argus-conflict refute guard (reactive backstop,
@@ -6602,6 +6614,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "对照活跃假设，若均未覆盖该机制，可用 "
                         "propose_hypotheses 追加 1 个假设覆盖（追加通道，"
                         "不占换批预算）；已覆盖则忽略。"
+                        # v3.34.2: positive if-then sequence at the exact
+                        # shortcut moment (replaces the v3.34.1 negative
+                        # boundary — the model attempted a borrowed-evidence
+                        # confirmed DESPITE it, sessions f636dd31 /
+                        # 0ea0928c; implementation intentions beat boundary
+                        # statements, Gollwitzer & Sheeran 2006).  State
+                        # the legal next ACTION, not the prohibition.
+                        "若候选对应已有未决假设：下一步 task 定向委派该"
+                        "假设的验证（description 带候选机制与实体参数）→ "
+                        "专家结论到位即 record_finding confirmed 落账——"
+                        "提前委派可省 1 轮。"
                     )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"

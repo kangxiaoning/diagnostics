@@ -1925,6 +1925,26 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             _record_hint = (
                 f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
             )
+        # v3.34.1: per-hypothesis evidence attribution boundary (design
+        # document §9) — phase-dynamic AND selective (P7): surfaced only
+        # while OTHER root hypotheses remain pending, i.e. exactly when
+        # the cross-hypothesis shortcut shape exists (observed 2026-09-09
+        # session f636dd31: after H1's expert evidence named the real
+        # cause, the model tried record_finding(confirmed, H2) with
+        # H1-attributed evidence — G17 block + 1 delegation to recover).
+        # No UNDERSTAND/EVALUATE/REPORT pollution; disappears once the
+        # attribution ambiguity is impossible (single pending hypothesis).
+        _others_pending = [
+            fmt_hid(h) for h, n in ledger.get("hypotheses", {}).items()
+            if h != active_id and n.get("status") == "pending"
+        ]
+        _attribution_hint = ""
+        if _others_pending:
+            _attribution_hint = (
+                "- ⚠ 专家证据按假设归属：验证本假设的专家结论不能作为其他"
+                f"未决假设（{'、'.join(_others_pending)}）的 confirmed 依据"
+                "——confirmed 它们须定向委派该假设的验证\n"
+            )
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
@@ -1934,6 +1954,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + "- 委派时明确\"验证假设"
             f"{disp_id}\"并传入假设上下文\n"
             + _record_hint
+            + _attribution_hint
             + "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
             "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
             "委派时明确要求专家「复用已有证据，仅补查缺失项」\n"
@@ -2064,10 +2085,18 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- {duty}\n"
             + _eval_rec +
             "- 下一步路径菜单：\n"
-            "  · 现有证据已可判定某未决假设 → 直接 record_finding 记录结论"
-            "（跨假设证据复用，无需重复委派——比 select_path 更省轮次；"
-            "仅限该假设已有专家验证结论的情形，confirmed 须以 expert 证据为依据，"
-            "未委派假设直接 confirmed 会被系统拦截）\n"
+            # v3.34.2: split the mixed reuse bullet (positive/negative
+            # split, design document §9) — the "省轮次" invite folded with
+            # the confirmed-evidence standard was a conflicting signal
+            # (borrowed-evidence confirmed attempts: sessions f636dd31 /
+            # 0ea0928c).  Refuted reuse stays positive; confirm-another
+            # becomes its own positive SEQUENCE.
+            "  · 现有证据已可排除某未决假设 → 直接 record_finding 判 "
+            "refuted/inconclusive（跨假设证据复用，无需重复委派——比 "
+            "select_path 更省轮次）\n"
+            "  · ⭐ 确认其他未决假设（如证伪某假设时专家指出的真正根因）→ "
+            "定向委派该假设的验证（task，description 带候选机制）→ "
+            "专家结论到位后 record_finding confirmed 落账\n"
             "  · 证据不足、需继续验证 → select_path 切换到最可能的假设\n"
             "- ℹ 若你在本阶段直接委派 task（描述指向某个未决假设，如"
             "\"验证假设Hx\"），系统会自动聚焦该假设进入 VERIFY——等价于 "

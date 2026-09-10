@@ -95,10 +95,18 @@ PHASE_SPEC: dict[str, dict] = {
                 "（现有证据足够 → 直接 record_finding 判定；不足 → select_path 验证/证伪）；"
                 "已委派仍无法定论的假设可 defer 搁置，不必反复重试。",
         "actions": [
-            "现有证据已足以判定某未决假设（跨假设证据复用）→ 直接 record_finding "
-            "记录结论，无需重复委派——比 select_path 更省轮次；"
-            "仅限该假设已有专家验证结论的情形（confirmed 须以 expert 证据为依据，"
-            "未委派假设直接 confirmed 会被系统拦截）",
+            # v3.34.2: split the mixed reuse bullet — the "省轮次" invite
+            # folded with the confirmed-evidence standard produced a
+            # conflicting signal and the model borrowed evidence into a
+            # confirmed attempt then hit G17 (2026-09-09 sessions
+            # f636dd31 / 0ea0928c).  Refuted reuse stays positive;
+            # confirm-another-hypothesis gets its own positive SEQUENCE
+            # (no gate-preview prohibition — design document §9 split).
+            "现有证据已足以排除某未决假设（跨假设证据复用）→ 直接 record_finding "
+            "判 refuted/inconclusive，无需重复委派——比 select_path 更省轮次",
+            "⭐ 确认其他未决假设（如证伪某假设时专家指出的真正根因）→ "
+            "定向委派该假设的验证（task，description 带候选机制与实体参数）"
+            "→ 专家结论到位后 record_finding confirmed 落账",
             "有待验证假设但证据不足以判定 → select_path 切换到最可能的继续验证"
             "（可用 deprioritized 参数同时搁置反复无法定论的假设）",
             "confirmed 假设需更具体 → record_finding(statement_update=...) 修正表述"

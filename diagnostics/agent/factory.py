@@ -187,12 +187,24 @@ class DeepExpertFindings(BaseModel):
             "假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）。"
             "verdict 须与证据主体方向一致：confirmed 的支持证据（key_evidence）为主体，"
             "refuted 的负证据（negative_evidence）为主体；两者矛盾时按证据主体修正 verdict"
-            "（曾实证：verdict=refuted 但 key_evidence 全支持向，致假设被误证伪）"
+            "（✗ 曾实证的误用：verdict=refuted 但 key_evidence 全支持向，致假设被误证伪）"
         )
     )
     key_evidence: list[str] = Field(
         default_factory=list,
-        description="关键证据 1~3 条，每条标注数据来源（工具名/日志/事件）",
+        description=(
+            "关键证据 1~3 条，每条标注数据来源（工具名/日志/事件）。"
+            "方向契约：本字段=支撑假设成立的证据（confirmed 时为主体）；"
+            "refuted 时证伪事实写入 negative_evidence（为主体）。"
+            # v3.34.2: label-guided contrastive pair (C-ICL/LC-ICL — the
+            # negative example must be explicitly marked as wrong, or it
+            # risks imitation).
+            "✗ 错误示范（refuted 误用本字段）：key_evidence=[\"目标 Pod "
+            "OOMKilled（Exit 137）\"]——证伪事实误入此处，触发方向错位告警；"
+            "✓ 正确示范（refuted）：key_evidence=[]；negative_evidence=["
+            "\"目标 Pod OOMKilled（Exit 137），RESTARTS=3\", "
+            "\"其他副本 Running/RESTARTS=0\"]"
+        ),
     )
     negative_evidence: list[str] = Field(
         default_factory=list,
@@ -258,6 +270,8 @@ class ArgusExpertFindings(BaseModel):
         description=(
             "参数缺失澄清：若因缺少必要参数（如 hostname/monitor_name）无法执行任何查询，"
             f"以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数；否则为空字符串。"
+            "部分成功规则：已查到的维度照常填写各字段交付（含正常项），"
+            "本字段写剩余所需参数——禁止只回澄清而丢弃已采发现。"
         ),
     )
     # 多值字段统一形态契约：字符串数组，每项一条完整短句（P1 前置形态
@@ -323,42 +337,33 @@ class ArgusExpertFindings(BaseModel):
 # NOTE: each subagent's own "返回不超过150字" line is removed; this suffix
 # provides the canonical return format so there is no duplication.
 _EXPERT_RETURN_SUFFIX = (
-    # Streamlined (design document §9, v3.32.0): removed reactive-
-    # interception notices ("system will count/warn/block/force-wrap") —
-    # those behaviours are already guaranteed by code guardrails
-    # (dedup/G26/G19-ext/file-governance/response_format), and previewing
-    # them wastes tokens and drifts from the code.  Kept: action
-    # guidance, content contracts, field-shape recipes.  Word limit
-    # removed (LLM cannot count — convergence anchor instead).
+    # v3.34.3 (schema-as-contract): the verdict direction contract, field
+    # recipes (key_evidence/negative_evidence/root_cause/verdict_target/
+    # confidence/multi-value shape/coverage_gaps) moved INTO the
+    # DeepExpertFindings field descriptions — single source for the
+    # tool's own contract (Anthropic tool-design: descriptions/specs are
+    # loaded with every call; duplicated prose drifts — the v3.34.1
+    # direction contract landed schema-only).  Kept here: cross-tool
+    # orchestration — file-tool boundary, evidence strategy, delivery
+    # directive (field NAMES as an index), convergence anchor.
     "\n\n**工具使用边界**:\n"
     "- 文件工具（read_file/grep/glob/ls）仅限访问 `/agent_data/skills/**`（技能文件）。\n"
     "- 远程主机/集群数据必须用本 subagent 的专用诊断工具获取。\n"
     "- 你只负责取证与分析——假设与结论的台账登记由 Coordinator 统一完成，"
-    "你只需按下方格式返回结构化结论。\n"
+    "结论通过 `DeepExpertFindings` 结构化交付（字段契约见工具 schema："
+    "方向契约、结论对象声明、负证据必报均在字段说明中）。\n"
     "\n**取证策略**:\n"
     "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个异常则全部核查）；同一指标同一时间窗口一次调用拿全量再筛选，不拆分多次查询；"
     "grep 多关键字用一条正则一次完成。\n"
     "- 收益递减时立即收尾：关键证据已足够做出置信度判断时立即返回；"
     "取证遇阻时优先换**新维度**（不同工具/不同观测视角），而非换措辞重试同类查询。\n"
-    "\n**返回格式（信息完整、证据充分即收束）**:\n"
-    "- 交付方式：证据收齐后调用 `DeepExpertFindings`（结构化结论工具）返回结构化 JSON"
-    "（verdict/key_evidence/negative_evidence/root_cause/confidence），Coordinator 据此落账；"
-    "聚焦支撑结论的关键证据，不展开无关细节、不复述工具原始输出。\n"
-    "- 假设验证: {confirmed|refuted|inconclusive}——verdict 须与证据主体方向一致："
-    "confirmed 以关键证据为主体，refuted 以负证据为主体，矛盾时按证据主体修正 verdict\n"
-    "- 关键证据: 1~3条，每条标注数据来源\n"
-    "- 负证据必报: 与假设矛盾、或未找到目标对象的证据（如\"目标 Pod 不存在\"\"目标组件正常\"）"
-    "必须如实列出，与阳性证据同等重要，不得省略\n"
-    "- 根因判断: confirmed 且已定位根因时陈述根因结论；refuted 时陈述排除原因及建议转向方向；"
-    "证据不足时说明还需什么数据\n"
-    "- 结论对象: 若被指派假设不成立、但你另发现了真正根因，填 verdict_target="
-    "alternative_root_cause（verdict=confirmed 表达'根因已确认'，root_cause 填真正根因）\n"
-    "- 置信度: {高|中|低} + 百分比\n"
-    "- 多值字段形态：key_evidence / negative_evidence / coverage_gaps 均为字符串数组，"
-    "每项一条独立短句，如 key_evidence 形态 [\"事件：15:03 OOMKilled\"]\n"
-    "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
-    "『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）后即可收尾"
+    "\n**返回**:\n"
+    "- 证据收齐后调用 `DeepExpertFindings`（结构化结论工具）交付（字段：verdict/key_evidence/"
+    "negative_evidence/root_cause/verdict_target/confidence/coverage_gaps——"
+    "各字段语义、方向契约与结论对象声明见工具 schema）；"
+    "聚焦支撑结论的关键证据，不展开无关细节、不复述工具原始输出；"
+    "信息完整、证据充分即收束。\n"
 )
 
 # Return format suffix for Argus time-series analysis experts.
@@ -366,11 +371,16 @@ _EXPERT_RETURN_SUFFIX = (
 # 1min-granularity monitoring metrics, returning structured time-series
 # correlation findings so Coordinator can form well-grounded hypotheses.
 _ARGUS_EXPERT_RETURN_SUFFIX = (
-    # Streamlined (design document §9, v3.32.0) — same discipline as
-    # _EXPERT_RETURN_SUFFIX: reactive-interception notices and the word
-    # limit removed; action guidance, content contracts, the progressive-
-    # discovery query contract, the clarification marker and field-shape
-    # recipes kept.
+    # v3.34.3 (schema-as-contract): the per-field recipes (mutation/ranking
+    # shapes, negative-evidence duty, confidence, coverage_gaps, partial-
+    # success rule) moved INTO the ArgusExpertFindings field descriptions —
+    # the schema is the single source for the tool's own contract (Anthropic
+    # tool-design: descriptions/specs are loaded with every call and steer
+    # invocation; duplicated prose drifts — the v3.34.1 direction contract
+    # landed schema-only and the suffix immediately diverged).  Kept here:
+    # cross-tool orchestration only — tool boundary, evidence strategy,
+    # delivery directive (field NAMES as an index; semantics live in the
+    # schema), text-fallback clarification marker, convergence anchor.
     "\n\n**工具使用边界**:\n"
     "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 你只负责指标采集与关联分析——假设与结论的台账登记由 Coordinator 统一完成。\n"
@@ -384,27 +394,14 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "概览不含对象级明细且委派未指明对象时，按完整维度扫描定位异常对象。\n"
     "- 已查过的「工具+参数」组合直接复用其返回做分析（重查只返回缓存结果、零新信息），"
     "后续查询只投向尚未覆盖的维度或对象。\n"
-    "- 参数缺失澄清标记: 若因缺少必要参数无法执行任何查询，"
-    f"回复必须以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数，禁止臆造参数。\n"
-    "- 部分成功必须交付: 已查到的维度照常以 ArgusExpertFindings 返回（含正常项），"
-    "剩余所需参数写入 clarification 字段——禁止只回澄清而丢弃已采发现。\n"
-    "\n**返回格式（信息完整、指标覆盖完整即收束）**:\n"
-    "- 交付方式：指标收齐后调用 `ArgusExpertFindings`（结构化结论工具）返回结构化 JSON"
-    "（clarification/mutation_points/anomaly_ranking/negative_evidence/concurrent_anomalies/"
-    "cross_domain/preliminary_judgment/confidence），Coordinator 据此分类；"
-    "聚焦关键指标，不复述工具原始输出。\n"
-    "- 突变时间点: 指标显著变化的时间点及变化值（如 15:03 CPU 36→95%）\n"
-    "- 异常排序（按严重程度）: 🔴严重 / ⚠中等 逐条列出具体数值；✅正常项合并为一条汇总\n"
-    "- 负证据必报: 关键指标正常/无异常必须明确报告（排除依据），与异常发现同等重要\n"
-    "- 并发异常: 同一时间点发生的多个异常（暗示共同根因）\n"
-    "- 跨域关联: 不同子系统指标之间的时序因果推断\n"
-    "- 初步判断: 基于指标关联的根因推断（一句话）\n"
-    "- 置信度: {高|中|低} + 百分比\n"
-    "- 多值字段形态：mutation_points / anomaly_ranking / negative_evidence / "
-    "concurrent_anomalies / cross_domain 均为字符串数组，每项一条独立短句，"
-    "如 mutation_points 形态 [\"15:03 CPU 36→95%\"]\n"
-    "- 未取证维度：与任务无关或数据不可用的维度，在 coverage_gaps 逐条写明"
-    "『维度名：原因』后即可收尾，无需补采"
+    "\n**返回**:\n"
+    "- 指标收齐后调用 `ArgusExpertFindings`（结构化结论工具）交付（字段：clarification/mutation_points/"
+    "anomaly_ranking/negative_evidence/concurrent_anomalies/cross_domain/"
+    "preliminary_judgment/confidence/coverage_gaps——各字段语义与形态契约"
+    "见工具 schema，含部分成功规则与未取证维度声明）；"
+    "聚焦关键指标，不复述工具原始输出；信息完整、指标覆盖完整即收束。\n"
+    "- 文本回退：若因缺少必要参数无法执行任何查询，"
+    f"回复以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数，禁止臆造参数。\n"
 )
 
 
