@@ -29,8 +29,17 @@ Discipline (all inherited from Coordinator-side lessons):
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any
+
+
+def _env_int(name: str, default: int) -> int:
+    """Env var with safe fallback (test-only knob, not a product API)."""
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -52,9 +61,42 @@ from diagnostics.agent.expert_stall_watchdog import (
     _total_hard,
     _total_soft,
 )
-from diagnostics.agent.model_usage import extract_usage, first_truncated
+from diagnostics.agent.model_usage import (
+    extract_usage,
+    first_truncated,
+    reasoning_chars,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# Wrap-up reasoning cut (v3.37.3, P0).  Scenario 34 evidence: one truncated
+# turn spent all 16384 output tokens on a 71419-character reasoning stream
+# (0 content, 0 tool_calls) — the reasoning loop had taken over the budget.
+# The recovery turns must therefore run WITHOUT reasoning: probe against
+# ollama (qwen3.6:35b-mlx, 2026-09-11) shows reasoning_effort="none" yields
+# 0 reasoning tokens, while thinking={"type":"disabled"} is accepted but
+# IGNORED.  Applied only to OllamaChatOpenAI instances (the value travels
+# as extra_body; other backends could reject it) and only for a delegation
+# that has already truncated once.
+_WRAPUP_THINKING_OFF = os.getenv(
+    "DIAGNOSTICS_WRAPUP_THINKING_OFF", "1").strip() != "0"
+
+
+def _thinking_off_variant(model: Any) -> Any | None:
+    """Thinking-disabled variant of *model* (None when not applicable)."""
+    if not _WRAPUP_THINKING_OFF:
+        return None
+    try:
+        from diagnostics.agent.ollama_chat import OllamaChatOpenAI
+
+        if not isinstance(model, OllamaChatOpenAI):
+            return None
+        if getattr(model, "reasoning_effort_override", None):
+            return None
+        return model.model_copy(update={"reasoning_effort_override": "none"})
+    except Exception:
+        return None
 
 
 def _delegation_text(request: Any) -> str:
@@ -114,6 +156,25 @@ def _channels(tool_names: list[str]) -> list[str]:
 # tools (Coordinator-side), and the structured-return conclusion tools
 # (defense in depth — they are intercepted at the model node's
 # structured-output path and normally never reach this middleware).
+# Redundancy wrap-up (v3.37.3, P1).  A delegation that keeps re-issuing the
+# SAME call with the SAME parameters is not converging — the per-call block
+# receipts (dedup's ⛔ message already says "produce your conclusion") have
+# not stopped it.  Measured 2026-09-11 (scenario 34, kmc-expert): 6 identical
+# calls, 5 blocked, the resulting confusion drove the reasoning stream into a
+# 69×-repeated loop that consumed the whole 16384 output budget.  Circuit
+# breaker practice (AgentOps Circuit Breaker; deer-flow's LOOP DETECTED) is
+# to convert the PATTERN — not the single call — into a forced wrap-up.
+# The signal reuses the G27/G28 latch and guidance channel, so the cost stays
+# bounded (guidance + one strengthened reminder, no extra turns by itself).
+_REDUNDANCY_WRAPUP_HITS = _env_int("DIAGNOSTICS_REDUNDANCY_WRAPUP_HITS", 3)
+_REDUNDANCY_WRAPUP_GUIDANCE = (
+    "[系统提示·重复取证收敛] 本委派已有多次完全相同参数的调用被系统去重"
+    "（结果已缓存并返回到上下文中，重复调用不会获得新数据）——请立即基于"
+    "已采集数据调用结论工具收尾：尚未取证的维度在 coverage_gaps 按"
+    "『维度名：类型｜原因』声明（类型：数据不可用/不适用/强制收尾）。"
+    "不要再用相同参数重复调用任何工具。"
+)
+
 _SKIP_TOOLS = frozenset({
     "write_todos", "read_todos",
     "read_file", "edit_file", "write_file", "ls", "glob", "grep",
@@ -276,6 +337,19 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             if self._dedup is not None:
                 hits = self._dedup._dedup_hit_counts.get(key)
                 dedup_hits = sum(hits.values()) if hits else 0
+            # P1 (v3.37.3): redundancy wrap-up — identical-parameter repeats
+            # inside ONE delegation mean the model is not converging.  The
+            # per-call block receipts did not stop it, so convert the
+            # PATTERN into a forced wrap-up (guidance channel + latch).
+            if (dedup_hits >= _REDUNDANCY_WRAPUP_HITS
+                    and not self._ledger.conclusion_hinted(key)):
+                self._ledger.mark_conclusion_hinted(
+                    key, _REDUNDANCY_WRAPUP_GUIDANCE)
+                logger.warning(
+                    "Redundancy wrap-up: delegation %s has %d deduplicated "
+                    "identical call(s) — forced wrap-up guidance injected",
+                    key, dedup_hits,
+                )
             tool_names = []
             for t in (getattr(request, "tools", None) or []):
                 name = getattr(t, "name", None) or (
@@ -315,6 +389,14 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 if messages:
                     request = request.override(
                         messages=[*messages, SystemMessage(content=reminder)])
+            # P0 (v3.37.3): once this delegation has truncated, the recovery
+            # turns run without reasoning — the truncated turn spent its
+            # whole output budget on a reasoning loop (71419 chars, 0
+            # content/tool_calls), so the retry must not repeat that.
+            if self._ledger.truncation_count(key):
+                variant = _thinking_off_variant(request.model)
+                if variant is not None:
+                    request = request.override(model=variant)
         except Exception:
             pass  # guidance must never become a failure source
         import time as _time
@@ -429,10 +511,12 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         if message is None:
             return
         _in_tok, out_tok, reason_tok = extract_usage(message)
+        reason_chars = reasoning_chars(message)
         channels = _channels(self._ledger.session(key).get("tools") or [])
         count = self._ledger.record_truncation(key, {
             "out": out_tok,
             "reasoning": reason_tok,
+            "reasoning_chars": reason_chars,
             "duration_s": duration_s,
             "channels": channels,
         })
@@ -442,11 +526,11 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         logger.warning(
             "G28 expert output truncated (finish_reason=length, "
             "delegation %s, occurrence %d, out=%s, reasoning=%s, "
-            "duration=%.1fs, channels=%s) — no structured conclusion; "
-            "recovery follows in after_model (bounce once with "
-            "evidence, degrade otherwise)",
+            "reasoning_chars=%d, duration=%.1fs, channels=%s) — no "
+            "structured conclusion; recovery follows in after_model "
+            "(bounce once with evidence, degrade otherwise)",
             key, count, out_tok or "?", reason_tok or "?",
-            duration_s, ",".join(channels) or "?",
+            reason_chars, duration_s, ",".join(channels) or "?",
         )
 
     def _truncation_recovery(self, state: Any) -> dict | None:

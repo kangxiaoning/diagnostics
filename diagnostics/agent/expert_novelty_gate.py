@@ -59,6 +59,12 @@ from langchain_core.messages import ToolMessage
 
 from diagnostics.agent.delegation_key import delegation_key_from_request
 from diagnostics.agent.expert_session_ledger import ExpertSessionLedger
+from diagnostics.agent.interception_receipts import ReceiptRegistry
+
+# v3.37.5: the hard block explains itself once per delegation; later triggers
+# return a fixed short receipt instead of repeating ~156 characters of
+# near-identical text (see interception_receipts for the rationale).
+_RECEIPTS = ReceiptRegistry()
 from diagnostics.agent.expert_stall_watchdog import _is_zero_yield
 
 logger = logging.getLogger(__name__)
@@ -202,13 +208,14 @@ class ExpertNoveltyGateMiddleware(AgentMiddleware):
                 key, tool_name, streak, soft, hard,
             )
             return ToolMessage(
-                content=(
+                content=_RECEIPTS.receipt(
+                    key, "g26_hard",
                     f"⛔ 系统强制收尾（低信息增量防护）：已连续 {streak} 次调用"
                     f"返回与已有结果高度相似的数据（同形态、内容重合≥"
                     f"{int(sim_threshold * 100)}%）——"
-                    "继续同类调用的边际信息已低于成本。\n"
+                    "继续同类调用的边际价值已低于成本。\n"
                     "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
-                    "（如实说明数据缺口与置信度），结束本次委派。"
+                    "（如实说明数据缺口与置信度），结束本次委派。",
                 ),
                 tool_call_id=tool_call_id,
             )

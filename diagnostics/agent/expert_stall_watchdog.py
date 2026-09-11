@@ -46,6 +46,14 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
 from diagnostics.agent.delegation_key import delegation_key_from_request
+from diagnostics.agent.interception_receipts import ReceiptRegistry
+
+# v3.37.5: one full explanation per (delegation, guard kind).  Later triggers
+# of the SAME guard return a fixed short receipt — the block still happens,
+# but the context no longer accumulates repeated 100+ character messages
+# (duplicate content + low-temperature decoding is the self-reinforcing
+# repetition combination this project measured in scenario 34).
+_RECEIPTS = ReceiptRegistry()
 
 logger = logging.getLogger(__name__)
 
@@ -200,11 +208,12 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
                 key, tool_name, streak,
             )
             return ToolMessage(
-                content=(
+                content=_RECEIPTS.receipt(
+                    key, "g19_zero_yield_hard",
                     f"⛔ 系统强制收尾（零产出停滞防护）：已连续 {streak} 次工具调用"
                     "未获得任何有效数据——该方向的数据不可用，继续调用不会改善结果。\n"
                     "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
-                    "（如实说明数据缺口与置信度），结束本次委派。"
+                    "（如实说明数据缺口与置信度），结束本次委派。",
                 ),
                 tool_call_id=tool_call_id,
             )
@@ -224,11 +233,12 @@ class ExpertStallWatchdogMiddleware(AgentMiddleware):
                 key, tool_name, total,
             )
             return ToolMessage(
-                content=(
+                content=_RECEIPTS.receipt(
+                    key, "g19_budget_hard",
                     f"⛔ 系统强制收尾（调用总量预算）：本次委派已执行 {total} 次工具调用，"
                     "达到总量上限——继续取证的边际收益已不抵成本。\n"
                     "你不得再调用任何工具。立即基于已采集的信息输出最终结论"
-                    "（如实说明数据缺口与置信度），结束本次委派。"
+                    "（如实说明数据缺口与置信度），结束本次委派。",
                 ),
                 tool_call_id=tool_call_id,
             )

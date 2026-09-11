@@ -50,6 +50,35 @@ def first_truncated(response: Any) -> Any | None:
     return None
 
 
+def reasoning_chars(message: Any) -> int:
+    """Character length of the reasoning stream carried by *message*.
+
+    v3.37.3 (observed 2026-09-11, scenario 34): a truncated turn reported
+    ``out=16384, reasoning=?`` — the provider exposed NO reasoning token
+    counter, yet the captured response body carried a 71419-character
+    ``message.reasoning`` field (0 content, 0 tool_calls).  Token counters
+    are optional across OpenAI-compatible endpoints, so the observable
+    fact must be the stream itself: this returns its character length,
+    which lets the G28 log distinguish "the answer was cut off" from
+    "the thinking stream exhausted the shared budget".
+    """
+    for attr in ("reasoning", "reasoning_content"):
+        v = getattr(message, attr, None)
+        if isinstance(v, str) and v.strip():
+            return len(v)
+    extra = getattr(message, "additional_kwargs", None)
+    if isinstance(extra, dict):
+        for key in ("reasoning", "reasoning_content", "thinking"):
+            v = extra.get(key)
+            if isinstance(v, str) and v.strip():
+                return len(v)
+            if isinstance(v, dict):
+                inner = v.get("content") or v.get("text")
+                if isinstance(inner, str) and inner.strip():
+                    return len(inner)
+    return 0
+
+
 def extract_usage(message: Any) -> tuple[int, int, int]:
     """Best-effort ``(input, output, reasoning)`` token counts.
 

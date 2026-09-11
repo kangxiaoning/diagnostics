@@ -49,19 +49,36 @@ class OllamaChatOpenAI(ChatOpenAI):
     re-add the legacy field after the fact.
     """
 
+    # Per-instance reasoning-effort override (v3.37.3).  The wrap-up path
+    # (G28 recovery after an output-truncated turn) switches to a
+    # "none"-effort variant of this model so the reasoning stream cannot
+    # exhaust the output budget a second time.  Instance-scoped on purpose:
+    # the same model object serves every other turn untouched, and no
+    # global switch is flipped for the whole session.
+    reasoning_effort_override: str | None = None
+
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         mct = payload.get("max_completion_tokens")
         if mct is not None and "max_tokens" not in payload:
             payload["max_tokens"] = mct
-        if _THINKING_MODE in ("enabled", "disabled"):
+        # Reasoning-effort (v3.37.3): emitted whenever an effort is in force
+        # — module-level default (operator opt-in) or the per-instance
+        # override used by the wrap-up path.  Empirically verified against
+        # ollama (qwen3.6:35b-mlx) on 2026-09-11: ``reasoning_effort="none"``
+        # yields 0 reasoning tokens, whereas ``thinking={"type":"disabled"}``
+        # is accepted (200) but IGNORED — it keeps thinking.
+        effort = self.reasoning_effort_override or _REASONING_EFFORT
+        if effort:
+            extra_body = payload.get("extra_body") or {}
+            extra_body["reasoning_effort"] = effort
+            payload["extra_body"] = extra_body
+        elif _THINKING_MODE in ("enabled", "disabled"):
             # Vendor-specific fields travel in extra_body: langchain
             # splats the payload into the OpenAI client as keyword
             # arguments, so unknown top-level keys raise TypeError.
             extra_body = payload.get("extra_body") or {}
             extra_body["thinking"] = {"type": _THINKING_MODE}
-            if _THINKING_MODE == "enabled" and _REASONING_EFFORT:
-                extra_body["reasoning_effort"] = _REASONING_EFFORT
             payload["extra_body"] = extra_body
         if _KEEP_ALIVE:
             extra_body = payload.get("extra_body") or {}

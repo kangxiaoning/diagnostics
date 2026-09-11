@@ -56,6 +56,14 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
 from diagnostics.agent.delegation_key import delegation_key_from_request
+from diagnostics.agent.interception_receipts import ReceiptRegistry
+
+# v3.37.5: each governance rejection explains itself once per delegation;
+# later triggers of the SAME rejection return a fixed short receipt.  The
+# rejections here are exactly the "repeated call → repeated long receipt"
+# channel (A3 identical-call block and the covered-interval block fire on
+# every repeat), which is what the receipt registry exists to stop.
+_RECEIPTS = ReceiptRegistry()
 
 logger = logging.getLogger(__name__)
 
@@ -278,10 +286,11 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
         if tool_name == "grep" and path.rstrip("/") == "/agent_data/skills":
             logger.warning("治理拦截(skills目录grep): delegation=%s", dkey)
             return ToolMessage(
-                content=(
+                content=_RECEIPTS.receipt(
+                    dkey, "file_skills_grep",
                     "⛔ [文件工具治理] 禁止对 /agent_data/skills/ 目录做内容搜索。\n"
                     "你的技能已在委派时指定——请用 ls /agent_data/skills/ 定位"
-                    "技能文件后直接 read_file 读取；grep 仅允许针对具体文件。"
+                    "技能文件后直接 read_file 读取；grep 仅允许针对具体文件。",
                 ),
                 tool_call_id=tool_call_id,
                 name=tool_name,
@@ -304,14 +313,15 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
                     "（工具结果缓存）。"
                 )
             return ToolMessage(
-                content=(
+                content=_RECEIPTS.receipt(
+                    dkey, f"file_path_outside:{path}",
                     f"⛔ [文件工具治理] 路径 {path or '(空)'} 不在允许范围内。\n"
                     "诊断 Agent 通过远程调用获取被诊断主机数据：本地虚拟文件"
                     "系统中不存在 /proc、/sys 等主机路径，这些调用读不到任何"
                     "与被诊断对象相关的数据。\n"
                     f"{hint}\n"
                     "远程主机/集群数据必须使用本专家配备的专用诊断工具获取，"
-                    "不能用文件工具代替。"
+                    "不能用文件工具代替。",
                 ),
                 tool_call_id=tool_call_id,
                 name=tool_name,
@@ -329,12 +339,13 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
                     tool_name, dkey, sig[:120],
                 )
                 return ToolMessage(
-                    content=(
+                    content=_RECEIPTS.receipt(
+                        dkey, "file_repeat_call",
                         f"⛔ [文件工具治理] 重复调用：本次委派中已用完全相同的参数"
                         f"执行过 {tool_name}，结果就在上方消息历史中，直接引用即可"
                         "（重复读取的信息增益为 0）。\n"
                         "若需文件的其他部分，请调整 offset/limit；"
-                        "若需定位特定内容，请用 grep 正则一次定位。"
+                        "若需定位特定内容，请用 grep 正则一次定位。",
                     ),
                     tool_call_id=tool_call_id,
                     name=tool_name,
@@ -356,13 +367,14 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
                     path, _iv[0], _iv[1], dkey,
                 )
                 return ToolMessage(
-                    content=(
+                    content=_RECEIPTS.receipt(
+                        dkey, f"file_interval_covered:{path}:{_iv[0]}-{_iv[1]}",
                         f"⛔ [文件工具治理] 重复读取：{path} 的 "
                         f"[{_iv[0]},{_iv[1]}) 区间已被本次委派先前的读取完全"
                         "覆盖（结果就在上方消息历史中，直接引用即可——"
                         "重复读取信息增益为 0）。\n"
                         "如需该文件其他部分，请调整 offset 读取未覆盖区间；"
-                        "如需定位内容，请用 grep 正则一次定位。"
+                        "如需定位内容，请用 grep 正则一次定位。",
                     ),
                     tool_call_id=tool_call_id,
                     name=tool_name,
@@ -389,13 +401,14 @@ class ExpertFileToolGovernanceMiddleware(AgentMiddleware):
                     tool_name, dkey, used,
                 )
                 return ToolMessage(
-                    content=(
+                    content=_RECEIPTS.receipt(
+                        dkey, "file_budget_exhausted",
                         f"⛔ [文件工具治理] 本次委派的文件读取预算已耗尽"
                         f"（{_hard_budget()} 次 read_file/grep）。"
                         "继续翻页的期望信息增益已低于调用成本。\n"
                         "请立即基于已获得的数据产出结论并返回；"
                         "如证据不足，在返回中明确说明还缺什么数据，"
-                        "由 Coordinator 决策下一步。"
+                        "由 Coordinator 决策下一步。",
                     ),
                     tool_call_id=tool_call_id,
                     name=tool_name,

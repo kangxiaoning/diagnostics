@@ -66,6 +66,24 @@ _FULL_CONTENT_MAX = int(os.getenv("DIAGNOSTICS_DEDUP_FULL_CONTENT_MAX", "30000")
 # less information than a ceremonial verdict restatement, which G18 blocks
 # on the second offense).
 _DEDUP_HIT_BLOCK = int(os.getenv("DIAGNOSTICS_DEDUP_HIT_BLOCK", "2"))
+
+# Repeat receipt (v3.37.4, P0/P1 — context-pollution fix).  Deliberately
+# IDENTICAL on every repeat: the result already lives in this conversation,
+# so re-injecting it adds nothing but duplicate content.  Measured
+# 2026-09-11 (scenario 34, captured request 23): the pre-fix behaviour
+# duplicated 28% of the tool-result characters in one delegation (5/21 tool
+# messages; one result appeared 3x) and appended one escalating
+# "this is repeat #N" note per attempt — and the model's reasoning then
+# echoed that pattern ("I notice something odd…" x69) until it consumed the
+# whole 16384-token output budget.  Literature: duplicate/redundant content
+# is the textbook definition of context pollution, and self-reinforcement
+# of a repeated context is a documented root cause of repetition loops
+# (arXiv:2512.04419).  Brevity is the point: one fixed line, no counter, no
+# content, no retrieval hint (the data is one turn above).
+_DEDUP_REPEAT_RECEIPT = (
+    "[系统去重] 与上次相同参数的调用已跳过：结果与上次一致，已在上文返回。"
+    "请直接引用已有结果；需要新数据时调整参数（时间窗/维度/过滤）。"
+)
 """Subagent dedup hits return full content (not preview) up to this size.
 
 A subagent starts with a fresh context — the original result is NOT in
@@ -435,30 +453,33 @@ class ToolDedupMiddleware(AgentMiddleware):
                 full = cached_msg.content if isinstance(
                     cached_msg.content, str) else str(cached_msg.content)
                 # G24: count the hit in THIS context (Coordinator session
-                # or this expert delegation), then apply the 1/2 ladder.
+                # or this expert delegation).
                 hit_key = self._hit_context_key(request)
                 counts = self._dedup_hit_counts.setdefault(hit_key, {})
-                repeat_count = counts.get(cache_key, 0) + 1
-                counts[cache_key] = repeat_count
-                if repeat_count >= _DEDUP_HIT_BLOCK:
+                # v3.37.4 (P0/P1): an IDENTICAL repeat inside the SAME
+                # context carries no new information — the original result
+                # is already in this conversation, so only a fixed one-line
+                # receipt is returned.  The pre-fix path re-injected the full
+                # body on the first repeat and an escalating "this is repeat
+                # #N" note afterwards; measured 2026-09-11 that polluted 28%
+                # of the tool-result characters of one delegation and the
+                # model echoed the pattern into a 69x reasoning loop.
+                # Cross-context first hits (parallel delegations, the
+                # Coordinator) keep the full-content path: their history
+                # does NOT contain the result, so a summary there would
+                # force an unnecessary read_file round-trip.
+                if cache_key in counts:
+                    counts[cache_key] += 1
                     logger.warning(
                         "去重拦截(上下文%s 重复%d次): %s",
-                        hit_key, repeat_count, cache_key,
+                        hit_key, counts[cache_key], cache_key,
                     )
                     return ToolMessage(
-                        content=(
-                            f"⛔ [系统去重] 这是本上下文中第 {repeat_count} 次"
-                            f"以完全相同参数调用 {tool_name}——"
-                            "结果与前几次确定性一致，重复调用不会获得新数据。\n"
-                            f"已有结果：read_file \"{_DEDUP_CACHE_PREFIX}/{cache_key}\""
-                            "（limit≥500）一次性查看，或直接引用此前去重回执中的结果。\n"
-                            "如需新数据：调整查询参数（时间窗/维度/过滤）。\n"
-                            "如证据已足够：请立即基于已有数据产出结论并返回；"
-                            "如证据不足，在返回中明确说明还缺什么数据。"
-                        ),
+                        content=_DEDUP_REPEAT_RECEIPT,
                         tool_call_id=tool_call_id,
                         name=cached_msg.name or tool_name,
                     )
+                counts[cache_key] = 1
                 return self._dedup_hit_result(
                     cache_key, tool_call_id, cached_msg.name or tool_name,
                     full,
