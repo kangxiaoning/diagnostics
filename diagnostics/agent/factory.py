@@ -31,38 +31,28 @@ from diagnostics.agent.ledger import (
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
-from diagnostics.tools import get_k8s_live_tools
+from diagnostics.tools.registry import (
+    get_family_argus_live_tools,
+    get_gpu_live_tools,
+    get_host_argus_live_tools,
+    get_host_live_tools,
+    get_k8s_argus_live_tools,
+    get_k8s_family_live_tools,
+    get_k8s_live_tools,
+)
 
 # Mock tools are optional — only available in local dev environments.
 # GitHub clones should set DIAGNOSTICS_MODE=production.
 try:
     from diagnostics.tools.mock import (
         get_coordinator_mock_tools,
+        get_family_argus_tools,
+        get_gpu_mock_tools,
         get_host_argus_tools,
+        get_host_mock_tools,
         get_k8s_argus_tools,
+        get_k8s_family_tools,
         get_k8s_mock_tools,
-        get_kmc_argus_tools,
-        get_kmc_tools,
-        get_sci_argus_tools,
-        get_sci_tools,
-        get_serverless_argus_tools,
-        get_serverless_tools,
-    )
-    from diagnostics.tools.mock.gpu import check_gpu_health, check_gpu_memory, check_gpu_utilization
-    from diagnostics.tools.mock.hosts import (
-        check_conntrack,
-        check_cpu,
-        check_disk,
-        check_dmesg,
-        check_memory,
-        check_network,
-        check_processes,
-        get_system_overview,
-    )
-    from diagnostics.tools.mock.kubernetes import (
-        check_kubernetes_control_plane,
-        check_kubernetes_nodes,
-        check_kubernetes_pods,
     )
     _MOCK_AVAILABLE = True
 except ImportError:
@@ -72,19 +62,13 @@ except ImportError:
     # requested but mock tools are not installed.
     def get_coordinator_mock_tools(): return []
     def get_host_argus_tools(): return []
+    def get_host_mock_tools(): return []
+    def get_gpu_mock_tools(): return []
     def get_k8s_argus_tools(): return []
     def get_k8s_mock_tools(): return []
-    def get_serverless_argus_tools(): return []
-    def get_serverless_tools(): return []
-    def get_kmc_argus_tools(): return []
-    def get_kmc_tools(): return []
-    def get_sci_argus_tools(): return []
-    def get_sci_tools(): return []
-    check_gpu_health = check_gpu_memory = check_gpu_utilization = None
-    check_conntrack = check_cpu = check_disk = check_dmesg = None
-    check_memory = check_network = check_processes = None
-    get_system_overview = None
-    check_kubernetes_control_plane = check_kubernetes_nodes = check_kubernetes_pods = None
+    def get_k8s_family_tools(): return []
+    def get_family_argus_tools(): return []
+
 
 # ── Harness profile: disable the auto-added general-purpose subagent ──
 # deepagents auto-adds a general-purpose subagent that sits outside the
@@ -238,10 +222,14 @@ class DeepExpertFindings(BaseModel):
         default_factory=list,
         description=(
             "未取证维度声明：与本次任务无关、或数据不可用而无法取证的维度，"
-            "逐条写明『维度名：原因』（如『节点指标：目标节点无监控数据』）。"
-            "已声明的维度视为已交代，不会因缺数据被要求补采。"
-            "若因系统强制收尾未取证，写明『维度名：系统强制收尾未取证』——"
-            "不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
+            "逐条按『维度名：类型｜原因』写明——类型三选一："
+            "数据不可用（该渠道确实取不到数据）/ 不适用（与本次任务无关）/ "
+            "强制收尾（被系统预算截断未采集）。"
+            "示例：『节点指标：数据不可用｜目标节点无监控数据』、"
+            "『网络策略：不适用｜本次任务为资源不足』、"
+            "『Pod日志：强制收尾｜预算用尽未采集』。"
+            "已声明的维度视为已交代，不会因缺数据被要求补采；"
+            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
         ),
     )
 
@@ -311,10 +299,12 @@ class ArgusExpertFindings(BaseModel):
         default_factory=list,
         description=(
             "未取证维度声明（数组，每项一条）：与本次任务无关、或数据不可用而无法取证的"
-            "维度，逐条写明『维度名：原因』（如 [\"Pod指标：目标命名空间无 Pod\"]）。"
-            "已声明的维度视为已交代，不会因缺数据被要求补采。"
-            "若因系统强制收尾未取证，写明『维度名：系统强制收尾未取证』——"
-            "不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
+            "维度，逐条按『维度名：类型｜原因』写明——类型三选一："
+            "数据不可用 / 不适用 / 强制收尾。"
+            "示例：[\"Pod指标：数据不可用｜目标命名空间无 Pod\", "
+            "\"网络指标：不适用｜本次任务为存储不足\"]。"
+            "已声明的维度视为已交代，不会因缺数据被要求补采；"
+            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
         ),
     )
 
@@ -382,16 +372,20 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     # delivery directive (field NAMES as an index; semantics live in the
     # schema), text-fallback clarification marker, convergence anchor.
     "\n\n**工具使用边界**:\n"
-    "- 你只有 query_argus_* 监控工具，无文件工具和深度诊断工具。\n"
+    "- 你只有 get_argus_* 监控工具，无文件工具和深度诊断工具。\n"
     "- 你只负责指标采集与关联分析——假设与结论的台账登记由 Coordinator 统一完成。\n"
     "\n**取证策略**:\n"
     "- 并行查询所有相关指标（通常 2~4 次工具调用），覆盖完整后立即汇总返回。\n"
     "- 区分采集目的：定位对象（委派指定的目标实体或已观测异常的指标）→ 完整采集其关键指标维度；"
     "排除对象（其余节点/组件，仅确认「该方向正常」）→ 概览性查询确认无突变即止。\n"
-    "- 渐进式发现（概览→下钻）：先查概览类工具（*_cluster / *_overview）获取维度级突变信号，"
-    "再仅对「概览标记突变的维度」与「委派指定的目标对象」下钻做对象级归因；"
+    "- 渐进式发现（概览→下钻）：**顺序契约——首个工具调用必须是概览类工具**"
+    "（*_cluster / *_overview：k8s 面 get_argus_k8s_cluster_metrics、"
+    "主机面 get_argus_os_overview_metrics），一次取到维度级突变信号；再仅对"
+    "「概览标记突变的维度」与「委派指定的目标对象」下钻做对象级归因；"
     "概览无突变的关键维度各查一次确认即止；"
-    "概览不含对象级明细且委派未指明对象时，按完整维度扫描定位异常对象。\n"
+    "概览不含对象级明细且委派未指明对象时，按完整维度扫描定位异常对象。"
+    "（2026-09-10 实证：概览未覆盖全部维度时专家会绕过概览直接并发多维查询；"
+    "概览已覆盖全部 argus 维度，顺序契约可完整执行。）\n"
     "- 已查过的「工具+参数」组合直接复用其返回做分析（重查只返回缓存结果、零新信息），"
     "后续查询只投向尚未覆盖的维度或对象。\n"
     "\n**返回**:\n"
@@ -431,9 +425,23 @@ def _build_subagents(
             "Set DIAGNOSTICS_MODE=production or install the mock package."
         )
 
-    k8s_tools = get_k8s_mock_tools() if mode == "mock" else get_k8s_live_tools()
-    argus_host_tools = get_host_argus_tools() if mode == "mock" else []
-    argus_k8s_tools = get_k8s_argus_tools() if mode == "mock" else []
+    # 工具面（mock / live 同签名、同分组；live 侧为占位实现，移植时按签名对接）
+    if mode == "mock":
+        k8s_tools = get_k8s_mock_tools()
+        k8s_family_tools = get_k8s_family_tools()
+        argus_host_tools = get_host_argus_tools()
+        argus_k8s_tools = get_k8s_argus_tools()
+        argus_family_tools = get_family_argus_tools()
+        host_tools = get_host_mock_tools()
+        gpu_tools = get_gpu_mock_tools()
+    else:
+        k8s_tools = get_k8s_live_tools()
+        k8s_family_tools = get_k8s_family_live_tools()
+        argus_host_tools = get_host_argus_live_tools()
+        argus_k8s_tools = get_k8s_argus_live_tools()
+        argus_family_tools = get_family_argus_live_tools()
+        host_tools = get_host_live_tools()
+        gpu_tools = get_gpu_live_tools()
     subagents: list[dict[str, Any]] = [
         # ── Host Argus expert (host-level time-series analysis) ──
         #
@@ -451,7 +459,7 @@ def _build_subagents(
                 "你是 Linux 主机指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度的分项指标时间线，"
                 "识别异常突变点、跨子系统时序关联、异常严重程度排序。\n\n"
-                "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
+                "⚠ 关键约束：你只有 get_argus_os_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
                 "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 hostname 参数值，优先级最高）\n"
                 "2. 消息开头的「Argus 诊断上下文（工具参数契约）」JSON 区块（Serverless 场景；"
@@ -463,7 +471,9 @@ def _build_subagents(
                 "（结构化返回），并在其中说明剩余所需参数——禁止以参数澄清"
                 "替代已可交付的采集结果。\n\n"
                 "诊断原则：\n"
-                "- 并行查询所有相关 Argus 指标（CPU/内存/磁盘/网络）\n"
+                "- **首轮先调用 get_argus_os_overview_metrics**（一次拿到全部 11 维"
+                "——CPU/内存/磁盘/网络/NAS/PING/TCP/内核/负载/时间同步——的维度级突变信号），"
+                "再只对概览标记突变的维度与委派指定对象下钻分项指标；概览无突变则不逐维枚举\n"
                 "- 识别每个子系统的突变时间点（指标显著变化的分钟）\n"
                 "- 分析跨子系统时序关联——同一分钟的异常可能共享根因\n"
                 "- 推断因果方向（如：磁盘IO突变先于iowait升高→磁盘是根因方向）\n"
@@ -485,11 +495,11 @@ def _build_subagents(
             "name": "k8s-argus-expert",
             "description": (
                 "查询并分析 Kubernetes 集群级 Argus 监控指标时序。"
-                "工具 query_argus_k8s_cluster: 集群概览(API延迟/etcd/DNS/节点就绪)。"
-                "工具 query_argus_k8s_node: 单节点(Ready/驱逐/kubelet)。"
-                "工具 query_argus_k8s_workload: 工作负载(副本/重启/Pending)。"
-                "工具 query_argus_k8s_pod: 单Pod(重启/OOM/探针)。"
-                "工具 query_argus_k8s_etcd: etcd(leader/raft/存储)。"
+                "工具 get_argus_k8s_cluster_metrics: 集群概览(API延迟/etcd/DNS/节点就绪)。"
+                "工具 get_argus_k8s_node_metrics: 单节点(Ready/驱逐/kubelet)。"
+                "工具 get_argus_k8s_workload_metrics: 工作负载(副本/重启/Pending)。"
+                "工具 get_argus_k8s_pod_metrics: 单Pod(重启/OOM/探针)。"
+                "工具 get_argus_k8s_master_metrics: 控制面组件(重启/CPU/内存/就绪)。"
                 "适用场景：需要获取K8s集群指标时间线以识别集群异常时序、"
                 "控制面稳定性与工作负载状态时委派。"
             ),
@@ -499,12 +509,12 @@ def _build_subagents(
                 "识别集群异常时序与控制面稳定性问题。\n\n"
                 "你有五个按维度分区的专用工具（首参均为 monitor_name，"
                 "已由系统预解析提供）：\n"
-                "- query_argus_k8s_cluster: 集群概览(API Server延迟/错误、etcd Leader/DB用量、DNS延迟/错误、NotReady节点数)\n"
-                "- query_argus_k8s_node: 单节点(Ready状态/驱逐/kubelet心跳/节点CPU/内存)\n"
-                "- query_argus_k8s_workload: 工作负载(期望/就绪副本、Pod重启、Pending)\n"
-                "- query_argus_k8s_pod: 单Pod(容器重启/OOMKilled/探针失败/内存工作集)\n"
-                "- query_argus_k8s_etcd: etcd(Leader/Leader变更/提案失败/WAL fsync/Backend Commit/DB大小)\n\n"
-                "⚠ 关键约束：你只有 query_argus_* 工具，没有文件工具。"
+                "- get_argus_k8s_cluster_metrics: 集群概览(API Server延迟/错误、etcd Leader/DB用量、DNS延迟/错误、NotReady节点数)\n"
+                "- get_argus_k8s_node_metrics: 单节点(Ready状态/驱逐/kubelet心跳/节点CPU/内存)\n"
+                "- get_argus_k8s_workload_metrics: 工作负载(期望/就绪副本、Pod重启、Pending)\n"
+                "- get_argus_k8s_pod_metrics: 单Pod(容器重启/OOMKilled/探针失败/内存工作集)\n"
+                "- get_argus_k8s_master_metrics: Master控制面组件(组件Pod重启/API Server CPU/内存/组件就绪)\n\n"
+                "⚠ 关键约束：你只有 get_argus_k8s_* 工具，没有文件工具。"
                 "所有必需参数必须从以下来源获取（按优先级）：\n"
                 "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 monitor_name/cluster_name 参数值，优先级最高）\n"
                 "2. Coordinator 的 task 描述\n"
@@ -513,7 +523,9 @@ def _build_subagents(
                 "若已能执行部分查询，必须照常交付已采集的发现（结构化返回），"
                 "并在其中说明剩余所需参数——禁止以参数澄清替代已可交付的采集结果。\n\n"
                 "诊断原则：\n"
-                "- 按需并行调用维度工具（先 cluster 概览定位异常层，再 node/workload/pod/etcd 下钻）\n"
+                "- **首轮必须先调用 get_argus_k8s_cluster_metrics（集群概览）**取维度级突变信号，"
+                "再只对概览标记突变的维度与委派指定对象下钻 node/workload/pod/master；"
+                "概览无突变的维度不逐个枚举\n"
                 "- 识别每个维度的突变时间点（指标显著变化的分钟）\n"
                 "- 分析跨维度时序关联——同一分钟的异常可能共享根因\n"
                 "- 区分控制面问题(API/etcd/DNS) vs 节点资源问题(NotReady/Evictions) vs 工作负载问题(Restarts/Pending)\n"
@@ -564,8 +576,10 @@ def _build_subagents(
                 "- 跨域复合症状 → cross-layer-diagnosis\n"
                 "- GPU CUDA OOM/温度限速/利用率异常/ECC 错误 → gpu-diagnosis"
                 "（检查顺序：健康状态[温度/限速/ECC/PCIe] → 显存[OOM/泄漏] → 利用率）\n"
-                "- 技能工具不足时，使用 check_cpu/check_memory/check_disk/check_network/"
-                "check_gpu_* 直接分析\n\n"
+                "- 技能工具不足时，使用 get_os_*/get_gpu_* 家族工具直接分析\n"
+                "- 主机指标一律经 get_os_*/get_gpu_* 家族工具获取（各维度已封装 "
+                "/proc、sysctl、dmesg、iostat、ss、ethtool 语义）；文件工具仅用于"
+                "报告与台账产物——读 /proc 等主机路径会被系统治理拦截并浪费一轮\n\n"
                 "关键诊断动作：\n"
                 "- iowait 高 + 进程 D 状态 → 锁定磁盘 IO 根因\n"
                 "- RSS 远超 heap limit → 识别堆外内存泄漏\n"
@@ -580,7 +594,7 @@ def _build_subagents(
             # "CUDA OOM kills the process while host memory stays normal";
             # container-scene GPU checks go through the host expert too,
             # since GPUs live on physical nodes).
-            "tools": [t for t in [get_system_overview, check_cpu, check_memory, check_disk, check_network, check_processes, check_conntrack, check_dmesg, check_gpu_health, check_gpu_memory, check_gpu_utilization] if t is not None],
+            "tools": [*host_tools, *gpu_tools],
             "skills": [
                 "/agent_data/skills/system-health-check/",
                 "/agent_data/skills/cpu-diagnosis/",
@@ -633,12 +647,18 @@ def _build_subagents(
                 "- 标准 Pod/Deployment 排障 → kubernetes-diagnosis\n"
                 "- 容器运行时（镜像/崩溃） → container-runtime-diagnosis\n"
                 "- 主机级联故障追踪 → cross-layer-diagnosis\n"
-                "- 技能工具不足时，使用 check_kubernetes_* 和 K8s 工具直接分析\n\n"
+                "- 技能工具不足时，直接使用本专家的 K8s 工具分析\n\n"
+                "症状→工具族（族内按需选择，能力细节见工具描述）:\n"
+                "- DNS 异常 → `*_coredns_*`；etcd 深度 → `*_etcd_*`（含 get_k8s_etcd_check）\n"
+                "- 发布 → `*_helm_*`；安全面 → `check_k8s_rbac_*` / `check_k8s_webhook_*` / "
+                "`check_k8s_certificate_*` / `get_k8s_network_policies`\n"
+                "- 载荷聚焦 → `get_k8s_{pod_restart_counts,node_conditions}` / "
+                "`check_k8s_{pods,nodes,control_plane}`\n\n"
                 "**K8s 工具参数发现（必须先发现再操作）**:\n"
-                "- `namespace` → 先调 `get_namespaces(cluster_name)` 获取可用命名空间\n"
+                "- `namespace` → 先调 `get_k8s_namespaces(cluster_name)` 获取可用命名空间\n"
                 "- `resource_type` → 使用完整名称：`deployment` / `daemonset`（非 `deploy` / `ds`）\n"
                 "- `cluster_name` → 从用户描述或集群元数据获取，不臆造\n"
-                "- `pod_name` → 先从 `check_kubernetes_pods` 或 `get_pod_events` 获取\n\n"
+                "- `pod_name` → 先从 `get_k8s_resource_list` 或 `get_k8s_pod_events_info` 获取\n\n"
                 "关键诊断问题：\n"
                 "- 区分基础设施根因与工作负载症状\n"
                 "- 节点 NotReady → 判断主机层 vs K8s 层原因\n"
@@ -649,12 +669,7 @@ def _build_subagents(
                 "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据，供 Coordinator 综合判断\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": [
-                t for t in [
-                    check_kubernetes_control_plane, check_kubernetes_nodes, check_kubernetes_pods,
-                    *k8s_tools,
-                ] if t is not None
-            ],
+            "tools": [*k8s_tools],
             "skills": [
                 "/agent_data/skills/control-plane-diagnosis/",
                 "/agent_data/skills/etcd-diagnosis/",
@@ -680,25 +695,26 @@ def _build_subagents(
             "system_prompt": (
                 "你是 Serverless 逻辑集群指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别逻辑集群异常时序。\n\n"
-                "⚠ 关键约束：你只有 query_argus_serverless_* 与 query_argus_shared_etcd 工具，没有文件工具。\n"
+                "⚠ 关键约束：你只有 get_argus_k8s_* 规范监控工具（实际环境与 k8s-argus-expert "
+                "同一工具面，监控平台按 monitor_name/cluster_name 路由到本逻辑集群视角数据），没有文件工具。\n"
                 "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
-                "pod（单 Pod）/ shared_etcd（共享 etcd）。\n"
+                "pod（单 Pod）/ master（控制面组件）；共享 etcd 后端（多集群同时异常优先怀疑）"
+                "用 get_argus_shared_etcd_metrics。\n"
                 "所有参数必须从消息开头的「Argus 诊断上下文（工具参数契约）」JSON 区块解析（优先级最高）：\n"
                 "- monitor_name / cluster_name / 时间窗 ← tool_params（唯一来源）\n"
                 "- 诊断目标 namespace / workload_type / workload_name / pod_name ← diagnostic_target\n"
                 "- 目标物理落点 pod_name / node_name ← landings；其余资源参数 ← inventory.serverless_views（resource / physical_pods）\n"
-                "- 共享 etcd 查询：inventory.etcd_views 条目（host_name 可选）\n"
                 "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
                 "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
                 "禁止只回参数澄清而丢弃已采集数据。\n\n"
                 "诊断原则：\n"
-                "- 先查集群概览（_cluster），异常时按维度深入（_node/_workload/_pod）\n"
-                "- 共享 etcd 异常（多集群同时异常优先怀疑）用 query_argus_shared_etcd\n"
+                "- 先查集群概览（cluster 维度），异常时按维度深入（node/workload/pod）\n"
+                "- 逻辑集群 API 异常时用 master 维度查控制面组件（跨层关联输入）\n"
                 "- 与 KMC/SCI 物理层时序关联由 Coordinator 跨层综合\n"
                 "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
                 + _ARGUS_EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_serverless_argus_tools(),
+            "tools": argus_family_tools,
         },
         {
             "name": "serverless-expert",
@@ -716,11 +732,13 @@ def _build_subagents(
                 "- 对比逻辑状态与 SCI 物理状态（VK 同步链路故障时两视图不一致）\n\n"
                 "诊断原则：\n"
                 "- 查 Deployment 状态/事件、Pod 生命周期（OOMKilled/CrashLoopBackOff）\n"
+                "  （用 get_k8s_resource_list / list_k8s_namespace_resources / "
+                "get_k8s_pod_events_info / get_k8s_pod_logs 等规范工具）\n"
                 "- 检查 Pod 固定 IP 注解与重建行为（固定 IP 保留）\n"
                 "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_serverless_tools(),
+            "tools": k8s_family_tools,
             "skills": [
                 "/agent_data/skills/kubernetes-diagnosis/",
             ],
@@ -734,14 +752,15 @@ def _build_subagents(
             "system_prompt": (
                 "你是 KMC 物理集群（控制面承载）指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别控制面集群异常时序。\n\n"
-                "⚠ 关键约束：你只有 query_argus_kmc_* 与 query_argus_kmc_etcd 工具，没有文件工具。\n"
+                "⚠ 关键约束：你只有 get_argus_k8s_* 规范监控工具（实际环境与 k8s-argus-expert "
+                "同一工具面，监控平台按 monitor_name/cluster_name 路由到 KMC 物理集群视角数据），没有文件工具。\n"
                 "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
-                "pod（单 Pod）/ kmc_etcd（KMC 自身 etcd）。\n"
+                "pod（单 Pod）/ master（控制面组件）；共享 etcd 后端（多集群同时异常优先怀疑）"
+                "用 get_argus_shared_etcd_metrics。\n"
                 "所有参数必须从消息开头的「Argus 诊断上下文（工具参数契约）」JSON 区块解析（优先级最高）：\n"
                 "- monitor_name / cluster_name / 时间窗 ← tool_params（唯一来源）\n"
                 "- 诊断目标及其控制面落点 ← diagnostic_target / landings\n"
                 "- 其余资源参数 ← inventory.kmc_views（kmc_resource(kind/ns/name/node_name)）\n"
-                "- KMC 自身 etcd 查询：inventory.kmc_views 中 kind=EtcdMember 条目（kmc-etcd-*，host_name 可选）\n"
                 "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
                 "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
                 "禁止只回参数澄清而丢弃已采集数据。\n\n"
@@ -751,7 +770,7 @@ def _build_subagents(
                 "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
                 + _ARGUS_EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_kmc_argus_tools(),
+            "tools": argus_family_tools,
         },
         {
             "name": "kmc-expert",
@@ -770,13 +789,15 @@ def _build_subagents(
                 "- 共享组件命名空间：API Gateway `kube-system`、Group1-xxx `kmc-ingress`、IPAM `kmc-system`\n\n"
                 "诊断原则：\n"
                 "- 控制面 Deployment/Pod（apiserver/cm/vk/vpc-cni-controller）状态与重启\n"
-                "- 控制面组件异常时查 Pod 日志定位根因（崩溃/报错）→ get_kmc_pod_logs\n"
-                "- 共享 etcd（5 节点，etcd_views）/ KMC 自身 etcd 健康/leader/延迟（多集群同时异常优先怀疑）→ get_kmc_etcd_status\n"
+                "- 控制面组件异常时查 Pod 日志定位根因（崩溃/报错）→ get_k8s_pod_logs\n"
+                "- 共享 etcd（5 节点）/ 控制面 etcd 健康/leader/延迟（多集群同时异常优先怀疑）→ get_k8s_etcd_check；共享 etcd 时序指标 → 委派 kmc-argus-expert\n"
+                "- 共享组件：API Gateway（VK→SCI 隧道入口）→ get_k8s_apigateway_status；"
+                "Group1-xxx（logs/exec 隧道）→ get_k8s_group1_status；IPAM（固定 IP 分配）→ get_k8s_ipam_status\n"
                 "- 共享组件链路：API Gateway（VK→SCI）、Group1-xxx（logs/exec 隧道）、IPAM（固定 IP）\n"
                 "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_kmc_tools(),
+            "tools": k8s_family_tools,
             "skills": [
                 "/agent_data/skills/control-plane-diagnosis/",
                 "/agent_data/skills/etcd-diagnosis/",
@@ -791,15 +812,16 @@ def _build_subagents(
             "system_prompt": (
                 "你是 SCI 物理集群（工作负载执行）指标时序分析专家。\n"
                 "你的职责是查询和分析 Argus 1min 粒度指标时间线，识别数据面集群异常时序。\n\n"
-                "⚠ 关键约束：你只有 query_argus_sci_* 与 query_argus_sci_etcd 工具，没有文件工具。\n"
+                "⚠ 关键约束：你只有 get_argus_k8s_* 规范监控工具（实际环境与 k8s-argus-expert "
+                "同一工具面，监控平台按 monitor_name/cluster_name 路由到 SCI 物理集群视角数据），没有文件工具。\n"
                 "工具按监控维度分区：cluster（集群概览）/ node（节点）/ workload（工作负载）/ "
-                "pod（单 Pod）/ sci_etcd（SCI 自身 etcd）。\n"
+                "pod（单 Pod）/ master（控制面组件）；共享 etcd 后端（多集群同时异常优先怀疑）"
+                "用 get_argus_shared_etcd_metrics。\n"
                 "所有参数必须从消息开头的「Argus 诊断上下文（工具参数契约）」JSON 区块解析（优先级最高）：\n"
                 "- monitor_name / cluster_name / 时间窗 ← tool_params（唯一来源）\n"
                 "- 诊断目标 SCI Pod ← diagnostic_target.derived_sci_pod；落点 ← landings\n"
                 "- boundary.target_sci_pod_absent=true 表示目标在 SCI 物理侧缺席（可能为同步链路故障本体），按缺席事实分析关联指标\n"
                 "- 其余资源参数 ← inventory.sci_views（sci_pod.name / sci_pod.node_name）\n"
-                "- SCI 自身 etcd 查询：inventory.sci_views 中 kind=EtcdMember 条目（sci-etcd-*，host_name 可选）\n"
                 "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
                 "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
                 "禁止只回参数澄清而丢弃已采集数据。\n\n"
@@ -809,7 +831,7 @@ def _build_subagents(
                 "- 按严重程度排序（🔴严重/⚠中等/✅正常）\n"
                 + _ARGUS_EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_sci_argus_tools(),
+            "tools": argus_family_tools,
         },
         {
             "name": "sci-expert",
@@ -828,13 +850,14 @@ def _build_subagents(
                 "- 工作负载 Pod 名 = burst-<serverless_ns>-<serverless_pod_name>（命名规则）\n"
                 "- 逻辑资源关联经「环境拓扑」区块（serverless_views 的 physical_pods）\n\n"
                 "诊断原则：\n"
-                "- 用户 Pod 状态/重启/OOM 与固定 IP（VPC-CNI/IPAM 分配记录）\n"
+                "- 用户 Pod 状态/重启/OOM 与固定 IP（VPC-CNI/IPAM 分配记录）→ "
+                "get_k8s_pod_ip（Pod IP 与固定 IP 保留）/ get_k8s_vpc_cni（CNI 状态与 IP 池）\n"
                 "- 节点/kubelet 与 VPC-CNI DaemonSet 状态（网络不通/IP 冲突优先怀疑）\n"
                 "- 与逻辑集群状态对比（VK 同步链路故障时两视图不一致）\n"
                 "- 返回验证结论（confirmed/refuted/inconclusive）+ 1~3 条关键证据\n"
                 + _EXPERT_RETURN_SUFFIX
             ),
-            "tools": get_sci_tools(),
+            "tools": k8s_family_tools,
             "skills": [
                 "/agent_data/skills/kubernetes-diagnosis/",
                 "/agent_data/skills/container-runtime-diagnosis/",

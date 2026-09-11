@@ -3,7 +3,7 @@
 In container diagnosis scenarios, the frontend collects K8s-level parameters
 (cluster_name, namespace, workload_type, workload_name, pod_name) but not
 the underlying host node name.  However, ``host-argus-expert`` needs a
-concrete hostname to call ``query_argus_cpu`` / ``query_argus_memory`` etc.
+concrete hostname to call ``get_argus_os_cpu_metrics`` / ``get_argus_os_mem_metrics`` etc.
 
 This module resolves the hostname **before** the diagnosis starts and
 injects it into ``param_overrides`` so that host-level Argus tool calls

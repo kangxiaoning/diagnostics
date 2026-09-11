@@ -29,6 +29,7 @@ Discipline (all inherited from Coordinator-side lessons):
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, hook_config
@@ -43,6 +44,7 @@ from diagnostics.agent.expert_novelty_gate import (
 from diagnostics.agent.expert_session_ledger import (
     ExpertSessionLedger,
     expected_dimensions,
+    parse_focus_dims,
 )
 from diagnostics.agent.expert_stall_watchdog import (
     _hard_threshold as _g19_hard,
@@ -53,6 +55,22 @@ from diagnostics.agent.expert_stall_watchdog import (
 from diagnostics.agent.model_usage import extract_usage, first_truncated
 
 logger = logging.getLogger(__name__)
+
+
+def _delegation_text(request: Any) -> str:
+    """Text of the delegation messages (description + system-injected context).
+
+    P-1 consumes this to extract the Coordinator-named focus dimensions;
+    only HumanMessage content is read (the injected context and the
+    Coordinator's ``[Coordinator 委派指令]`` block both live there).
+    """
+    parts: list[str] = []
+    for m in (getattr(request, "messages", None) or []):
+        if isinstance(m, HumanMessage):
+            c = getattr(m, "content", "")
+            if isinstance(c, str):
+                parts.append(c)
+    return "\n".join(parts)
 
 
 def _last_ai_text_chars(state: Any) -> int:
@@ -76,14 +94,16 @@ def _channels(tool_names: list[str]) -> list[str]:
     """Observability channel labels derived from the bound toolset.
 
     The subagent's own name is not visible inside the middleware, but
-    every Argus expert binds ``query_argus_<domain>_*`` tools, so the
-    domain identifies the channel for logs and for the Coordinator-facing
+    every Argus expert binds ``get_argus_<domain>_*`` tools (legacy
+    ``query_argus_<domain>_*`` kept for backward compat), so the domain
+    identifies the channel for logs and for the Coordinator-facing
     degradation note.
     """
     domains: list[str] = []
     for name in tool_names or []:
         parts = name.split("_")
-        if len(parts) >= 3 and parts[0] == "query" and parts[1] == "argus":
+        is_argus = len(parts) >= 3 and parts[1] == "argus" and parts[0] in ("get", "query")
+        if is_argus:
             if parts[2] not in domains:
                 domains.append(parts[2])
     return domains or [n for n in (tool_names or [])[:3]]
@@ -132,13 +152,58 @@ def _gap_declared(dim: str, declared: list[str]) -> bool:
     model may also abbreviate it ("Pod指标").  The short-token guard
     stops a vague declaration such as "指标" from silently clearing every
     dimension and disabling the checkpoint.
+
+    v3.37.2 (structured declarations, guidance-first): a declaration that
+    follows the TAUGHT shape (「维度名：类型｜原因」) is matched on its
+    parsed dimension field first.  The historical substring paths remain
+    in force for every entry — including structured ones whose field
+    match failed — so this can only ADD matches, never remove one.
     """
     for g in declared:
+        parsed = parse_gap_declaration(g)
+        if parsed is not None:
+            gdim = parsed[0]
+            if dim == gdim or dim in gdim or (len(gdim) >= 4 and gdim in dim):
+                return True
         if dim in g:
             return True
         if len(g) >= 4 and g in dim:
             return True
     return False
+
+
+# ── Structured gap declarations (v3.37.2) ─────────────────────────────
+# The declaration CHANNEL has existed since v3.26.0, but its payload was
+# free text: the checkpoint could only substring-match a dimension name,
+# and nobody downstream could tell WHY a dimension was skipped (data
+# truly unavailable vs. irrelevant to the task vs. cut off by a budget
+# guard — a distinction the Coordinator is explicitly asked to preserve).
+# Per the project principle「前置引导优先于反应式拦截」the shape is taught
+# AT THE DECISION POINT (the conclusion field description the expert fills
+# in + the closing contract), and the parser merely consumes it.  The
+# reactive checkpoint gains precision WITHOUT becoming stricter: free-text
+# declarations keep passing exactly as before.
+_GAP_KINDS = ("数据不可用", "不适用", "强制收尾")
+
+_GAP_STRUCT_RE = re.compile(
+    r"^\s*(?P<dim>[^：:｜|]{1,24})\s*[：:]\s*(?P<kind>"
+    + "|".join(_GAP_KINDS)
+    + r")\s*(?:[｜|:：]\s*(?P<reason>.*))?$",
+    re.DOTALL,
+)
+
+
+def parse_gap_declaration(entry: str) -> tuple[str, str, str] | None:
+    """(dimension, kind, reason) when *entry* follows the taught shape.
+
+    Returns None for any other free-text declaration (the caller then
+    applies the historical substring match unchanged).
+    """
+    m = _GAP_STRUCT_RE.match(str(entry or "").strip())
+    if not m:
+        return None
+    return (m.group("dim").strip(), m.group("kind"),
+            (m.group("reason") or "").strip())
 
 
 class ExpertGuidanceMiddleware(AgentMiddleware):
@@ -221,6 +286,12 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             # (after_model, which has no ModelRequest) can compute the
             # expected-dimension set.
             self._ledger.set_tools(key, tool_names)
+            # P-1 (v3.35.0): parse the Coordinator-named focus dimensions
+            # from the delegation description on the FIRST model call.
+            # Idempotent thereafter (set_focus only writes while unset) so
+            # the task scope cannot drift mid-delegation.
+            if self._ledger.session(key)["focus_dims"] is None:
+                self._ledger.set_focus(key, parse_focus_dims(_delegation_text(request)))
             parts = []
             pending = self._ledger.pop_pending_guidance(key)
             if pending:
@@ -312,7 +383,7 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 sr.get("clarification", "") if isinstance(sr, dict) else "")
             if clarification:
                 return None
-            uncovered = expected_dimensions(s["tools"]) - s["covered"]
+            uncovered = expected_dimensions(s["tools"], s["focus_dims"]) - s["covered"]
             declared = _declared_gaps(sr)
             if declared and uncovered:
                 uncovered = {
@@ -323,8 +394,9 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             guidance = (
                 "[系统提示·结论完整性校验] 结论已收到。系统台账显示以下维度"
                 f"尚无取证数据：{dims}——请补取其中与本次任务相关的维度后重新提交结论；"
-                "与任务无关或数据不可用的维度，在结论 coverage_gaps 中逐条写明"
-                "『维度名：原因』后再提交（已声明的维度视为已交代，无需补采）。"
+                "确属数据不可用、与本任务无关、或被系统强制收尾的，在结论 coverage_gaps 中"
+                "按『维度名：类型｜原因』逐条写明（类型取 数据不可用/不适用/强制收尾）"
+                "后再提交（已声明的维度视为已交代，无需补采）。"
             )
             self._ledger.mark_conclusion_hinted(key, guidance)
             logger.info(

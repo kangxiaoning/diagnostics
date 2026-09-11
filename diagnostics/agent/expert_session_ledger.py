@@ -33,6 +33,7 @@ files; a deterministic excerpt risks misleading truncation.
 from __future__ import annotations
 
 import os
+import re
 from collections import OrderedDict
 from typing import Any
 
@@ -42,104 +43,117 @@ from typing import Any
 # excluded from the expected-dimension set — they never block, matching
 # the portability constraint that unknown names degrade gracefully.
 TOOL_DIMENSION: dict[str, str] = {
-    # ── Host deep tools (host-expert) ──
-    "get_system_overview": "主机概览",
-    "check_cpu": "CPU",
-    "check_memory": "内存",
-    "check_disk": "磁盘IO",
-    "check_network": "网络",
-    "check_processes": "进程",
-    "check_conntrack": "conntrack",
-    "check_dmesg": "内核日志",
-    "check_gpu_health": "GPU",
-    "check_gpu_memory": "GPU",
-    "check_gpu_utilization": "GPU",
-    # ── Host Argus metrics (host-argus-expert) ──
-    "query_argus_host_overview": "主机指标概览",
-    "query_argus_cpu": "CPU指标",
-    "query_argus_memory": "内存指标",
-    "query_argus_disk": "磁盘指标",
-    "query_argus_network": "网络指标",
-    # ── K8s deep tools (k8s-expert) ──
-    "check_kubernetes_control_plane": "控制面",
-    "check_kubernetes_nodes": "节点",
-    "check_kubernetes_pods": "Pod",
-    "get_namespaces": "集群概览",
-    "get_cluster_overview": "集群概览",
-    "get_pod_logs": "Pod日志",
-    "get_pod_logs_since": "Pod日志",
-    "get_pod_logs_lines": "Pod日志",
-    "get_pod_previous_logs": "Pod日志",
-    "describe_pod": "Pod",
-    "get_pod_events": "事件",
-    "get_cluster_events": "事件",
-    "get_node_info": "节点",
-    "get_node_conditions": "节点",
-    "get_pod_resource_usage": "资源用量",
-    "get_node_resource_usage": "资源用量",
-    "get_system_pods": "CoreDNS/系统组件",
-    "get_coredns_logs": "CoreDNS/系统组件",
-    "describe_coredns": "CoreDNS/系统组件",
-    "list_helm_releases": "Helm",
-    "get_helm_release_history": "Helm",
-    "get_helm_release_values": "Helm",
-    "get_network_policies": "网络策略",
-    "check_rbac_permissions": "RBAC",
-    "get_pod_restart_counts": "Pod",
-    "check_certificate_expiry": "证书/Webhook",
-    "check_webhook_status": "证书/Webhook",
-    "get_etcd_status": "etcd",
-    "get_etcd_logs": "etcd",
-    "check_etcd_health": "etcd",
-    "get_etcd_metrics": "etcd",
-    "check_service_endpoints": "Service/Ingress",
-    "get_configmap": "ConfigMap",
-    "list_namespace_resources": "命名空间资源",
-    "get_pv_pvc_status": "存储",
-    "get_ingress_status": "Service/Ingress",
-    # ── K8s Argus metrics (k8s-argus-expert) ──
-    "query_argus_k8s_cluster": "集群指标",
-    "query_argus_k8s_node": "节点指标",
-    "query_argus_k8s_workload": "工作负载指标",
-    "query_argus_k8s_pod": "Pod指标",
-    "query_argus_k8s_etcd": "etcd指标",
-    # ── Serverless logical cluster ──
-    "query_argus_serverless_cluster": "逻辑集群指标",
-    "query_argus_serverless_node": "逻辑节点指标",
-    "query_argus_serverless_workload": "逻辑工作负载指标",
-    "query_argus_serverless_pod": "逻辑Pod指标",
-    "query_argus_shared_etcd": "共享etcd指标",
-    "get_serverless_deployments": "逻辑工作负载",
-    "get_serverless_pods": "逻辑Pod",
-    "get_serverless_pod_logs": "逻辑Pod日志",
-    "get_serverless_events": "逻辑事件",
-    # ── KMC physical cluster ──
-    "query_argus_kmc_cluster": "KMC集群指标",
-    "query_argus_kmc_node": "KMC节点指标",
-    "query_argus_kmc_workload": "KMC工作负载指标",
-    "query_argus_kmc_pod": "KMC Pod指标",
-    "query_argus_kmc_etcd": "KMC etcd指标",
-    "get_kmc_deployments": "KMC工作负载",
-    "get_kmc_pods": "KMC Pod",
-    "get_kmc_events": "KMC事件",
-    "get_kmc_pod_logs": "KMC日志",
-    "get_kmc_etcd_status": "共享etcd",
-    "get_kmc_apigateway_status": "API Gateway",
-    "get_kmc_group1_status": "Group1隧道",
-    "get_kmc_ipam_status": "IPAM",
-    "get_kmc_vpc_cni_controller_status": "VPC-CNI控制器",
-    # ── SCI physical cluster ──
-    "query_argus_sci_cluster": "SCI集群指标",
-    "query_argus_sci_node": "SCI节点指标",
-    "query_argus_sci_workload": "SCI工作负载指标",
-    "query_argus_sci_pod": "SCI Pod指标",
-    "query_argus_sci_etcd": "SCI etcd指标",
-    "get_sci_nodes": "SCI节点",
-    "get_sci_pods": "SCI Pod",
-    "get_sci_pod_logs": "SCI日志",
-    "get_sci_events": "SCI事件",
-    "check_sci_cni_status": "SCI CNI",
-    "get_sci_pod_ip": "Pod IP",
+    # ── Host deep tools (host-expert, 实际环境 get_os_*/get_gpu_* 家族) ──
+    "get_os_system_overview": "主机概览",
+    "get_os_base_info": "主机概览",
+    "get_os_cpu_info": "CPU",
+    "get_os_cpu_load": "CPU",
+    "get_os_cpu_cs": "CPU",
+    "get_os_cpu_ps_elf": "进程",
+    "get_os_mem_5s": "内存",
+    "get_os_mem_oom": "内存",
+    "get_os_mem_top_process": "进程",
+    "get_os_block_5s": "磁盘IO",
+    "get_os_block_info": "磁盘IO",
+    "get_os_net_ss_s": "网络",
+    "get_os_net_sar_dev": "网络",
+    "get_os_net_softnet_stat": "网络",
+    "get_os_net_tc_stat": "网络",
+    "get_os_net_softirqs": "网络",
+    "get_os_net_ethtools_s": "网络",
+    "get_os_net_ethtool": "网络",
+    "get_os_net_ping": "网络",
+    "get_os_net_nslookup": "网络",
+    "get_os_net_conntrack": "conntrack",
+    "get_os_kernel_dmesg_err": "内核日志",
+    "get_os_kernel_sysctl_one": "内核参数",
+    "get_os_kernel_sysctl_all": "内核参数",
+    "get_os_kernel_sysctl_grep": "内核参数",
+    "get_os_kernel_numa_info": "内核参数",
+    "get_os_kernel_journalctl_period": "系统日志",
+    "get_gpu_status_info": "GPU",
+    "get_gpu_pcie_info": "GPU",
+    "get_gpu_driver_info": "GPU",
+    "get_gpu_mod_info": "GPU",
+    "get_gpu_dmesg_info": "GPU",
+    # ── Host Argus metrics (host-argus-expert, 实际环境 11 维) ──
+    "get_argus_os_overview_metrics": "主机指标概览",
+    "get_argus_os_cpu_metrics": "CPU指标",
+    "get_argus_os_mem_metrics": "内存指标",
+    "get_argus_os_disk_metrics": "磁盘指标",
+    "get_argus_os_net_metrics": "网络指标",
+    "get_argus_os_nas_metrics": "NAS指标",
+    "get_argus_os_ping_metrics": "PING指标",
+    "get_argus_os_tcp_metrics": "TCP指标",
+    "get_argus_os_kernel_metrics": "内核指标",
+    "get_argus_os_load_metrics": "负载指标",
+    "get_argus_os_ntp_metrics": "时间同步指标",
+    # ── K8s deep tools (k8s-expert 及 serverless/kmc/sci 深度专家共用) ──
+    "check_k8s_control_plane": "控制面",
+    "check_k8s_nodes": "节点",
+    "check_k8s_pods": "Pod",
+    "get_pod_node_name": "Pod",
+    "get_k8s_kubelet_status": "节点",
+    "get_k8s_kubelet_logs": "节点日志",
+    "get_k8s_kubeproxy_logs": "网络",
+    "get_k8s_xid_logs": "GPU/Xid日志",
+    "get_k8s_etcd_check": "etcd",
+    "get_k8s_namespaces": "集群概览",
+    "get_k8s_cluster_overview": "集群概览",
+    "get_k8s_api_resources": "集群概览",
+    "get_k8s_api_versions": "集群概览",
+    "get_k8s_pod_logs": "Pod日志",
+    "get_k8s_pod_logs_since": "Pod日志",
+    "get_k8s_pod_logs_head": "Pod日志",
+    "get_k8s_pod_previous_logs": "Pod日志",
+    "describe_k8s_resource": "Pod",
+    "get_k8s_resource_summary": "Pod",
+    "get_k8s_pod_events_info": "事件",
+    "get_k8s_cluster_events": "事件",
+    "get_k8s_node_events_info": "事件",
+    "get_k8s_node_info": "节点",
+    "get_k8s_node_conditions": "节点",
+    "get_k8s_pod_resource_usage": "资源用量",
+    "get_k8s_node_resource_usage": "资源用量",
+    "get_k8s_resource_top": "资源用量",
+    "get_k8s_resource_list": "命名空间资源",
+    "get_k8s_resource_yaml": "资源定义",
+    "get_k8s_resource_history": "变更历史",
+    "get_k8s_system_pods": "CoreDNS/系统组件",
+    "get_k8s_coredns_logs": "CoreDNS/系统组件",
+    "describe_k8s_coredns": "CoreDNS/系统组件",
+    "list_k8s_helm_releases": "Helm",
+    "get_k8s_helm_release_history": "Helm",
+    "get_k8s_helm_release_values": "Helm",
+    "get_k8s_network_policies": "网络策略",
+    "check_k8s_rbac_permissions": "RBAC",
+    "get_k8s_pod_restart_counts": "Pod",
+    "check_k8s_certificate_expiry": "证书/Webhook",
+    "check_k8s_webhook_status": "证书/Webhook",
+    "get_k8s_etcd_status": "etcd",
+    "get_k8s_etcd_logs": "etcd",
+    "check_k8s_etcd_health": "etcd",
+    "get_k8s_etcd_metrics": "etcd",
+    "check_k8s_service_endpoints": "Service/Ingress",
+    "get_k8s_elb_service": "Service/Ingress",
+    "get_k8s_configmap": "ConfigMap",
+    "list_k8s_namespace_resources": "命名空间资源",
+    "get_k8s_pv_pvc_status": "存储",
+    "get_k8s_ingress_status": "Service/Ingress",
+    "get_k8s_vpc_cni": "网络",
+    "explain_k8s_resource": "资源定义",
+    # ── K8s Argus metrics (k8s-argus-expert 及 serverless/kmc/sci argus 专家共用) ──
+    "get_argus_k8s_cluster_metrics": "集群指标",
+    "get_argus_k8s_node_metrics": "节点指标",
+    "get_argus_k8s_workload_metrics": "工作负载指标",
+    "get_argus_k8s_pod_metrics": "Pod指标",
+    "get_argus_k8s_master_metrics": "Master组件指标",
+    # ── Serverless 家族专属补充工具（实际环境 k8s 面无等价语义）──
+    "get_argus_shared_etcd_metrics": "共享etcd指标",
+    "get_k8s_apigateway_status": "API Gateway",
+    "get_k8s_group1_status": "Group1隧道",
+    "get_k8s_ipam_status": "IPAM",
+    "get_k8s_pod_ip": "Pod IP",
 }
 
 _UNKNOWN_DIM = "其他"
@@ -161,7 +175,8 @@ _GUIDANCE_MAX_CHARS = 400
 # cost a full regeneration turn each.
 _CLOSING_CONTRACT = (
     "收尾契约：调用结论工具提交——多值字段填字符串数组（每项一条短句）；"
-    "未取证维度在 coverage_gaps 写明『维度名：原因』即视为已交代。"
+    "未取证维度在 coverage_gaps 按『维度名：类型｜原因』写明"
+    "（类型取 数据不可用/不适用/强制收尾）即视为已交代。"
 )
 
 # Truncation records kept per delegation (G28).  The bounded resubmit
@@ -183,12 +198,69 @@ def dimension_of(tool_name: str) -> str:
     return TOOL_DIMENSION.get(tool_name, _UNKNOWN_DIM)
 
 
-def expected_dimensions(tool_names: list[str]) -> set[str]:
-    """Dimensions the CURRENT delegation can cover — derived from the
-    tools actually bound to this expert (each expert assembles a
-    different toolset, so the expectation is computed per-call from the
-    live request rather than maintained as a second static map)."""
-    return {dimension_of(n) for n in tool_names} - {_UNKNOWN_DIM}
+def expected_dimensions(tool_names: list[str],
+                        focus_dims: set[str] | None = None) -> set[str]:
+    """Dimensions the CURRENT delegation is expected to cover.
+
+    Default (no focus declared): every dimension the expert's toolset can
+    observe — derived from the tools actually bound to this expert (each
+    expert assembles a different toolset, so the expectation is computed
+    per-call from the live request rather than maintained as a second
+    static map).
+
+    Task-scoped (v3.35.0, P-1): when the Coordinator names the relevant
+    dimensions in the delegation description (``相关维度：…``), the
+    expectation is the NAMED SUBSET **intersected with the expert's own
+    toolset dimensions** instead (portability guard: a toolset that maps
+    to no known dimension — the production port's renamed tools — yields
+    an empty expectation, i.e. no check, never an unsatisfiable one).
+    Rationale: the toolset-wide
+    expectation (k8s experts: ~20 dimensions) is unrelated to any single
+    task, so a concluding expert is bounced by G27 for 12-15 dimensions it
+    correctly never needed — and, worse, is motivated to over-collect
+    until the G19-ext call budget forces a wrap-up, after which the same
+    dimensions are still uncovered (measured 2026-09-11: G27 18 bounces,
+    G19-ext 36 interventions across two log segments; the two are one
+    root cause).  Task-scoped expectation keeps the completeness check
+    (the named dimensions must be covered or declared) while dropping the
+    unrelated ones — Requirements-after-first-edit evidence (arXiv 2609.03028):
+    stating the acceptance scope BEFORE the work cuts rework.
+    """
+    toolset_dims = {dimension_of(n) for n in tool_names} - {_UNKNOWN_DIM}
+    if focus_dims:
+        return set(focus_dims) & toolset_dims
+    return toolset_dims
+
+
+# ── Task-scoped focus extraction (P-1, v3.35.0) ──────────────────────
+# Only an EXPLICITLY MARKED line is parsed ("相关维度：Pod、事件"): free
+# prose mentioning 网络/内存 must not silently re-widen the expectation.
+_FOCUS_MARK_RE = re.compile(
+    r"(?:相关维度|取证范围|覆盖维度|focus\s*dimensions?)\s*[：:]\s*([^\n]+)",
+    re.IGNORECASE,
+)
+# Longest-first so "Pod日志" is consumed before "Pod", "节点指标" before "节点".
+_DIM_NAMES = sorted((d for d in set(TOOL_DIMENSION.values()) if d),
+                    key=len, reverse=True)
+
+
+def parse_focus_dims(text: str) -> set[str]:
+    """Extract Coordinator-named dimensions from a delegation description.
+
+    Deterministic, zero-LLM: match a marked line, then longest-name-first
+    match against the dimension vocabulary (consumed names are removed so
+    short names cannot double-match inside long ones).
+    """
+    if not text:
+        return set()
+    found: set[str] = set()
+    for m in _FOCUS_MARK_RE.finditer(text):
+        line = m.group(1)
+        for dim in _DIM_NAMES:
+            if dim in line:
+                found.add(dim)
+                line = line.replace(dim, " ")
+    return found
 
 
 class ExpertSessionLedger:
@@ -216,6 +288,10 @@ class ExpertSessionLedger:
                 # receives is a fallback text, not evidence.
                 "truncations": [],           # [{out, reasoning, duration_s, channels}]
                 "truncation_reported": False,  # degraded path surfaced once
+                # P-1 (v3.35.0): Coordinator-named focus dimensions parsed
+                # from the delegation description.  None = not parsed yet;
+                # empty set = parsed, nothing named (fallback to toolset).
+                "focus_dims": None,
             }
             self._sessions[key] = s
         self._sessions.move_to_end(key)
@@ -239,6 +315,23 @@ class ExpertSessionLedger:
         else:
             s["covered"].add(dim)
             s["dim_streaks"][dim] = 0
+
+    # ── task-scoped focus (P-1) ──
+
+    def set_focus(self, key: str, dims: set[str]) -> None:
+        """Record the Coordinator-named focus dimensions for this delegation.
+
+        Called once per delegation (first model call) with the parse result
+        of the delegation description; idempotent thereafter so a later
+        turn cannot silently re-widen the expectation.
+        """
+        s = self.session(key)
+        if s["focus_dims"] is None:
+            s["focus_dims"] = set(dims)
+
+    def expected_for(self, key: str, tool_names: list[str]) -> set[str]:
+        """Expected dimensions for this delegation (focus-aware, P-1)."""
+        return expected_dimensions(tool_names, self.session(key)["focus_dims"])
 
     # ── novelty-gate state (G26) ──
 
@@ -376,7 +469,7 @@ class ExpertSessionLedger:
         s = self._sessions.get(key)
         if s is None or not s["calls"]:
             return None
-        uncovered = expected_dimensions(tool_names) - s["covered"]
+        uncovered = self.expected_for(key, tool_names) - s["covered"]
         if uncovered:
             return ("未覆盖维度：" + "、".join(sorted(uncovered))
                     + "——相关维度补采 1-2 次；" + _CLOSING_CONTRACT)
@@ -408,7 +501,7 @@ class ExpertSessionLedger:
             lines.append(f"· 系统已去重 {dedup_hits} 次重复调用"
                          "——相同参数重查不会获得新数据")
         lines.append("· 下一步："
-                     + self.next_action(key, expected_dimensions(tool_names),
+                     + self.next_action(key, self.expected_for(key, tool_names),
                                         budget_soft))
         block = "\n".join(lines)
         if len(block) > _GUIDANCE_MAX_CHARS:

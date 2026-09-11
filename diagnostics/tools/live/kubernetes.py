@@ -70,7 +70,7 @@ def _kubectl(cluster_name: str, args: list[str],
 # ═══════════════ Discovery ═══════════════
 
 @tool
-def get_namespaces(cluster_name: str) -> str:
+def get_k8s_namespaces(cluster_name: str) -> str:
     """List all namespaces in a cluster. Call before tools that need namespace."""
     return _kubectl(cluster_name, ["get", "namespaces", "-o", "wide"], timeout=10)
 
@@ -78,7 +78,7 @@ def get_namespaces(cluster_name: str) -> str:
 # ═══════════════ Overview ═══════════════
 
 @tool
-def get_cluster_overview(cluster_name: str) -> str:
+def get_k8s_cluster_overview(cluster_name: str) -> str:
     """Get high-level cluster overview: nodes, non-running pods, namespace count."""
     nodes = _kubectl(cluster_name, ["get", "nodes", "-o", "wide"])
     pods = _kubectl(cluster_name, ["get", "pods", "--all-namespaces",
@@ -97,7 +97,7 @@ def get_cluster_overview(cluster_name: str) -> str:
 # ═══════════════ Pod Tools ═══════════════
 
 @tool
-def get_pod_logs(cluster_name: str, namespace: str,
+def get_k8s_pod_logs(cluster_name: str, namespace: str,
                  pod_name: str, tail_lines: int = 200) -> str:
     """Retrieve recent pod logs."""
     return _kubectl(cluster_name, [
@@ -107,7 +107,7 @@ def get_pod_logs(cluster_name: str, namespace: str,
 
 
 @tool
-def get_pod_logs_since(cluster_name: str, namespace: str,
+def get_k8s_pod_logs_since(cluster_name: str, namespace: str,
                        pod_name: str, minutes: int = 5) -> str:
     """Retrieve pod logs from the last N minutes."""
     return _kubectl(cluster_name, [
@@ -117,7 +117,7 @@ def get_pod_logs_since(cluster_name: str, namespace: str,
 
 
 @tool
-def get_pod_logs_lines(cluster_name: str, namespace: str,
+def get_k8s_pod_logs_head(cluster_name: str, namespace: str,
                        pod_name: str, head_lines: int = 50) -> str:
     """Retrieve the last N lines of pod logs."""
     return _kubectl(cluster_name, [
@@ -127,7 +127,7 @@ def get_pod_logs_lines(cluster_name: str, namespace: str,
 
 
 @tool
-def get_pod_previous_logs(cluster_name: str, namespace: str,
+def get_k8s_pod_previous_logs(cluster_name: str, namespace: str,
                           pod_name: str, tail_lines: int = 200) -> str:
     """Retrieve logs from the PREVIOUS (crashed) container instance."""
     return _kubectl(cluster_name, [
@@ -137,7 +137,7 @@ def get_pod_previous_logs(cluster_name: str, namespace: str,
 
 
 @tool
-def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
+def describe_k8s_resource(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get full describe output for a pod."""
     return _kubectl(cluster_name, [
         "describe", "pod", pod_name, "-n", namespace,
@@ -145,7 +145,7 @@ def describe_pod(cluster_name: str, namespace: str, pod_name: str) -> str:
 
 
 @tool
-def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
+def get_k8s_pod_events_info(cluster_name: str, namespace: str, pod_name: str) -> str:
     """Get events related to a specific pod."""
     return _kubectl(cluster_name, [
         "get", "events", "-n", namespace,
@@ -155,7 +155,7 @@ def get_pod_events(cluster_name: str, namespace: str, pod_name: str) -> str:
 
 
 @tool
-def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_cluster_events(cluster_name: str, namespace: str = "") -> str:
     """Get recent cluster-wide or namespace-scoped events (last 30)."""
     args = ["get", "events", "--sort-by=.lastTimestamp"]
     if namespace:
@@ -172,7 +172,7 @@ def get_cluster_events(cluster_name: str, namespace: str = "") -> str:
 # ═══════════════ Node Tools ═══════════════
 
 @tool
-def get_node_info(cluster_name: str, node_name: str) -> str:
+def get_k8s_node_info(cluster_name: str, node_name: str) -> str:
     """Get detailed node information."""
     return _kubectl(cluster_name, ["describe", "node", node_name], timeout=15)
 
@@ -180,7 +180,7 @@ def get_node_info(cluster_name: str, node_name: str) -> str:
 # ═══════════════ Resource Usage ═══════════════
 
 @tool
-def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
     """Get pod CPU/Memory usage (requires metrics-server)."""
     args = ["top", "pods"]
     if namespace:
@@ -191,7 +191,7 @@ def get_pod_resource_usage(cluster_name: str, namespace: str = "") -> str:
 
 
 @tool
-def get_node_resource_usage(cluster_name: str) -> str:
+def get_k8s_node_resource_usage(cluster_name: str) -> str:
     """Get node CPU/Memory usage (requires metrics-server)."""
     return _kubectl(cluster_name, ["top", "nodes"], timeout=20)
 
@@ -199,21 +199,21 @@ def get_node_resource_usage(cluster_name: str) -> str:
 # ═══════════════ API & Resources ═══════════════
 
 @tool
-def get_api_resources(cluster_name: str) -> str:
+def get_k8s_api_resources(cluster_name: str) -> str:
     """List all API resources on the cluster (incl. CRDs)."""
     return _kubectl(cluster_name, ["api-resources", "--sort-by=name"], timeout=15)
 
 
 @tool
-def get_api_versions(cluster_name: str) -> str:
+def get_k8s_api_versions(cluster_name: str) -> str:
     """List all API group versions supported by the cluster."""
     return _kubectl(cluster_name, ["api-versions"], timeout=15)
 
 
 @tool
-def get_resource_yaml(cluster_name: str, resource_type: str,
-                      resource_name: str, namespace: str = "") -> str:
-    """Get full YAML of any resource (e.g. get_resource_yaml('prod','deploy','vpc-cni','kube-system'))."""
+def get_k8s_resource_yaml(cluster_name: str, resource_type: str,
+                      resource_name: str, namespace: str = "default") -> str:
+    """Get full YAML of any resource (e.g. get_k8s_resource_yaml('prod','deploy','vpc-cni','kube-system'))."""
     args = ["get", resource_type, resource_name, "-o", "yaml"]
     if namespace:
         args.extend(["-n", namespace])
@@ -221,19 +221,15 @@ def get_resource_yaml(cluster_name: str, resource_type: str,
 
 
 @tool
-def explain_resource(cluster_name: str, resource_path: str,
-                     recursive: bool = False) -> str:
-    """Get field documentation via kubectl explain."""
-    args = ["explain", resource_path]
-    if recursive:
-        args.append("--recursive")
-    return _kubectl(cluster_name, args, timeout=15)
+def explain_k8s_resource(cluster_name: str, resource_type: str) -> str:
+    """Get field documentation via kubectl explain (signature mirrors mock)."""
+    return _kubectl(cluster_name, ["explain", resource_type], timeout=15)
 
 
 # ═══════════════ System Pods ═══════════════
 
 @tool
-def get_system_pods(cluster_name: str) -> str:
+def get_k8s_system_pods(cluster_name: str) -> str:
     """Get all system pods in kube-system namespace."""
     return _kubectl(cluster_name, ["get", "pods", "-n", "kube-system", "-o", "wide"], timeout=15)
 
@@ -241,21 +237,21 @@ def get_system_pods(cluster_name: str) -> str:
 # ═══════════════ Controllers ═══════════════
 
 @tool
-def describe_controller(cluster_name: str, resource_type: str,
-                        resource_name: str, namespace: str = "") -> str:
+def describe_k8s_controller(cluster_name: str, controller_name: str,
+                            resource_type: str = "deployment") -> str:
     """Describe a controller (deployment, statefulset, daemonset, replicaset).
     Use full resource_type names: deployment not deploy, daemonset not ds.
+    Signature mirrors mock/describe_k8s_controller.
     """
-    args = ["describe", resource_type, resource_name]
-    if namespace:
-        args.extend(["-n", namespace])
-    return _kubectl(cluster_name, args, timeout=15)
+    return _kubectl(cluster_name,
+                    ["describe", resource_type, controller_name, "-n", "default"],
+                    timeout=15)
 
 
 # ═══════════════ Services ═══════════════
 
 @tool
-def check_service_endpoints(cluster_name: str, service_name: str,
+def check_k8s_service_endpoints(cluster_name: str, service_name: str,
                             namespace: str = "default") -> str:
     """Check whether a Service has healthy endpoints."""
     svc = _kubectl(cluster_name, ["get", "svc", service_name, "-n", namespace, "-o", "wide"], timeout=10)
@@ -267,20 +263,20 @@ def check_service_endpoints(cluster_name: str, service_name: str,
 # ═══════════════ Config & Resources ═══════════════
 
 @tool
-def get_configmap(cluster_name: str, configmap_name: str,
+def get_k8s_configmap(cluster_name: str, configmap_name: str,
                   namespace: str = "default") -> str:
     """Get ConfigMap content."""
     return _kubectl(cluster_name, ["get", "configmap", configmap_name, "-n", namespace, "-o", "yaml"], timeout=10)
 
 
 @tool
-def list_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
+def list_k8s_namespace_resources(cluster_name: str, namespace: str = "default") -> str:
     """List all resources in a namespace."""
     return _kubectl(cluster_name, ["get", "all", "-n", namespace, "-o", "wide"], timeout=15)
 
 
 @tool
-def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
     """Get PV/PVC status."""
     pv = _kubectl(cluster_name, ["get", "pv", "-o", "wide"], timeout=10)
     pvc_args = ["get", "pvc"] + (["-n", namespace] if namespace else ["--all-namespaces"])
@@ -289,7 +285,7 @@ def get_pv_pvc_status(cluster_name: str, namespace: str = "") -> str:
 
 
 @tool
-def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_ingress_status(cluster_name: str, namespace: str = "") -> str:
     """Get Ingress resources and backend status."""
     args = ["get", "ingress", "-o", "wide"]
     if namespace:
@@ -302,7 +298,7 @@ def get_ingress_status(cluster_name: str, namespace: str = "") -> str:
 # ═══════════════ CoreDNS ═══════════════
 
 @tool
-def get_coredns_logs(cluster_name: str, tail_lines: int = 200,
+def get_k8s_coredns_logs(cluster_name: str, tail_lines: int = 200,
                      since_minutes: int = 0) -> str:
     """Get logs from all CoreDNS pods in kube-system.
 
@@ -344,7 +340,7 @@ def get_coredns_logs(cluster_name: str, tail_lines: int = 200,
 
 
 @tool
-def describe_coredns(cluster_name: str) -> str:
+def describe_k8s_coredns(cluster_name: str) -> str:
     """Describe CoreDNS deployment and show Corefile ConfigMap in kube-system."""
     deploy = _kubectl(cluster_name, [
         "describe", "deployment", "coredns", "-n", "kube-system",
@@ -365,7 +361,7 @@ def describe_coredns(cluster_name: str) -> str:
 # ═══════════════ Helm 3 ═══════════════
 
 @tool
-def list_helm_releases(cluster_name: str, namespace: str = "") -> str:
+def list_k8s_helm_releases(cluster_name: str, namespace: str = "") -> str:
     """List all Helm 3 releases by querying release secrets.
 
     Helm 3 stores release metadata in secrets with label owner=helm.
@@ -396,7 +392,7 @@ def list_helm_releases(cluster_name: str, namespace: str = "") -> str:
 
 
 @tool
-def get_helm_release_history(cluster_name: str, release_name: str,
+def get_k8s_helm_release_history(cluster_name: str, release_name: str,
                               namespace: str = "default", max_revisions: int = 10) -> str:
     """Get revision history of a Helm release from its stored secrets.
 
@@ -430,7 +426,7 @@ def get_helm_release_history(cluster_name: str, release_name: str,
 
 
 @tool
-def get_helm_release_values(cluster_name: str, release_name: str,
+def get_k8s_helm_release_values(cluster_name: str, release_name: str,
                              namespace: str = "default", revision: int = 0) -> str:
     """Extract values from a Helm release secret for a specific revision.
 
@@ -493,7 +489,7 @@ def get_helm_release_values(cluster_name: str, release_name: str,
 # ═══════════════ Node Conditions ═══════════════
 
 @tool
-def get_node_conditions(cluster_name: str) -> str:
+def get_k8s_node_conditions(cluster_name: str) -> str:
     """Get a quick overview of all node conditions (Ready, MemoryPressure, DiskPressure, PIDPressure).
 
     Args:
@@ -516,7 +512,7 @@ def get_node_conditions(cluster_name: str) -> str:
 # ═══════════════ Network Policy ═══════════════
 
 @tool
-def get_network_policies(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_network_policies(cluster_name: str, namespace: str = "") -> str:
     """List NetworkPolicies affecting pod-to-pod communication.
 
     Args:
@@ -534,7 +530,7 @@ def get_network_policies(cluster_name: str, namespace: str = "") -> str:
 # ═══════════════ RBAC ═══════════════
 
 @tool
-def check_rbac_permissions(cluster_name: str, namespace: str = "") -> str:
+def check_k8s_rbac_permissions(cluster_name: str, namespace: str = "") -> str:
     """List RBAC roles, rolebindings, and clusterroles to debug permission issues.
 
     Args:
@@ -553,7 +549,7 @@ def check_rbac_permissions(cluster_name: str, namespace: str = "") -> str:
 # ═══════════════ Pod Restart Summary ═══════════════
 
 @tool
-def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
+def get_k8s_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
     """Get pods with high restart counts (>=5 restarts), sorted by restart count.
 
     Args:
@@ -598,7 +594,7 @@ def get_pod_restart_counts(cluster_name: str, namespace: str = "") -> str:
 # ═══════════════ Certificate & Security ═══════════════
 
 @tool
-def check_certificate_expiry(cluster_name: str) -> str:
+def check_k8s_certificate_expiry(cluster_name: str) -> str:
     """Check TLS certificate expiry for kube-apiserver, kubelet, and etcd.
 
     Args:
@@ -610,7 +606,7 @@ def check_certificate_expiry(cluster_name: str) -> str:
 
 
 @tool
-def check_webhook_status(cluster_name: str) -> str:
+def check_k8s_webhook_status(cluster_name: str) -> str:
     """List MutatingWebhookConfigurations and ValidatingWebhookConfigurations.
 
     Use when Pod creation/update is unexpectedly blocked or modified.
@@ -662,7 +658,7 @@ def _etcd_exec(cluster_name: str, etcdctl_args: str, timeout: int = 15) -> str:
 
 
 @tool
-def get_etcd_status(cluster_name: str) -> str:
+def get_k8s_etcd_status(cluster_name: str) -> str:
     """Get etcd cluster status: pod health, member list, leader info.
 
     Args:
@@ -694,7 +690,7 @@ def get_etcd_status(cluster_name: str) -> str:
 
 
 @tool
-def get_etcd_logs(cluster_name: str = "default", tail_lines: int = 200,
+def get_k8s_etcd_logs(cluster_name: str = "default", tail_lines: int = 200,
                   since_minutes: int = 0) -> str:
     """Get recent logs from all etcd pods.
 
@@ -733,7 +729,7 @@ def get_etcd_logs(cluster_name: str = "default", tail_lines: int = 200,
 
 
 @tool
-def check_etcd_health(cluster_name: str) -> str:
+def check_k8s_etcd_health(cluster_name: str) -> str:
     """Check etcd endpoint health, alarm list, and Raft leader changes.
 
     Args:
@@ -762,7 +758,7 @@ def check_etcd_health(cluster_name: str) -> str:
 
 
 @tool
-def get_etcd_metrics(cluster_name: str) -> str:
+def get_k8s_etcd_metrics(cluster_name: str) -> str:
     """Get key etcd metrics: disk backend commit duration, Raft proposal duration, WAL fsync.
 
     Args:
@@ -780,3 +776,165 @@ def get_etcd_metrics(cluster_name: str) -> str:
         "grep -v '#' | head -30"
     )
     return _etcd_exec(cluster_name, metrics_cmd, timeout=15)
+
+# ═══════════════════════════════════════════════════════════════════
+# 实际环境工具面补齐（生产在用、此前缺失的占位实现）
+# ═══════════════════════════════════════════════════════════════════
+
+
+@tool
+def get_pod_node_name(cluster_name: str, namespace: str, pod_name: str) -> str:
+    """获取Pod所在节点信息（节点名/IP）。"""
+    return _kubectl(cluster_name, ["get", "pod", pod_name, "-n", namespace,
+                                   "-o", "jsonpath={.spec.nodeName}{'\\t'}{.status.hostIP}"])
+
+
+@tool
+def get_k8s_kubelet_status(cluster_name: str, node_name: str = "") -> str:
+    """获取节点容器组件状态：kubelet 运行状态、runtime。"""
+    return _kubectl(cluster_name, ["get", "node", node_name, "-o", "wide"])
+
+
+@tool
+def get_k8s_kubelet_logs(cluster_name: str, node_name: str,
+                         tail_lines: int = 200) -> str:
+    """获取节点Kubelet日志。"""
+    return "[LIVE] kubelet logs — requires OSP script execution on the target node."
+
+
+@tool
+def get_k8s_kubeproxy_logs(cluster_name: str, node_name: str,
+                           tail_lines: int = 200) -> str:
+    """获取节点Kube-Proxy日志。"""
+    return "[LIVE] kube-proxy logs — requires OSP script execution on the target node."
+
+
+@tool
+def get_k8s_xid_logs(cluster_name: str, node_name: str = "") -> str:
+    """获取节点XID错误日志（GPU Xid/NVRM，来自 dmesg）。"""
+    return "[LIVE] GPU Xid/NVRM logs — requires OSP script execution on the target node."
+
+
+@tool
+def get_k8s_etcd_check(cluster_name: str, endpoint: str = "") -> str:
+    """获取etcd健康检查：成员/leader/延迟/DB 用量。
+
+    返回契约（2026-09-10 明确）：bool 维度渲染为「是/否」而非值+单位
+    （mock 曾输出 `0.0bool`）；has_leader=否 时须显式给出「无 Leader
+    （多数派丢失 / quorum lost）」判定与后续确认方向（成员状态 + WAL fsync）。
+    """
+    return _etcd_exec(cluster_name, "etcdctl endpoint health && etcdctl endpoint status -w table")
+
+
+@tool
+def get_k8s_node_events_info(cluster_name: str, node_name: str = "") -> str:
+    """获取K8S节点事件日志（节点级事件）。"""
+    field = f"--field-selector involvedObject.name={node_name}" if node_name else ""
+    return _kubectl(cluster_name, ["get", "events", "-A", field, "--sort-by=.lastTimestamp"])
+
+
+@tool
+def get_k8s_elb_service(cluster_name: str, service_name: str = "") -> str:
+    """获取K8S ELB服务信息。"""
+    return _kubectl(cluster_name, ["get", "service", service_name, "-A", "-o", "wide"])
+
+
+@tool
+def get_k8s_vpc_cni(cluster_name: str, node_name: str = "") -> str:
+    """获取K8S VPC CNI网络信息。"""
+    return "[LIVE] VPC CNI info — requires OSP script execution on the target node."
+
+
+@tool
+def get_k8s_resource_top(cluster_name: str, resource_type: str = "pods",
+                         namespace: str = "") -> str:
+    """获取K8S资源（节点/Pod）的Top资源使用统计。"""
+    if resource_type in ("node", "nodes"):
+        return _kubectl(cluster_name, ["top", "nodes"])
+    ns = ["-n", namespace] if namespace else ["-A"]
+    return _kubectl(cluster_name, ["top", "pods", *ns, "--sort-by=cpu"])
+
+
+@tool
+def get_k8s_resource_list(cluster_name: str, resource_type: str = "pods",
+                          namespace: str = "default") -> str:
+    """获取K8S指定资源列表。"""
+    return _kubectl(cluster_name, ["get", resource_type, "-n", namespace, "-o", "wide"])
+
+
+@tool
+def get_k8s_resource_summary(cluster_name: str, namespace: str,
+                             resource_type: str, resource_name: str) -> str:
+    """获取K8S资源的精简要信息。"""
+    return _kubectl(cluster_name, ["get", resource_type, resource_name,
+                                   "-n", namespace, "-o", "wide"])
+
+
+@tool
+def get_k8s_resource_history(cluster_name: str, namespace: str,
+                             resource_type: str, resource_name: str) -> str:
+    """获取K8S资源变更历史记录。"""
+    return _kubectl(cluster_name, ["rollout", "history",
+                                   f"{resource_type}/{resource_name}", "-n", namespace])
+
+@tool
+def check_k8s_control_plane() -> str:
+    """[LIVE 占位] Check Kubernetes control plane health: kube-apiserver, etcd, kube-scheduler, kube-controller-manager.
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] check_k8s_control_plane — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def check_k8s_nodes() -> str:
+    """[LIVE 占位] Check Kubernetes node statuses, resource usage, and conditions (MemoryPressure, etc.).
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] check_k8s_nodes — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def check_k8s_pods(namespace: str = 'default') -> str:
+    """[LIVE 占位] Check Kubernetes pod statuses, restart counts, and OOM events.
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] check_k8s_pods — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def get_k8s_apigateway_status(cluster_name: str, namespace: str = 'kube-system') -> str:
+    """[LIVE 占位] 获取K8S API Gateway状态（Serverless 控制面 VK→SCI 隧道入口链路）。
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] get_k8s_apigateway_status — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def get_k8s_group1_status(cluster_name: str, namespace: str = 'kmc-ingress') -> str:
+    """[LIVE 占位] 获取K8S Group1 隧道状态（Serverless logs/exec 隧道组件）。
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] get_k8s_group1_status — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def get_k8s_ipam_status(cluster_name: str, namespace: str = 'kmc-system') -> str:
+    """[LIVE 占位] 获取K8S IPAM状态（Serverless Pod 固定 IP 分配与冲突）。
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] get_k8s_ipam_status — implement against the actual environment backend (signature mirrors mock)."
+
+
+@tool
+def get_k8s_pod_ip(cluster_name: str, namespace: str, pod_name: str) -> str:
+    """[LIVE 占位] 获取K8S Pod IP 与固定 IP 保留记录（VPC-CNI/IPAM 分配）。
+
+    移植说明：实现体请对接实际环境的对应接口/脚本；签名与 mock 严格一致。
+    """
+    return "[LIVE] get_k8s_pod_ip — implement against the actual environment backend (signature mirrors mock)."
