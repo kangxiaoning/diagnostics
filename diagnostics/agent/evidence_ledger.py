@@ -66,7 +66,7 @@ from typing import Any
 
 # ── Budgets (deterministic caps, report-time rendering only) ───────────────
 
-DIGEST_MAX_CHARS = 600
+DIGEST_MAX_CHARS = 4000
 """Max chars of one verbatim excerpt (code-selected lines)."""
 
 DIGEST_MIN_CONTENT = 400
@@ -78,7 +78,7 @@ INDEX_LIMIT = 20
 PACK_PER_HYPOTHESIS = 3
 """Max excerpts per hypothesis in the report-time evidence pack."""
 
-PACK_MAX_CHARS = 4000
+PACK_MAX_CHARS = 16000
 """Total budget of the report-time evidence pack."""
 
 EVIDENCE_INDEX_TITLE = "原始证据索引（系统整理，可用 read_file 回读全文）"
@@ -112,7 +112,7 @@ _TARGET_ARG_KEYS: tuple[str, ...] = (
     "minutes", "query", "pattern",
 )
 _TARGET_MAX_KEYS = 4
-_TARGET_VALUE_CHARS = 40
+_TARGET_VALUE_CHARS = 120
 
 
 def is_dedup_receipt(content: str) -> bool:
@@ -225,7 +225,7 @@ def artifact_digest(content: str, max_chars: int = DIGEST_MAX_CHARS) -> str:
     seen: set[str] = set()
     total = 0
     for i in chosen:
-        ln = lines[i][:200]
+        ln = lines[i][:800]
         if ln in seen:
             continue
         if total + len(ln) + 1 > max_chars:
@@ -274,7 +274,7 @@ def build_artifact_entry(
     entry: dict[str, Any] = {
         "path": source_path,
         "round": round_no,
-        "preview": content[:200].replace("\n", " "),
+        "preview": content[:800].replace("\n", " "),
         "lines": len(lines),
         "chars": len(content),
         "tool": tool,
@@ -482,7 +482,7 @@ def _pack_block(hid: str, node: dict, arts: list[tuple[str, dict]],
         digest = str(info.get("digest") or "")
         if digest:
             for dline in digest.splitlines():
-                lines.append(f"  - `{dline.strip()[:200]}`")
+                lines.append(f"  - `{dline.strip()[:800]}`")
         else:
             lines.append("  - （结果过短，无摘录——见路径或 preview）")
     return lines

@@ -80,6 +80,9 @@ from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，desig
     _PHASE_HARD_FILTER,
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
+from diagnostics.agent.ledger import experts_for_hypothesis  # 假设↔专家归属视图（v3.38.0）
+from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
+from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
 from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
     delegation_key_from_request,
@@ -4902,6 +4905,81 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             node["_last_evidence_round"] = self._model_call_count
                             if tool_name not in node["verification_tools"]:
                                 node["verification_tools"].append(tool_name)
+                            # ── v3.37.7 (D+A'): multi-hypothesis attribution ──
+                            # One delegation's evidence routinely bears on
+                            # OTHER hypotheses as well (differential-diagnosis
+                            # dual-inference).  The expert declares them in
+                            # its structured return; every declared hypothesis
+                            # that EXISTS in the ledger gets its own evidence
+                            # entry carrying the declared direction.  Without
+                            # this, a delegation that had already informed H_n
+                            # left H_n with "no expert evidence", so a later
+                            # confirmed verdict on H_n was blocked by G17 and
+                            # cost an extra delegation round.  Undeclared or
+                            # hallucinated ids are dropped by construction.
+                            _rel_items = None
+                            if isinstance(_structured_expert, dict):
+                                _rel_items = _structured_expert.get(
+                                    "related_hypotheses")
+                            elif _structured_expert is not None:
+                                _rel_items = getattr(
+                                    _structured_expert, "related_hypotheses", None)
+                            for _rel in _rel_items or []:
+                                if isinstance(_rel, dict):
+                                    _raw_rid = str(_rel.get("id") or "").strip()
+                                    _effect = str(_rel.get("effect") or "unclear")
+                                else:
+                                    _raw_rid = str(getattr(_rel, "id", "") or "").strip()
+                                    _effect = str(getattr(_rel, "effect", "") or "unclear")
+                                # v3.38.2 (R1): the expert quotes the DISPLAY
+                                # form ("H2") because that is exactly what every
+                                # model-facing surface renders (fmt_hid), while
+                                # the ledger keys by RAW id ("2").  parse_hid
+                                # accepts both.  The previous exact-match guard
+                                # compared "H2" against {"1","2",...} and
+                                # discarded every declaration silently —
+                                # 2026-09-11 session d32b0e4c: 7 declarations
+                                # across 5 delegations, zero related_via.
+                                _rid = parse_hid(_raw_rid,
+                                                 ledger.get("hypotheses", {}))
+                                if not _rid or _rid == target_hid:
+                                    # v3.38.2 (R2): fail loud.  An unresolvable
+                                    # declaration is either a hallucinated id or
+                                    # a namespace bug — both must leave a trace.
+                                    # (Declaring the delegated hypothesis itself
+                                    # is normal noise and stays silent.)
+                                    if _raw_rid and _rid is None:
+                                        logger.warning(
+                                            "multi-hypothesis declaration dropped: "
+                                            "id=%r unresolvable in ledger "
+                                            "(from %s, via=%s)",
+                                            _raw_rid, source,
+                                            fmt_hid(target_hid),
+                                        )
+                                    continue
+                                _rev = new_evidence(
+                                    source, summary,
+                                    supports={"supports": True,
+                                              "refutes": False}.get(_effect),
+                                    tool_call_id=tool_call_id,
+                                )
+                                if _structured_expert is not None:
+                                    # v3.38.4 (R1): the return describes the
+                                    # ASSIGNED hypothesis; restate its verdict
+                                    # as the declared effect for the attributed
+                                    # one (guardrail-bleed fix).
+                                    _rev["structured"] = attributed_structured(
+                                        _structured_expert, _effect)
+                                    _rev["related_via"] = target_hid
+                                _rnode = ledger["hypotheses"][_rid]
+                                _rnode["evidence"].append(_rev)
+                                _rnode["_last_evidence_round"] = self._model_call_count
+                                logger.info(
+                                    "multi-hypothesis evidence: %s → %s "
+                                    "(effect=%s, via=%s)",
+                                    source, fmt_hid(_rid), _effect,
+                                    fmt_hid(target_hid),
+                                )
                         else:
                             add_evidence_to_active(
                                 ledger, source, summary,
@@ -6247,11 +6325,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "证据不足请判 inconclusive。"
                             )
                     if not _has_expert and _experts:
+                        # v3.38.0: name the actual situation.  "No expert
+                        # evidence" has two very different causes — nobody
+                        # looked at this hypothesis, or an expert's evidence
+                        # only TOUCHED it in passing (related_via entries
+                        # recorded for another delegation's finding).  The
+                        # derived view keeps both facts in one place, and the
+                        # guidance below then states what is actually missing
+                        # (a DIRECT verification) instead of repeating a
+                        # vague "no expert evidence" that reads as "the work
+                        # you just did was ignored" (2026-09-11 session).
+                        _hid_map = experts_for_hypothesis(ledger, hypothesis_id)
+                        _inc = _hid_map.get("incidental") or []
+                        _inc_hint = (
+                            f"（注：{fmt_hid(hypothesis_id)} 已有来自 "
+                            f"{'、'.join(_inc)} 的**顺带影响**证据——那是其它委派"
+                            "结论顺带触及，不构成对该假设的直接验证。）"
+                            if _inc else ""
+                        )
                         logger.warning(
                             "record_finding blocked by G17: confirmed on "
-                            "%s without expert evidence (round=%d)",
+                            "%s without expert evidence (round=%d%s)",
                             fmt_hid(hypothesis_id),
                             self._model_call_count,
+                            f", incidental-only via {','.join(_inc)}" if _inc else "",
                         )
                         # Track G17 block for state-driven recovery guidance
                         # (design document §10, v3.10.1): compute_next_action
@@ -6262,7 +6359,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         _g17_node["_g17_blocked_round"] = self._model_call_count
                         return (
                             f"⛔ confirmed 判定需专家验证证据（证据标准门控）："
-                            f"{fmt_hid(hypothesis_id)} 尚无专家验证结论。"
+                            f"{fmt_hid(hypothesis_id)} 尚无专家**直接验证**结论。"
+                            f"{_inc_hint}"
                             f"请委派 task 验证该假设（可用专家："
                             f"{', '.join(_experts)}；监控时序定向复核可委派对应 "
                             "argus 专家，description 带假设聚焦的具体问题），"
@@ -6475,11 +6573,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         else:
                             logger.warning(
                                 "record_finding blocked by G21: %s verdict=%s "
-                                "opposes prior %s verdict=%s (round=%d)",
+                                "opposes prior %s verdict=%s (round=%d%s)",
                                 fmt_hid(hypothesis_id), verdict,
                                 _g21_conflict["expert"],
                                 _g21_conflict["prev_verdict"],
                                 self._model_call_count,
+                                ", provenance=related_via:"
+                                + fmt_hid(_g21_conflict["related_via"])
+                                if _g21_conflict.get("related_via")
+                                else "",
+                            )
+                            # v3.38.4 (R3): if the "prior verdict" is merely an
+                            # ATTRIBUTED entry, say so.  Otherwise route #2
+                            # below ("改判 inconclusive") reads as the path of
+                            # least resistance and produces a reason-free flip
+                            # even when the current verdict agrees with the
+                            # declared effect (2026-09-11 session 29dfc820).
+                            _g21_prov = _g21_conflict.get("related_via")
+                            _g21_prov_hint = (
+                                f"\nℹ 注意：该「既有结论」来自**旁支归因**"
+                                f"（由 {fmt_hid(_g21_prov)} 的委派结果顺带归因到"
+                                f"本假设，其方向以专家声明的 effect 为准）。若本次"
+                                f"判定与该 effect 方向一致，则不构成跨专家矛盾——"
+                                f"请携 statement_update 说明后重新落账，通道立即开放。"
+                                if _g21_prov else ""
                             )
                             return (
                                 f"⛔ 假设 {fmt_hid(hypothesis_id)} 已有专家终局结论与"
@@ -6489,7 +6606,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 f"（证据摘要：{_g21_conflict['summary']}…），"
                                 f"而本次拟判 {verdict}。两个深度专家对同一假设给出"
                                 f"相反终局结论属跨专家证据矛盾，直接落账将以新结论"
-                                f"静默覆盖旧结论。请先仲裁：\n"
+                                f"静默覆盖旧结论。{_g21_prov_hint}请先仲裁：\n"
                                 f"1. 复检矛盾数据源：委派第三方视角专家（或同一专家"
                                 f"复核具体矛盾点，如两侧对同一物理量的观测差异）确认"
                                 f"哪侧证据可靠；\n"
@@ -6820,10 +6937,33 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "专家结论到位即 record_finding confirmed 落账——"
                         "提前委派可省 1 轮。"
                     )
+            # v3.38.7 (R2): constraint pinning at the decision point.  The
+            # evidence standard previously lived only in the (33K+) system
+            # prefix, where it decays as the context grows — measured
+            # 2026-09-11 session b050c5c8: the model attempted `confirmed`
+            # without expert evidence TWICE while the guidance was
+            # demonstrably in context (2–3 occurrences per request).  Restating
+            # it in the TOOL RECEIPT places it at the tail, exactly where the
+            # next decision is taken (Constraint Pinning, arXiv:2606.22528;
+            # "constraints must be MAINTAINED, not merely declared",
+            # arXiv:2605.10481).  Selective (P7): only while other hypotheses
+            # are still pending — i.e. only when the standard can be violated
+            # again.
+            _other_open = [
+                fmt_hid(h) for h, n in ledger.get("hypotheses", {}).items()
+                if h != hypothesis_id and n.get("status") == "pending"
+            ]
+            _constraint_pin = (
+                "ℹ 约束维持（对其余未决假设同样适用）："
+                + "、".join(_other_open)
+                + " 判 confirmed 须有 expert:<type> 证据且无相互冲突的证据通道；"
+                "仅有监控数据时可判 refuted/inconclusive（越权 confirmed 会被 G17 拦截）。\n"
+                if _other_open else ""
+            )
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
                 f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_candidate_hint}{_g18_warn}"
-                f"{_degraded_hint}"
+                f"{_constraint_pin}{_degraded_hint}"
             )
 
         return StructuredTool.from_function(

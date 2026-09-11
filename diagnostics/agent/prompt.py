@@ -67,7 +67,8 @@ PHASE_SPEC: dict[str, dict] = {
             "证据齐后 record_finding 综合判定",
             "委派时明确\"验证假设X\"并传入所需参数（hostname / cluster_name / namespace）",
             "confirmed 判定须以对应领域专家的验证结论为依据（专家证据）——监控数据可直接支撑"
-            " refuted（明确证伪）或 inconclusive（证据不足），但单独不足以支撑 confirmed",
+            " refuted（明确证伪）或 inconclusive（证据不足），但单独不足以支撑 confirmed；"
+            "若同一假设存在相互冲突的证据通道（如 argus 指标与日志/事件矛盾），须先澄清冲突再落账",
             "收到结论后必须调用 record_finding 记录；若原始表述不准确，用 statement_update 修正",
             "若假设仅部分不成立（某环节被证伪但核心机制已确认），用 confirmed + statement_update，"
             "禁止整体 refuted",

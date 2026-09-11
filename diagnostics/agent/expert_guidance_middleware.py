@@ -61,9 +61,15 @@ from diagnostics.agent.expert_stall_watchdog import (
     _total_hard,
     _total_soft,
 )
+from diagnostics.agent.model_budget import (
+    MAX_OUTPUT_TOKENS,
+    reasoning_pressure_chars,
+    truncation_risk_chars,
+)
 from diagnostics.agent.model_usage import (
     extract_usage,
     first_truncated,
+    messages_of,
     reasoning_chars,
 )
 
@@ -97,6 +103,45 @@ def _thinking_off_variant(model: Any) -> Any | None:
         return model.model_copy(update={"reasoning_effort_override": "none"})
     except Exception:
         return None
+
+
+_GOAL_MARK_RE = re.compile(r"\[Coordinator 委派指令\]\s*(.+)", re.S)
+
+
+def _delegation_goal(text: str) -> str:
+    """The delegated task statement (progress frame, v3.37.6).
+
+    Taken verbatim from the Coordinator's instruction block — the block
+    frames "how far from the goal am I", so the goal must be the task that
+    was actually delegated, never a system invention.
+    """
+    m = _GOAL_MARK_RE.search(text or "")
+    if not m:
+        return ""
+    return " ".join(m.group(1).split())[:120]
+
+
+def _call_ref(tool: str, args: Any) -> str:
+    """Compact ``tool(arg/arg)`` label used to count repeatable calls.
+
+    Keeps at most three discriminating values, each capped at 18 chars: the
+    progress block is a fixed-cost channel and argument sets are dominated
+    by low-signal fields (time windows, limits).  The label lets the frame
+    NAME the call an expert is about to repeat; it is not a parameter mirror.
+    """
+    if not isinstance(args, dict) or not args:
+        return tool
+    vals: list[str] = []
+    for _k, v in args.items():
+        if v in (None, "", [], {}):
+            continue
+        s = str(v).replace("\n", " ").strip()
+        if len(s) > 18:
+            s = s[:17] + "…"
+        vals.append(s)
+        if len(vals) >= 3:
+            break
+    return f"{tool}({'/'.join(vals)})" if vals else tool
 
 
 def _delegation_text(request: Any) -> str:
@@ -166,13 +211,54 @@ def _channels(tool_names: list[str]) -> list[str]:
 # to convert the PATTERN — not the single call — into a forced wrap-up.
 # The signal reuses the G27/G28 latch and guidance channel, so the cost stays
 # bounded (guidance + one strengthened reminder, no extra turns by itself).
-_REDUNDANCY_WRAPUP_HITS = _env_int("DIAGNOSTICS_REDUNDANCY_WRAPUP_HITS", 3)
+# v3.39.2: lowered 3 → 1.  Measured 2026-09-12 (scenario 38, delegation
+# del:26788e7ca9ac): 20 identical-parameter calls were blocked by dedup and
+# the expert STILL kept going — the loop ended in a length-truncated turn with
+# no conclusion.  The FIRST repeat is already diagnostic; waiting for the
+# third wastes two round-trips and, on a saturated output budget, costs the
+# conclusion itself.  The latch keeps the guidance one-shot, so an earlier
+# trigger cannot repeat or spam.  Proactive by design: the block receipts are
+# the reactive fallback, not the primary teacher.
+_REDUNDANCY_WRAPUP_HITS = _env_int("DIAGNOSTICS_REDUNDANCY_WRAPUP_HITS", 1)
 _REDUNDANCY_WRAPUP_GUIDANCE = (
     "[系统提示·重复取证收敛] 本委派已有多次完全相同参数的调用被系统去重"
     "（结果已缓存并返回到上下文中，重复调用不会获得新数据）——请立即基于"
     "已采集数据调用结论工具收尾：尚未取证的维度在 coverage_gaps 按"
     "『维度名：类型｜原因』声明（类型：数据不可用/不适用/强制收尾）。"
     "不要再用相同参数重复调用任何工具。"
+)
+
+    # Q4 (v3.38.5): near-truncation reasoning pressure.  A single turn whose
+    # reasoning stream runs an order of magnitude longer than its siblings is
+    # the leading indicator of the degeneracy that ends in a length
+    # truncation (2026-09-11 session fe3a8604: 40417 chars vs ≤4095
+    # elsewhere).  Guidance on the NEXT turn is proactive; the thinking-off
+    # recovery after a real truncation stays as the reactive backstop.
+    # Industry context: CoT length vs accuracy follows an inverted-U
+    # (ICLR 2026 "When More Is Less"), i.e. the over-long tail is exactly
+    # where quality degrades.
+# v3.39.0: the threshold is DERIVED from the deployment's output cap
+# (model_budget.reasoning_pressure_chars) rather than fixed here.  Both
+# supported backends spend `max_tokens` on CoT + content together, and the
+# deployment uses ONE cap for both (32K) — so 32768 tokens → 36864 chars,
+# i.e. half the budget, leaving the other half for the conclusion itself.
+# The old fixed 8000 was calibrated on 16K-token mock runs and would fire
+# constantly at 32K/64K (measured 2026-09-11).
+_REASONING_PRESSURE_GUIDANCE = (
+    "[系统提示·思考收敛] 上一轮你的内部推理异常冗长（远超正常水平，已接近"
+    "输出上限）——继续发散会耗尽输出预算、导致结论无法产出。请立即停止展开"
+    "推理，基于已采集数据直接调用结论工具收尾：尚未取证的维度在 coverage_gaps"
+    " 按『维度名：类型｜原因』声明。"
+)
+# v3.39.2 (C): output-budget guard.  The cap is shared by CoT and content on
+# both backends.  When the PREVIOUS turn's CONTENT alone is already near the
+# ceiling, the next turn must conclude rather than emit more bulk — measured
+# 2026-09-12 (scenario 38): a turn saturated 16384 tokens with
+# reasoning_chars=0, i.e. content-only saturation, and the conclusion was lost.
+_OUTPUT_PRESSURE_GUIDANCE = (
+    "[系统提示·输出预算保护] 上一轮你的输出内容已接近输出上限——继续输出大段内容"
+    "（写文件、长文本）会触发系统截断并丢失结论。请立即收敛：直接调用结论工具"
+    "提交结论；确需落盘的内容精简为关键摘要，未覆盖项在 coverage_gaps 声明。"
 )
 
 _SKIP_TOOLS = frozenset({
@@ -325,7 +411,8 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             if not content.strip().startswith("⛔"):
                 verdict = "zero_yield" if _is_zero_yield(result) else "yield"
                 self._ledger.record_call(
-                    self._delegation_key(request), tool_name, verdict)
+                    self._delegation_key(request), tool_name, verdict,
+                    ref=_call_ref(tool_name, tool_call.get("args") or {}))
         return result
 
     # ── consumer A-2: inject the progress block before each model call ──
@@ -350,6 +437,36 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                     "identical call(s) — forced wrap-up guidance injected",
                     key, dedup_hits,
                 )
+            # Q4 (v3.38.5): reasoning pressure from the PREVIOUS turn — tell
+            # the model to converge BEFORE the output budget is exhausted.
+            # Proactive counterpart of the truncation recovery below; reuses
+            # the same one-time latch channel (selective, never repeats).
+            _pressure = reasoning_pressure_chars()
+            if (self._ledger.reasoning_chars(key) >= _pressure
+                    and not self._ledger.conclusion_hinted(key)):
+                self._ledger.mark_conclusion_hinted(
+                    key, _REASONING_PRESSURE_GUIDANCE)
+                logger.warning(
+                    "Reasoning pressure: delegation %s previous-turn "
+                    "reasoning=%d chars (>= %d chars = 50%% of the %d-token "
+                    "output cap) — convergence guidance injected",
+                    key, self._ledger.reasoning_chars(key),
+                    _pressure, MAX_OUTPUT_TOKENS,
+                )
+            # v3.39.2 (C): content-side saturation — the other way a turn can
+            # eat the shared output budget (see _OUTPUT_PRESSURE_GUIDANCE).
+            _out_pressure = truncation_risk_chars()
+            if (self._ledger.output_chars(key) >= _out_pressure
+                    and not self._ledger.conclusion_hinted(key)):
+                self._ledger.mark_conclusion_hinted(
+                    key, _OUTPUT_PRESSURE_GUIDANCE)
+                logger.warning(
+                    "Output pressure: delegation %s previous-turn content="
+                    "%d chars (>= %d = 90%% of the %d-token output cap) — "
+                    "conclusion-first guidance injected",
+                    key, self._ledger.output_chars(key),
+                    _out_pressure, MAX_OUTPUT_TOKENS,
+                )
             tool_names = []
             for t in (getattr(request, "tools", None) or []):
                 name = getattr(t, "name", None) or (
@@ -365,7 +482,11 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             # Idempotent thereafter (set_focus only writes while unset) so
             # the task scope cannot drift mid-delegation.
             if self._ledger.session(key)["focus_dims"] is None:
-                self._ledger.set_focus(key, parse_focus_dims(_delegation_text(request)))
+                _text = _delegation_text(request)
+                self._ledger.set_focus(key, parse_focus_dims(_text))
+                # v3.37.6: frame the progress block around the delegated
+                # goal (set once, from the Coordinator's instruction).
+                self._ledger.set_goal(key, _delegation_goal(_text))
             parts = []
             pending = self._ledger.pop_pending_guidance(key)
             if pending:
@@ -408,10 +529,42 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         # truncation must be detected here and bookkept per delegation
         # key (the instance is shared across experts).
         try:
+            _k = self._delegation_key(request)
             self._record_truncation(
-                self._delegation_key(request), response,
+                _k, response,
                 round(_time.monotonic() - _started, 1),
             )
+            # Q4 (v3.38.5): remember this turn's reasoning volume so the NEXT
+            # turn can be told to converge (see model_budget.reasoning_pressure_chars).
+            # v3.38.6 fix: use the shared model_usage helpers.  The first cut
+            # read a raw `response.message` attribute, which a LangChain
+            # AIMessage does not have — so the recorded value was always 0 and
+            # the guidance never fired in the field (2026-09-11 session
+            # b050c5c8: an expert turn carried 15691 reasoning chars with no
+            # guidance injected).  Best-effort: never break the model call.
+            try:
+                _msgs = messages_of(response)
+                _chars = max(
+                    (reasoning_chars(m) for m in _msgs),
+                    default=0,
+                )
+                self._ledger.set_reasoning_chars(_k, _chars)
+                # v3.39.2 (C): remember the CONTENT volume too — it is the
+                # other half of the shared output budget, and a content-only
+                # saturation is invisible to the reasoning counter.
+                _content = 0
+                for _m in _msgs:
+                    _c = getattr(_m, "content", "") or ""
+                    if isinstance(_c, list):
+                        for _b in _c:
+                            _content += (len(str(_b.get("text", "")))
+                                         if isinstance(_b, dict)
+                                         else len(str(_b)))
+                    else:
+                        _content += len(str(_c))
+                self._ledger.set_output_chars(_k, _content)
+            except Exception:
+                pass
         except Exception:
             pass  # recovery bookkeeping must never break the model call
         return response
@@ -555,9 +708,31 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             # result it cannot tell apart from "checked, nothing
             # found" — the pseudo-signal G28 exists to eliminate
             # (design document §8 G28).  Degrade instead of bouncing.
+            # Nothing was ever collected: the truncation hit the FIRST
+            # model turn.  v3.37.9 (R1): the observed cause is the reasoning
+            # stream exhausting the SHARED output budget (captured body of
+            # such a turn: 71419 reasoning characters, 0 content, 0
+            # tool_calls), and probing the same model shows tool calls are
+            # emitted normally once reasoning is disabled.  So bounce ONCE
+            # with reasoning off — the retry automatically runs on the
+            # none-effort model variant selected in awrap_model_call — and
+            # degrade only if that retry also fails (truncation_count >= 2,
+            # which keeps the loop provably bounded).
             if not s["calls"]:
-                self._report_truncated_delegation(state, key)
-                return None
+                if self._ledger.truncation_count(key) >= 2:
+                    self._report_truncated_delegation(state, key)
+                    return None
+                guidance = (
+                    "[系统提示·输出被截断] 上一次输出达到长度上限，且尚未产生"
+                    "任何取证调用（本次已关闭长篇推理）。请立即调用 1-2 个最关键"
+                    "的取证工具获取证据，然后提交结论——不要展开长篇推理。"
+                )
+                self._ledger.mark_conclusion_hinted(key, guidance)
+                logger.warning(
+                    "G28 zero-call truncation: delegation %s bounced once "
+                    "with reasoning disabled", key,
+                )
+                return {"jump_to": "model"}
             if self._ledger.conclusion_hinted(key):
                 # The one bounce was already spent (by G27 or by G28);
                 # the second truncation is terminal — degrade instead of

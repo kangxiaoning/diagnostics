@@ -26,7 +26,14 @@ class Settings:
     # (response_format JSON) are compact, so the larger cap primarily
     # protects the reasoning stream + full report.  Honored by ollama
     # via OllamaChatOpenAI's top-level max_tokens passthrough.
-    max_tokens: int = 16384
+    # v3.39.2: raised 16384 → 32768.  Measured 2026-09-11 (scenario 38): an
+    # expert turn saturated the old ceiling with reasoning_chars=0 — i.e. the
+    # CONTENT alone filled the budget — which is exactly what the larger cap
+    # prevents.  32768 also matches the output-budget layer
+    # (model_budget.MAX_OUTPUT_TOKENS); the two numbers MUST stay in sync,
+    # otherwise every derived threshold drifts.  Both supported backends
+    # (qwen3.6-35b-a3b / deepseek-v4-flash) accept 32K.
+    max_tokens: int = 32768
     max_history_messages: int = 16
     app_title: str = "Linux Diagnostics Agent"
 

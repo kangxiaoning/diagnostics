@@ -163,8 +163,51 @@ def _coerce_list_value(value: Any) -> Any:
 
 # Deep diagnostic experts (host-expert / k8s-expert / serverless-expert /
 # kmc-expert / sci-expert): verdict + evidence + root cause.
+class RelatedHypothesis(BaseModel):
+    """A hypothesis this delegation's evidence ALSO bears on (v3.37.7).
+
+    One forensic pass routinely informs several competing hypotheses
+    (differential-diagnosis practice: a single finding simultaneously
+    supports and excludes candidates — dual-inference DDx).  The
+    delegation still targets ONE assigned hypothesis, but the expert is
+    the only party that knows which OTHER hypotheses its evidence
+    touches, so it declares them here.  The ledger then files the
+    evidence against each declared hypothesis, which is what keeps a
+    later `record_finding confirmed` from being blocked for "no expert
+    evidence" on a hypothesis that was in fact already informed.
+    """
+
+    id: str = Field(
+        description=(
+            "受本次取证影响的其他假设编号（如 H2，写 2 亦可——系统两种写法都认）。"
+            "**必须使用假设编号**（H1/H2…），不要写描述性名称（如 control_plane_"
+            "resource_bottleneck）——后者无法归因，会被系统丢弃。仅填写委派描述中"
+            "出现的假设编号；没有其他受影响假设、或本次委派发生在假设提出之前"
+            "（数据采集阶段），留空数组"
+        ),
+    )
+    effect: Literal["supports", "refutes", "unclear"] = Field(
+        default="unclear",
+        description=(
+            "本次证据对该假设的作用方向：supports（支持）/ refutes（排除）"
+            "/ unclear（暂不明确）"
+        ),
+    )
+
+
 class DeepExpertFindings(BaseModel):
     """Structured return for deep diagnostic subagents."""
+
+    related_hypotheses: list[RelatedHypothesis] = Field(
+        default_factory=list,
+        description=(
+            "受本次取证影响的其他假设（≤3 项，可选）：一次取证常同时支持或排除多个"
+            "竞争假设——把你这次结论还影响到、且**委派描述中出现过**的假设编号写上"
+            "（如 H2，写 2 亦可——系统两种写法都认），"
+            "并标注作用方向；系统据此把本次证据同时归档到这些假设（后续对它们判 "
+            "confirmed 时不会因『缺少专家证据』被拦）。没有其他受影响假设时留空数组。"
+        ),
+    )
 
     verdict: Literal["confirmed", "refuted", "inconclusive"] = Field(
         description=(
@@ -252,6 +295,16 @@ class DeepExpertFindings(BaseModel):
 # matches it deterministically.
 class ArgusExpertFindings(BaseModel):
     """Structured return for Argus time-series subagents."""
+
+    related_hypotheses: list[RelatedHypothesis] = Field(
+        default_factory=list,
+        description=(
+            "受本次取证影响的其他假设（≤3 项，可选）：指标层证据同样可能同时支持或"
+            "排除多个竞争假设——把你这次结论还影响到、且**委派描述中出现过**的假设编号"
+            "写上（如 H2，写 2 亦可——系统两种写法都认）并标注方向；"
+            "系统据此把本次证据同时归档到这些假设。无则留空数组。"
+        ),
+    )
 
     clarification: str = Field(
         default="",

@@ -286,6 +286,38 @@ def new_hypothesis(
     )
 
 
+def experts_for_hypothesis(ledger: DiagnosisLedger, hid: str) -> dict[str, list[str]]:
+    """Which experts bear on *hid*, split by direct vs incidental (v3.38.0).
+
+    Failure attribution in multi-agent systems routinely involves several
+    agent–error pairs per trajectory — one failure may implicate more than
+    one agent (VerifyMAS, arXiv:2605.17467) — and a single delegation's
+    evidence can bear on hypotheses it was NOT sent to verify (v3.37.7
+    ``related_hypotheses``).  Both directions exist in the ledger already:
+    ``evidence[].source == "expert:<type>"`` names the expert, and
+    ``related_via`` marks an entry as incidental rather than direct.
+
+    This view only DERIVES that mapping from the evidence list (the single
+    source of truth) so callers stop re-implementing the traversal — and so
+    diagnostics can tell "no expert looked at this" apart from "an expert's
+    evidence touched it in passing", which is exactly the distinction G17's
+    block message needs (2026-09-11 session).
+
+    Returns {"direct": [...], "incidental": [...]} of expert type names.
+    """
+    node = (ledger.get("hypotheses") or {}).get(hid) or {}
+    direct: list[str] = []
+    incidental: list[str] = []
+    for e in node.get("evidence", []):
+        src = str(e.get("source", ""))
+        if not src.startswith("expert:"):
+            continue
+        # "expert:<type>" or "expert:<type>:auto" (auto-recorded, v3.37.7)
+        name = src.split("expert:", 1)[-1].split(":auto", 1)[0]
+        (incidental if e.get("related_via") else direct).append(name)
+    return {"direct": sorted(set(direct)), "incidental": sorted(set(incidental))}
+
+
 def new_evidence(
     source: str,
     summary: str,
@@ -341,6 +373,79 @@ def fmt_hid(hid: object) -> str:
     if s[:1] in ("H", "h"):
         return "H" + s[1:]
     return "H" + s
+
+
+def parse_hid(raw: object, hypotheses: dict[str, HypothesisNode]) -> str | None:
+    """Resolve a hypothesis identifier to the ledger's RAW key (v3.38.2).
+
+    Two namespaces coexist by design: the ledger keys hypotheses by raw id
+    ("2"), while every model-facing surface renders the display form ("H2")
+    through :func:`fmt_hid`.  A structured expert return therefore quotes what
+    the model actually SEES — the display form — so an exact-match check
+    against the raw namespace silently discards every such declaration.
+
+    2026-09-11 (session d32b0e4c): 7 declarations across 5 delegations
+    (`[{"id":"H2","effect":"supports"}, ...]`) were all dropped by that
+    check, with no log line and zero ``related_via`` entries — a textbook
+    data-contract mismatch (Silent-Failure-Hunter, category 1) that cost the
+    whole multi-hypothesis attribution mechanism.
+
+    Accepts both forms and returns the raw key; ``None`` when the identifier
+    resolves to nothing in the ledger (callers decide whether to warn).
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if s in hypotheses:
+        return s
+    if len(s) > 1 and s[0] in ("H", "h") and s[1:].isdigit() \
+            and s[1:] in hypotheses:
+        return s[1:]
+    return None
+
+
+EFFECT_TO_VERDICT: dict[str, str] = {
+    "supports": "confirmed",
+    "refutes": "refuted",
+    # "unclear" deliberately maps to the non-terminal fallback below.
+}
+ATTRIBUTED_UNKNOWN_VERDICT = "inconclusive"
+
+
+def attributed_structured(structured: object, effect: str) -> object:
+    """Restate a structured expert return for an ATTRIBUTED hypothesis (v3.38.4).
+
+    A delegation's structured return describes the ASSIGNED hypothesis.  When
+    the same return is also filed against a merely-RELATED hypothesis (the
+    v3.37.7 multi-hypothesis attribution), copying it verbatim claims that the
+    related hypothesis was terminally judged too — a provenance error.
+
+    2026-09-11 (session 29dfc820): H2/H3 inherited host-expert's
+    ``verdict=confirmed`` (a statement about H1), so G21 read "already holds an
+    opposing terminal expert verdict" and blocked the Coordinator's correct
+    ``refuted`` four times; the model then made a reason-free flip to
+    ``inconclusive``, discarding the expert's explicit ``effect=refutes`` for
+    H3.  Industry name for this class: *guardrail bleed* — the guard's
+    activation boundary miscalibrated by bad data, distorting the decision
+    signal.
+
+    The direction of attributed evidence IS the declared ``effect``; ``unclear``
+    carries no terminal verdict (mapped to the non-terminal fallback so that
+    Literal-typed fields stay valid).  Returns a shallow copy; the original
+    object is never mutated (it stays the assigned hypothesis' record).
+    """
+    verdict = EFFECT_TO_VERDICT.get(str(effect or "").strip().lower(),
+                                    ATTRIBUTED_UNKNOWN_VERDICT)
+    try:
+        if isinstance(structured, dict):
+            clone = dict(structured)
+            clone["verdict"] = verdict
+            return clone
+        clone = structured.model_copy(deep=False)  # pydantic model
+        clone.verdict = verdict
+        return clone
+    except Exception:  # unknown shape: keep it, never break landing
+        return structured
 
 
 def _valid_ids_hint(hypotheses: dict[str, HypothesisNode]) -> str:
@@ -1946,10 +2051,50 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "或补第二通道交叉验证后一次通过\n"
             )
         elif _has_expert_ev:
-            _record_hint = ""
+            # v3.38.3 (S1: decision-point guidance).  This branch used to be
+            # SILENT, so the first thing to tell the model about G17-E2's
+            # conflict check was the block itself (2026-09-11 session
+            # dd61a995: "G17-E2: confirmed on H1 with conflicted argus
+            # evidence, round=5").  State the self-check BEFORE the action,
+            # in positive form (§11 v2.9.2: prohibition copy backfires under
+            # motivated violation; a success criterion becomes the model's
+            # own target).
+            _record_hint = (
+                "- ⚠ 落账 confirmed 前自检：①证据来源须为 expert:<type>；"
+                "②同一假设**无相互冲突的证据通道**（如 argus 指标与日志/事件"
+                "矛盾）——冲突未澄清时 confirmed 会被系统拦截\n"
+            )
+            # v3.38.4 (R2): when this hypothesis holds RELATED evidence (filed
+            # via another delegation's structured return), state that its
+            # direction is the declared effect — never the source hypothesis'
+            # verdict.  Without this the model treats the inherited verdict as
+            # an obstacle and flips to inconclusive (2026-09-11 session
+            # 29dfc820, H3: explicit effect=refutes discarded).
+            _rel_ev = [
+                e for e in active.get("evidence", []) if e.get("related_via")
+            ]
+            if _rel_ev:
+                _rel_from = "、".join(sorted(
+                    {fmt_hid(e.get("related_via")) for e in _rel_ev}
+                ))
+                _record_hint += (
+                    f"- ℹ 本假设含**旁支归因**证据（由 {_rel_from} 的委派结果"
+                    "顺带归因而来）：其方向以该证据的 effect 为准，不受来源假设"
+                    "的 verdict 影响——据其方向正常落账即可，无需回避\n"
+                )
         else:
+            # v3.38.3 (S1).  State 2 = delegated but no expert conclusion has
+            # come back yet.  The old copy said only "must record the
+            # conclusion", which reads as an invitation to land a verdict;
+            # the first correction then arrived reactively (same session:
+            # "G17: confirmed on H4 without expert evidence, round=13",
+            # costing an extra delegation to recover).  Name what is NOT
+            # available yet, at the moment of decision.
             _record_hint = (
                 f"- 收到结果后必须调用 record_finding 记录结论（{exit_txt}）\n"
+                "- ⚠ 当前尚无专家验证结论回归：此时 record_finding(confirmed) "
+                "会被系统拦截——请等待专家结果或先补委派；若现有证据已明确"
+                "证伪，可直接判 refuted/inconclusive（三要素齐备）\n"
             )
         # v3.34.1: per-hypothesis evidence attribution boundary (design
         # document §9) — phase-dynamic AND selective (P7): surfaced only
@@ -1960,16 +2105,49 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # H1-attributed evidence — G17 block + 1 delegation to recover).
         # No UNDERSTAND/EVALUATE/REPORT pollution; disappears once the
         # attribution ambiguity is impossible (single pending hypothesis).
-        _others_pending = [
-            fmt_hid(h) for h, n in ledger.get("hypotheses", {}).items()
+        _others_pending_pairs = [
+            (h, n) for h, n in ledger.get("hypotheses", {}).items()
             if h != active_id and n.get("status") == "pending"
         ]
+        _others_pending = [fmt_hid(h) for h, _ in _others_pending_pairs]
         _attribution_hint = ""
         if _others_pending:
             _attribution_hint = (
                 "- ⚠ 专家证据按假设归属：验证本假设的专家结论不能作为其他"
                 f"未决假设（{'、'.join(_others_pending)}）的 confirmed 依据"
                 "——confirmed 它们须定向委派该假设的验证\n"
+            )
+        # v3.38.1: supply side of the v3.37.7 multi-hypothesis attribution.
+        # The landing path has always been implemented (declared ids get their
+        # own evidence entry), and the expert schema is deliberately narrow —
+        # it accepts ONLY ids that "appeared in the delegation description".
+        # Nothing, however, was responsible for putting the competing
+        # hypotheses THERE, so experts never had ids to declare and the whole
+        # mechanism idled (2026-09-11 session 6bb354f4: 3/3 structured returns
+        # had related_hypotheses=[], H2/H3 ended up attributed by the
+        # Coordinator instead).  Explicitly listing the differential is an
+        # established cognitive forcing function in diagnostic reasoning
+        # (AMIE, Nature 2025 — DDx generation; counterfactual multi-agent
+        # reasoning, arXiv:2603.27820), and omitting it from a downstream
+        # agent's context is the "inter-agent misalignment" failure class of
+        # MAST (arXiv:2503.13657).  Selective by construction (P7): injected
+        # only while OTHER hypotheses are pending, i.e. only when a
+        # differential actually exists.  Guidance only — no gate or landing
+        # change, so nothing can be blocked by it.
+        _ddx_hint = ""
+        if _others_pending_pairs:
+            _ddx_items = []
+            for _h, _n in _others_pending_pairs:
+                _s = str(_n.get("statement") or "").strip()
+                if len(_s) > 30:
+                    _s = _s[:30] + "…"
+                _ddx_items.append(f"{fmt_hid(_h)}：{_s}" if _s else fmt_hid(_h))
+            _ddx_hint = (
+                "- ⚠ 委派描述中请一并写入其它未决假设的编号与一句话陈述（"
+                + "；".join(_ddx_items)
+                + "）——专家据此声明 related_hypotheses，系统把本次证据同时"
+                "归档到这些假设（后续对它们判 confirmed 时不会因「缺少专家"
+                "证据」被拦）\n"
             )
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
@@ -1981,6 +2159,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"{disp_id}\"并传入假设上下文\n"
             + _record_hint
             + _attribution_hint
+            + _ddx_hint
             + "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
             "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
             "委派时明确要求专家「复用已有证据，仅补查缺失项」\n"
@@ -3100,6 +3279,12 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
                 "expert": source[len("expert:"):],
                 "prev_verdict": prev,
                 "summary": (ev.get("summary") or "")[:200],
+                # v3.38.4 (R4): provenance of the conflicting entry — a
+                # related_via value means this "prior verdict" was restated
+                # from ANOTHER hypothesis' return.  Surfacing it in the log
+                # and the arbitration message turns a 20-minute archaeology
+                # session into a one-line read (2026-09-11 session 29dfc820).
+                "related_via": ev.get("related_via"),
             }
     return None
 

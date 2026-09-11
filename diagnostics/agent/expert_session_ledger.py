@@ -167,7 +167,7 @@ _MAX_FINGERPRINTS_PER_TOOL = 8
 # Hard cap on the rendered guidance block (design document PG4: the
 # injected state must never bury the one action that matters; Anthropic
 # context engineering — smallest set of high-signal tokens).
-_GUIDANCE_MAX_CHARS = 400
+_GUIDANCE_MAX_CHARS = 600
 # Conclusion contract restated at the decision point (design document
 # §9, v3.26.0).  Two clauses only: the array field shape (the sole
 # observed parse-failure mode) and the gap-declaration channel — the
@@ -292,6 +292,15 @@ class ExpertSessionLedger:
                 # from the delegation description.  None = not parsed yet;
                 # empty set = parsed, nothing named (fallback to toolset).
                 "focus_dims": None,
+                # v3.37.6 (progress frame): the delegation's own goal plus a
+                # per-call "ref" counter (tool + key args).  Together they
+                # turn the block from an ACTION TALLY into a TASK-PROGRESS
+                # frame — the missing piece behind repeated calls: the expert
+                # could see "N calls / some dimensions", but never "how far
+                # from the delegated goal am I, and which call am I about to
+                # repeat".
+                "goal": "",
+                "ref_counts": {},            # "tool(arg/arg)" → count
             }
             self._sessions[key] = s
         self._sessions.move_to_end(key)
@@ -301,15 +310,21 @@ class ExpertSessionLedger:
 
     # ── call recording (guidance middleware) ──
 
-    def record_call(self, key: str, tool: str, verdict: str) -> None:
+    def record_call(self, key: str, tool: str, verdict: str,
+                    ref: str = "") -> None:
         """Record one genuinely-executed diagnostic call.
 
         *verdict* is "yield" or "zero_yield" (classified by the caller
         via the G19 zero-yield predicate — one predicate, one truth).
+        *ref* (v3.37.6) is the compact "tool(key args)" label: counting
+        equal refs lets the progress frame name the call the expert is
+        about to repeat, instead of only reporting a total.
         """
         s = self.session(key)
         dim = dimension_of(tool)
         s["calls"].append({"tool": tool, "dim": dim, "verdict": verdict})
+        if ref:
+            s["ref_counts"][ref] = s["ref_counts"].get(ref, 0) + 1
         if verdict == "zero_yield":
             s["dim_streaks"][dim] = s["dim_streaks"].get(dim, 0) + 1
         else:
@@ -317,6 +332,16 @@ class ExpertSessionLedger:
             s["dim_streaks"][dim] = 0
 
     # ── task-scoped focus (P-1) ──
+
+    def set_goal(self, key: str, goal: str) -> None:
+        """Record the delegation goal (progress frame, v3.37.6).
+
+        Set once from the Coordinator's instruction block — the frame must
+        be the task actually delegated, never a system invention.
+        """
+        s = self.session(key)
+        if not s["goal"]:
+            s["goal"] = (goal or "").strip()[:120]
 
     def set_focus(self, key: str, dims: set[str]) -> None:
         """Record the Coordinator-named focus dimensions for this delegation.
@@ -417,6 +442,35 @@ class ExpertSessionLedger:
     def mark_truncation_reported(self, key: str) -> None:
         self.session(key)["truncation_reported"] = True
 
+    # ── near-truncation reasoning pressure (Q4, v3.38.5) ──
+    # A turn whose reasoning stream balloons far above normal (but stays
+    # short of the output cap) is the leading indicator of the degeneracy
+    # that ends in a length truncation — measured 2026-09-11 session
+    # fe3a8604: one turn produced 40417 reasoning chars while every other
+    # turn stayed ≤4095, and the stream was visibly re-deciding ("OK, let me
+    # finalize ..." ×8).  Recording it per delegation lets the NEXT turn be
+    # told to converge BEFORE the budget is gone (proactive guidance); the
+    # post-truncation thinking-off variant remains the reactive backstop.
+
+    def set_reasoning_chars(self, key: str, chars: int) -> None:
+        self.session(key)["last_reasoning_chars"] = int(chars or 0)
+
+    def reasoning_chars(self, key: str) -> int:
+        return int(self.session(key).get("last_reasoning_chars", 0) or 0)
+
+    # v3.39.2 (C): output-budget pressure — the CONTENT side.  A turn whose
+    # content ALONE approaches the output ceiling saturates the budget with
+    # reasoning_chars=0 (measured 2026-09-12, scenario 38) and the conclusion
+    # then has no room.  Tracked per delegation, exactly like the reasoning
+    # side, so the next turn can be told to conclude instead of emitting more
+    # bulk.
+
+    def set_output_chars(self, key: str, chars: int) -> None:
+        self.session(key)["last_output_chars"] = int(chars or 0)
+
+    def output_chars(self, key: str) -> int:
+        return int(self.session(key).get("last_output_chars", 0) or 0)
+
     # ── derived views ──
 
     def dead_ends(self, key: str) -> dict[str, int]:
@@ -487,19 +541,34 @@ class ExpertSessionLedger:
         n = len(s["calls"])
         if n == 0:
             return ""
-        lines = [
-            f"[取证进展·系统维护] 已执行 {n} 次取证调用"
-            f"（{budget_soft} 次提醒 / {budget_hard} 次强制收尾）"
-        ]
+        # v3.37.6 progress FRAME (replaces the former action tally): the
+        # block now answers "how far from the delegated goal am I" — goal,
+        # repeated calls named explicitly, covered/uncovered dimensions,
+        # budget, next step.  The old "系统已去重 N 次" line is gone: the
+        # per-ref counts below carry the same information in a locatable
+        # form ("which call"), so the total was pure redundancy.
+        lines = ["[委派进展·系统维护]"]
+        if s["goal"]:
+            lines.append("· 委派目标：" + s["goal"])
+        repeated = {r: c for r, c in s["ref_counts"].items() if c > 1}
+        if repeated:
+            top = sorted(repeated.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+            lines.append(
+                "· 已重复调用（同参数，勿再发）："
+                + "；".join(f"{r} ×{c}" for r, c in top)
+                + ("…" if len(repeated) > len(top) else ""))
         if s["covered"]:
             lines.append("· 已有数据维度：" + "、".join(sorted(s["covered"])))
+        uncovered = sorted(self.expected_for(key, tool_names) - s["covered"])
+        if uncovered:
+            lines.append("· 尚未覆盖：" + "、".join(uncovered[:8])
+                         + ("…" if len(uncovered) > 8 else ""))
         dead = self.dead_ends(key)
         if dead:
             lines.append("· 连续无数据方向："
                          + "、".join(f"{d}({c}次)" for d, c in dead.items()))
-        if dedup_hits:
-            lines.append(f"· 系统已去重 {dedup_hits} 次重复调用"
-                         "——相同参数重查不会获得新数据")
+        lines.append(f"· 进度：已执行 {n} 次"
+                     f"（软提醒 {budget_soft} 次 / 强制收尾 {budget_hard} 次）")
         lines.append("· 下一步："
                      + self.next_action(key, self.expected_for(key, tool_names),
                                         budget_soft))

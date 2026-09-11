@@ -85,3 +85,42 @@ class OllamaChatOpenAI(ChatOpenAI):
             extra_body["keep_alive"] = _KEEP_ALIVE
             payload["extra_body"] = extra_body
         return payload
+
+    # ── Preserve provider reasoning (v3.37.7, R2 observability) ──────
+    # LangChain's ChatOpenAI targets the official OpenAI schema and, by its
+    # own documentation, neither extracts nor preserves non-standard
+    # response fields such as ``message.reasoning`` / ``reasoning_content``
+    # (langchain issue #34706, #36413).  The provider we run against
+    # (ollama + qwen3) DOES return them: the captured body of a truncated
+    # turn carried 71419 characters of ``message.reasoning`` while the
+    # middleware logged ``reasoning_chars=0`` — i.e. the G28 log could not
+    # tell "the answer was cut off" from "the thinking stream ate the whole
+    # budget", which is exactly the distinction the truncation fix needs.
+    #
+    # Implemented as a post-processing hook on the RAW response: it never
+    # changes what the model sees, only what we can observe.  EXTRACTION
+    # failures are swallowed (a missing/oddly-shaped field must not become
+    # a call failure source); the framework's own parse errors still
+    # propagate untouched, since those are real errors.
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        try:
+            if isinstance(response, dict):
+                data = response
+            else:
+                try:
+                    data = response.model_dump()
+                except Exception:
+                    data = {}
+            for gen, choice in zip(result.generations, (data or {}).get("choices") or []):
+                msg = getattr(gen, "message", None)
+                if msg is None:
+                    continue
+                raw_msg = (choice or {}).get("message") or {}
+                reason = raw_msg.get("reasoning") or raw_msg.get("reasoning_content")
+                if isinstance(reason, str) and reason.strip():
+                    msg.additional_kwargs["reasoning"] = reason
+                    msg.additional_kwargs["reasoning_chars"] = len(reason)
+        except Exception:
+            pass
+        return result

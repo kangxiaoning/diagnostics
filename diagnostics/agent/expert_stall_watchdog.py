@@ -81,7 +81,13 @@ def _hard_threshold() -> int:
 # hard refusal at the cap.  Conclusion tools stay exempt (see
 # _IGNORED_TOOLS) so the required-tool-choice loop can still terminate.
 def _total_soft() -> int:
-    return _env_int("DIAGNOSTICS_EXPERT_CALLS_SOFT", 12)
+    # Q3' (v3.38.5): pulled forward 12 → 8.  Measured 2026-09-11 (scenario 38,
+    # delegation del:e488514b9330): the soft nudge at 12 calls arrived after
+    # the expert had already burned several redundant calls (3 of them
+    # dedup-blocked, which separately tripped the redundancy wrap-up).  An
+    # earlier, single nudge is still "selective" (P7) while leaving more of
+    # the budget for conclusion-grade evidence.
+    return _env_int("DIAGNOSTICS_EXPERT_CALLS_SOFT", 8)
 
 
 def _total_hard() -> int:
