@@ -10,7 +10,7 @@ description: >
 # Network Layer Diagnosis (L3/L4)
 
 ## Primary Tool
-`check_network()` — returns `ss` connections, interface errors/drops, TCP retransmits, dmesg.
+`get_os_net_ss_s()` — returns `ss` connections, interface errors/drops, TCP retransmits, dmesg.
 
 ## Quick Triage
 

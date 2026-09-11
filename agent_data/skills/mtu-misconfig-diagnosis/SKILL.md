@@ -14,8 +14,8 @@ description: Diagnoses MTU mismatch between CNI overlay and host network interfa
 
 ## Workflow
 
-1. **check_network()** — look for high TCP retransmit rate with interface drops=0
-2. **check_processes()** — identify applications sending large payloads
+1. **get_os_net_ss_s()** — look for high TCP retransmit rate with interface drops=0
+2. **get_os_cpu_ps_elf()** — identify applications sending large payloads
 3. **Verify MTU chain**:
    - Host eth0: `ip link show eth0 | grep mtu` → should be 1500
    - Pod eth0: `ip link show eth0 | grep mtu` (inside pod) → should match CNI

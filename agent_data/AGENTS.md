@@ -7,7 +7,7 @@
 
 ## Argus 监控协作模型
 
-Coordinator **不持有** `query_argus_*` 工具——这些工具仅 Argus 专家 subagent 可用，
+Coordinator **不持有** `get_argus_*` 工具——这些工具仅 Argus 专家 subagent 可用，
 Coordinator 直接调用会被系统拦截。监控时序一律通过 `task()` 委派获取：
 
 - 主机级指标（CPU/内存/磁盘/网络）→ 委派当前场景的主机 argus 专家
@@ -71,11 +71,11 @@ Coordinator 直接调用会被系统拦截。监控时序一律通过 `task()` �
 ### 系统层（委派 host-expert）
 | 症状 | 可能根因 | 专家工具 | Skill |
 |------|---------|---------|-------|
-| load avg 高 + CPU util 低 + iowait 高 | 磁盘 IO 瓶颈 | check_cpu, check_disk | `disk-io-diagnosis` |
-| 进程 RSS 持续增长 + swap 增加 | 内存泄漏 | check_memory | `memory-diagnosis` |
-| 磁盘 util 99% + await 高 + 进程 D 状态 | 存储性能瓶颈 | check_disk | `disk-io-diagnosis` |
-| GPU 显存耗尽 + CUDA OOM | 显存不足或泄漏 | check_gpu_memory, check_gpu_utilization | `gpu-diagnosis` |
-| GPU 温度 >85°C + clock 降低 | 散热不足 | check_gpu_health | `gpu-diagnosis` |
+| load avg 高 + CPU util 低 + iowait 高 | 磁盘 IO 瓶颈 | get_os_cpu_info, get_os_block_5s | `disk-io-diagnosis` |
+| 进程 RSS 持续增长 + swap 增加 | 内存泄漏 | get_os_mem_5s | `memory-diagnosis` |
+| 磁盘 util 99% + await 高 + 进程 D 状态 | 存储性能瓶颈 | get_os_block_5s | `disk-io-diagnosis` |
+| GPU 显存耗尽 + CUDA OOM | 显存不足或泄漏 | get_gpu_status_info, get_gpu_status_info | `gpu-diagnosis` |
+| GPU 温度 >85°C + clock 降低 | 散热不足 | get_gpu_status_info | `gpu-diagnosis` |
 
 ### 网络层（委派 host-expert）
 | 症状 | 可能根因 | Skill |

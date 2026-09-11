@@ -23,10 +23,10 @@ This is a **class of bugs**, not a single issue. Fixed in kubelet v1.20+ with HT
 
 ## Workflow
 
-1. **check_kubernetes_nodes()** — node Ready=Unknown? conditions all Unknown?
-2. **check_cpu()** — CPU/load normal? (if normal, not a CPU starvation issue)
-3. **check_memory()** — memory normal? (if normal, not OOM)
-4. **check_disk()** — disk util normal? (if normal, not disk IO starvation)
+1. **check_k8s_nodes()** — node Ready=Unknown? conditions all Unknown?
+2. **get_os_cpu_info()** — CPU/load normal? (if normal, not a CPU starvation issue)
+3. **get_os_mem_5s()** — memory normal? (if normal, not OOM)
+4. **get_os_block_5s()** — disk util normal? (if normal, not disk IO starvation)
 5. **Check kubelet logs** (`journalctl -u kubelet --since '30 min ago'`):
    - `transport: http2Client.notifyError got notified that the client transport was broken`
    - `rpc error: code = Unavailable desc = transport is closing`

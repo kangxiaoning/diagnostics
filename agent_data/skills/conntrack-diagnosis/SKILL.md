@@ -19,24 +19,24 @@ description: "Diagnoses kernel connection tracking (conntrack) table saturation 
 Execute the following steps in order. Do NOT skip any step. Each step's output determines whether to continue to the next or escalate.
 
 ### Step 1: Verify conntrack saturation on affected nodes
-- **check_network()** — examine dmesg for `nf_conntrack: table full, dropping packet`
+- **get_os_net_ss_s()** — examine dmesg for `nf_conntrack: table full, dropping packet`
 - Confirm current conntrack count vs max (`sysctl net.netfilter.nf_conntrack_max`)
 - **Expected for this scenario**: `nf_conntrack: table full (131072/131072 entries)` in dmesg
 
 ### Step 2: Assess cluster impact
-- **check_kubernetes_nodes()** — verify `NetworkUnavailable=True` on worker-5 and worker-8
-- **get_cluster_events()** — look for DNS timeout events, readiness probe failures
+- **check_k8s_nodes()** — verify `NetworkUnavailable=True` on worker-5 and worker-8
+- **get_k8s_cluster_events()** — look for DNS timeout events, readiness probe failures
 - **Expected**: NetworkUnavailable=True, ReadinessProbeFailed events citing DNS timeout
 
 ### Step 3: Identify high-connection sources
-- **check_processes()** — find processes with unusually high ESTAB connection counts
+- **get_os_cpu_ps_elf()** — find processes with unusually high ESTAB connection counts
 - Look for: service mesh sidecars (envoy/istio-proxy) with 5000+ connections
 - Look for: connection pool exhaustion in application logs
 - **Expected for this scenario**: api-gateway or envoy sidecar with ESTAB 5000+ connections
 
 ### Step 4: Check CoreDNS impact
-- **get_coredns_logs(tail_lines=200)** — look for UDP i/o timeout errors
-- **describe_coredns()** — verify CoreDNS replicas are healthy and sufficient
+- **get_k8s_coredns_logs(tail_lines=200)** — look for UDP i/o timeout errors
+- **describe_k8s_coredns()** — verify CoreDNS replicas are healthy and sufficient
 - **Expected**: CoreDNS error logs with `read udp ... i/o timeout`
 
 ### Step 5: Root cause classification

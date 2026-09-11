@@ -6,13 +6,13 @@ description: >
   anomalous.
 ---
 
-1. `check_cpu()` — examine vmstat r/b columns, us/sy/wa/id percentages
+1. `get_os_cpu_info()` — examine vmstat r/b columns, us/sy/wa/id percentages
 2. Classify bottleneck:
    - `wa > 30%` → IO-bound, cross-reference with disk-io-diagnosis
    - `sy > us` → kernel overhead, check system calls / softirq
-   - `r > CPU cores` → CPU saturated, check_processes() for top consumers
+   - `r > CPU cores` → CPU saturated, get_os_cpu_ps_elf() for top consumers
    - `b > 0` + wa not high → possible lock contention
-3. `check_processes()` — count D-state processes
+3. `get_os_cpu_ps_elf()` — count D-state processes
    - ≥2 D-state → strong IO bottleneck signal
    - high %CPU user mode → application compute bottleneck
 4. If suspected IO: switch to disk-io-diagnosis skill

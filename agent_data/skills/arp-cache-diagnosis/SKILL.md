@@ -13,8 +13,8 @@ description: "Diagnoses Linux ARP neighbor table overflow -- when `arp_cache: ne
 
 ## Workflow
 
-1. **check_kubernetes_nodes()** — any node with `NetworkUnavailable=True`?
-2. **check_network()** — look for `arp_cache: neighbor table overflow!` in dmesg
+1. **check_k8s_nodes()** — any node with `NetworkUnavailable=True`?
+2. **get_os_net_ss_s()** — look for `arp_cache: neighbor table overflow!` in dmesg
 3. **On affected node**: `ip neigh show nud stale | wc -l` — count stale entries
 4. **Check GC thresholds**: `sysctl net.ipv4.neigh.default.gc_thresh1/2/3`
 

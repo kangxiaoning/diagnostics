@@ -8,8 +8,8 @@ description: >
 
 ## General workflow
 
-1. `check_kubernetes_pods(namespace)` — READY, STATUS, RESTARTS
-2. `check_kubernetes_nodes()` — readiness, MemoryPressure, DiskPressure
+1. `check_k8s_pods(namespace)` — READY, STATUS, RESTARTS
+2. `check_k8s_nodes()` — readiness, MemoryPressure, DiskPressure
 3. Route based on status:
    - OOMKilled → follow OOMKilled workflow below
    - CrashLoopBackOff → check logs/describe for exit reason
@@ -18,9 +18,9 @@ description: >
 
 ## OOMKilled workflow
 
-1. `check_kubernetes_pods()` → confirm OOMKilled, note memory limit
-2. `check_kubernetes_nodes()` → check for MemoryPressure on affected node
-3. `check_memory()` → distinguish node-level vs pod-level shortage
+1. `check_k8s_pods()` → confirm OOMKilled, note memory limit
+2. `check_k8s_nodes()` → check for MemoryPressure on affected node
+3. `get_os_mem_5s()` → distinguish node-level vs pod-level shortage
 4. Compare: pod memory limit vs actual peak usage from describe output
 5. Differentiate:
    - `peak > limit` → increase resources.limits.memory

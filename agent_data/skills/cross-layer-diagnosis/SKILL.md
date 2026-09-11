@@ -17,15 +17,15 @@ A failure at any layer cascades downward. The key principle: **always check the 
 
 ## Workflow
 
-1. **check_kubernetes_nodes()** — Is the node NotReady/Unknown?
+1. **check_k8s_nodes()** — Is the node NotReady/Unknown?
    - `Ready=Unknown && NodeStatusUnknown` → kubelet stopped posting → check host layer
    - `Ready=True` but pods failing → check kubelet events and host resources
 
 2. **Identify the host-layer trigger using cluster info from node conditions:**
-   - `DiskPressure=True` → **disk I/O starvation**: run `check_disk()`
-   - `MemoryPressure=True` → **host memory shortage**: run `check_memory()`
-   - `NetworkUnavailable=True` → **kernel networking**: run `check_network()`
-   - All conditions `Unknown` → **kubelet dead/unreachable**: check `dmesg` in `check_processes()` and `check_memory()`
+   - `DiskPressure=True` → **disk I/O starvation**: run `get_os_block_5s()`
+   - `MemoryPressure=True` → **host memory shortage**: run `get_os_mem_5s()`
+   - `NetworkUnavailable=True` → **kernel networking**: run `get_os_net_ss_s()`
+   - All conditions `Unknown` → **kubelet dead/unreachable**: check `dmesg` in `get_os_cpu_ps_elf()` and `get_os_mem_5s()`
 
 3. **Cross-reference** host data with pod symptoms:
    - Host iowait > 50% AND kubelet D-state → **Disk IO blocking kubelet lease**
@@ -76,4 +76,4 @@ Fix:    Set CPU limits, add node anti-affinity, tune probe `timeoutSeconds`
 ## Summary
 - Host-layer metrics always have priority over pod-level assumptions
 - Kubelet is a single point of failure — protect its IO and CPU
-- Cross-reference: a disk issue on one node should show consistently in `check_disk()` AND `check_processes()` AND `check_kubernetes_nodes()`
+- Cross-reference: a disk issue on one node should show consistently in `get_os_block_5s()` AND `get_os_cpu_ps_elf()` AND `check_k8s_nodes()`

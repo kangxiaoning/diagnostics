@@ -45,8 +45,8 @@ net.ipv4.tcp_abort_on_overflow → 1 causes RST instead of silent drop (use only
 
 ## Workflow
 
-1. **check_network()** — interface errors? softirq drops?
-2. **check_processes()** — is the application setting socket options?
+1. **get_os_net_ss_s()** — interface errors? softirq drops?
+2. **get_os_cpu_ps_elf()** — is the application setting socket options?
 3. **Audit sysctl** — `sysctl -a | grep -E 'rmem|wmem|backlog|tcp_tw|somaxconn|netdev'`
 4. **ss -ti** — per-connection TCP window and retransmit diagnostics
 5. **nstat** — kernel-wide TCP counters for overflow/drop patterns

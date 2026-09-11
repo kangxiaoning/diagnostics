@@ -14,8 +14,8 @@ description: Diagnoses network packet loss caused by softirq starvation — when
 
 ## Workflow
 
-1. **check_network()** — look for `rx_dropped` or `rx_missed_errors` in interface stats
-2. **check_cpu()** — check if `sys%` is abnormally high (softirq shows as sys CPU)
+1. **get_os_net_ss_s()** — look for `rx_dropped` or `rx_missed_errors` in interface stats
+2. **get_os_cpu_info()** — check if `sys%` is abnormally high (softirq shows as sys CPU)
 3. **On affected node**, run the ring buffer / softirq diagnostic chain below
 
 ## Diagnostic Chain

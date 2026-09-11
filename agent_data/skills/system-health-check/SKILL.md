@@ -2,11 +2,11 @@
 name: system-health-check
 description: >
   Quick system health assessment. Use when user reports general slowness,
-  unknown symptoms, or wants a first-pass check. Calls get_system_overview
+  unknown symptoms, or wants a first-pass check. Calls get_os_system_overview
   then routes to subsystem skills based on findings.
 ---
 
-1. `get_system_overview()` — check uptime, load average, kernel version
+1. `get_os_system_overview()` — check uptime, load average, kernel version
 2. Route based on load:
    - load < 2× cores → normal, no urgent action
    - load > 2× cores → proceed to cpu-diagnosis skill
