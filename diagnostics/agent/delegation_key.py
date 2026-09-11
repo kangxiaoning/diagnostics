@@ -82,3 +82,14 @@ def delegation_key(state: Any) -> str:
 def delegation_key_from_request(request: Any) -> str:
     """``delegation_key`` for middleware hooks, which see a request."""
     return delegation_key(getattr(request, "state", None) or {})
+
+
+def delegation_text_from_request(request: Any) -> str:
+    """Delegation instruction text for middleware hooks.
+
+    Public accessor for the same first-HumanMessage derivation the key
+    uses: callers that need to READ the instruction (e.g. the evidence
+    ledger parsing the target hypothesis out of it) must not re-derive
+    it, or the two views can drift.
+    """
+    return _first_human_text(getattr(request, "state", None) or {})

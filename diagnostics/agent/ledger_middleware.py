@@ -67,7 +67,6 @@ from diagnostics.agent.ledger import (
     new_ledger,
     record_finding,
     record_round,
-    render_derived_report_appendix,
     render_failure_digest,
     render_ledger_context,
     render_unrecorded_evidence_appendix,
@@ -82,6 +81,19 @@ from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，desig
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
+from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
+    delegation_key_from_request,
+    delegation_text_from_request,
+)
+from diagnostics.agent.dedup_middleware import (  # v3.37.0 证据条目失败分类（SSOT）
+    _is_tool_failure,
+)
+from diagnostics.agent.evidence_ledger import (  # v3.37.0 原始证据层（design document §6.6）
+    build_artifact_entry,
+    drop_excerpts,
+    is_metric_tool,
+    record_artifact,
+)
 from deepagents.middleware._utils import append_to_system_message
 
 from diagnostics.agent.model_usage import (
@@ -172,8 +184,12 @@ _FILE_TOOL_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
 # (the scope guard middleware was removed — see README), so the mechanism
 # holds for the mock backend and any future production backend alike.
 _HOST_ARGUS_TOOLS: frozenset[str] = frozenset({
-    "query_argus_cpu", "query_argus_memory",
-    "query_argus_disk", "query_argus_network",
+    "get_argus_os_overview_metrics",
+    "get_argus_os_cpu_metrics", "get_argus_os_mem_metrics",
+    "get_argus_os_disk_metrics", "get_argus_os_net_metrics",
+    "get_argus_os_nas_metrics", "get_argus_os_ping_metrics",
+    "get_argus_os_tcp_metrics", "get_argus_os_kernel_metrics",
+    "get_argus_os_load_metrics", "get_argus_os_ntp_metrics",
 })
 
 # ── propose_hypotheses validation-feedback enhancement ──
@@ -468,6 +484,18 @@ _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # r
 _MODEL_MAX_ATTEMPTS = max(1, int(os.getenv("DIAGNOSTICS_MODEL_MAX_ATTEMPTS", "3")))  # total attempts (1 initial + retries); floor 1
 _MODEL_RETRY_BACKOFF_BASE = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BASE", "2"))  # backoff base seconds (doubles per attempt)
 _MODEL_RETRY_BACKOFF_MAX = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BACKOFF_MAX", "30"))  # backoff cap seconds
+
+# ── 模型不可用 fail-fast（2026-09-10，§8）──
+# 连续 N 个**轮次**的模型调用全部失败（传输层不可用）时判定"模型服务不可用"，
+# 置终态标记并立即结束会话——避免"失败→兜底报告→再进一轮"的空转。
+# 实证（2026-09-10 场景 39）：模型不可达期间会话空转 352 轮 / 1056 次尝试
+# 达 1 小时，台账 rounds 记录为空、产出 270 字符桩报告，期间无任何诊断动作。
+# 语义依据：重试（G7'，同轮内 attempts）与轮次（诊断推进）必须分离——
+# OpenTelemetry 语义约定把重试建模为独立维度，SRE 实践要求重试预算而非
+# 无限重试风暴。连续失败阈值保守取 2（单轮失败多为瞬时抖动；连续两轮
+# 全失败即视为后端不可用）。
+_MODEL_UNAVAILABLE_STREAK = max(
+    2, int(os.getenv("DIAGNOSTICS_MODEL_UNAVAILABLE_STREAK", "2")))
 
 # ── Expert verdict text-signal patterns ───────────────────────────────────
 # Used by verify-stall detection to infer verdict from expert subagent
@@ -818,9 +846,9 @@ def _argus_delegation_desc(expert: str, entity: str, time_hint: str) -> str:
     if expert == "k8s-argus-expert":
         return (
             f"查询并分析 {entity} 集群 Argus K8s 指标时序"
-            f"（query_argus_k8s_cluster: API延迟/etcd/DNS/节点就绪，"
-            f"query_argus_k8s_node/workload/pod: 节点/工作负载/Pod 维度，"
-            f"query_argus_k8s_etcd: etcd 指标）。{time_hint}。"
+            f"（get_argus_k8s_cluster_metrics: API延迟/etcd/DNS/节点就绪，"
+            f"get_argus_k8s_node_metrics/workload/pod: 节点/工作负载/Pod 维度，"
+            f"get_argus_k8s_master_metrics: etcd 指标）。{time_hint}。"
             if entity else
             "查询并分析 K8s 集群 Argus 指标时序"
             "（集群概览、节点状态、工作负载、Pod 重启、etcd）"
@@ -1194,6 +1222,21 @@ _RETRYABLE_EXC_NAMES = frozenset({
     "ConnectTimeout", "ReadTimeout", "PoolTimeout",
     "RemoteProtocolError", "ServiceUnavailableError",
 })
+
+
+def _resolved_model_base_url() -> str:
+    """模型后端解析后的 base_url（传输层诊断用；失败返回空串）。
+
+    仅供观测：模型不可用类故障必须能区分"后端未监听（Connection refused）/
+    端口配置错 / 连接池残留（ReadError）/ 真超时"，否则分析只能靠猜
+    （2026-09-10 实证：httpx.ReadError 被包装为 APIConnectionError，日志中
+    看不到目标地址）。
+    """
+    try:
+        from diagnostics.config import Settings
+        return Settings.from_env().base_url
+    except Exception:  # noqa: BLE001 — 观测性不得成为故障源
+        return ""
 
 
 def _is_retryable_model_error(exc: BaseException) -> bool:
@@ -1595,6 +1638,38 @@ def _build_dynamic_ctx(ledger: dict) -> str:
     return "\n".join(lines)
 
 
+def _expert_budget_block(subagent_type: str) -> str:
+    """P-2 (v3.35.0): declare the delegation's tool-call budget up front.
+
+    The expert progress block only appears AFTER the first executed call
+    (selective injection), so until then the expert has no cost signal at
+    all and plans an unbounded investigation — measured 2026-09-11: 36
+    G19-ext interventions (21 soft nudges + 15 hard blocks) across two log
+    segments.  Evidence for budget-as-signal: Budget-Aware Tool-Use
+    (COLM 2026, arXiv:2511.17006) — per-step in-context budget awareness
+    breaks the test-time-scaling plateau; BAGEN (arXiv:2606.00198) — LLM
+    budget estimates are systematically optimistic (alarms fire only in
+    the last 20%), so the number must be externalised rather than left to
+    self-estimation.
+
+    Positive recipe only (P7): states the two thresholds and the planning
+    use, never a prohibition.
+    """
+    if not subagent_type:
+        return ""
+    from diagnostics.agent.expert_stall_watchdog import _total_hard, _total_soft
+
+    soft, hard = _total_soft(), _total_hard()
+    return (
+        "## 本次委派取证预算（按工具调用计数；结论工具不计）\n"
+        f"- 软阈值 {soft} 次：到达时盘点已采集证据——足够置信即收尾，"
+        "仍有关键缺口只补最关键的 1-2 项\n"
+        f"- 硬阈值 {hard} 次：系统将强制收尾，尚未取证的维度需在结论 "
+        "coverage_gaps 按『维度名：类型｜原因』声明（类型：数据不可用/不适用/强制收尾）\n"
+        "- 预算用于规划取证节奏：概览先行 → 定向深查 → 及时收尾"
+    )
+
+
 def _build_subagent_context(ledger: dict, subagent_type: str = "",
                             max_chars: int = 24000,
                             stable_cache: dict | None = None) -> str:
@@ -1617,6 +1692,9 @@ def _build_subagent_context(ledger: dict, subagent_type: str = "",
     parts: list[str] = []
     if stable:
         parts.append(stable)
+    budget = _expert_budget_block(subagent_type)
+    if budget:
+        parts.append(budget)
     if dynamic:
         parts.append(dynamic)
     context = "\n".join(parts)
@@ -1648,7 +1726,11 @@ def _sanitize_ledger(ledger: dict) -> dict:
     """Strip internal fields from ledger before sending to frontend/streaming."""
     internal_keys = {"_inconclusive_streak", "_backtrack_count",
                      "_root_propose_count", "_propose_count"}
-    return {k: v for k, v in ledger.items() if k not in internal_keys}
+    out = {k: v for k, v in ledger.items() if k not in internal_keys}
+    # Evidence excerpts (design document §6.6, v3.37.0) serve the report-time
+    # LLM context and the persisted ledger file; they need not ride every
+    # streaming snapshot (one <=600-char excerpt per gathered result).
+    return drop_excerpts(out)
 
 
 # ── Agent memory injection (replaces deepagents MemoryMiddleware) ──
@@ -1893,6 +1975,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         )
         self._current_ledger: DiagnosisLedger | None = None
         self._model_call_count: int = 0
+        # ── 模型调用健康度计数（2026-09-10，§8 模型不可用 fail-fast）──
+        # attempts（尝试）与 rounds（诊断轮次）分离计量；连续失败达到阈值
+        # 即置终态 model_unavailable 并短路后续轮次，避免空转风暴。
+        self._model_attempts_total: int = 0
+        self._model_success_rounds: int = 0
+        self._model_failure_rounds: int = 0
+        self._model_failure_streak: int = 0
+        self._model_unavailable_hits: int = 0
         # Subagent-only call counter for log triage: before_model is a
         # no-op for subagents (their rounds are not ledger rounds), so
         # the inherited _model_call_count never advances.
@@ -2203,6 +2293,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse | ExtendedModelResponse:
+        # ── 模型不可用 fail-fast（2026-09-10，§8）──
+        # 连续 N 轮模型调用全部失败后已判定后端不可用：不再进入模型调用，
+        # 直接返回可结束循环的空响应（与 G7 兜底注入的 synthetic write_file
+        # 配对，保证图状态干净退出），避免"失败→兜底报告→再失败"的空转风暴
+        # （实证 2026-09-10 场景 39：352 轮 / 1056 次尝试 / 1 小时空转）。
+        _led_fast = self._current_ledger
+        if _led_fast is not None and _led_fast.get("_model_unavailable"):
+            self._model_unavailable_hits += 1
+            if self._model_unavailable_hits == 1:
+                logger.error(
+                    "Model unavailable fail-fast: short-circuiting model call "
+                    "(round=%d, terminal_reason=%s) — 会话不再重试模型调用",
+                    self._model_call_count,
+                    _led_fast.get("_terminal_reason", "model_unavailable"),
+                )
+            return ModelResponse(result=[AIMessage(content="")])
+
         # Subagent: skip ledger context injection and safety warnings.
         # The Coordinator already passes relevant context via task() description.
         if self._is_subagent:
@@ -2411,7 +2518,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # attempt fails does the G7 fallback (else-branch) fire.
         response = None
         _call_error: BaseException | None = None
+        _attempts_used = 0
         for _attempt in range(1, _MODEL_MAX_ATTEMPTS + 1):
+            _attempts_used = _attempt
             try:
                 response = await asyncio.wait_for(
                     handler(_call_request),
@@ -2430,6 +2539,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if isinstance(_exc, asyncio.TimeoutError)
                     else f"{type(_exc).__name__}: {_exc}"
                 )
+                # 传输层诊断（2026-09-10）：附上解析后的 base_url，便于
+                # 区分"后端未监听 / 端口错 / 连接池残留 / 真超时"。
+                _base = _resolved_model_base_url()
+                if _base:
+                    _err_label = f"{_err_label} [base_url={_base}]"
                 if _attempt < _MODEL_MAX_ATTEMPTS:
                     _backoff = _retry_backoff_seconds(_attempt)
                     logger.warning(
@@ -2448,6 +2562,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _phase(ledger), _err_label,
                 )
         if _call_error is None:
+            # 计数分离（2026-09-10）：成功轮次与模型尝试分别累计，
+            # attempts/retries 不再混入诊断轮次语义。
+            self._model_success_rounds += 1
+            self._model_failure_streak = 0
+            self._model_attempts_total += _attempts_used
+            if self._current_ledger is not None:
+                self._current_ledger["model_attempts_total"] = \
+                    self._model_attempts_total
+                self._current_ledger["model_success_rounds"] = \
+                    self._model_success_rounds
             # ── Per-round inference metrics ──
             import time as _time2
             _duration = round(_time2.monotonic() - self._inference_start, 1)
@@ -2524,6 +2648,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # 720c4c8a: an UnboundLocalError in this handler killed the
             # stream after the report had already been written).
             try:
+                # ── 模型不可用判定 + 计数分离（2026-09-10，§8）──
+                # 连续 N 轮全失败 ⇒ 判定后端不可用：置终态标记，后续轮次由
+                # awrap_model_call 顶部短路（不再调用模型），避免空转风暴。
+                self._model_failure_streak += 1
+                self._model_failure_rounds += 1
+                self._model_attempts_total += _attempts_used
+                ledger["model_attempts_total"] = self._model_attempts_total
+                ledger["model_failure_rounds"] = self._model_failure_rounds
+                ledger["model_success_rounds"] = self._model_success_rounds
+                if self._model_failure_streak >= _MODEL_UNAVAILABLE_STREAK:
+                    ledger["_model_unavailable"] = True
+                    ledger["_terminal_reason"] = "model_unavailable"
+                    logger.error(
+                        "模型服务不可用：连续 %d 轮模型调用全部失败"
+                        "（round=%d，最后错误=%s）——置终态 terminal_reason="
+                        "model_unavailable，以披露式报告结束，不再重试",
+                        self._model_failure_streak, self._model_call_count,
+                        _err_label,
+                    )
+
                 # ── Finalize pending hypotheses ──
                 # Any hypothesis still in "pending" state was never
                 # reached by the LLM.  Hard-close as refuted with
@@ -4144,26 +4288,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "(round %d, %d chars)",
                         self._model_call_count, len(_appendix),
                     )
-                # ── Ledger-derived sections (design document §9,
-                # v3.14.0): evidence-layer labels, topology mapping,
-                # delegated experts and refuted hypotheses are computed
-                # from the ledger and injected on every gate-passing
-                # write — structured ledger data never depends on LLM
-                # transcription (fail-open, same channel as the
-                # evidence-closure appendix above).
-                _derived = render_derived_report_appendix(ledger)
-                if (_derived
-                        and not _is_stub_echo_write
-                        and isinstance(tool_args.get("content"), str)
-                        and "系统附录：台账派生数据" not in tool_args["content"]):
-                    tool_args["content"] = (
-                        tool_args["content"].rstrip() + _derived
-                    )
-                    logger.warning(
-                        "write_file ledger-derived appendix injected "
-                        "(round %d, %d chars)",
-                        self._model_call_count, len(_derived),
-                    )
+                # NOTE: the ledger-derived appendix channel (evidence
+                # layers / topology mapping / delegated experts /
+                # refuted hypotheses, v3.14.0 - v3.36.0) was REMOVED.
+                # Every one of those sections duplicated content the
+                # report body already carries per the report contract,
+                # and the derived rendering quality was poor (truncated
+                # internal echoes in the expert list).  The obligations
+                # themselves stay with the LLM (design document §9);
+                # no system appendix is appended to report writes.
                 # ── Canonicalize the report path (v2.5) ──
                 # The report path is system-generated and handed to the
                 # LLM, which merely carries it back — LLM path
@@ -4276,13 +4409,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # in shared_backend.
         if not self._is_subagent:
             _EXPERT_ONLY_TOOLS = frozenset({
-                "query_argus_cpu", "query_argus_memory",
-                "query_argus_disk", "query_argus_network",
-                "query_argus_nodes", "query_argus_services",
-                "query_argus_k8s_cluster", "query_argus_k8s_node",
-                "query_argus_k8s_workload", "query_argus_k8s_pod",
-                "query_argus_k8s_etcd",
-                "query_argus_gpu",
+                # Host Argus（实际环境 11 维）
+                "get_argus_os_overview_metrics",
+                "get_argus_os_cpu_metrics", "get_argus_os_mem_metrics",
+                "get_argus_os_disk_metrics", "get_argus_os_net_metrics",
+                "get_argus_os_nas_metrics", "get_argus_os_ping_metrics",
+                "get_argus_os_tcp_metrics", "get_argus_os_kernel_metrics",
+                "get_argus_os_load_metrics", "get_argus_os_ntp_metrics",
+                # K8s Argus（规范 5 维）+ 家族共享 etcd
+                "get_argus_k8s_cluster_metrics", "get_argus_k8s_node_metrics",
+                "get_argus_k8s_workload_metrics", "get_argus_k8s_pod_metrics",
+                "get_argus_k8s_master_metrics", "get_argus_shared_etcd_metrics",
             })
             if tool_name in _EXPERT_ONLY_TOOLS:
                 logger.warning(
@@ -4588,12 +4725,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if self._backend and tool_name not in _OFFLOAD_SKIP and isinstance(result, ToolMessage):
             content = result.content if isinstance(result.content, str) else str(result.content)
             if content:
+                # Evidence round (design document §6.6, v3.37.0): a subagent's
+                # own round counter is frozen (before_model is a no-op there,
+                # the value is inherited at for_subagent() time), so every
+                # expert-gathered result would be stamped round 0 — read the
+                # Coordinator's live counter instead.  Same value feeds the
+                # offload path and the evidence entry, so a path is
+                # self-describing about when it was gathered.
+                _ev_round = self._model_call_count
+                _coordinator = getattr(self, "_coordinator", None)
+                if self._is_subagent and _coordinator is not None:
+                    _ev_round = _coordinator._model_call_count
                 cache_key = _make_cache_key(tool_name, tool_args)
                 safe_name = _sanitize_path_component(tool_name)
                 args_suffix = cache_key.split(":", 1)[1] if ":" in cache_key else ""
                 safe_suffix = _sanitize_path_component(args_suffix)[:24] if args_suffix else "noargs"
                 file_path = (
-                    f"{self._tool_results_prefix}/r{self._model_call_count}"
+                    f"{self._tool_results_prefix}/r{_ev_round}"
                     f"/{safe_name}_{safe_suffix}.txt"
                 )
                 try:
@@ -4602,15 +4750,43 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 except Exception:
                     file_path = ""
                     logger.debug("Offload write skipped for %s (backend error)", tool_name)
-                # Store metadata in ledger for context injection
-                lines = content.splitlines()
+                # Store metadata in ledger for context injection AND register
+                # the raw-evidence entry (design document §6.6, v3.37.0):
+                # addressable ID, actor, target args, hypothesis attribution
+                # (parsed from the delegation instruction) and a deterministic
+                # verbatim excerpt.  Attribution by code — the LLM never
+                # transports evidence text.
                 if self._current_ledger is not None:
-                    self._current_ledger.setdefault("tool_results", {})[cache_key] = {
-                        "path": file_path,
-                        "round": self._model_call_count,
-                        "preview": content[:200].replace("\n", " "),
-                        "lines": len(lines),
-                    }
+                    _hid = ""
+                    _delegation = ""
+                    if self._is_subagent:
+                        _delegation = delegation_key_from_request(request)
+                        _hid = _parse_hypothesis_id_from_description(
+                            delegation_text_from_request(request),
+                            self._current_ledger.get("hypotheses", {}),
+                        ) or ""
+                    _entry = build_artifact_entry(
+                        self._current_ledger,
+                        tool=tool_name,
+                        args=tool_args,
+                        content=content,
+                        source_path=file_path,
+                        round_no=_ev_round,
+                        actor="expert" if self._is_subagent else "coordinator",
+                        hypothesis_id=_hid,
+                        delegation=_delegation,
+                        is_failure=_is_tool_failure(content),
+                    )
+                    _stored = record_artifact(self._current_ledger, cache_key, _entry)
+                    logger.debug(
+                        "evidence entry %s: %s (round=%d, actor=%s, %d chars%s)",
+                        _stored.get("ev_id") or "(dedup)",
+                        tool_name,
+                        _ev_round,
+                        _stored.get("actor"),
+                        len(content),
+                        ", failure" if _stored.get("is_failure") else "",
+                    )
 
         # Use the in-memory ledger (shared via self._current_ledger)
         ledger = self._current_ledger
@@ -4734,13 +4910,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 tool_name=tool_name,
                                 structured=_structured_expert,
                             )
-                    else:
+                    elif not is_metric_tool(tool_name):
                         add_evidence_to_active(
                             ledger, source, summary,
                             supports=None,
                             tool_call_id=tool_call_id,
                             tool_name=tool_name,
                             structured=_structured_expert,
+                        )
+                    else:
+                        # ── Metric-layer exclusion (v3.37.1, user decision
+                        # 2026-09-11) ──
+                        # Argus results are metric time series; raw series
+                        # are not report-grade material ("当前基于时序总结的
+                        # 格式满足要求"), and the Argus experts already deliver
+                        # the summary form through their structured return.
+                        # The raw series is therefore NOT attached to a
+                        # hypothesis as evidence (it used to land on the
+                        # ACTIVE hypothesis — often not even the one under
+                        # verification).  Offload, the evidence-ledger entry
+                        # (§6.6) and the round record are unaffected, so
+                        # traceability, progress and stall semantics keep
+                        # working.
+                        logger.debug(
+                            "metric raw output not attached as evidence: %s "
+                            "(round=%d)", tool_name, self._model_call_count,
                         )
 
             # Build key_findings from tool output.
@@ -4910,13 +5104,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             if (_apx
                                     and "已采集未落账证据" not in content):
                                 content = content.rstrip() + _apx
-                            # Ledger-derived sections (design document
-                            # §9, v3.14.0) — deterministic rendering on
-                            # the rewrite path too.
-                            _drv = render_derived_report_appendix(ledger)
-                            if (_drv
-                                    and "系统附录：台账派生数据" not in content):
-                                content = content.rstrip() + _drv
+                            # NOTE: no ledger-derived appendix on the
+                            # rewrite path either (removed, v3.36.0) —
+                            # those sections duplicate the report body
+                            # (design document §9).
                         ledger["report"] = content
                         if not _is_stub_echo:
                             ledger["_report_auto_generated"] = False
@@ -5166,15 +5357,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             rounds_history = ledger.get("rounds", [])
             _data_collection_tools = frozenset({
                 "task",
-                "query_argus_nodes", "query_argus_services",
-                "query_argus_k8s_cluster", "query_argus_k8s_node",
-                "query_argus_k8s_workload", "query_argus_k8s_pod",
-                "query_argus_k8s_etcd",
-                "query_argus_cpu",
-                "query_argus_memory", "query_argus_disk",
-                "query_argus_network", "query_argus_gpu",
-                "check_kubernetes_pods", "check_kubernetes_nodes",
-                "check_gpu_nodes",
+                "get_argus_os_overview_metrics",
+                "get_argus_k8s_cluster_metrics", "get_argus_k8s_node_metrics",
+                "get_argus_k8s_workload_metrics", "get_argus_k8s_pod_metrics",
+                "get_argus_k8s_master_metrics", "get_argus_shared_etcd_metrics",
+                "get_argus_os_cpu_metrics",
+                "get_argus_os_mem_metrics", "get_argus_os_disk_metrics",
+                "get_argus_os_net_metrics", "get_argus_os_nas_metrics",
+                "get_argus_os_ping_metrics", "get_argus_os_tcp_metrics",
+                "get_argus_os_kernel_metrics", "get_argus_os_load_metrics",
+                "get_argus_os_ntp_metrics",
+                "check_k8s_pods", "check_k8s_nodes", "check_k8s_control_plane",
+                "get_gpu_status_info",
             })
             has_collected_data = any(
                 _data_collection_tools & set(r.get("tools_called", []))

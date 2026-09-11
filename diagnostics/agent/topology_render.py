@@ -183,7 +183,7 @@ def build_argus_compact_view(topology: dict, view_key: str) -> dict:
                 item["physical_pods"] = pods
             items.append(item)
         payload["serverless_views"] = items
-        # 共享 etcd 独立块（供 query_argus_shared_etcd 的 host_name 参数）——§5A.5
+        # 共享 etcd 独立块（供 get_argus_shared_etcd_metrics 的 host_name 参数）——§5A.5
         etcd = [_etcd_member_compact(v) for v in (topology.get("etcd_views") or [])]
         if etcd:
             payload["etcd_views"] = etcd
@@ -421,7 +421,7 @@ def build_argus_context_view(topology: dict, expert: str,
 
     # ── naming rules (deterministic derivation basis, JSON form) ──
     # Per-role slices: each rule is injected only where a consumer exists.
-    # sci_pod is consumed solely by the sci expert (query_argus_sci_pod
+    # sci_pod is consumed solely by the sci expert (get_argus_k8s_pod_metrics
     # takes the physical burst-pod name; the view carries logical names) —
     # zero-consumer template text in other experts' blocks is a pure
     # misdirection surface (§7.3 minimal sufficient context).
@@ -536,203 +536,6 @@ def render_json_block(title: str, payload: dict) -> str:
 def coordinator_block(topology: dict, title: str = "环境拓扑（Serverless RelationGraph）") -> str:
     """Render the Coordinator's compact topology block."""
     return render_json_block(title, build_coordinator_inventory(topology))
-
-
-def _is_cluster_level_topology(topology: dict) -> bool:
-    """Cluster-level RelationGraph form detection.
-
-    The session-init query stamps ``_query_anchor`` onto the topology
-    dict (private key, same convention as ``_not_found``): cluster-level
-    form = anchor present but carries NO pod/workload/namespace scoping
-    (single_cluster serverless queries pass only cluster_name).  When
-    the marker is absent (legacy callers / unit-constructed dicts) the
-    Pod-anchored rendering applies unchanged — conservative default that
-    keeps every existing consumer's output identical.
-    """
-    anchor = topology.get("_query_anchor")
-    if not isinstance(anchor, dict):
-        return False
-    return not any(
-        str(anchor.get(k) or "").strip()
-        for k in ("namespace", "workload_name", "pod_name")
-    )
-
-
-def _render_cluster_level_mapping(topology: dict) -> str:
-    """Cluster-level topology mapping for the single-cluster serverless form.
-
-    The diagnostic subject is the three-cluster relationship, so the
-    mapping renders relation header + per-view scale summary rows
-    instead of per-resource landing rows.  Purely derived from the
-    RelationGraph — deterministic, no generative transcription.
-    Returns "" when the mapping lacks the logical cluster name.
-    """
-    m = topology.get("mapping") or {}
-    sls_c = m.get("serverless_cluster") or ""
-    if not sls_c:
-        return ""
-
-    rel = f"逻辑集群 **{sls_c}**"
-    phys = [f"{role} **{name}**" for role, name in
-            (("KMC", m.get("kmc_cluster")), ("SCI", m.get("sci_cluster")))
-            if name]
-    if phys:
-        rel += " → " + "，".join(phys)
-    monitors = [f"{c}（{m[k]}）" for c, k in
-                ((sls_c, "serverless_monitor_name"),
-                 (m.get("kmc_cluster") or "", "kmc_monitor_name"),
-                 (m.get("sci_cluster") or "", "sci_monitor_name"))
-                if m.get(k)]
-    head = rel + "\n\n"
-    if monitors:
-        head += "监控名：" + "，".join(monitors) + "\n\n"
-
-    def _cp_count(views: list[dict], flag: str) -> tuple[int, int]:
-        total = len(views)
-        cp = sum(1 for v in views if v.get(flag))
-        return total, cp
-
-    sls_views = topology.get("serverless_views") or []
-    kmc_views = topology.get("kmc_views") or []
-    sci_views = topology.get("sci_views") or []
-    etcd_views = topology.get("etcd_views") or []
-    host_nodes = build_host_views(topology)
-
-    rows: list[str] = []
-
-    def _row(view: str, total: int, cp: int, desc: str) -> None:
-        comp = f"控制面组件 {cp}" if cp else "—"
-        rest = total - cp
-        if rest:
-            comp = comp + f" + 其他资源 {rest}" if cp else "—"
-        rows.append(f"| {view} | {total} | {comp} | {desc} |")
-
-    t, cp = _cp_count(sls_views, "is_control_plane")
-    _row("逻辑集群资源（serverless_views）", t, cp,
-         "控制面 Deployment 形态下沉于 KMC")
-    t, cp = _cp_count(kmc_views, "is_kmc_control_plane")
-    _row("KMC 物理资源（kmc_views）", t, cp, "承载逻辑控制面与共享组件")
-    t, cp = _cp_count(sci_views, "is_sci_control_plane")
-    _row("SCI 数据面资源（sci_views）", t, cp, "用户工作负载物理 Pod")
-    etcd_hosts = sorted({((v.get("etcd_member") or {}).get("host_name") or "")
-                         for v in etcd_views} - {""})
-    rows.append(f"| 共享 etcd（etcd_views） | {len(etcd_views)} | — "
-                f"| {'/'.join(etcd_hosts) or '—'} |")
-    if host_nodes:
-        clusters: dict[str, int] = {}
-        for n in host_nodes:
-            c = n.get("cluster") or "?"
-            clusters[c] = clusters.get(c, 0) + 1
-        breakdown = "，".join(f"{k} {v}" for k, v in sorted(clusters.items()))
-        rows.append(f"| 物理节点（host_views 派生） | {len(host_nodes)} | — "
-                    f"| {breakdown} |")
-
-    return (head
-            + "| 视图 | 条目数 | 控制面构成 | 说明 |\n"
-            + "|---|---|---|---|\n" + "\n".join(rows))
-
-
-def report_mapping_table(topology: dict) -> str:
-    """Report-level topology mapping table (design document §9, v3.14.0).
-
-    Two forms dispatched by ``_query_anchor`` stamp:
-    - Cluster-level (single_cluster serverless): three-cluster relation
-      header + per-view scale summary rows.
-    - Pod-anchored (default): logical resource → physical layer/object/
-      landing rows.
-
-    The report's 拓扑映射 section is a transcription of structured
-    ledger data, so it is rendered by code and injected at report-write
-    time instead of being transcribed by the LLM (generative
-    transcription of structured data is a known fidelity-failure
-    surface, design document §12).
-    Returns "" when the topology carries no mappable rows.
-    """
-    if not topology:
-        return ""
-    if _is_cluster_level_topology(topology):
-        return _render_cluster_level_mapping(topology)
-
-    def _ref(ref: dict | None) -> str:
-        r = _resource_ref(ref)
-        if not r:
-            return ""
-        kind, name = r.get("kind", ""), r.get("name", "")
-        return f"{kind}/{name}" if kind else name
-
-    def _pod_desc(pod: dict) -> str:
-        desc = pod.get("name") or ""
-        if desc and pod.get("pod_id"):
-            desc += f"（IP {pod['pod_id']}）"
-        return desc
-
-    def _landing(pod: dict) -> str:
-        return pod.get("host_name") or pod.get("node_name") or ""
-
-    sci_views = topology.get("sci_views") or []
-    kmc_views = topology.get("kmc_views") or []
-    rows: list[str] = []
-    for v in topology.get("serverless_views") or []:
-        logical = _ref(v.get("resource"))
-        if not logical:
-            continue
-        res_name = (v.get("resource") or {}).get("name")
-        layer_raw = v.get("physical_cluster_type")
-        layer = getattr(layer_raw, "value", layer_raw) or ""
-        physical: list[str] = []
-        nodes: list[str] = []
-
-        def _add(desc: str, host: str) -> None:
-            if desc and desc not in physical:
-                physical.append(desc)
-            if host and host not in nodes:
-                nodes.append(host)
-
-        for p in v.get("physical_pods") or []:
-            _add(_pod_desc(p), _landing(p))
-        for sv in sci_views:
-            if (sv.get("serverless_resource") or {}).get("name") != res_name:
-                continue
-            _add(_pod_desc(sv.get("sci_pod") or {}),
-                 _landing(sv.get("sci_pod") or {}))
-        existing = {d.split("（")[0] for d in physical}
-        for kv in kmc_views:
-            if (kv.get("serverless_resource") or {}).get("name") != res_name:
-                continue
-            owner = kv.get("owner_kmc_deployment")
-            if owner:
-                oref = _resource_ref(owner)
-                _add(f"{oref.get('kind', 'Deployment')}/{oref.get('name', '')}", "")
-                continue
-            bare = ((kv.get("kmc_resource") or {}).get("name")) or ""
-            if bare and bare in existing:
-                continue
-            _add(_ref(kv.get("kmc_resource")), "")
-        rows.append(
-            f"| {logical} | {layer} | {'<br>'.join(physical) or '—'} "
-            f"| {'/'.join(nodes) or '—'} |"
-        )
-    etcd_hosts: list[str] = []
-    for ev in topology.get("etcd_views") or []:
-        h = _landing(ev.get("etcd_member") or {})
-        if h and h not in etcd_hosts:
-            etcd_hosts.append(h)
-    if etcd_hosts:
-        rows.append(f"| 共享 etcd | shared_etcd | etcd 集群 "
-                    f"| {'/'.join(etcd_hosts)} |")
-    if not rows:
-        return ""
-    m = topology.get("mapping") or {}
-    head = ""
-    if m.get("serverless_cluster"):
-        parts = [f"{k}={v}" for k, v in
-                 (("KMC", m.get("kmc_cluster")), ("SCI", m.get("sci_cluster")))
-                 if v]
-        head = (f"逻辑集群 **{m['serverless_cluster']}**"
-                + (f" → {'，'.join(parts)}" if parts else "") + "\n\n")
-    return (head
-            + "| 逻辑资源 | 物理层 | 物理对象 | 落点节点 |\n"
-            + "|---|---|---|---|\n" + "\n".join(rows))
 
 
 def expert_view(topology: dict, view_key: str) -> dict:

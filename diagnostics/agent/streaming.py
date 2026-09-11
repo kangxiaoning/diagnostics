@@ -39,7 +39,7 @@ def _make_tool_label(name: str) -> str:
 def _format_args_summary(tc_name: str, tc_args: dict) -> str:
     """Build a compact parameter summary for the think-stream tool line.
 
-    Same-named calls on different entities (e.g. query_argus_cpu on
+    Same-named calls on different entities (e.g. get_argus_os_cpu_metrics on
     master-1 vs worker-3) must be distinguishable in the text stream,
     which otherwise shows only the tool label.  Long values (delegation
     descriptions, file contents, etc.) are truncated to keep the line
@@ -81,7 +81,7 @@ def _tool_done_suffix(info: dict) -> str:
     """Build the discriminative suffix for "Tool done" log lines.
 
     Parallel experts and multi-entity collection issue same-named calls
-    that complete in the same second; bare "Tool done: query_argus_cpu"
+    that complete in the same second; bare "Tool done: get_argus_os_cpu_metrics"
     lines then read as duplicate executions (2026-08-05 scenario-39
     round-1: 12 legitimate host-argus calls across 3 SCI nodes + 2 pod
     IPs looked like 3x duplication at INFO level).  Suffix carries the
@@ -538,7 +538,7 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     tc_args = _extract_tool_args(tc)
                     # Log every tool call with its args for traceability
                     # (previously only a small whitelist had it, so expert
-                    # queries like query_argus_cpu were indistinguishable).
+                    # queries like get_argus_os_cpu_metrics were indistinguishable).
                     logger.debug("[round=%d] %s args: %s",
                                  state.round_number, tc_name,
                                  json.dumps(tc_args, ensure_ascii=False)[:300])
@@ -816,6 +816,13 @@ def _sanitize_ledger_for_event(ledger: dict[str, Any]) -> dict[str, Any]:
     """
     internal_keys = {"_inconclusive_streak", "_backtrack_count"}
     out = {k: v for k, v in ledger.items() if k not in internal_keys}
+    # Evidence excerpts (design document §6.6, v3.37.0) are for the report-time
+    # LLM context and the persisted ledger file — drop them from UI payloads.
+    try:
+        from diagnostics.agent.evidence_ledger import drop_excerpts
+        out = drop_excerpts(out)
+    except Exception:
+        pass  # best-effort; excerpts only affect payload size
     try:
         from diagnostics.agent.ledger import derive_phase
         out["current_phase"] = derive_phase(ledger)

@@ -213,6 +213,8 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 委派时使用用户指定的时间窗口（见「诊断会话参数」），**禁止自行扩大或缩小**。专家的返回格式由其系统指令预定义——不要在 description 中重复规定返回格式，只说明分析/验证目标与需确认的关键信号。会话基线与已收集证据由系统自动注入委派描述，禁止重复粘贴。委派描述里只描述症状、假设内容和期望结论，禁止引用 `/proc/**`、`/sys/**`、`/var/log/**` 等主机路径。
 
+**取证范围点名（结论校验依据，v3.35.0）**：在 description 末尾写一行 `相关维度：X、Y`（2-5 项，取自该专家工具的观测维度——K8s 侧如 `Pod`、`Pod日志`、`事件`、`节点`、`控制面`、`etcd`、`网络`、`存储`、`资源用量`、`集群概览`；主机侧如 `CPU`、`内存`、`磁盘IO`、`网络`、`内核日志`）。系统据此校验专家结论完整性：点名的维度需"取证或声明"，其余维度不再计入校验。未点名时按该专家**工具面全维度**校验，专家会被要求对十余个无关维度逐条声明（多花一轮且稀释结论）。点名只限定**校验范围**，不限制专家自主扩展取证。
+
 **委派描述中立性（design document §9 v3.2.2）**：描述只陈述**症状 + 待验证问题**，**禁止预设异常方向或疑似结论**（如把"Pod 为何 Pending"写成"检查 OOMKilled 事件"）——引导性描述会污染专家取证（谄媚效应：模型倾向迎合提示中暗示的观点，arXiv:2310.13548），让专家客观勘察后再下结论。
 </delegation_params>
 {serverless_routing}
@@ -251,10 +253,10 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 **根因置信度**：{{高/中/低}}（{{百分比}}）
 
 ## 证据链与时间线
-（按诊断步骤描述关键发现，标注每个证据的来源和置信度）
+（按诊断步骤描述关键发现；每条关键证据给出**可核验锚点**——工具名 + 实体（Pod/节点/集群）+ 时间窗，并标注置信度；指标类证据以**时序总结**表述（不粘贴原始数据序列）；系统在报告期注入的「证据编号」（如 EV-r6-2）可直接引用。内部文件路径不得写入报告）
 
 ## 根因分析
-- **最终假设**：已被证实的根因（如有多根因，按条目分别列出）；每条根因的证据层级（【深度确证】/【指标直接观测】）与置信度由系统附录基于台账确定性标注，无需手动标注
+- **最终假设**：已被证实的根因（如有多根因，按条目分别列出）；每条根因须标注证据层级（【深度确证】/【指标直接观测】）与置信度
 - **排除的假设**：验证后被排除的竞争性假设及排除原因
 - **证据链**：工具A发现X → 工具B确认Y → 专家C验证Z
 
@@ -267,7 +269,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 3. 预防措施与长期改进建议
 
 ## 附录
-- 委派的专家及各自关键发现（注：根因证据层级、拓扑映射（如适用）、委派专家清单、排除假设清单由系统附录确定性生成并自动注入——无需手写，正文可引用其内容）
+- 委派的专家及各自关键发现（逐专家列出：专家名 + 关键证据与结论）
 ```
 
 **根因断言范围**（严格遵守）：
@@ -329,7 +331,7 @@ _DEDICATED_EXAMPLE = """<example>
 
 UNDERSTAND (委派当前场景的 Argus 专家并行采集):
   当前场景 Argus 专家：host-argus-expert、k8s-argus-expert
-  → task(subagent_type="host-argus-expert", description="查询并分析 prod-cluster 集群 Argus 指标时序（2026-07-01 15:00:00 ~ 15:10:00）：重点关注 query_argus_k8s_workload 的 Pod 重启、query_argus_k8s_node 的节点 NotReady，以及 query_argus_k8s_cluster 的 API 延迟")
+  → task(subagent_type="host-argus-expert", description="查询并分析 prod-cluster 集群 Argus 指标时序（2026-07-01 15:00:00 ~ 15:10:00）：重点关注 get_argus_k8s_workload_metrics 的 Pod 重启、get_argus_k8s_node_metrics 的节点 NotReady，以及 get_argus_k8s_cluster_metrics 的 API 延迟")
   → task(subagent_type="host-argus-expert", description="查询并分析 worker-3 主机 CPU/内存 Argus 指标时序（同上时间窗），关注节点资源压力时间点")
   （其余 Argus 专家按相同格式并行委派）
   (Argus 专家委派完成后——含返回参数澄清的情形——系统自动进入 HYPOTHESIZE)
@@ -402,10 +404,8 @@ VERIFY (聚焦 H1, 委派当前场景领域专家):
 EVALUATE → 退出条件满足（根因确认 p≥80，系统自动进入 REPORT）
 REPORT:
   → write_file(file_path="{report_path}", content=诊断报告)
-  （Serverless 报告必含「拓扑映射」章节——示例骨架：
-    ## 拓扑映射
-    | 逻辑资源（my-sls-cluster） | 物理集群 | 物理 Pod | 节点（host_name） |
-    | apiserver（控制面组件） | kmc-prod01 | apiserver-deployment-xxx | kmc-node-01/02 |
+  （环境拓扑是诊断输入，报告不必整表复述——仅当定位跨逻辑/物理层时用 1~2 行给出对应关系，
+    例如「逻辑集群 my-sls-cluster 的 API 超时 ← KMC 控制面 apiserver（kmc-prod01/kmc-node-01）负载」；
     证据链每条标注来源视角：kmc-argus-expert 发现 CPU 突增（cluster_view=kmc）→ …）
   （台账已由系统自动持久化；随后用 3~5 句话向用户总结）
 </example>"""
@@ -537,11 +537,11 @@ _SCENE_EXAMPLES = {
 # sections outperforms narrative instructions.
 _SERVERLESS_REPORT_ADDENDUM = """
 <report_contract_serverless>
-## Serverless 报告附加契约（本场景必含章节清单）
+## Serverless 报告附加契约（本场景必含要点）
 
-- [ ] **拓扑映射**：映射表由系统附录确定性注入（数据取自会话拓扑，无需手写、禁止凭空编造）
+- [ ] **跨层定位**：根因结论须说明逻辑集群症状与物理集群根因位置的对应关系（环境拓扑是诊断输入；仅当需要解释定位时给出必要的逻辑→物理对应，不要求完整映射表）
 - [ ] 证据链中每条证据标注来源视角（`cluster_view`）：serverless（逻辑集群）/ kmc（控制面）/ sci（数据面）/ host（物理主机）
-- [ ] 根因结论必须同时给出逻辑集群症状与物理集群根因位置的对应关系
+- [ ] 证据链中的关键证据给出可核验锚点（工具名 + 实体 + 时间窗）
 </report_contract_serverless>
 """
 

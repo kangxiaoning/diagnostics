@@ -243,7 +243,12 @@ def new_ledger(entity_type: str = "", hostname: str = "",
         exhausted=False,
         skill_mode=False,
         skill_ids=[],
-        tool_results={},               # cache_key → {path, round, preview, lines, is_failure}
+        tool_results={},               # cache_key → raw-evidence entry (design
+                                       # document §6.6, v3.37.0): path, round,
+                                       # preview, lines, chars, tool, actor,
+                                       # hypothesis_id, delegation, target,
+                                       # is_failure, is_empty, dedup_hits,
+                                       # ev_id, digest
         _inconclusive_streak=0,
         _backtrack_count=0,
         _root_propose_count=0,
@@ -1199,7 +1204,7 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "write_todos", "read_todos",
     "ls", "glob", "grep",
     "propose_hypotheses", "select_path", "record_finding", "backtrack",
-    "list_diagnostic_capabilities", "get_system_overview",
+    "list_diagnostic_capabilities", "get_os_system_overview",
 })
 
 def render_ledger_context(ledger: DiagnosisLedger | None,
@@ -1382,6 +1387,27 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
         lines.append("- 下一步：缩小查询范围后重新委派该通道，或改用其他取证通道补证")
         lines.append("")
 
+    # ── Raw-evidence layer at report time (design document §6.6, v3.37.0) ──
+    # The report must be writable from primary evidence, not from memory:
+    # the index says what was gathered and where the full text is (re-readable
+    # with read_file), the pack carries verbatim excerpts attributed to the
+    # root causes (and to refuted hypotheses).  Both are code-rendered and
+    # bounded; excerpts are never LLM-transcribed (that failure mode is why
+    # the ledger-derived appendix was removed in v3.36.0).
+    if phase == "report":
+        from diagnostics.agent.evidence_ledger import (
+            render_evidence_index,
+            render_evidence_pack,
+        )
+        _evidence_index = render_evidence_index(ledger)
+        if _evidence_index:
+            lines.append("")
+            lines.append(_evidence_index)
+        _evidence_pack = render_evidence_pack(ledger)
+        if _evidence_pack:
+            lines.append("")
+            lines.append(_evidence_pack)
+
     # Current step guidance
     guidance = _phase_guidance(phase, ledger, report_path)
     if guidance:
@@ -1478,10 +1504,10 @@ _ARGUS_CHANNEL_NOTE_SLS = (
 # TOPOLOGICAL owner is not always the owner of its EVIDENCE CHANNEL.
 # Empirically: virtualNode is a KMC control-plane component, so the
 # topo-derived map routes "VK sync-link anomaly" to kmc-expert — yet
-# kmc-expert's toolset (get_kmc_deployments/pods/pod_logs/etcd_status/
+# kmc-expert's toolset (get_k8s_resource_list/pods/pod_logs/etcd_status/
 # apigateway/group1/ipam/vpc_cni) has NO logical-layer event channel,
 # while the decisive evidence (SyncFailed events, vk_sync_failure_count)
-# lives in get_serverless_events — serverless-expert only.  The expert
+# lives in get_k8s_cluster_events — serverless-expert only.  The expert
 # then reported "no vk_sync_failure_count spike observed", i.e. an
 # INABILITY TO SEE rendered as a positive negative finding
 # (argument from absence in its least detectable form); the correctly
@@ -2739,128 +2765,6 @@ def render_unrecorded_evidence_appendix(ledger: DiagnosisLedger) -> str:
     )
 
 
-def _evidence_layer_label(node: dict) -> str:
-    """Deterministic evidence-layer label for a confirmed root cause
-    (design document §9, v3.14.0): a pure function of the ledger's
-    evidence sources — any deep-expert conclusion → 深度确证; argus-only
-    (metric layer) → 指标直接观测.  Whether the STATEMENT overclaims
-    beyond its layer stays a semantic obligation of the report contract
-    (【推断】 marking); code only reports the facts.
-    """
-    sources = [
-        str(e.get("source", ""))
-        for e in node.get("evidence", [])
-        if str(e.get("source", "")).startswith("expert:")
-    ]
-    if not sources:
-        return "协调员记录"
-    if all("-argus-expert" in s for s in sources):
-        return "指标直接观测"
-    return "深度确证"
-
-
-def render_derived_report_appendix(ledger: DiagnosisLedger) -> str:
-    """Render ledger-derived report sections deterministically (design
-    document §9, v3.14.0): per-root-cause evidence-layer labels +
-    confidence, Serverless topology mapping, delegated-expert list with
-    key conclusions, refuted hypotheses with reasons.
-
-    Deterministic logic must be code, not prompt obligations: every
-    section here is a pure function of the ledger, and transcription of
-    structured data through the generative path is a known
-    fidelity-failure surface (hallucination literature, design document
-    §12).  Injected on every gate-passing report write — the same
-    fail-open channel as the v3.11.0 evidence-closure appendix.
-    Returns "" when there is nothing to derive.
-    """
-    hypotheses = ledger.get("hypotheses", {})
-    sections: list[str] = []
-
-    # 1. Root-cause evidence layers + confidence.
-    confirmed = [
-        (hid, n) for hid, n in hypotheses.items()
-        if n.get("status") == "confirmed"
-    ]
-    if confirmed:
-        lines = []
-        for hid, node in confirmed:
-            lines.append(
-                f"- **{fmt_hid(hid)}**（置信度 {node.get('probability')}%）"
-                f"【{_evidence_layer_label(node)}】："
-                f"{node.get('statement', '')}"
-            )
-        sections.append(
-            "### 根因证据层级\n\n"
-            "> 【深度确证】=领域专家经日志/事件/状态验证；"
-            "【指标直接观测】=监控指标直接呈现故障事实"
-            "（机制性解释未经深度验证，正文引用时视为推断）\n\n"
-            + "\n".join(lines)
-        )
-
-    # 2. Serverless topology mapping (scene-conditional).  Only the
-    # Serverless RelationGraph renders a mapping table — the dedicated
-    # environment is injected as diagnosis context only (design document —
-    # dedicated environment spec).
-    topology = ledger.get("topology")
-    if topology and _is_serverless_topology(ledger):
-        from diagnostics.agent.topology_render import report_mapping_table
-        table = report_mapping_table(topology)
-        if table:
-            sections.append("### 拓扑映射\n\n" + table)
-
-    # 3. Delegated experts + latest key conclusion (from rounds[]).
-    delegated: list[str] = []
-    for r in ledger.get("rounds", []):
-        for e in r.get("delegated_experts") or []:
-            if e and e not in delegated:
-                delegated.append(e)
-    if delegated:
-        lines = []
-        for expert in delegated:
-            latest: dict | None = None
-            for node in hypotheses.values():
-                for e in node.get("evidence", []):
-                    if str(e.get("source", "")) == f"expert:{expert}":
-                        latest = e
-            finding = ""
-            if latest:
-                structured = latest.get("structured")
-                if (isinstance(structured, dict)
-                        and structured.get("preliminary_judgment")):
-                    finding = _clean_evidence_text(
-                        str(structured["preliminary_judgment"]), 200)
-                else:
-                    finding = _clean_evidence_text(
-                        str(latest.get("summary", "")), 200)
-            lines.append(f"- {expert}" + (f"：{finding}" if finding else ""))
-        sections.append("### 委派专家与关键结论\n\n" + "\n".join(lines))
-
-    # 4. Refuted hypotheses with reasons.
-    refuted = [
-        (hid, n) for hid, n in hypotheses.items()
-        if n.get("status") == "refuted"
-    ]
-    if refuted:
-        lines = []
-        for hid, node in refuted:
-            reason = _clean_evidence_text(
-                str(node.get("verdict_reason") or ""), 200)
-            lines.append(
-                f"- **{fmt_hid(hid)}**：{node.get('statement', '')}"
-                + (f"——{reason}" if reason else "")
-            )
-        sections.append("### 排除的假设\n\n" + "\n".join(lines))
-
-    if not sections:
-        return ""
-    return (
-        "\n\n---\n\n## 系统附录：台账派生数据（系统确定性生成）\n\n"
-        "> 以下内容由系统从诊断台账确定性生成（非 LLM 转录），"
-        "与正文具有同等效力：\n\n"
-        + "\n\n".join(sections)
-    )
-
-
 def render_failure_digest(ledger: DiagnosisLedger) -> str:
     """Render a structured digest of the failed batch for retry-batch
     HYPOTHESIZE guidance (design document §9, v3.11.0).
@@ -3217,7 +3121,7 @@ def single_channel_refute_signal(ledger: DiagnosisLedger, hid: str) -> dict | No
     (VK sync-link anomaly) was routed to kmc-expert by the topology-
     derived map (virtualNode IS a KMC control-plane component), but the
     decisive evidence — SyncFailed events and vk_sync_failure_count
-    1→6 in 15:00~15:05 — lives in get_serverless_events, i.e.
+    1→6 in 15:00~15:05 — lives in get_k8s_cluster_events, i.e.
     serverless-expert only.  kmc-expert reported "no vk_sync_failure_count
     spike observed" and refuted a CORRECTLY directed hypothesis,
     cascading into five refutations and a 3600s timeout without
