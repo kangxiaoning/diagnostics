@@ -1061,6 +1061,19 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
     # ── 4. Report template ──
     lines.append("## 4. 报告结构模板")
     lines.append("请按以下结构调用 write_file 生成报告：")
+    # v3.39.5 (W1): the report body is one very long tool argument
+    # (~5k chars observed).  Long single-argument generation is a known
+    # LLM weak spot — the 2026-09-12 batch had write_file({}) twice in
+    # REPORT phase on a ~33k-token context (long-form generation is
+    # documented as needing plan-then-segment decomposition, cf.
+    # AgentWrite/LongWriter, ICLR 2025).  Offering an explicit two-pass
+    # recipe leaves the common short-report path unchanged while giving
+    # the model a way out when the body would be large.
+    lines.append(
+        "- **报告较长时（预计正文 > 3000 字）**：请分两步写入，避免单次参数"
+        "过长——① 先用 `write_file` 写入完整骨架（各节标题 + 每节一句占位"
+        "说明）；② 再用 `edit_file` 逐节替换为正式内容。报告较短时仍一次"
+        "写完即可。")
     lines.append("")
     lines.append("```markdown")
     lines.append("# 诊断报告")
@@ -4009,11 +4022,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if not (tool_args or {}).get(k)
             ]
             if _missing:
+                # v3.39.5 (W2): surface the raw payload + a per-session
+                # counter.  The 2026-09-12 batch had the same expert emit
+                # write_file({}) twice in REPORT phase (rounds 9 and 15);
+                # without the raw args and a repeat count the log cannot
+                # distinguish a truly empty object from a partially
+                # filled one, nor tell whether recovery is oscillating.
+                self._malformed_file_calls = (
+                    getattr(self, "_malformed_file_calls", 0) + 1)
                 logger.warning(
-                    "%s called with missing/empty args %s (round=%d) — "
-                    "model emitted malformed tool call; schema validation "
-                    "error will be returned to the LLM",
+                    "%s called with missing/empty args %s (round=%d; "
+                    "occurrence #%d this session) — raw args=%s; model "
+                    "emitted malformed tool call; schema validation error "
+                    "will be returned to the LLM",
                     tool_name, _missing, self._model_call_count,
+                    self._malformed_file_calls, repr(tool_args)[:80],
                 )
 
         # ── write_file gate: enforce "verify before report" ──
