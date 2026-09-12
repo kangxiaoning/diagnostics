@@ -211,10 +211,12 @@ class DeepExpertFindings(BaseModel):
 
     verdict: Literal["confirmed", "refuted", "inconclusive"] = Field(
         description=(
-            "假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）。"
-            "verdict 须与证据主体方向一致：confirmed 的支持证据（key_evidence）为主体，"
-            "refuted 的负证据（negative_evidence）为主体；两者矛盾时按证据主体修正 verdict"
-            "（✗ 曾实证的误用：verdict=refuted 但 key_evidence 全支持向，致假设被误证伪）"
+            "假设验证结论：confirmed（成立）/ refuted（不成立）/ inconclusive（证据不足）。\n"
+            "⚠ 定 verdict 前先决定证据去向（顺序：先 verdict，再按下列规则落证据）："
+            "判 refuted 时，证伪事实必须写进 negative_evidence，key_evidence 留空或仅放排除性说明；"
+            "判 confirmed 时反之，支撑事实放 key_evidence。"
+            "把证伪事实写进 key_evidence 会被系统标记为「方向错位」"
+            "（2026-09-12 实测：4/4 回执因本条被标记——不阻断落账，但污染台账方向，需持续为零）"
         )
     )
     key_evidence: list[str] = Field(
@@ -235,7 +237,12 @@ class DeepExpertFindings(BaseModel):
     )
     negative_evidence: list[str] = Field(
         default_factory=list,
-        description="负证据必报：与假设矛盾、或未找到目标对象的证据（如目标 Pod 不存在/目标组件正常），与阳性证据同等重要，不得省略",
+        description=(
+            "负证据必报：与假设矛盾、或未找到目标对象的证据（如目标 Pod 不存在/目标组件正常），"
+            "与阳性证据同等重要，不得省略。"
+            "⚠ 判 refuted 时本字段是主体：证伪事实（如「目标 Pod OOMKilled、RESTARTS=3」）写在这里；"
+            "此时 key_evidence 应为空或仅含排除性说明"
+        ),
     )
     root_cause: str = Field(
         default="",
