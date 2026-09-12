@@ -16,6 +16,11 @@ from deepagents.graph import DeepAgentState
 from langchain.agents.middleware.types import PrivateStateAttr
 
 from diagnostics.agent.prompt import PHASE_SPEC  # P6/§9: duty/exit 单源（无循环依赖：prompt 不导入本模块）
+from diagnostics.tools.channels import (  # G22 证据通道类别（v3.40.0，环境无关）
+    channel_labels,
+    effective_channels,
+    is_metric_channel,
+)
 
 
 # ── Phase & status types ──
@@ -1603,36 +1608,44 @@ _ARGUS_CHANNEL_NOTE_SLS = (
     + _ARGUS_CHANNEL_NOTE_SUFFIX
 )
 
-# ── Serverless 委派映射：层归属 + 观测域/证据通道（design document §9,
-# v3.20.0; 2026-08-28 scenario 39 post-mortem) ─────────────────────────
+# ── Serverless 委派映射：层归属 + 视角数据源（design document §9,
+# v3.20.0; 2026-08-28 scenario 39 post-mortem; v3.40.0 与工具面对齐）───
 # Structural-ownership routing alone is insufficient: a component's
 # TOPOLOGICAL owner is not always the owner of its EVIDENCE CHANNEL.
-# Empirically: virtualNode is a KMC control-plane component, so the
-# topo-derived map routes "VK sync-link anomaly" to kmc-expert — yet
-# kmc-expert's toolset (get_k8s_resource_list/pods/pod_logs/etcd_status/
-# apigateway/group1/ipam/vpc_cni) has NO logical-layer event channel,
-# while the decisive evidence (SyncFailed events, vk_sync_failure_count)
-# lives in get_k8s_cluster_events — serverless-expert only.  The expert
-# then reported "no vk_sync_failure_count spike observed", i.e. an
-# INABILITY TO SEE rendered as a positive negative finding
-# (argument from absence in its least detectable form); the correctly
-# directed H1 was refuted, cascading into 5 refutations and a 3600s
-# timeout without convergence.
-# The remedy is a POSITIVE routing recipe (§9 P5): name each expert's
+# Empirically (2026-08-28 scenario 39): virtualNode IS a KMC control-plane
+# component, so the topology-derived map routed "VK sync-link anomaly" to
+# kmc-expert — at that time that expert's toolset had NO logical-layer
+# event channel, while the decisive evidence (SyncFailed events,
+# vk_sync_failure_count) was reachable only by serverless-expert.  The
+# expert reported "no spike observed", i.e. an INABILITY TO SEE rendered
+# as a positive negative finding (argument from absence in its least
+# detectable form); a correctly directed hypothesis was refuted and the
+# session timed out without convergence.
+#
+# v3.40.0 — the channel boundary is now a FACT OF THE ASSEMBLED TOOL
+# SURFACE, never a static claim about an expert: since the 2026-09 tool
+# surface alignment the three family deep experts (serverless/kmc/sci)
+# share ONE K8s surface (identical events / logs / state channels) and
+# differ only in the VIEW they query (cluster_name).  This text therefore
+# routes by layer/view and states the channel equivalence explicitly; the
+# coverage gate consumes the same fact from `ledger["expert_channels"]`
+# (tools/channels.py), so prose can no longer drift away from reality.
+# The remedy stays a POSITIVE routing recipe (§9 P5): name each expert's
 # observation domain so the coordinator checks evidence-channel coverage
-# BEFORE delegating.  Single source of truth: the expert toolsets in the
-# mock tool registry — test_sls_expert_domain_map.py asserts this text
-# stays consistent with the actual tool bindings (doc-drift guard).
+# BEFORE delegating; the gate only backstops the compliance residual.
 _SLS_EXPERT_DOMAIN_MAP = (
-    "- Serverless 场景委派映射（层归属 + 观测域）：委派前先明确期望从该专家"
-    "获得哪条证据，并确认该证据在其观测域内——若不在，改派观测域覆盖该证据的专家\n"
-    "  · 逻辑集群：Deployment/Pod 状态与日志、**逻辑层事件**（VK 同步状态、"
-    "Pod 生命周期事件、同步失败计数）→ serverless-expert\n"
+    "- Serverless 场景委派映射（层归属 + 视角数据源）：委派前先明确期望从该专家"
+    "获得哪条证据，并确认该证据在其视角内——若不在，改派视角覆盖该证据的专家\n"
+    "  · 逻辑集群：Deployment/Pod 状态与日志、事件（含 VK 同步状态、Pod 生命周期"
+    "事件、同步失败计数）→ serverless-expert（cluster_name 取逻辑集群）\n"
     "  · KMC 控制面组件与共享组件链路：控制面 Deployment/Pod 与日志、共享 etcd、"
-    "API Gateway / Group1 / IPAM / VPC-CNI → kmc-expert"
-    "（无逻辑层事件通道：查证 VK 同步状态/同步失败计数须走 serverless-expert）\n"
+    "API Gateway / Group1 / IPAM / VPC-CNI → kmc-expert\n"
     "  · SCI 数据面：burst Pod 与日志、节点/kubelet、VPC-CNI、IP 分配 → sci-expert\n"
     "  · 物理节点/主机：CPU/内存/磁盘/网络 → host-expert\n"
+    "  · 通道说明：三个家族深度专家共享同一 K8s 工具面（事件/日志/状态通道一致），"
+    "差异在**视角数据源**（cluster_name 决定逻辑/控制面/数据面视图）——按视角归属"
+    "委派即可，系统不假定某专家看不到某类证据；物理主机通道与 K8s 通道不同，"
+    "主机层结论不能替代 K8s 事件/日志层证据\n"
 )
 
 
@@ -3291,55 +3304,56 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
 
 def single_channel_refute_signal(ledger: DiagnosisLedger, hid: str) -> dict | None:
     """Detect a SINGLE-CHANNEL refutation on hypothesis *hid*
-    (design document §8 G22, v3.20.0, judgement narrowed v3.20.1).
+    (design document §8 G22, v3.20.0; narrowed v3.20.1;
+     channel-difference judgement v3.40.0).
 
-    A refutation is single-channel when the hypothesis' expert-layer
-    evidence comes from EXACTLY ONE distinct deep expert, in a scene that
-    actually assembled two or more deep experts.  That is the structural
-    precondition of *argument from absence* in its least detectable form:
-    an expert that CANNOT observe a given evidence channel tends to
-    phrase its blindness as a positive negative finding ("no spike
-    observed", "logs all normal") — and a topologically-correct routing
-    can send the hypothesis to exactly that expert.
+    A refutation is single-channel when the hypothesis' confirming-layer
+    (non-metric) evidence comes from EXACTLY ONE deep expert, while the
+    scene assembled at least one OTHER deep expert whose EVIDENCE CHANNELS
+    DIFFER.  That is the structural precondition of *argument from
+    absence* in its least detectable form: an expert that cannot observe a
+    given channel tends to phrase its blindness as a positive negative
+    finding ("no spike observed", "logs all normal") — and a
+    topologically-correct routing can send the hypothesis to exactly that
+    expert.
 
-    Empirical driver (2026-08-28 scenario 39, session a8fa9526): H1
-    (VK sync-link anomaly) was routed to kmc-expert by the topology-
-    derived map (virtualNode IS a KMC control-plane component), but the
-    decisive evidence — SyncFailed events and vk_sync_failure_count
-    1→6 in 15:00~15:05 — lives in get_k8s_cluster_events, i.e.
-    serverless-expert only.  kmc-expert reported "no vk_sync_failure_count
-    spike observed" and refuted a CORRECTLY directed hypothesis,
-    cascading into five refutations and a 3600s timeout without
-    convergence.  The same session's morning run (directed at
-    serverless-expert) confirmed H1 in 8 rounds.
+    Empirical driver (2026-08-28 scenario 39, session a8fa9526): H1 (VK
+    sync-link anomaly) was routed to kmc-expert by the topology-derived
+    map, while the decisive evidence (SyncFailed events) was reachable
+    only by serverless-expert at that time.  The expert reported "no
+    spike observed" and refuted a CORRECTLY directed hypothesis, cascading
+    into five refutations and a 3600s timeout without convergence.
 
-    Structural ownership ≠ evidence-channel ownership; this signal does
-    not attempt to judge which channel is correct (that needs semantics),
-    it only flags the precondition and hands the LLM the ledger's fault
-    window so it can self-check coverage.  Multi-deep-expert scenes only
-    (a scene with a single deep expert has no alternative channel to
-    route to — blocking there would be pure ceremony).
+    v3.40.0 — CHANNEL CLASSES INSTEAD OF EXPERT COUNTING / NAMING:
+      · channels are derived from each expert's ASSEMBLED tool surface at
+        session init (`ledger["expert_channels"]`, tools/channels.py), so
+        the judgement tracks real observational capability and survives
+        tool renames across deployments;
+      · experts sharing the SAME channel set are not alternative channels:
+        delegating to a same-surface peer yields correlated evidence from
+        the same data source, not independent coverage — the "double
+        independent confirmation" it produces is a pseudo-independence
+        artifact (2026-09-12 session 47c34832: the two family experts read
+        the same pod-metric channel and were reported as two);
+      · metric-channel experts are the SCREENING layer, never the
+        confirmation layer — classified from tool surfaces rather than the
+        `-argus-expert` naming suffix (which does not survive deployment
+        renames);
+      · unregistered channel metadata → FAIL OPEN (no block).  This gate is
+        an advisory backstop (bounded once, then passes with disclosure),
+        so missing registry data must not manufacture false blocks.
 
-    WHY EXACTLY ONE, NOT "AT MOST ONE" (v3.20.1, 2026-08-28 scenario 39
-    session 7ce7bb66 post-mortem): the ZERO-deep-expert case is a path
-    the PROACTIVE layer explicitly authorises — ledger.py §9 verify 档1
-    grants "若现有监控证据已明确证伪…可直接 record_finding 判 refuted"
-    and 档2/3 actively ENCOURAGES reusing evidence gathered while
-    verifying OTHER hypotheses.  Blocking it pitted the gate against the
-    guidance (the same layer-coherence anti-pattern recorded in §11
-    v3.8.0, which previously produced a four-block loop).  Measured
-    cost in that session: both G22 triggers fired on hypotheses holding
-    ZERO expert evidence — H2 (serverless-expert had already shown the
-    sync failure was an API-Server watch timeout, not a tunnel fault)
-    and H3 (four argus returns showed etcd fully healthy — argus IS the
-    authoritative channel for an infrastructure-health hypothesis) — i.e.
-    a 100% false-positive rate against the <2% target that production
-    guardrail practice sets, and two legitimate refutations were
-    demoted to inconclusive (over-abstention).  The original defect's
-    H1 carried exactly ONE deep channel (expert:kmc-expert + a
-    coordinator entry), so this narrowing keeps the defect covered.
+    WHY EXACTLY ONE, NOT "AT MOST ONE" (v3.20.1, session 7ce7bb66
+    post-mortem): the ZERO-channel case is a path the PROACTIVE layer
+    explicitly authorises — §9 verify 档1 grants a direct refute on
+    monitoring evidence and 档2/3 encourages reusing evidence gathered for
+    OTHER hypotheses.  Blocking it pitted the gate against the guidance
+    (the layer-coherence anti-pattern recorded in §11 v3.8.0) and measured
+    a 100% false-positive rate (two legitimate refutations demoted to
+    inconclusive — over-abstention is itself a failure mode).
 
-    Returns a dict (expert name / deep-expert candidates) or None.
+    Returns a dict (expert / channel labels / divergent experts / fault
+    window) or None.
     """
     nodes = ledger.get("hypotheses", {})
     if hid not in nodes:
@@ -3348,31 +3362,59 @@ def single_channel_refute_signal(ledger: DiagnosisLedger, hid: str) -> dict | No
         # avoids a silent "fires" reading for a non-existent node.
         return None
     node = nodes[hid] or {}
-    experts = ledger.get("scene_experts") or []
-    deep = [e for e in experts if not str(e).endswith("-argus-expert")]
-    if len(deep) < 2:
+    expert_channels = ledger.get("expert_channels") or {}
+    if not expert_channels:
+        # Fail open: no channel registry for this session (e.g. a
+        # deployment whose tool surfaces are not registered yet).  An
+        # advisory gate must not block on missing metadata.
         return None
-    seen: list[str] = []
+
+    def _channels_of(expert: str) -> frozenset[str]:
+        return effective_channels(expert_channels.get(expert) or ())
+
+    used: list[str] = []
     for ev in node.get("evidence", []):
         source = str(ev.get("source", ""))
         if not source.startswith("expert:"):
             continue
         name = source[len("expert:"):]
-        # an argus expert is a monitoring channel, not a deep-evidence
-        # channel: it cannot observe event/log state either.
-        if name.endswith("-argus-expert"):
+        channels = _channels_of(name)
+        if not channels:
+            # Unregistered expert / unrecognised tool surface: it cannot
+            # be classified as a confirmation channel.
             continue
-        if name not in seen:
-            seen.append(name)
-    # EXACTLY one deep channel (v3.20.1): zero deep channels is the
-    # proactive layer's own authorised path (monitoring-evidence refute +
+        if is_metric_channel(channels):
+            # Screening layer (metrics) — not a confirmation channel.
+            continue
+        if name not in used:
+            used.append(name)
+    # EXACTLY one confirmation channel (v3.20.1): zero is the proactive
+    # layer's own authorised path (monitoring-evidence refute +
     # cross-hypothesis evidence reuse) — never block it.  Two or more
-    # means coverage exists.
-    if len(seen) != 1:
+    # means coverage already exists.
+    if len(used) != 1:
+        return None
+    used_expert = used[0]
+    used_channels = _channels_of(used_expert)
+    divergent: list[str] = []
+    for name in (ledger.get("scene_experts") or []):
+        if name == used_expert:
+            continue
+        channels = _channels_of(name)
+        if not channels or is_metric_channel(channels):
+            continue
+        if channels != used_channels:
+            divergent.append(name)
+    if not divergent:
+        # Every other confirmation-layer expert reads the SAME channels:
+        # no alternative evidence source exists, so a same-surface peer
+        # would be repeat observation rather than independent coverage.
         return None
     return {
-        "expert": seen[0] if seen else None,
-        "deep_experts": deep,
+        "expert": used_expert,
+        "channels": sorted(used_channels),
+        "channel_labels": channel_labels(used_channels),
+        "divergent_experts": divergent,
         "fault_window": (
             f"{ledger.get('start_time', '?')} ~ {ledger.get('end_time', '?')}"
         ),

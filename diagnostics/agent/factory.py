@@ -31,6 +31,7 @@ from diagnostics.agent.ledger import (
 from diagnostics.agent.ledger_middleware import DiagnosisLedgerMiddleware
 from diagnostics.config import Settings
 from diagnostics.tools import get_agent_tools as _get_live_tools
+from diagnostics.tools.channels import expert_channels_from_configs
 from diagnostics.tools.registry import (
     get_family_argus_live_tools,
     get_gpu_live_tools,
@@ -1056,6 +1057,13 @@ def build_agent(
         topology=topology,
         topology_unavailable=topology_unavailable,
         valid_subagents=[sa["name"] for sa in subagent_configs],
+        # Evidence-channel snapshot (design document §8 G22, v3.40.0):
+        # derived from each subagent's ASSEMBLED tool surface and frozen
+        # into the ledger, so the refute-coverage gate compares channel
+        # classes rather than expert identities / naming suffixes.  This
+        # keeps the judgement portable across tool renames and across
+        # mock/live deployments (no mock dependency in the agent layer).
+        expert_channels=expert_channels_from_configs(subagent_configs),
     )
     # Subagent instance: shares ledger state, P1 blocking disabled.
     subagent_ledger = DiagnosisLedgerMiddleware.for_subagent(ledger_middleware)

@@ -1962,6 +1962,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         topology: dict | None = None,
         topology_unavailable: bool = False,
         valid_subagents: list[str] | None = None,
+        expert_channels: dict[str, list[str]] | None = None,
     ) -> None:
         self.ledger_path = ledger_path
         self.report_path = report_path
@@ -1979,6 +1980,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Valid subagent names for task() validation (Coordinator only).
         # None/empty disables the check (tests, subagent instances).
         self._valid_subagents = tuple(valid_subagents or ())
+        # Evidence-channel snapshot (design document §8 G22, v3.40.0):
+        # {expert: [channel_class, ...]} derived at assembly time from each
+        # subagent's tool surface.  Consumed by the refute-coverage gate so
+        # the judgement compares channel classes (portable) instead of
+        # expert counts / naming suffixes (not portable).  Empty means
+        # "unregistered" → the gate fails open (advisory guardrail).
+        self._expert_channels: dict[str, tuple[str, ...]] = {
+            str(k): tuple(v or ()) for k, v in (expert_channels or {}).items()
+        }
+        # One-shot disclosure when the coverage gate has no channel
+        # snapshot to work with (fails open rather than guessing).
+        self._g22_unregistered_logged: bool = False
         # Stable subagent-context cache (session-scoped): topology is a
         # read-only session fact, so the stable layers are built once per
         # subagent type and reused across delegations (design §7.3).
@@ -2213,6 +2226,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # complementary-expert computation must never suggest an
         # unassembled expert.
         ledger["scene_experts"] = list(self._valid_subagents)
+        # Evidence-channel snapshot (design document §8 G22, v3.40.0):
+        # frozen at session init from the assembled expert tool surfaces —
+        # the coverage gate reads THIS (never the expert names) to decide
+        # whether an alternative evidence channel actually exists.
+        if self._expert_channels:
+            ledger["expert_channels"] = {
+                k: list(v) for k, v in self._expert_channels.items()
+            }
         # Serverless scene: topology (RelationGraph) injected at session init
         # and availability flag — consumed by the coverage gate (D1/D2) and
         # subagent context anchors (design document §5.2/§7.2).
@@ -6502,32 +6523,42 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         )
             # ── G22: single-channel refute coverage gate (reactive
             # backstop, design document §8 G22, v3.20.0; 2026-08-28
-            # scenario 39, session a8fa9526) ── Structural ownership ≠
-            # evidence-channel ownership: an expert that CANNOT observe a
-            # channel reports its blindness as a positive negative finding
-            # ("no spike observed"), which reads exactly like "checked,
-            # it is fine".  Refuting on such a single channel is argument
-            # from absence wearing a disguise.  The judgment of WHICH
-            # channel is authoritative is semantic and stays with the LLM;
-            # this gate only flags the structural precondition and hands
-            # over the ledger's fault window so coverage can be self-
-            # checked.  Proactive layer (P7) is the observation-domain
-            # routing map injected into VERIFY (ledger.py §9); this is the
-            # compliance-residual backstop.  Bounded-block degrade
-            # symmetric with C2/G17-E2/G21.  Mutually exclusive with
-            # G20/C2 (argus-conflict) and G21 (two opposing deep
-            # verdicts): those need ≥2 returns, this fires on exactly 1.
-            # v3.20.1: the judgement is EXACTLY one deep channel, not
-            # "at most one" — zero deep channels is the proactive layer's
-            # own authorised path (ledger.py §9 verify 档1 grants direct
-            # refute on monitoring evidence; 档2/3 encourages reusing
-            # evidence gathered for OTHER hypotheses).  Blocking it
-            # pitted the gate against the guidance and measured a 100%
-            # false-positive rate (both triggers in session 7ce7bb66
-            # fired on legitimately refuted hypotheses), which is the
-            # layer-coherence anti-pattern already recorded in §11
-            # v3.8.0.  Zero-channel cases are now left to the proactive
-            # success criterion (P2) injected in the same hint.
+            # scenario 39, session a8fa9526; channel-difference judgement
+            # v3.40.0) ── Structural ownership ≠ evidence-channel
+            # ownership: an expert that CANNOT observe a channel reports
+            # its blindness as a positive negative finding ("no spike
+            # observed"), which reads exactly like "checked, it is fine".
+            # Refuting on such a single channel is argument from absence
+            # wearing a disguise.  The judgment of WHICH channel is
+            # authoritative is semantic and stays with the LLM; this gate
+            # only flags the structural precondition and hands over the
+            # fault window so coverage can be self-checked.  Proactive
+            # layer (P7) is the observation-domain routing map injected
+            # into VERIFY (ledger.py §9); this is the compliance-residual
+            # backstop.  Bounded-block degrade symmetric with C2/G17-E2/
+            # G21.  Mutually exclusive with G20/C2 (argus-conflict) and
+            # G21 (two opposing verdicts): those need ≥2 returns, this
+            # fires on exactly 1.
+            #
+            # v3.40.0: the gate compares EVIDENCE CHANNEL CLASSES derived
+            # from the assembly-time tool surfaces (ledger["expert_channels"],
+            # tools/channels.py) instead of counting experts or matching the
+            # `-argus-expert` naming suffix.  Same-surface experts are not
+            # alternative channels, so a scene whose deep experts share one
+            # surface stops producing coverage blocks (and stops calling
+            # correlated re-reads "independent confirmation").  Missing
+            # channel metadata fails OPEN — an advisory gate must never
+            # manufacture a block from absent metadata.
+            if (verdict == "refuted"
+                    and hypothesis_id in ledger.get("hypotheses", {})
+                    and not ledger.get("expert_channels")
+                    and not getattr(self, "_g22_unregistered_logged", False)):
+                self._g22_unregistered_logged = True
+                logger.warning(
+                    "G22 coverage gate inactive: no expert_channels snapshot "
+                    "in the ledger (expert tool surfaces unregistered) — "
+                    "failing open on refute-coverage checks"
+                )
             if (verdict == "refuted"
                     and hypothesis_id in ledger.get("hypotheses", {})
                     and not _argus_conflict_signal(ledger, hypothesis_id)
@@ -6560,23 +6591,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     else:
                         logger.warning(
                             "record_finding blocked by G22: refuted on %s from a "
-                            "single evidence channel (%s, round=%d)",
+                            "single evidence channel (%s [%s], round=%d)",
                             fmt_hid(hypothesis_id), _g22.get("expert") or "none",
+                            ",".join(_g22.get("channels") or []) or "-",
                             self._model_call_count,
                         )
-                        _deep = [e for e in (_g22.get("deep_experts") or [])
-                                 if e != _g22.get("expert")]
+                        _divergent = _g22.get("divergent_experts") or []
+                        _labels = "、".join(_g22.get("channel_labels") or []) or "?"
                         return (
                             f"⛔ refuted 判定仅来自单一证据通道（覆盖性门控）："
                             f"{fmt_hid(hypothesis_id)} 的专家证据只来自 "
-                            f"{_g22.get('expert')}。"
+                            f"{_g22.get('expert')}（通道：{_labels}）。"
                             f"组件的拓扑归属不等于其证据通道归属——某专家看不到某类证据时，"
                             f"常把『查不到』表述为『未发现异常』，"
                             f"据此证伪方向正确的假设属于以证据缺失作反证。"
-                            f"请确认该专家的观测域是否覆盖本假设所涉证据通道"
+                            f"请确认本次证据通道是否覆盖本假设所涉证据类型"
                             f"（故障时段 {_g22.get('fault_window')}）："
-                            f"① 若不覆盖 → 改派观测域覆盖该证据的专家"
-                            f"（可选：{'、'.join(_deep[:3])}）；"
+                            f"① 若不覆盖 → 改派通道覆盖该证据的专家"
+                            f"（可选：{'、'.join(_divergent[:3])}）；"
                             f"② 若该证据确实无法取得 → 判 inconclusive 并披露；"
                             f"③ 若确认该通道已完整覆盖本假设 → 再次 record_finding "
                             f"refuted 即放行（通道自动开放）。"
