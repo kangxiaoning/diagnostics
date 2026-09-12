@@ -4833,8 +4833,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # proved insufficient (2026-08-29 scenario 35);
                         # unguided this cascaded into a 13-round stall
                         # (2026-09-08 session 898d4699).
-                        if (_structured_expert.get("verdict") == "confirmed"
-                                and _structured_expert.get("verdict_target")
+                        # v3.39.4: verdict and verdict_target are
+                        # orthogonal — an expert that falsifies the
+                        # assigned hypothesis while confirming another
+                        # root cause naturally reports it as `refuted`
+                        # (the hypothesis reading).  Requiring
+                        # `confirmed` here suppressed this
+                        # deterministic receipt for exactly those
+                        # reports (2026-09-12 scenario-38: the expert
+                        # did confirm the real cause, yet
+                        # `verdict_target` appeared 0 times in the
+                        # whole batch).
+                        if (_structured_expert.get("verdict_target")
                                 == "alternative_root_cause"):
                             _alt_rc = str(
                                 _structured_expert.get("root_cause")

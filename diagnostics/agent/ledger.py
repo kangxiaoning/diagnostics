@@ -3805,13 +3805,24 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                 # alternative-confirmed paired with another expert's
                 # refuted (both falsifying the hypothesis — agreeing
                 # directions) is not misread as a conflict.
+                # v3.39.4: verdict is orthogonal to verdict_target — an
+                # expert who falsifies the assigned hypothesis while
+                # confirming another root cause may legitimately report
+                # either `refuted` (hypothesis reading) or `confirmed`
+                # (root-cause reading).  Requiring `confirmed` here made
+                # the natural `refuted` expression unreachable, so this
+                # alternative-root-cause route never fired (2026-09-12
+                # scenario-38: `verdict_target` observed 0 times across a
+                # whole batch while an expert did confirm the real cause).
+                # Match on verdict_target + non-empty root_cause only —
+                # consistent with the observation-warning exemption and
+                # the conflict-gate exemption, which already ignore the
+                # verdict value.
                 _alt_rc = next(
                     (str((e.get("structured") or {}).get("root_cause")
                          or "").strip()
                      for e in reversed(node.get("evidence", []))
                      if str(e.get("source", "")).startswith("expert:")
-                     and (e.get("structured") or {}).get("verdict")
-                     == "confirmed"
                      and (e.get("structured") or {}).get("verdict_target")
                      == "alternative_root_cause"),
                     "",

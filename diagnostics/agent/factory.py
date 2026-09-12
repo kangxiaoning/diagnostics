@@ -255,13 +255,23 @@ class DeepExpertFindings(BaseModel):
     verdict_target: Literal["assigned_hypothesis", "alternative_root_cause"] = Field(
         default="assigned_hypothesis",
         description=(
-            "结论对象（v3.23.0）：assigned_hypothesis（默认——verdict 针对被指派"
-            "假设本身）/ alternative_root_cause（被指派假设不成立，但你另发现了"
-            "真正根因或真正故障对象时**必须**填此项 + verdict=confirmed"
-            "（表达'根因已确认'而非'假设成立'），root_cause 填你发现的真正根因；"
-            "此时 key_evidence 承载'确证真正根因的正向证据'——方向混合是预期，"
-            "不要误用 refuted + assigned_hypothesis）。如实声明：Coordinator 凭此走"
-            "'排除假设 + 收录新根因'通道，refuted 不会被结论冲突门控误拦"
+            "结论对象（v3.23.0；v3.39.4 起与 verdict 解耦）：**先定结论对象，再落证据**。"
+            "assigned_hypothesis（默认——本次结论针对被指派假设本身）/ "
+            "alternative_root_cause（你另发现了真正根因或真正故障对象时必须填此项）。"
+            "本字段与 verdict **正交**：verdict 说'被指派假设是否成立'，本字段说"
+            "'你的证据靶向谁'——**两种 verdict 都可搭配本项**，"
+            "不要为迁就本字段而改写 verdict。\n"
+            "✓ 完整示例（他因形态，最常见）：{\"verdict\": \"refuted\", "
+            "\"verdict_target\": \"alternative_root_cause\", \"key_evidence\": "
+            "[\"目标 Pod OOMKilled（Exit 137），RESTARTS=3\"], \"negative_evidence\": "
+            "[\"同命名空间其余 3 个副本 Running、RESTARTS=0\"], \"root_cause\": "
+            "\"容器 memory limit 512Mi 低于实际峰值，导致 OOMKilled\"}"
+            "——此时 key_evidence 承载'确证真正根因的正向证据'，与前文『refuted 时 "
+            "key_evidence 留空或仅放排除性说明』**不冲突**：后者只适用于下述纯证伪形态。\n"
+            "✓ 最小示例（纯证伪，未发现他因）：{\"verdict\": \"refuted\", "
+            "\"key_evidence\": [], \"negative_evidence\": [\"同命名空间其余 Pod 无异常\"]}。\n"
+            "如实声明：Coordinator 凭此走'排除假设 + 收录新根因'通道，refuted 不会被"
+            "结论冲突门控误拦"
         ),
     )
     confidence: str = Field(
