@@ -4504,6 +4504,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 subagent_type = tool_args.get("subagent_type", "")
                 desc = tool_args.get("description", "")
 
+                # v3.39.6 (R2): coercion layer for a known field-name
+                # hallucination.  On 2026-09-12 the coordinator emitted
+                # six parallel task() calls using `parameter_type`
+                # instead of `subagent_type` (round 1, ~30k-char static
+                # prompt); all six were rejected and a full round
+                # (~115s) plus a stagnation valve were burned before the
+                # model self-corrected in round 2.  A long prompt body
+                # pushes the field-name contract toward the middle of
+                # the context, where recall degrades (Lost in the
+                # Middle, arXiv:2307.03172).  Accept the alias, but keep
+                # the WARNING so the anomaly stays observable.
+                if not subagent_type:
+                    _alias = tool_args.get("parameter_type")
+                    if _alias:
+                        # R3: session-scoped counter — the repeat count
+                        # separates a one-off slip from an oscillating
+                        # contract breach (same rationale as the
+                        # malformed-write_file warning).
+                        self._arg_alias_coercions = (
+                            getattr(self, "_arg_alias_coercions", 0) + 1)
+                        logger.warning(
+                            "task(): coercing hallucinated arg "
+                            "parameter_type=%r -> subagent_type "
+                            "(round=%d; occurrence #%d this session)",
+                            _alias, self._model_call_count,
+                            self._arg_alias_coercions,
+                        )
+                        subagent_type = str(_alias)
+
                 # ── Unknown subagent fast-fail (Coordinator only) ──
                 # A missing/unresolvable subagent_type otherwise falls
                 # through to the task tool and wastes a round on an

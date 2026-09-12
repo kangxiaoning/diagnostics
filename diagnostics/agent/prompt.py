@@ -752,4 +752,43 @@ def make_system_prompt(
     prompt = prompt.replace("{ledger_path}", ledger_path or "{ledger_path}")
     for var, name in _expert_placeholder_map(agent_names or []).items():
         prompt = prompt.replace(var, name)
+
+    # v3.39.6 (R1a): tail-anchored critical-contract cheatsheet.
+    # The static prompt body runs ~30k chars (~51% of a round-1 request,
+    # tools ~26%, dialogue history only 2 messages).  The 2026-09-12 run
+    # showed contracts sitting in the MIDDLE of that body being ignored
+    # or hallucinated: task(parameter_type=...) x6, verdict_target never
+    # declared (0/11 ledgers across two batches), and the segmented
+    # report recipe unused (0/6 sessions) despite the reports actually
+    # exceeding the stated threshold.  Recall degrades for information
+    # in the middle of long contexts (Lost in the Middle,
+    # arXiv:2307.03172), so the few contracts whose breach costs a whole
+    # round are restated HERE, at the tail, where attention is
+    # strongest.  Deliberately terse — this is a cheatsheet, not a
+    # second copy of the guidance.
+    # v3.39.7 (V1): tail block reduced to the two items a tool schema
+    # genuinely cannot express.  Two earlier entries were removed after
+    # review:
+    #   · the `subagent_type` field name — the tool layer already builds
+    #     a special system prompt out of the tool definitions, so
+    #     restating it here is pure duplication (Anthropic, "Define
+    #     tools");
+    #   · the write_file required-arg reminder — same reason.
+    # The field-name entry was also phrased negatively ("NOT
+    # parameter_type / agent_type / type"), which pulls the very tokens
+    # we do not want into the context: negative instructions are the
+    # weakest instruction form and tend to activate the forbidden token
+    # (Negative Prompting literature; TianPan, conflicting-instruction
+    # silent-failure).  What remains is positive-only and limited to
+    # usage patterns (Anthropic's two-layer contract: schema =
+    # structural validity, guidance = correct usage), and it stays at the
+    # tail where attention is strongest (position effects).
+    prompt += (
+        "\n\n---\n\n"
+        "## 使用模式补充（字段定义与必填项见各工具 schema；此处只补 schema 未表达的用法）\n"
+        "1. **结论对象**：专家证伪了被指派假设、但同时确证了另一个根因时，"
+        "同时给出 `verdict_target=alternative_root_cause` 与该根因的 `root_cause`。\n"
+        "2. **长报告**：正文预计超过 3000 字时，先写骨架、再逐节补充，"
+        "避免单次参数过长。\n"
+    )
     return prompt
