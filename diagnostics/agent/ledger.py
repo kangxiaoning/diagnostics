@@ -291,6 +291,53 @@ def new_hypothesis(
     )
 
 
+def confirmatory_expert_evidence(ledger: DiagnosisLedger, hid: str) -> bool:
+    """Whether *hid* holds expert evidence able to carry a ``confirmed``
+    verdict (design document §8 G17, evidence-standard gate; v3.42.0).
+
+    Two families of ``expert:*`` entries exist on a hypothesis:
+
+    * **direct** (no ``related_via``) — an expert was SENT to verify this
+      hypothesis.  It always counts: whether its conclusion agrees with a
+      later verdict is the *conflict* question (G21), not the *evidence
+      standard* question.
+    * **incidental** (``related_via`` set, v3.37.7 multi-hypothesis
+      attribution) — the entry restates ANOTHER delegation's declared
+      ``effect`` toward this hypothesis.  It counts only when that
+      declared direction is POSITIVE (``supports`` true / restated
+      verdict ``confirmed``): a direction declaration that refutes (or
+      leaves unclear) the hypothesis is not confirmatory-layer evidence
+      for it.
+
+    Why the direction matters (2026-09-13 session ac7e7551, scenario 17):
+    host-expert verified H1 and declared
+    ``related_hypotheses=[{H2, effect=refutes}]``; the restated entry made
+    H2 count as "has expert evidence", so a ``confirmed`` resting on
+    metric-layer reasoning passed the G17 precondition and was then
+    blocked by G21 — which reads the *opposite* direction as a
+    cross-expert verdict conflict and offers "re-grade to inconclusive"
+    among its exits.  The same polluted entry also disabled G17-E2 (the
+    argus-conflict signal requires ALL expert views to be metric-layer).
+    One bad provenance thus closed the correct gate and armed the wrong
+    one; the substantive gap was "no direct verification", which is what
+    G17's receipt already names (v3.38.0 direct-vs-incidental view).
+
+    Pure derivation from the evidence list (single source of truth); no
+    storage field is added.
+    """
+    node = (ledger.get("hypotheses") or {}).get(hid) or {}
+    for e in node.get("evidence", []):
+        if not str(e.get("source", "")).startswith("expert:"):
+            continue
+        if not e.get("related_via"):
+            return True
+        if e.get("supports") is True:
+            return True
+        if (e.get("structured") or {}).get("verdict") == "confirmed":
+            return True
+    return False
+
+
 def experts_for_hypothesis(ledger: DiagnosisLedger, hid: str) -> dict[str, list[str]]:
     """Which experts bear on *hid*, split by direct vs incidental (v3.38.0).
 
@@ -3632,10 +3679,15 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
     if not node or node.get("status") in ("confirmed", "refuted"):
         return None
 
-    has_expert = any(
-        str(e.get("source", "")).startswith("expert:")
-        for e in node.get("evidence", [])
-    )
+    # v3.42.0: same predicate as G17's evidence standard — "expert evidence
+    # awaiting a verdict" must not be claimed for an entry that is merely
+    # another delegation's OPPOSING direction declaration.  Otherwise the
+    # guidance ("已有专家验证证据但未落账，请落账") and the gate ("该判定与既有
+    # 专家结论相反，拦截") contradict each other in the same turn — the
+    # lead-vs-gate inconsistency recorded before (2026-09-13 session
+    # ac7e7551: guidance said "H2 已有专家验证证据但未 record_finding 落账",
+    # the very next record_finding was blocked by G21).
+    has_expert = confirmatory_expert_evidence(ledger, hid)
     ev_round = node.get("_last_evidence_round", 0)
     find_round = node.get("_last_finding_round", 0)
     g17_round = node.get("_g17_blocked_round")
@@ -3676,11 +3728,12 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
             return ActionHint(
                 "record_finding", "critical",
                 f"{fmt_hid(hid)} 的判定此前被冲突类门控拦截"
-                "（指标层/专家结论层证据矛盾）——按拦截回执三选一处置："
-                "①复检矛盾数据源后重提交原判定"
-                "（通道已开放，降级放行并披露）；"
-                "②判 inconclusive 并披露证据缺口；"
-                "③改派第三方视角专家仲裁。"
+                "（指标层/专家结论层证据矛盾）——按拦截回执处置，按证据"
+                "价值排序：①复检矛盾数据源（委派针对本假设的直接验证/"
+                "第三方视角专家，据其结论重提交原判定）——直接测量优先"
+                "于方向声明与间接观测；②携 statement_update 明示推翻理由"
+                "后重提交；③以 inconclusive + 证据缺口披露收口（最后手段："
+                "会把已到位的证据一并搁置）。"
                 "落账成功后相位自动进入 EVALUATE——新方向假设届时提出",
             )
         if stall >= 2:
@@ -3911,15 +3964,32 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                         "委派互补专家："
                         f"{_format_expert_names(candidates[:3])}；"
                     )
+                # v3.42.0: name the PROVENANCE of the cited conclusion.  An
+                # incidental entry (related_via) was not produced by
+                # verifying THIS hypothesis, so "已由 X 验证" overstates it
+                # — the same overstatement that made a coordinator treat a
+                # bare direction declaration as a verdict on this
+                # hypothesis (2026-09-13 session ac7e7551).
+                _last_inc = bool(
+                    next((e.get("related_via")
+                          for e in reversed(node.get("evidence", []))
+                          if str(e.get("source", "")).startswith("expert:")),
+                         None)
+                )
+                _src_phrase = (
+                    f"{expert_sources[-1]} 的委派**顺带归因**"
+                    "（该专家未被派来验证本假设，其方向以声明 effect 为准）"
+                    if _last_inc else f"{expert_sources[-1]} 验证"
+                )
                 if seeding:
                     directive = (
-                        f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
+                        f"⚠ {fmt_hid(active_id)} 已由 {_src_phrase}"
                         f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"{seeding}{anti_fab}。"
                     )
                 else:
                     directive = (
-                        f"⚠ {fmt_hid(active_id)} 已由 {expert_sources[-1]} 验证"
+                        f"⚠ {fmt_hid(active_id)} 已由 {_src_phrase}"
                         f"（结论见上方证据），{_action_prefix(active_id, ledger)}；"
                         f"证据不足可再委派（价值仍高于阈值）{anti_fab}。"
                     )
@@ -3959,13 +4029,29 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                 # consistent with the observation-warning exemption and
                 # the conflict-gate exemption, which already ignore the
                 # verdict value.
+                # v3.42.0: DIRECT entries only.  An incidental entry
+                # (``related_via``) preserves the SOURCE return's
+                # ``verdict_target``/``root_cause`` verbatim, but those
+                # fields describe the SOURCE hypothesis' conclusion
+                # object — reading them here claims the expert "refuted
+                # THIS hypothesis and confirmed another cause" when the
+                # expert was never sent to verify it.  2026-09-13 session
+                # ac7e7551 (scenario 17): the directive told the model to
+                # record H2=refuted because host-expert's H1 return
+                # (verdict_target=alternative_root_cause) had been
+                # attributed to H2 — i.e. the pre-guidance actively
+                # pushed the verdict OPPOSITE to the correct one.  The
+                # declared direction of an incidental entry is already
+                # carried by its evidence entry (``supports``), which the
+                # evidence-impact re-assessment below consumes.
                 _alt_rc = next(
                     (str((e.get("structured") or {}).get("root_cause")
                          or "").strip()
-                     for e in reversed(node.get("evidence", []))
-                     if str(e.get("source", "")).startswith("expert:")
-                     and (e.get("structured") or {}).get("verdict_target")
-                     == "alternative_root_cause"),
+                    for e in reversed(node.get("evidence", []))
+                    if str(e.get("source", "")).startswith("expert:")
+                    and not e.get("related_via")
+                    and (e.get("structured") or {}).get("verdict_target")
+                    == "alternative_root_cause"),
                     "",
                 )
                 if _alt_rc:

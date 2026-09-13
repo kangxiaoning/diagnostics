@@ -82,6 +82,7 @@ from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，desig
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from diagnostics.agent.ledger import experts_for_hypothesis  # 假设↔专家归属视图（v3.38.0）
+from diagnostics.agent.ledger import confirmatory_expert_evidence  # G17 确证层证据判据（v3.42.0）
 from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
 from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
@@ -6354,10 +6355,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     and hypothesis_id in ledger.get("hypotheses", {})):
                 _g17_node = ledger["hypotheses"][hypothesis_id]
                 if _g17_node.get("status") != "confirmed":
-                    _has_expert = any(
-                        str(e.get("source", "")).startswith("expert:")
-                        for e in _g17_node.get("evidence", [])
-                    )
+                    # v3.42.0: the precondition is CONFIRMATORY-layer
+                    # evidence, not "any expert string".  A DIRECT entry
+                    # counts; an INCIDENTAL one (related_via) counts only
+                    # when its declared direction is positive.  Before
+                    # this, an incidental entry whose declared effect was
+                    # ``refutes`` satisfied the precondition, so a
+                    # confirmed resting on metric-layer reasoning passed
+                    # G17 and was stopped by G21 instead — with a receipt
+                    # (expert-verdict conflict) whose exits read as "grade
+                    # to inconclusive" and whose premise ("two deep
+                    # experts judged this hypothesis in opposite
+                    # directions") did not hold (2026-09-13 session
+                    # ac7e7551, scenario 17: 14.5k chars of coordinator
+                    # reasoning, ~5 near-flips to inconclusive).  The
+                    # substantive gap was the missing DIRECT verification
+                    # — exactly what this receipt names.
+                    _has_expert = confirmatory_expert_evidence(
+                        ledger, hypothesis_id)
                     _experts = ledger.get("scene_experts") or []
                     # ── G17-E2: conflicted argus evidence ≠ confirmatory ──
                     # (2026-08-11 scenario 38, design document §8 G17 —
@@ -6449,10 +6464,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # you just did was ignored" (2026-09-11 session).
                         _hid_map = experts_for_hypothesis(ledger, hypothesis_id)
                         _inc = _hid_map.get("incidental") or []
+                        # v3.42.0: state the DECLARED DIRECTION of the
+                        # incidental entry.  Otherwise "there IS expert
+                        # evidence on this hypothesis" plus an opposing
+                        # direction reads as a cross-expert verdict
+                        # conflict ON this hypothesis — the misread that
+                        # burned 14.5k chars of coordinator reasoning and
+                        # nearly produced a baseless inconclusive
+                        # (2026-09-13 session ac7e7551).
+                        _inc_opposing = any(
+                            e.get("supports") is False
+                            or (e.get("structured") or {}).get("verdict")
+                            == "refuted"
+                            for e in _g17_node.get("evidence", [])
+                            if str(e.get("source", "")).startswith("expert:")
+                            and e.get("related_via")
+                        )
                         _inc_hint = (
                             f"（注：{fmt_hid(hypothesis_id)} 已有来自 "
                             f"{'、'.join(_inc)} 的**顺带影响**证据——那是其它委派"
-                            "结论顺带触及，不构成对该假设的直接验证。）"
+                            "结论顺带触及，不构成对该假设的直接验证"
+                            + ("；该旁支声明声明的方向为**不支持**本假设，"
+                               "同样不能作为 confirmed 的依据——"
+                               "如你认为它不适用于本假设的当前表述，"
+                               "请委派一次针对本假设的直接验证，据其结论落账"
+                               if _inc_opposing else "")
+                            + "。）"
                             if _inc else ""
                         )
                         logger.warning(
@@ -6657,39 +6694,68 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 if _g21_conflict.get("related_via")
                                 else "",
                             )
-                            # v3.38.4 (R3): if the "prior verdict" is merely an
-                            # ATTRIBUTED entry, say so.  Otherwise route #2
-                            # below ("改判 inconclusive") reads as the path of
-                            # least resistance and produces a reason-free flip
-                            # even when the current verdict agrees with the
-                            # declared effect (2026-09-11 session 29dfc820).
+                            # v3.42.0: name the trigger FORM honestly, and
+                            # order the exits by evidential value.  Two
+                            # distinct shapes reach this gate:
+                            #   (a) DIRECT terminal conflict — experts were
+                            #       SENT to verify THIS hypothesis and their
+                            #       terminal verdicts disagree;
+                            #   (b) INCIDENTAL direction declaration — the
+                            #       entry restates another delegation's
+                            #       declared effect onto this hypothesis
+                            #       (the expert was never sent here).
+                            # Describing (b) as "两个深度专家对同一假设给出
+                            # 相反终局结论" is factually false and drives the
+                            # model into ledger archaeology and toward the
+                            # least-resistance downgrade: v3.38.4 R3 recorded
+                            # the same class for an even simpler shape, and
+                            # 2026-09-13 session ac7e7551 spent 14.5k chars of
+                            # reasoning, considered "改判 inconclusive 后直接出
+                            # 报告" about five times, and only escaped because
+                            # it overrode the receipt on its own.  Route 1 is
+                            # therefore the DIRECT re-verification (the action
+                            # that resolved that session), route 3 the last
+                            # resort with its cost stated.
                             _g21_prov = _g21_conflict.get("related_via")
-                            _g21_prov_hint = (
-                                f"\nℹ 注意：该「既有结论」来自**旁支归因**"
-                                f"（由 {fmt_hid(_g21_prov)} 的委派结果顺带归因到"
-                                f"本假设，其方向以专家声明的 effect 为准）。若本次"
-                                f"判定与该 effect 方向一致，则不构成跨专家矛盾——"
-                                f"请携 statement_update 说明后重新落账，通道立即开放。"
-                                if _g21_prov else ""
-                            )
+                            if _g21_prov:
+                                _g21_form = (
+                                    f"本假设的既有「方向声明」来自**旁支归因**："
+                                    f"{_g21_conflict['expert']} 的委派目标是 "
+                                    f"{fmt_hid(_g21_prov)}，它在那次委派中声明了"
+                                    f"对本假设的方向 "
+                                    f"{_g21_conflict['prev_verdict']}"
+                                    f"；该专家**未被派来验证本假设**——"
+                                    f"这不是「两个专家对同一假设的终局结论冲突」，"
+                                    f"而是「一条既存方向声明与本次拟判方向相反」。"
+                                    f"若你认为该声明已不适用于本假设的当前表述，"
+                                    f"出路 2 立即开放。"
+                                )
+                            else:
+                                _g21_form = (
+                                    f"{_g21_conflict['expert']} 曾**被派来验证**"
+                                    f"本假设并判定 {_g21_conflict['prev_verdict']}"
+                                    f"——两个深度专家对同一假设给出相反终局结论属"
+                                    f"跨专家证据矛盾，直接落账将以新结论静默覆盖"
+                                    f"旧结论。"
+                                )
                             return (
-                                f"⛔ 假设 {fmt_hid(hypothesis_id)} 已有专家终局结论与"
-                                f"本次判定相反（专家结论冲突仲裁）："
+                                f"⛔ 假设 {fmt_hid(hypothesis_id)} 的既有专家结论"
+                                f"与本次拟判 {verdict} 方向相反（专家结论冲突仲裁）："
                                 f"{_g21_conflict['expert']} 此前判定 "
                                 f"{_g21_conflict['prev_verdict']}"
-                                f"（证据摘要：{_g21_conflict['summary']}…），"
-                                f"而本次拟判 {verdict}。两个深度专家对同一假设给出"
-                                f"相反终局结论属跨专家证据矛盾，直接落账将以新结论"
-                                f"静默覆盖旧结论。{_g21_prov_hint}请先仲裁：\n"
-                                f"1. 复检矛盾数据源：委派第三方视角专家（或同一专家"
-                                f"复核具体矛盾点，如两侧对同一物理量的观测差异）确认"
-                                f"哪侧证据可靠；\n"
-                                f"2. 以冲突披露收口：若无法仲裁，改判 inconclusive 并"
-                                f"在 new_insights 披露两侧矛盾证据，报告将如实呈现"
-                                f"未解冲突；\n"
-                                f"3. 明示推翻理由：若确有把握推翻既有结论，携带 "
+                                f"（证据摘要：{_g21_conflict['summary']}…）。"
+                                f"{_g21_form}请先处置：\n"
+                                f"1. 复检矛盾数据源（推荐）：委派一次**针对本假设**"
+                                f"的直接验证（第三方视角专家，或同一专家复核具体"
+                                f"矛盾点，如两侧对同一物理量的观测差异），据其结论"
+                                f"落账——直接测量优先于方向声明与间接观测；\n"
+                                f"2. 明示推翻理由：若确有把握推翻既有结论，携带 "
                                 f"statement_update（含推翻理由，如\"新证据为直接测量，"
-                                f"旧证据为间接观测\"）重新落账，通道立即开放。"
+                                f"旧证据为间接观测\"）重新落账，通道立即开放；\n"
+                                f"3. 以冲突披露收口（最后手段）：若无法仲裁，改判 "
+                                f"inconclusive 并在 new_insights 披露两侧矛盾证据"
+                                f"——注意这会把已到位的证据一并搁置，报告将如实"
+                                f"呈现未解冲突。"
                             )
             # ── G18: ceremonial-repeat guard (design document §8,
             # v3.11.0) ──
