@@ -1489,9 +1489,19 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                 f"；留有 {item.get('fallback_chars')} 字非结构化文本（未采信为结论）"
                 if item.get("fallback_chars") else ""
             )
+            # v3.41.2 (R3): two terminal conditions produce this entry —
+            # the output-length cap (truncation) and the model-turn budget
+            # (turn_limit).  Reporting the turn cap as a truncation would
+            # misattribute the cause the Coordinator has to reason about.
+            if (item.get("cause") or "truncation") == "turn_limit":
+                reason = (f"模型轮次达到上限 {item.get('turns', 0)} 轮仍未收尾"
+                          f"（已采集 {item.get('calls', 0)} 项数据）")
+            else:
+                reason = (f"输出达到长度上限被截断 "
+                          f"{item.get('truncations', 1)} 次"
+                          f"（已采集 {item.get('calls', 0)} 项数据）")
             lines.append(
-                f"- 第{item.get('round', 0)}轮 [{channels}]: 输出达到长度上限被截断 "
-                f"{item.get('truncations', 1)} 次（已采集 {item.get('calls', 0)} 项数据），"
+                f"- 第{item.get('round', 0)}轮 [{channels}]: {reason}，"
                 f"未返回结构化结论{extra}——该方向视为未取证，不等于「已检查且正常」"
             )
         lines.append("- 下一步：缩小查询范围后重新委派该通道，或改用其他取证通道补证")

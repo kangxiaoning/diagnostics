@@ -301,6 +301,20 @@ class ExpertSessionLedger:
                 # repeat".
                 "goal": "",
                 "ref_counts": {},            # "tool(arg/arg)" → count
+                # v3.41.2 turn accounting (R3): the call-level budget
+                # (G19-ext) counts EXECUTED tool calls, so a loop whose turns
+                # never execute a tool is invisible to it (measured
+                # 2026-09-13: 13 model turns, 0 executed calls).  Turns get
+                # their own counter and their own bound; `turn_hinted` keeps
+                # the wrap-up guidance one-shot.
+                "turns": 0,
+                "turn_hinted": False,
+                # v3.41.2 (R2): the zero-forensics bounce is one-shot BY
+                # ITSELF.  The shared conclusion latch cannot express that
+                # (G27 and the redundancy/reasoning/output guidance channels
+                # set it too), and reusing it would let a first-turn
+                # truncation end the delegation silently instead of bouncing.
+                "zerocall_bounced": False,
             }
             self._sessions[key] = s
         self._sessions.move_to_end(key)
@@ -424,11 +438,51 @@ class ExpertSessionLedger:
     # delegation case that G19/G26 already guard against).
 
     def record_truncation(self, key: str, info: dict[str, Any]) -> int:
-        """Record one length-truncated model turn; returns the count."""
+        """Record one length-truncated model turn; returns the count.
+
+        ``info["turn"]`` (v3.41.2) carries the turn index the truncation
+        belongs to, so the recovery can tell "this turn was truncated" from
+        "a previous turn was" without a second store.  Legacy callers that
+        omit it are treated as belonging to the current turn.
+        """
         s = self.session(key)
         s["truncations"].append(info)
         del s["truncations"][:-_MAX_TRUNCATIONS_PER_DELEGATION]
         return len(s["truncations"])
+
+    def bump_turn(self, key: str) -> int:
+        """Count one model turn for this delegation (R3, v3.41.2)."""
+        s = self.session(key)
+        s["turns"] = int(s.get("turns", 0) or 0) + 1
+        return s["turns"]
+
+    def turns(self, key: str) -> int:
+        return int(self.session(key).get("turns", 0) or 0)
+
+    def turn_hinted(self, key: str) -> bool:
+        return bool(self.session(key).get("turn_hinted"))
+
+    def mark_turn_hinted(self, key: str, guidance: str) -> None:
+        """Deliver the turn-cap wrap-up guidance once.
+
+        Deliberately does NOT touch ``conclusion_hinted``: that latch carries
+        G27/G28 conclusion semantics (and a set latch makes G27/G28 pass
+        through), so borrowing it here would silently disable those paths.
+        Appends instead of overwriting: a pending G27 guidance must survive.
+        """
+        s = self.session(key)
+        if s.get("turn_hinted"):
+            return
+        s["turn_hinted"] = True
+        if guidance:
+            existing = s.get("pending_guidance") or ""
+            s["pending_guidance"] = (existing + "\n" + guidance) if existing else guidance
+
+    def zerocall_bounced(self, key: str) -> bool:
+        return bool(self.session(key).get("zerocall_bounced"))
+
+    def mark_zerocall_bounced(self, key: str) -> None:
+        self.session(key)["zerocall_bounced"] = True
 
     def truncation_count(self, key: str) -> int:
         return len(self.session(key)["truncations"])

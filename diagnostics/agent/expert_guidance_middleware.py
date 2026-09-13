@@ -196,6 +196,77 @@ def _channels(tool_names: list[str]) -> list[str]:
     return domains or [n for n in (tool_names or [])[:3]]
 
 
+def _content_chars(msgs: Any) -> int:
+    """Visible (non-reasoning) characters carried by a turn's messages."""
+    total = 0
+    for m in msgs or []:
+        content = getattr(m, "content", "") or ""
+        if isinstance(content, list):
+            for block in content:
+                total += (len(str(block.get("text", "")))
+                          if isinstance(block, dict) else len(str(block)))
+        else:
+            total += len(str(content))
+    return total
+
+
+# v3.41.2 (R1/R4): a recovery jump skips the tools node, so it must never
+# take a legitimate action with it, and it must answer any call it does
+# skip.  Measured 2026-09-13 (host-argus-expert, session 095731): a
+# length-truncated first turn was bounced; the retry proposed
+# ``get_argus_os_overview_metrics``, the bounce discarded that call, the
+# ledger's ``calls`` stayed empty and the zero-forensics branch re-fired on
+# every following turn — 13 bounces in 6 minutes, 6 identical calls never
+# executed, the session ended (client disconnect) with no report.  Two
+# established rules are violated by such a discard: LangChain's
+# human-in-the-loop middleware *synthesises a ToolMessage for every
+# rejected call* (so the model learns the call was not executed and does
+# not simply re-issue it), and the OpenAI-compatible protocol requires an
+# answer for every ``tool_call_id`` ("an assistant message with
+# 'tool_calls' must be followed by tool messages responding to each
+# 'tool_call_id'").  Hence: pass a legitimate action through, and answer
+# explicitly whatever a jump skips.
+
+def _pending_tool_calls(state: Any) -> list[tuple[str, str]]:
+    """(id, name) of the last assistant turn's unanswered tool calls."""
+    messages = (list(state.get("messages", []) or [])
+                if isinstance(state, dict) else [])
+    answered = {
+        getattr(m, "tool_call_id", None)
+        for m in messages
+        if isinstance(m, ToolMessage)
+    }
+    for msg in reversed(messages):
+        calls = getattr(msg, "tool_calls", None) or []
+        if not calls:
+            continue
+        pending: list[tuple[str, str]] = []
+        for call in calls:
+            if isinstance(call, dict):
+                cid, name = call.get("id"), call.get("name", "")
+            else:
+                cid, name = getattr(call, "id", None), getattr(call, "name", "")
+            if cid and cid not in answered:
+                pending.append((cid, name or ""))
+        return pending
+    return []
+
+
+_SKIPPED_CALL_NOTE = (
+    "[系统] 该工具调用未被执行：上一次输出被长度上限截断，系统改为重新生成该轮。"
+    "不要原样重发同一调用——直接发起你需要的取证调用即可。"
+)
+
+
+def _skipped_call_results(pending: list[tuple[str, str]]) -> list[ToolMessage]:
+    """Placeholder answers for calls a recovery jump will not execute."""
+    return [
+        ToolMessage(content=_SKIPPED_CALL_NOTE, tool_call_id=cid,
+                    name=name or None)
+        for cid, name in pending
+    ]
+
+
 # Tools that never carry diagnostic information into the ledger:
 # planner scaffolding, file tools (G11's domain), ledger/delegation
 # tools (Coordinator-side), and the structured-return conclusion tools
@@ -259,6 +330,32 @@ _OUTPUT_PRESSURE_GUIDANCE = (
     "[系统提示·输出预算保护] 上一轮你的输出内容已接近输出上限——继续输出大段内容"
     "（写文件、长文本）会触发系统截断并丢失结论。请立即收敛：直接调用结论工具"
     "提交结论；确需落盘的内容精简为关键摘要，未覆盖项在 coverage_gaps 声明。"
+)
+
+# v3.41.2 (R3): model-turn bound per delegation — the fail-safe counterpart
+# of the recovery fixes.  A recovery action must never be able to block its
+# own exit condition, and the only bound that holds whatever the cause is a
+# turn/step budget: OpenAI Agents SDK counts agent-loop turns (several tool
+# calls in one turn count once) and raises MaxTurnsExceeded, with an error
+# handler for a controlled final output; LangGraph's recursion_limit bounds
+# super-steps and its own docs are explicit that raising the limit is not
+# the fix, only the circuit breaker.  The call-level budget (G19-ext) cannot
+# serve this purpose: it counts EXECUTED calls, and the measured livelock had
+# 13 turns with 0 executed calls.  Soft: converge now (positive recipe).
+# Hard: terminate and report the channel as lost, exactly like a truncation,
+# so "no conclusion" can never be read as "checked and clean".
+def _turn_soft() -> int:
+    return _env_int("DIAGNOSTICS_EXPERT_TURNS_SOFT", 24)
+
+
+def _turn_hard() -> int:
+    return _env_int("DIAGNOSTICS_EXPERT_TURNS_HARD", 32)
+
+
+_TURN_CAP_GUIDANCE = (
+    "[系统提示·轮次预算] 本委派的模型轮次已接近上限，系统随后会强制结束该委派，"
+    "未收尾的取证将不再进行。请立即调用结论工具提交结论；尚未覆盖的维度在"
+    "coverage_gaps 按『维度名：类型｜原因』声明（类型取 数据不可用/不适用/强制收尾）。"
 )
 
 _SKIP_TOOLS = frozenset({
@@ -467,6 +564,18 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                     key, self._ledger.output_chars(key),
                     _out_pressure, MAX_OUTPUT_TOKENS,
                 )
+            # v3.41.2 (R3): model-turn accounting + soft turn cap.  Turn
+            # based, so a loop whose turns execute no tool (invisible to
+            # G19-ext) is still bounded; the guidance is one-shot (dedicated
+            # flag, never the conclusion latch).
+            _turns = self._ledger.bump_turn(key)
+            if _turns >= _turn_soft() and not self._ledger.turn_hinted(key):
+                self._ledger.mark_turn_hinted(key, _TURN_CAP_GUIDANCE)
+                logger.warning(
+                    "Turn cap (soft): delegation %s at %d model turns "
+                    "(soft=%d, hard=%d) — wrap-up guidance injected",
+                    key, _turns, _turn_soft(), _turn_hard(),
+                )
             tool_names = []
             for t in (getattr(request, "tools", None) or []):
                 name = getattr(t, "name", None) or (
@@ -552,16 +661,7 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 # v3.39.2 (C): remember the CONTENT volume too — it is the
                 # other half of the shared output budget, and a content-only
                 # saturation is invisible to the reasoning counter.
-                _content = 0
-                for _m in _msgs:
-                    _c = getattr(_m, "content", "") or ""
-                    if isinstance(_c, list):
-                        for _b in _c:
-                            _content += (len(str(_b.get("text", "")))
-                                         if isinstance(_b, dict)
-                                         else len(str(_b)))
-                    else:
-                        _content += len(str(_c))
+                _content = _content_chars(_msgs)
                 self._ledger.set_output_chars(_k, _content)
             except Exception:
                 pass
@@ -586,11 +686,19 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
     # BOUNDED single retry (one-time latch; the second submission
     # always passes, so the loop provably terminates — max +1 model
     # turn, 0 extra tool calls).
-    @hook_config(can_jump_to=["model"])
+    @hook_config(can_jump_to=["model", "end"])
     def after_model(self, state, runtime) -> dict | None:
         try:
             sr = state.get("structured_response") if isinstance(state, dict) else None
             if sr is None:
+                # ── R3 (v3.41.2): hard turn cap — fail-safe termination ──
+                # Checked BEFORE the recovery hooks: no recovery path may
+                # extend a delegation past its turn budget (the bug class
+                # this exists for is a recovery whose action blocked its own
+                # exit condition).
+                capped = self._terminate_if_turn_cap_reached(state)
+                if capped is not None:
+                    return capped
                 # ── G28: length-truncated turn ──
                 # No structured conclusion was parsed — most likely the
                 # response hit the output cap.  Bounce once for a minimal
@@ -672,56 +780,87 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             "reasoning_chars": reason_chars,
             "duration_s": duration_s,
             "channels": channels,
+            # v3.41.2: the turn the truncation belongs to, so the recovery
+            # can distinguish "this turn was truncated" from "a previous
+            # turn was" without a second store.
+            "turn": self._ledger.turns(key),
         })
         # The recovery decision runs later in after_model (bounce once
         # when evidence exists, degrade otherwise) — the wording here
         # must not pre-empt that decision.
+        # v3.41.2 (R5): content_chars + turn close two observation gaps:
+        # `reasoning_chars=0` alone cannot tell "reasoning ate the budget"
+        # from "content ate it", and the turn index places the event in the
+        # delegation's timeline (measured 2026-09-13: out=32768,
+        # reasoning_chars=0, 1084s — undecidable without the capture).
         logger.warning(
             "G28 expert output truncated (finish_reason=length, "
-            "delegation %s, occurrence %d, out=%s, reasoning=%s, "
-            "reasoning_chars=%d, duration=%.1fs, channels=%s) — no "
-            "structured conclusion; recovery follows in after_model "
+            "delegation %s, occurrence %d, turn=%d, out=%s, reasoning=%s, "
+            "reasoning_chars=%d, content_chars=%d, pending_calls=%d, "
+            "duration=%.1fs, channels=%s) — no structured conclusion; "
+            "recovery follows in after_model "
             "(bounce once with evidence, degrade otherwise)",
-            key, count, out_tok or "?", reason_tok or "?",
-            reason_chars, duration_s, ",".join(channels) or "?",
+            key, count, self._ledger.turns(key), out_tok or "?", reason_tok or "?",
+            reason_chars, _content_chars(messages_of(response)),
+            len(_pending_tool_calls({"messages": messages_of(response)})),
+            duration_s, ",".join(channels) or "?",
         )
 
     def _truncation_recovery(self, state: Any) -> dict | None:
-        """Bounce a truncated delegation once; degrade otherwise.
+        """Recover a delegation whose turn(s) hit the output cap.
 
-        Degradation covers both terminal cases: the second truncated
-        miss (the one bounce was already spent) and a first-turn
-        truncation with zero forensics (nothing to conclude from, so
-        the bounce is skipped — but the lost channel must still be
-        surfaced to the Coordinator).
+        Decision order (v3.41.2):
+          1. the current turn carries an unanswered tool call and was NOT
+             the truncated turn → never jump: the action is legitimate, so
+             it runs (R1).  A recovery may inject guidance, never swallow
+             the model's action — swallowing it is what produced the
+             livelock of 2026-09-13 (13 bounces, 6 discarded calls, no
+             report), because a skipped tool call never reaches the ledger
+             and the zero-forensics branch therefore re-fires forever;
+          2. a truncated turn WITH forensics → one bounded minimal-
+             resubmission bounce (v3.25.0 semantics);
+          3. a truncated turn with ZERO forensics → one bounce with
+             reasoning disabled (v3.37.9), gated by its OWN one-shot flag
+             (R2 — the shared conclusion latch cannot carry this meaning),
+             then degrade;
+          4. any later turn of an already-truncated delegation that needs no
+             action → pass through; the recovery must not keep re-deciding.
+
+        Every jump answers the calls it skips with placeholder ToolMessages
+        (R4), so the context never contains a dangling ``tool_call_id``.
         """
         try:
             key = self._key_from_state(state)
-            if not self._ledger.truncation_count(key):
+            count = self._ledger.truncation_count(key)
+            if not count:
                 return None
             s = self._ledger.session(key)
-            # Nothing was ever collected: the truncation hit the FIRST
-            # model turn (reasoning exhausted the output budget before
-            # any tool call — observed 2026-09-09).  A conclusion-
-            # oriented resubmit would be pointless without evidence,
-            # but ending silently would hand the Coordinator an empty
-            # result it cannot tell apart from "checked, nothing
-            # found" — the pseudo-signal G28 exists to eliminate
-            # (design document §8 G28).  Degrade instead of bouncing.
-            # Nothing was ever collected: the truncation hit the FIRST
-            # model turn.  v3.37.9 (R1): the observed cause is the reasoning
-            # stream exhausting the SHARED output budget (captured body of
-            # such a turn: 71419 reasoning characters, 0 content, 0
-            # tool_calls), and probing the same model shows tool calls are
-            # emitted normally once reasoning is disabled.  So bounce ONCE
-            # with reasoning off — the retry automatically runs on the
-            # none-effort model variant selected in awrap_model_call — and
-            # degrade only if that retry also fails (truncation_count >= 2,
-            # which keeps the loop provably bounded).
+            last = (self._ledger.truncations(key) or [{}])[-1]
+            # Records written by legacy callers (or fixtures) carry no turn
+            # index and are treated as belonging to the current turn.
+            trunc_now = (last.get("turn") is None
+                         or last.get("turn") == self._ledger.turns(key))
+            pending = _pending_tool_calls(state)
+            jump = self._recovery_jump(pending)
+
+            if pending and not trunc_now:
+                # R1: the turn completed normally and proposed work — the
+                # jump would discard it (`jump_to` skips the tools node).
+                return None
+
             if not s["calls"]:
-                if self._ledger.truncation_count(key) >= 2:
+                # Zero-forensics truncation (planning-phase): the observed
+                # cause is the reasoning stream exhausting the SHARED output
+                # budget (captured body of such a turn: 71419 reasoning
+                # characters, 0 content, 0 tool_calls), and probing the same
+                # model shows tool calls are emitted normally once reasoning
+                # is disabled.  One bounce with reasoning off (the retry
+                # automatically runs on the none-effort variant selected in
+                # awrap_model_call); the second miss is terminal.
+                if self._ledger.zerocall_bounced(key) or count >= 2:
                     self._report_truncated_delegation(state, key)
                     return None
+                self._ledger.mark_zerocall_bounced(key)
                 guidance = (
                     "[系统提示·输出被截断] 上一次输出达到长度上限，且尚未产生"
                     "任何取证调用（本次已关闭长篇推理）。请立即调用 1-2 个最关键"
@@ -730,9 +869,14 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 self._ledger.mark_conclusion_hinted(key, guidance)
                 logger.warning(
                     "G28 zero-call truncation: delegation %s bounced once "
-                    "with reasoning disabled", key,
+                    "with reasoning disabled (turn=%d, count=%d, skipped_calls=%d)",
+                    key, self._ledger.turns(key), count, len(pending),
                 )
-                return {"jump_to": "model"}
+                return jump
+            if not trunc_now:
+                # A later turn of a delegation that already answered the
+                # truncation question: nothing to recover here.
+                return None
             if self._ledger.conclusion_hinted(key):
                 # The one bounce was already spent (by G27 or by G28);
                 # the second truncation is terminal — degrade instead of
@@ -761,15 +905,59 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             logger.warning(
                 "G28 conclusion checkpoint: delegation %s bounced once "
                 "for a minimal resubmission (%d executed calls retained, "
-                "conclusion tool %s)",
-                key, len(s["calls"]), tool_hint,
+                "conclusion tool %s, skipped_calls=%d)",
+                key, len(s["calls"]), tool_hint, len(pending),
             )
-            return {"jump_to": "model"}
+            return jump
         except Exception:
             return None  # the recovery must never break the wrap-up path
 
-    def _report_truncated_delegation(self, state: Any, key: str) -> None:
-        """Surface a lost channel to the Coordinator (once per delegation)."""
+    @staticmethod
+    def _recovery_jump(pending: list[tuple[str, str]]) -> dict[str, Any]:
+        """Jump back to the model, answering whatever calls it skips (R4)."""
+        update: dict[str, Any] = {"jump_to": "model"}
+        placeholders = _skipped_call_results(pending)
+        if placeholders:
+            update["messages"] = placeholders
+        return update
+
+    def _terminate_if_turn_cap_reached(self, state: Any) -> dict | None:
+        """R3 fail-safe: end the delegation at the hard turn cap.
+
+        Returns the jump-to-end update (carrying placeholder answers for any
+        call the termination skips), or None while the cap is not reached.
+        The channel is reported as lost first, so the Coordinator sees "no
+        conclusion" instead of an unexplained empty delegation.
+        """
+        try:
+            key = self._key_from_state(state)
+            turns = self._ledger.turns(key)
+            if turns < _turn_hard():
+                return None
+            if not self._ledger.turn_hinted(key):
+                self._ledger.mark_turn_hinted(key, _TURN_CAP_GUIDANCE)
+            self._report_truncated_delegation(state, key, cause="turn_limit")
+            placeholders = _skipped_call_results(_pending_tool_calls(state))
+            logger.error(
+                "Turn cap (hard): delegation %s reached %d model turns "
+                "(hard=%d) — delegation terminated, channel reported as lost",
+                key, turns, _turn_hard(),
+            )
+            update: dict[str, Any] = {"jump_to": "end"}
+            if placeholders:
+                update["messages"] = placeholders
+            return update
+        except Exception:
+            return None  # the fail-safe must never break the wrap-up path
+
+    def _report_truncated_delegation(self, state: Any, key: str,
+                                     cause: str = "truncation") -> None:
+        """Surface a lost channel to the Coordinator (once per delegation).
+
+        *cause* (v3.41.2) distinguishes the two terminal conditions that
+        both mean "this delegation returned no conclusion": ``truncation``
+        (output-length cap) and ``turn_limit`` (R3 turn budget).
+        """
         try:
             if self._ledger.truncation_reported(key):
                 return
@@ -780,6 +968,8 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 "channels": _channels(s.get("tools") or []),
                 "truncations": self._ledger.truncation_count(key),
                 "calls": len(s["calls"]),
+                "cause": cause,
+                "turns": self._ledger.turns(key),
                 # Fact, not a verdict: how much non-structured text the
                 # last turn left behind.  Mirrors the vendor handling of
                 # incomplete responses, which distinguishes "ran out of
@@ -799,9 +989,9 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 ledger.setdefault("truncated_delegations", []).append(entry)
             logger.error(
                 "G28 delegation %s produced no conclusion after %d "
-                "truncated turns (channels=%s, fallback_chars=%d) — "
-                "marked as a lost channel",
-                key, entry["truncations"],
+                "truncated turns / %d model turns (cause=%s, channels=%s, "
+                "fallback_chars=%d) — marked as a lost channel",
+                key, entry["truncations"], entry["turns"], cause,
                 ",".join(entry["channels"]) or "?", entry["fallback_chars"],
             )
         except Exception:
