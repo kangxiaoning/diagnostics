@@ -4331,7 +4331,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     tool_args["content"] = (
                         tool_args["content"].rstrip() + _appendix
                     )
-                    logger.warning(
+                    # INFO, not WARNING (2026-09-13): injecting the appendix
+                    # is the system doing exactly what it is designed to do.
+                    # Logging levels reserve WARNING for the unexpected or
+                    # the near-future problem, so a successful injection
+                    # belongs to INFO; only the G22 "single-channel refute
+                    # disclosed" line stays at WARNING (it flags limited
+                    # evidence strength, i.e. a property worth a human look).
+                    logger.info(
                         "write_file evidence-closure appendix injected "
                         "(round %d, %d chars)",
                         self._model_call_count, len(_appendix),
@@ -4350,7 +4357,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     tool_args["content"] = (
                         tool_args["content"].rstrip() + _sc_appendix
                     )
-                    logger.warning(
+                    # Same level rationale as the evidence-closure appendix
+                    # above: successful injection = working as expected.
+                    logger.info(
                         "write_file single-channel limitation appendix "
                         "injected (round %d, %d chars)",
                         self._model_call_count, len(_sc_appendix),
