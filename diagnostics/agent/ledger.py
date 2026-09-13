@@ -1549,9 +1549,15 @@ def _render_hypothesis_tree(
             node["selected"] and node["status"] in ("pending", "inconclusive"))
             else "")
         deferred_tag = " [搁置]" if node.get("deferred") else ""
+        # v3.41.0 (design document §8 G22): a refutation supported by a
+        # single confirming channel is disclosed inline so the fact
+        # travels with the hypothesis everywhere the ledger is rendered
+        # (report-phase context included) — the coverage limitation used
+        # to be a block; it is now a visible property of the node.
+        _sc_tag = " [单通道证伪]" if node.get("_single_channel_refute") else ""
         lines.append(
-            f"{prefix}### {fmt_hid(node['id'])} [{node['status']}{deferred_tag} "
-            f"p={node['probability']}%]{marker} "
+            f"{prefix}### {fmt_hid(node['id'])} [{node['status']}{deferred_tag}"
+            f"{_sc_tag} p={node['probability']}%]{marker} "
             f"{node['statement']}{active_marker}"
         )
         # Evidence.  Once a coordinator verdict exists (verdict_reason
@@ -2053,15 +2059,17 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "（指标 / 日志 / 事件）②查询时段覆盖故障时段 ③该通道属"
                 "假设所涉实体的观测域；任一项不齐备则判 inconclusive，"
                 "并在 rationale 中写清缺哪一项、为何不可取得\n"
-                # v3.29.0: disclose G22's block-once semantics at the
-                # decision point — "可直接判 refuted" above otherwise
-                # over-promises: a single-channel refute is bounced once
-                # for a coverage self-check before it can land (observed
-                # 2026-09-09 session 9906c211 round-5).  Fact statement,
-                # not a prohibition (positive/negative split discipline).
-                "- 仅单一通道支撑的 refuted，首次落账会经一次覆盖性自检"
-                "（系统拦截并要求确认覆盖）：确认三要素齐备后重发即放行，"
-                "或补第二通道交叉验证后一次通过\n"
+                # v3.41.0 (G22 demoted to disclosure, design document §8):
+                # the former block-once semantics is GONE — a single-
+                # channel refute lands normally and the coverage
+                # limitation is disclosed by the system in the report
+                # (deterministic appendix).  Stated as a FACT, not a
+                # prohibition (positive/negative split discipline), so the
+                # model still knows the strengthening option exists.
+                "- 仅单一通道支撑的 refuted 可直接落账（三要素齐备即可）；"
+                "系统会在报告中如实标注该证据局限（单一专家通道支撑，"
+                "未经跨通道复核）——如需强化结论，可在落账前补第二通道"
+                "交叉验证\n"
             )
         elif _has_expert_ev:
             # v3.38.3 (S1: decision-point guidance).  This branch used to be
@@ -2957,6 +2965,66 @@ def render_unrecorded_evidence_appendix(ledger: DiagnosisLedger) -> str:
     )
 
 
+def single_channel_refute_hypotheses(
+    ledger: DiagnosisLedger,
+) -> list[tuple[str, HypothesisNode]]:
+    """Hypotheses carrying a landed single-channel refutation
+    (design document §8 G22 v3.41.0 — the coverage limitation is a node
+    property now, not a block).  Terminal refuted nodes are included on
+    purpose: the limitation belongs to the delivered conclusion.
+    """
+    return [
+        (hid, node)
+        for hid, node in ledger.get("hypotheses", {}).items()
+        if node.get("_single_channel_refute")
+    ]
+
+
+def render_single_channel_limitation_appendix(ledger: DiagnosisLedger) -> str:
+    """Render the system appendix disclosing single-channel refutations
+    (design document §8 G22 / §9, v3.41.0).
+
+    Deterministic DISCLOSURE, the same fail-open philosophy as
+    `render_unrecorded_evidence_appendix`: the refutation itself is
+    legitimate and lands normally, but a verdict supported by ONE
+    confirming channel is weaker evidence than one cross-checked across
+    channels — an expert that cannot observe a channel reports its
+    blindness as a negative finding, which reads exactly like "checked,
+    it is fine".  The reader (and the report) must see which conclusions
+    rest on a single channel; the former gate only promised this
+    disclosure and never delivered it.  Returns "" when nothing to
+    disclose.
+    """
+    pairs = single_channel_refute_hypotheses(ledger)
+    if not pairs:
+        return ""
+    lines = []
+    for hid, node in pairs:
+        detail = node.get("_single_channel_detail") or {}
+        expert = detail.get("expert") or "?"
+        labels = "、".join(detail.get("channel_labels") or []) or "?"
+        alternatives = "、".join(detail.get("divergent_experts") or [])
+        lines.append(
+            f"- **{fmt_hid(hid)}**（{node.get('status')}）："
+            f"{node.get('statement', '')}\n"
+            f"  - 证据局限：该判定仅由单一专家通道支撑"
+            f"（{expert}：{labels}）"
+            + (
+                f"；本场景通道类别不同的专家（{alternatives}）未参与该假设"
+                f"的验证，结论未经跨通道交叉复核"
+                if alternatives else ""
+            )
+        )
+    return (
+        "\n\n---\n\n## 证据局限（系统附录）\n\n"
+        "> 以下假设的判定仅由单一专家通道支撑。系统不阻断这类判定"
+        "（是否充分由证据与理由决定），而是如实标注其证据强度——"
+        "单一通道看不到某类证据时，缺失可能被表述为「未发现异常」，"
+        "如需更强的结论可补充跨通道验证：\n\n"
+        + "\n".join(lines)
+    )
+
+
 def render_failure_digest(ledger: DiagnosisLedger) -> str:
     """Render a structured digest of the failed batch for retry-batch
     HYPOTHESIZE guidance (design document §9, v3.11.0).
@@ -3352,6 +3420,25 @@ def single_channel_refute_signal(ledger: DiagnosisLedger, hid: str) -> dict | No
     a 100% false-positive rate (two legitimate refutations demoted to
     inconclusive — over-abstention is itself a failure mode).
 
+    v3.41.0 — BLOCK REMOVED, DISCLOSURE KEPT: this signal no longer gates
+    record_finding.  Measured over 2026-09-11..13 (21 sessions / 28
+    triggers) the block produced no verifiable coverage gain: 15 landed
+    as bounded-degrade passes (a deterministic one-round toll), 5 were
+    cleared by a SAME-surface peer (correlated evidence, i.e. pseudo-
+    coverage), 1 left the hypothesis pending at session end (verdict
+    lost) and 1 closed inconclusive — and every analysed trigger on
+    2026-09-13 was a false positive (the only divergent expert,
+    host-expert, was semantically irrelevant to the K8s-layer
+    hypotheses and unreachable anyway: the hostname never resolved).
+    Guardrail practice treats a non-actionable block as noise, and a
+    prompt-shaped backstop that cannot be satisfied is a pure round tax.
+    DETECTION stays because the failure mode is real and otherwise
+    invisible; it now feeds (a) a disclosure line on the successful
+    receipt and (b) a deterministic report appendix — which also
+    replaces the formerly unfulfilled promise that a degraded pass
+    "would be disclosed in the report" (that flag was written and never
+    consumed).
+
     Returns a dict (expert / channel labels / divergent experts / fault
     window) or None.
     """
@@ -3561,8 +3648,8 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
                 f"专家证据现已到位——confirmed 通道已开放，不会再被拦截",
             )
         # v3.34.0: blocked-verdict disclosure (design document §9) — a
-        # prior reactive-gate block (G22 single-channel refute / G21
-        # verdict conflict / C2 metric-conflict refute) left the verdict
+        # prior reactive-gate block (G21 verdict conflict / C2 metric-
+        # conflict refute / G17-E2 evidence standard) left the verdict
         # unrecorded while this hint kept demanding "record_finding".
         # The two systems contradicted each other and the LLM wandered
         # into illegal channels (observed 2026-09-09 session 2026474a:
@@ -3571,17 +3658,19 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
         # reassurance branch above: disclose the block, mirror the
         # receipt's three options, and state the phase-transition causal
         # chain (verdict recorded → EVALUATE → propose legal there).
+        # v3.41.0: G22 (single-channel refute) no longer blocks, so it is
+        # no longer part of this blocked-state branch.
         if any(node.get(k, 0)
-               for k in ("_g22_block_count", "_c2_block_count",
-                         "_g21_block_count", "_g17e2_block_count")):
+               for k in ("_c2_block_count", "_g21_block_count",
+                         "_g17e2_block_count")):
             return ActionHint(
                 "record_finding", "critical",
-                f"{fmt_hid(hid)} 的判定此前被覆盖性/冲突类门控拦截"
-                "——按拦截回执三选一处置："
-                "①确认专家观测域已完整覆盖后重提交原判定"
+                f"{fmt_hid(hid)} 的判定此前被冲突类门控拦截"
+                "（指标层/专家结论层证据矛盾）——按拦截回执三选一处置："
+                "①复检矛盾数据源后重提交原判定"
                 "（通道已开放，降级放行并披露）；"
                 "②判 inconclusive 并披露证据缺口；"
-                "③改派第二证据通道专家。"
+                "③改派第三方视角专家仲裁。"
                 "落账成功后相位自动进入 EVALUATE——新方向假设届时提出",
             )
         if stall >= 2:

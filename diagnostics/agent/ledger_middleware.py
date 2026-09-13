@@ -69,6 +69,7 @@ from diagnostics.agent.ledger import (
     record_round,
     render_failure_digest,
     render_ledger_context,
+    render_single_channel_limitation_appendix,
     render_unrecorded_evidence_appendix,
     resolve_hypothesis_id,
     select_path,
@@ -83,7 +84,7 @@ from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C
 from diagnostics.agent.ledger import experts_for_hypothesis  # 假设↔专家归属视图（v3.38.0）
 from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
-from diagnostics.agent.ledger import single_channel_refute_signal  # noqa: F401  (G22 单通道证伪信号，design document §8 G22 context)
+from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
 from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
     delegation_key_from_request,
     delegation_text_from_request,
@@ -305,9 +306,10 @@ def _phase_rejection_suffix(phase: str) -> str:
     (2026-09-08 session 898d4699).  v3.34.0 extends the pattern to all
     phases: in verify the wandering repeated (2026-09-09 session
     2026474a — propose blocked, then write_file blocked, then the
-    verify valve fired, 3 rounds lost, because a G22-blocked verdict
-    held the phase hostage and no rejection receipt named the unblock
-    sequence).  Error responses are recovery instructions for the model
+    verify valve fired, 3 rounds lost, because a blocked verdict (G22
+    then; the conflict gates still do this) held the phase hostage and
+    no rejection receipt named the unblock sequence).  Error responses
+    are recovery instructions for the model
     (§12 Tool-Design — actionable errors): name the legal next action
     and the phase-transition causal chain per phase.
     """
@@ -439,14 +441,9 @@ _VERIFY_STUCK_COOLDOWN = 3          # Min rounds between two verify-stuck interv
 # limit is only reached on refusal).  Symmetric with C2 — both conflict
 # guards share the same bound.
 _E2_BLOCK_LIMIT = 4
-# ── G22 single-channel refute bound (v3.20.0, design document §8 G22) ──
-# Deliberately MUCH tighter than _E2_BLOCK_LIMIT: G22 is a coverage
-# SELF-CHECK prompt, not an evidence-conflict constraint (C2/G17-E2/G21
-# block because the evidence is demonstrably conflicted; G22 blocks only
-# because coverage is unverified).  One block is enough to make the model
-# re-examine channel coverage; blocking four times would cost four rounds
-# for a purely advisory signal.
-_G22_BLOCK_LIMIT = 1
+# NOTE (v3.41.0, design document §8 G22 / §11): the G22 bounded-block
+# constant (block limit = 1) is REMOVED together with the block.  The
+# single-channel refute signal is now a disclosure input only.
 
 
 def _refute_root_candidate(hypothesis: dict) -> str:
@@ -1980,17 +1977,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Valid subagent names for task() validation (Coordinator only).
         # None/empty disables the check (tests, subagent instances).
         self._valid_subagents = tuple(valid_subagents or ())
-        # Evidence-channel snapshot (design document §8 G22, v3.40.0):
-        # {expert: [channel_class, ...]} derived at assembly time from each
-        # subagent's tool surface.  Consumed by the refute-coverage gate so
-        # the judgement compares channel classes (portable) instead of
-        # expert counts / naming suffixes (not portable).  Empty means
-        # "unregistered" → the gate fails open (advisory guardrail).
+        # Evidence-channel snapshot (design document §8 G22, v3.40.0;
+        # consumer changed in v3.41.0): {expert: [channel_class, ...]}
+        # derived at assembly time from each subagent's tool surface.  It
+        # feeds the single-channel refute DISCLOSURE (receipt line +
+        # report appendix) — the former blocking gate was removed (§11
+        # v3.41.0).  Empty means "unregistered" → no disclosure is
+        # produced (fail-open: never assert a limitation we cannot
+        # substantiate).
         self._expert_channels: dict[str, tuple[str, ...]] = {
             str(k): tuple(v or ()) for k, v in (expert_channels or {}).items()
         }
-        # One-shot disclosure when the coverage gate has no channel
-        # snapshot to work with (fails open rather than guessing).
+        # One-shot notice when the snapshot is missing, so a silent
+        # absence of disclosures is distinguishable from a clean session.
         self._g22_unregistered_logged: bool = False
         # Stable subagent-context cache (session-scoped): topology is a
         # read-only session fact, so the stable layers are built once per
@@ -2228,8 +2227,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         ledger["scene_experts"] = list(self._valid_subagents)
         # Evidence-channel snapshot (design document §8 G22, v3.40.0):
         # frozen at session init from the assembled expert tool surfaces —
-        # the coverage gate reads THIS (never the expert names) to decide
-        # whether an alternative evidence channel actually exists.
+        # the single-channel refute disclosure reads THIS (never the
+        # expert names) to state which channels back a verdict and which
+        # alternative channels went unused (v3.41.0).
         if self._expert_channels:
             ledger["expert_channels"] = {
                 k: list(v) for k, v in self._expert_channels.items()
@@ -4335,6 +4335,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "(round %d, %d chars)",
                         self._model_call_count, len(_appendix),
                     )
+                # ── Single-channel evidence-limitation appendix (design
+                # document §8 G22, v3.41.0) — deterministic disclosure of
+                # verdicts that rest on ONE confirming channel; same
+                # fail-open philosophy (code-injected, independent of LLM
+                # compliance).  Replaces the disclosure the old degrade
+                # branch only promised. ──
+                _sc_appendix = render_single_channel_limitation_appendix(ledger)
+                if (_sc_appendix
+                        and not _is_stub_echo_write
+                        and isinstance(tool_args.get("content"), str)
+                        and "证据局限（系统附录）" not in tool_args["content"]):
+                    tool_args["content"] = (
+                        tool_args["content"].rstrip() + _sc_appendix
+                    )
+                    logger.warning(
+                        "write_file single-channel limitation appendix "
+                        "injected (round %d, %d chars)",
+                        self._model_call_count, len(_sc_appendix),
+                    )
                 # NOTE: the ledger-derived appendix channel (evidence
                 # layers / topology mapping / delegated experts /
                 # refuted hypotheses, v3.14.0 - v3.36.0) was REMOVED.
@@ -5265,6 +5284,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             if (_apx
                                     and "已采集未落账证据" not in content):
                                 content = content.rstrip() + _apx
+                            # Single-channel limitation backstop (design
+                            # document §8 G22, v3.41.0): same rule for the
+                            # evidence-limitation section.
+                            _sc_apx = render_single_channel_limitation_appendix(
+                                ledger)
+                            if (_sc_apx
+                                    and "证据局限（系统附录）" not in content):
+                                content = content.rstrip() + _sc_apx
                             # NOTE: no ledger-derived appendix on the
                             # rewrite path either (removed, v3.36.0) —
                             # those sections duplicate the report body
@@ -6221,15 +6248,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
             # Capture old statement for root_causes sync
             old_statement = ""
-            # v3.23.0 bugfix: bounded-degrade passes (G17-E2/C2/G21/G22)
-            # must REALLY ledger the finding — previously they returned a
-            # "passed with disclosure" message WITHOUT ledgering, so the
-            # model believed the verdict had landed while the hypothesis
-            # stayed pending and every retry re-hit the same fake pass
-            # (2026-09-08 session dc242215: G22 counter reached 6 with
-            # H1 still pending → write_file blocked → retry loop).
-            # Degraded branches now only PREPARE this disclosure hint and
-            # fall through to the normal ledgering path.
+            # v3.23.0 bugfix: bounded-degrade passes (then G17-E2/C2/G21/
+            # G22) must REALLY ledger the finding — previously they
+            # returned a "passed with disclosure" message WITHOUT
+            # ledgering, so the model believed the verdict had landed
+            # while the hypothesis stayed pending and every retry re-hit
+            # the same fake pass (2026-09-08 session dc242215: the G22
+            # counter reached 6 with H1 still pending → write_file blocked
+            # → retry loop).  Degraded branches now only PREPARE this
+            # disclosure hint and fall through to the normal ledgering
+            # path.  v3.41.0: G22's block is gone (§8 G22) — it discloses
+            # through `_single_channel_hint` after a successful land.
             _degraded_hint = ""
             if statement_update and hypothesis_id in ledger.get("hypotheses", {}):
                 hnode = ledger["hypotheses"][hypothesis_id]
@@ -6521,98 +6550,49 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             f"事件）确认后再判定；若深度专家已确认目标实体无异常，"
                             f"可再次 record_finding refuted（通道自动开放）。"
                         )
-            # ── G22: single-channel refute coverage gate (reactive
-            # backstop, design document §8 G22, v3.20.0; 2026-08-28
-            # scenario 39, session a8fa9526; channel-difference judgement
-            # v3.40.0) ── Structural ownership ≠ evidence-channel
-            # ownership: an expert that CANNOT observe a channel reports
-            # its blindness as a positive negative finding ("no spike
-            # observed"), which reads exactly like "checked, it is fine".
-            # Refuting on such a single channel is argument from absence
-            # wearing a disguise.  The judgment of WHICH channel is
-            # authoritative is semantic and stays with the LLM; this gate
-            # only flags the structural precondition and hands over the
-            # fault window so coverage can be self-checked.  Proactive
-            # layer (P7) is the observation-domain routing map injected
-            # into VERIFY (ledger.py §9); this is the compliance-residual
-            # backstop.  Bounded-block degrade symmetric with C2/G17-E2/
-            # G21.  Mutually exclusive with G20/C2 (argus-conflict) and
-            # G21 (two opposing verdicts): those need ≥2 returns, this
-            # fires on exactly 1.
+            # ── G22: single-channel refute DISCLOSURE (design document
+            # §8 G22, v3.41.0 — the v3.20.0/v3.40.0 blocking backstop was
+            # REMOVED) ── Structural ownership ≠ evidence-channel
+            # ownership: an expert that cannot observe a channel reports
+            # its blindness as a positive negative finding, which reads
+            # exactly like "checked, it is fine".  Real failure mode, but
+            # the block never paid for itself — 2026-09-11..13 measured 28
+            # triggers with 0 verifiable coverage gain (15 bounded-degrade
+            # one-round tolls, 5 cleared by a same-surface peer = pseudo-
+            # coverage, 1 verdict lost, 1 inconclusive), and every
+            # 2026-09-13 trigger was a false positive: the only divergent
+            # expert was irrelevant to the hypothesis's evidence type AND
+            # unreachable, so the demanded second channel was
+            # unsatisfiable while the receipt wording pushed the model
+            # into a futile delegation.
             #
-            # v3.40.0: the gate compares EVIDENCE CHANNEL CLASSES derived
-            # from the assembly-time tool surfaces (ledger["expert_channels"],
-            # tools/channels.py) instead of counting experts or matching the
-            # `-argus-expert` naming suffix.  Same-surface experts are not
-            # alternative channels, so a scene whose deep experts share one
-            # surface stops producing coverage blocks (and stops calling
-            # correlated re-reads "independent confirmation").  Missing
-            # channel metadata fails OPEN — an advisory gate must never
-            # manufacture a block from absent metadata.
+            # WHICH channel is authoritative stays semantic and with the
+            # LLM (§11); the system asserts only the STRUCTURAL FACT that
+            # this verdict rests on one confirming channel — as (a) a node
+            # mark, (b) a line on the SUCCESS receipt, (c) a deterministic
+            # report appendix.  This also makes good on the disclosure the
+            # old degrade branch promised but never implemented.
             if (verdict == "refuted"
                     and hypothesis_id in ledger.get("hypotheses", {})
                     and not ledger.get("expert_channels")
                     and not getattr(self, "_g22_unregistered_logged", False)):
                 self._g22_unregistered_logged = True
                 logger.warning(
-                    "G22 coverage gate inactive: no expert_channels snapshot "
-                    "in the ledger (expert tool surfaces unregistered) — "
-                    "failing open on refute-coverage checks"
+                    "single-channel refute disclosure inactive: no "
+                    "expert_channels snapshot in the ledger (expert tool "
+                    "surfaces unregistered) — no disclosure emitted"
                 )
-            if (verdict == "refuted"
-                    and hypothesis_id in ledger.get("hypotheses", {})
-                    and not _argus_conflict_signal(ledger, hypothesis_id)
-                    and not expert_verdict_conflict(
-                        ledger, hypothesis_id, verdict)):
-                _g22 = single_channel_refute_signal(ledger, hypothesis_id)
-                if _g22:
-                    _g22_node = ledger["hypotheses"][hypothesis_id]
-                    _g22_node["_g22_block_count"] = (
-                        _g22_node.get("_g22_block_count", 0) + 1
-                    )
-                    if _g22_node["_g22_block_count"] > _G22_BLOCK_LIMIT:
-                        # _g22_block_count includes THIS passing attempt —
-                        # actual prior blocks = count - 1 (wording fix
-                        # v3.21.0: log previously read "after 2 blocks"
-                        # for 1 block + 1 pass, confusing post-hoc audit).
-                        _g22_blocks = _g22_node["_g22_block_count"] - 1
-                        logger.warning(
-                            "record_finding G22 degraded after %d block(s) on "
-                            "%s (round=%d) — passing with disclosure",
-                            _g22_blocks, fmt_hid(hypothesis_id),
-                            self._model_call_count,
-                        )
-                        _degraded_hint = (
-                            f"\n⚠ 本 refuted 判定经单通道覆盖性门控拦截 "
-                            f"{_g22_blocks} 次后降级放行：仅由单一专家通道证伪，"
-                            f"未做跨通道覆盖复核——系统在报告中披露此局限。"
-                        )
-                        _g22_node["_degraded_gate"] = "单通道覆盖性门控"
-                    else:
-                        logger.warning(
-                            "record_finding blocked by G22: refuted on %s from a "
-                            "single evidence channel (%s [%s], round=%d)",
-                            fmt_hid(hypothesis_id), _g22.get("expert") or "none",
-                            ",".join(_g22.get("channels") or []) or "-",
-                            self._model_call_count,
-                        )
-                        _divergent = _g22.get("divergent_experts") or []
-                        _labels = "、".join(_g22.get("channel_labels") or []) or "?"
-                        return (
-                            f"⛔ refuted 判定仅来自单一证据通道（覆盖性门控）："
-                            f"{fmt_hid(hypothesis_id)} 的专家证据只来自 "
-                            f"{_g22.get('expert')}（通道：{_labels}）。"
-                            f"组件的拓扑归属不等于其证据通道归属——某专家看不到某类证据时，"
-                            f"常把『查不到』表述为『未发现异常』，"
-                            f"据此证伪方向正确的假设属于以证据缺失作反证。"
-                            f"请确认本次证据通道是否覆盖本假设所涉证据类型"
-                            f"（故障时段 {_g22.get('fault_window')}）："
-                            f"① 若不覆盖 → 改派通道覆盖该证据的专家"
-                            f"（可选：{'、'.join(_divergent[:3])}）；"
-                            f"② 若该证据确实无法取得 → 判 inconclusive 并披露；"
-                            f"③ 若确认该通道已完整覆盖本假设 → 再次 record_finding "
-                            f"refuted 即放行（通道自动开放）。"
-                        )
+            # Detection only — the node mark and the receipt line are
+            # produced AFTER the verdict actually lands: a blocked verdict
+            # (e.g. G21 arbitration) must not leave a disclosure flag on a
+            # hypothesis that was never refuted.
+            _sc_signal = (
+                single_channel_refute_signal(ledger, hypothesis_id)
+                if (verdict == "refuted"
+                    and hypothesis_id in ledger.get("hypotheses", {}))
+                else None
+            )
+            _single_channel_hint = ""
             # ── G21: expert-verdict conflict arbitration (reactive
             # backstop, design document §8, v3.16.0; 2026-08-21 scenario
             # 40 follow-up) ── When the SAME hypothesis already holds a
@@ -6777,6 +6757,47 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 )
             except ValueError as e:
                 return f"记录失败: {e}"
+
+            # ── Single-channel refute disclosure (v3.41.0, design
+            # document §8 G22): the verdict landed — record the evidence
+            # limitation on the node (report appendix + ledger rendering
+            # consume it) and state it as a fact on the receipt. ──
+            if _sc_signal:
+                _sc_node = ledger.get("hypotheses", {}).get(hypothesis_id) or {}
+                _sc_node["_single_channel_refute"] = True
+                _sc_node["_single_channel_detail"] = {
+                    "expert": _sc_signal.get("expert") or "",
+                    "channels": list(_sc_signal.get("channels") or []),
+                    "channel_labels": list(
+                        _sc_signal.get("channel_labels") or []),
+                    "divergent_experts": list(
+                        _sc_signal.get("divergent_experts") or []),
+                    "round": self._model_call_count,
+                }
+                _sc_labels = "、".join(
+                    _sc_signal.get("channel_labels") or []) or "?"
+                _sc_alt = "、".join(
+                    (_sc_signal.get("divergent_experts") or [])[:3])
+                # Fact + optional strengthening path (positive form,
+                # §11 v2.9.2): the verdict is NOT bounced.
+                _single_channel_hint = (
+                    f"\nℹ 证据局限（已如实记录，不阻断落账）：本次 refuted 判定"
+                    f"仅由单一专家通道支撑（{_sc_signal.get('expert')}："
+                    f"{_sc_labels}）——系统已在报告附录中披露该局限"
+                    + (
+                        f"；如需更强结论，可委派通道类别不同的专家交叉验证"
+                        f"（如 {_sc_alt}）后再次落账（该局限随之解除）"
+                        if _sc_alt else ""
+                    )
+                )
+                logger.warning(
+                    "single-channel refute disclosed on %s "
+                    "(expert=%s channels=%s round=%d)",
+                    fmt_hid(hypothesis_id),
+                    _sc_signal.get("expert") or "none",
+                    ",".join(_sc_signal.get("channels") or []) or "-",
+                    self._model_call_count,
+                )
 
             # G21 arbitration counter resets on every successful verdict
             # (design document §8, v3.16.0): a completed verdict means the
@@ -7057,7 +7078,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             return (
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
                 f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_candidate_hint}{_g18_warn}"
-                f"{_constraint_pin}{_degraded_hint}"
+                f"{_constraint_pin}{_degraded_hint}{_single_channel_hint}"
             )
 
         return StructuredTool.from_function(
@@ -7340,6 +7361,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         lines.append("本报告由系统自动生成，基于诊断台账中的结构化证据。"
                      "LLM 未在 REPORT 阶段调用 write_file，"
                      "报告内容可能缺少手工撰写的叙述细节。")
+        # Single-channel evidence limitation (design document §8 G22,
+        # v3.41.0): disclosed deterministically even on the stub path.
+        _sc_stub = render_single_channel_limitation_appendix(ledger)
+        if _sc_stub:
+            lines.append(_sc_stub)
 
         return "\n".join(lines)
 
