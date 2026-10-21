@@ -47,6 +47,7 @@ from langchain_core.messages import ToolMessage
 
 from diagnostics.agent.delegation_key import delegation_key_from_request
 from diagnostics.agent.interception_receipts import ReceiptRegistry
+from diagnostics.agent.tool_result_contract import is_structural_failure
 
 # v3.37.5: one full explanation per (delegation, guard kind).  Later triggers
 # of the SAME guard return a fixed short receipt — the block still happens,
@@ -131,7 +132,16 @@ _MAX_TRACKED_DELEGATIONS = 64
 
 
 def _is_zero_yield(result: ToolMessage) -> bool:
-    """Conservative zero-yield predicate (design document §8 G19)."""
+    """Conservative zero-yield predicate (design document §8 G19).
+
+    v3.43.0: a closed structural failure (script-dispatch tool whose succeed
+    list is empty while its failed list is not, or a non-zero exit status with
+    stderr) counts as zero yield REGARDLESS of length.  The old length-bounded
+    branch missed the production shape: an OSP log line of ~400 characters
+    stating "exit status 2 / Name or service not known" was classified as a
+    productive call, so the zero-yield streak never moved while the expert kept
+    re-issuing it.
+    """
     if getattr(result, "status", "success") == "error":
         return True
     content = result.content if isinstance(result.content, str) else str(result.content)
@@ -141,6 +151,8 @@ def _is_zero_yield(result: ToolMessage) -> bool:
     if text.startswith("⛔"):
         # System rejection reached execution depth (defense in depth —
         # outer guards normally intercept before this middleware).
+        return True
+    if is_structural_failure(text):
         return True
     if len(text) <= _ZERO_YIELD_MAX_LEN and _ZERO_YIELD_RE.search(text):
         return True

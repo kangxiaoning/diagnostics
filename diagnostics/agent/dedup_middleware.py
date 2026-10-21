@@ -42,6 +42,11 @@ from deepagents.backends.protocol import BackendProtocol, ReadResult
 from deepagents.middleware._utils import append_to_system_message
 
 from diagnostics.agent.delegation_key import delegation_key_from_request
+from diagnostics.agent.tool_result_contract import (
+    failure_reason,
+    is_deterministic_failure,
+    is_structural_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,47 @@ _FULL_CONTENT_MAX = int(os.getenv("DIAGNOSTICS_DEDUP_FULL_CONTENT_MAX", "30000")
 # less information than a ceremonial verdict restatement, which G18 blocks
 # on the second offense).
 _DEDUP_HIT_BLOCK = int(os.getenv("DIAGNOSTICS_DEDUP_HIT_BLOCK", "2"))
+
+# Termination tier (v3.43.0, G24-T).  Measured 2026-10-21 in the production
+# environment: an identical-args call blocked 167 times and the expert still
+# kept re-issuing it — a receipt-level ladder cannot stop a model that keeps
+# regenerating the same call, because every receipt still costs one full
+# model turn and leaves the delegation running.  This tier converts the
+# PATTERN into a deterministic end: after _DEDUP_REPEAT_TERMINATE hits on the
+# same cache key, the whole context is terminated (every further tool call is
+# refused with a fixed receipt) while the conclusion tools and write_file stay
+# exempt so the agent can still deliver a report / structured conclusion.
+_DEDUP_REPEAT_TERMINATE = int(
+    os.getenv("DIAGNOSTICS_DEDUP_REPEAT_TERMINATE", "5"))
+
+_REPEAT_TERMINATE_RECEIPT = (
+    "[系统] 本上下文的重复工具调用已触发系统终止：相同参数的重发不会获得新数据，"
+    "系统不再执行任何工具调用。请立即基于已采集的结果输出结论；"
+    "未覆盖项在结论中如实声明数据缺口。"
+)
+
+# Per-turn fanout cap (v3.43.0, G24-W).  LangGraph's ToolNode dispatches an
+# unbounded number of tool calls from a single assistant message (measured by
+# third parties at 1/100/1000/5000 calls with no cap, no warning, no error),
+# and `recursion_limit` counts superstep DEPTH — a fan-out of any width costs
+# one superstep.  One production turn emitted 886 tool calls (869 deduped),
+# which the execution-side dedup cannot prevent: it blocks execution, not
+# generation, and every blocked call still injects a ToolMessage into the
+# context.  The cap protects the CONTEXT, not the tool runtime.
+_MAX_TOOL_CALLS_PER_TURN = int(
+    os.getenv("DIAGNOSTICS_MAX_TOOL_CALLS_PER_TURN", "20"))
+
+# Observation floor: log the shape of every non-trivial turn so a runaway
+# fan-out is visible in the log BEFORE the cap fires (the production incident
+# was found only after 167 blocks; the width was never logged).
+_FANOUT_OBSERVE_MIN = int(
+    os.getenv("DIAGNOSTICS_FANOUT_OBSERVE_MIN", "5"))
+
+_FANOUT_RECEIPT = (
+    "[系统] 本轮工具调用数量超过单批上限（{cap} 个），该调用未执行。"
+    "请重新规划：只保留必要的取证动作，其余分批进行；"
+    "相同参数的重发不会获得新数据。"
+)
 
 # Repeat receipt (v3.37.4, P0/P1 — context-pollution fix).  Deliberately
 # IDENTICAL on every repeat: the result already lives in this conversation,
@@ -170,17 +216,28 @@ def _make_cache_key(tool_name: str, args: dict) -> str:
 
 
 def _is_tool_failure(content: str) -> bool:
-    """Return True if tool output indicates a transport/network failure.
+    """Return True if tool output indicates a failed tool execution.
 
-    Diagnostic data often contains words like 'timeout' or 'error'
-    when describing the fault being investigated — these must NOT be
-    mistaken for tool failures.  A genuine tool failure is a short,
-    unstructured message; diagnostic output is long, multi-line,
-    and contains headers/tables.
+    Two branches, in this order:
+
+    1. **Closed structural contract** (v3.43.0): `STATUS: failed`, an OSP
+       result whose succeed list is empty while the failed list is not, or a
+       non-zero `exit status` accompanied by `stderr:`.  These are MECHANICAL
+       verdicts and must be length-independent — measured 2026-10-21 that the
+       same failure sat at 395 characters (classified as a failure) and would
+       flip to "diagnostic data" as soon as the payload crossed the
+       500-character guard below.  A verdict must not depend on the size of a
+       vm_name.
+    2. **Prose heuristic** (unchanged): diagnostic data often contains words
+       like 'timeout' or 'error' while describing the fault being investigated
+       — these must NOT be mistaken for tool failures, so long/multi-line/
+       table-shaped content keeps the conservative guards.
     """
     if not content:
         return False
-    # Only short content can be a failure message (diagnostic data
+    if is_structural_failure(content):
+        return True
+    # Only short content can be a prose-style failure message (diagnostic data
     # is typically >500 chars with multiple lines of structured output).
     if len(content) > 500:
         return False
@@ -231,6 +288,10 @@ class ToolDedupMiddleware(AgentMiddleware):
         # delegation's FIRST lookup (latent F2 bug that the tightened
         # 1/2 ladder would have amplified into systematic false blocks).
         self._dedup_hit_counts: dict[str, dict[str, int]] = {}
+        # Contexts whose repeat budget is exhausted (G24-T): every further
+        # tool call is refused deterministically.  Shared with subagents so a
+        # terminated delegation cannot restart through a sibling instance.
+        self._terminated_contexts: set[str] = set()
         logger.info(
             "ToolDedupMiddleware: backend=%s, breaker=%d",
             "enabled" if backend else "disabled",
@@ -252,6 +313,9 @@ class ToolDedupMiddleware(AgentMiddleware):
         # G24: share hit counters too — context isolation (Coordinator
         # fixed key vs per-delegation hash) keeps them from interfering.
         instance._dedup_hit_counts = coordinator._dedup_hit_counts
+        # G24-T: terminations are per context, so sharing the set is safe and
+        # keeps a terminated delegation terminated across instances.
+        instance._terminated_contexts = coordinator._terminated_contexts
         return instance
 
     # ── Tool call interception ─────────────────────────────────────────
@@ -275,15 +339,27 @@ class ToolDedupMiddleware(AgentMiddleware):
         if isinstance(result, ToolMessage):
             content = result.content if isinstance(result.content, str) else str(result.content)
 
-            # Failure classification order (v3.22.2): transport/service
-            # failure FIRST — a short network error (e.g. "error:
-            # connection timeout", <50 chars) must reach the circuit
-            # breaker instead of being swallowed by the empty-result
-            # guard below.  The old order made the breaker unreachable
-            # for short error messages: they were never cached, so every
-            # identical re-issue executed for real, unthrottled.
-            if _is_tool_failure(content):
-                self._tool_call_cache[cache_key] = (result, fail_base + 1)
+            # Failure classification order (v3.22.2, extended v3.43.0):
+            # failure FIRST — a short network error (e.g. "error: connection
+            # timeout", <50 chars) must reach the circuit breaker instead of
+            # being swallowed by the empty-result guard below.  The old order
+            # made the breaker unreachable for short error messages: they were
+            # never cached, so every identical re-issue executed for real,
+            # unthrottled.
+            #
+            # v3.43.0 adds two branches: the framework-level error status
+            # (LangChain tools that raise ToolException / set status="error")
+            # and the closed structural contract of script-dispatch tools.
+            if getattr(result, "status", "success") == "error" or _is_tool_failure(content):
+                # A deterministic failure (unresolvable DNS name, missing
+                # command) can never be fixed by re-issuing the same call:
+                # start at the breaker threshold so the FIRST repeat is
+                # refused instead of granted a real re-execution.  This is
+                # the retry budget that fed the 167-repeat loop (2026-10-21).
+                next_fail = (_TOOL_FAILURE_BREAKER
+                             if is_deterministic_failure(content)
+                             else fail_base + 1)
+                self._tool_call_cache[cache_key] = (result, next_fail)
             elif not content or (len(content) < 50 and _EMPTY_PATTERNS.search(content)):
                 # Non-failure empty/no-data result: never cached, so the
                 # agent may retry or widen the query (caching it would
@@ -412,7 +488,96 @@ class ToolDedupMiddleware(AgentMiddleware):
                         request.system_message, reminder))
         except Exception:
             pass
-        return await handler(request)
+        response = await handler(request)
+        return self._cap_fanout(response)
+
+    # ── Per-turn fanout cap (G24-W) ─────────────────────────────────────
+    @staticmethod
+    def _select_tool_calls(tool_calls: list) -> tuple[list, list]:
+        """Keep DISTINCT calls first (in order), then fill up to the cap.
+
+        Distinct-first matters: in a runaway turn the repeated calls vastly
+        outnumber the distinct ones, so truncating verbatim would keep N
+        copies of the same call and drop the genuinely different ones.
+        """
+        keep: list = []
+        dropped: list = []
+        seen: set[str] = set()
+        for tc in tool_calls:
+            if len(keep) >= _MAX_TOOL_CALLS_PER_TURN:
+                dropped.append(tc)
+                continue
+            key = _make_cache_key(tc.get("name", ""), tc.get("args") or {})
+            if key in seen:
+                dropped.append(tc)
+                continue
+            seen.add(key)
+            keep.append(tc)
+        return keep, dropped
+
+    def _cap_fanout(self, response: ModelResponse) -> ModelResponse:
+        """Trim an over-wide assistant turn and answer the trimmed calls.
+
+        LangGraph dispatches every tool call of one assistant message and
+        charges one superstep for the whole fan-out, so an unbounded turn is
+        invisible to `recursion_limit`; execution-side dedup does not help
+        either, because it blocks execution but still emits one ToolMessage
+        per blocked call (measured 2026-10-21: 886 calls in one turn, 869
+        deduped).  This cap protects the CONTEXT.  Trimmed calls are answered
+        with a paired ToolMessage (same shape as the G28 back-jump placeholder
+        contract) so no tool_call_id is left dangling.
+        """
+        try:
+            if not isinstance(response, ModelResponse):
+                return response
+            messages = (response.result
+                        if isinstance(response.result, list) else [response.result])
+            capped: list = []
+            trimmed = False
+            for msg in messages:
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if len(tool_calls) >= _FANOUT_OBSERVE_MIN:
+                    distinct = len({
+                        _make_cache_key(tc.get("name", ""), tc.get("args") or {})
+                        for tc in tool_calls
+                    })
+                    logger.info(
+                        "单批工具调用规模: %d 个（唯一 %d，上限 %d）",
+                        len(tool_calls), distinct, _MAX_TOOL_CALLS_PER_TURN,
+                    )
+                if len(tool_calls) <= _MAX_TOOL_CALLS_PER_TURN:
+                    capped.append(msg)
+                    continue
+                keep, dropped = self._select_tool_calls(tool_calls)
+                try:
+                    capped.append(msg.model_copy(update={"tool_calls": keep}))
+                except Exception:
+                    # Cannot trim this message type — keep it untouched rather
+                    # than emit an unbalanced conversation.
+                    capped.append(msg)
+                    continue
+                trimmed = True
+                logger.warning(
+                    "单批工具调用超上限: 收到 %d，保留 %d（唯一），丢弃 %d，上限 %d",
+                    len(tool_calls), len(keep), len(dropped),
+                    _MAX_TOOL_CALLS_PER_TURN,
+                )
+                for tc in dropped:
+                    capped.append(ToolMessage(
+                        content=_FANOUT_RECEIPT.format(
+                            cap=_MAX_TOOL_CALLS_PER_TURN),
+                        tool_call_id=tc.get("id", ""),
+                        name=tc.get("name", ""),
+                        status="error",
+                    ))
+            if not trimmed:
+                return response
+            return ModelResponse(
+                result=capped,
+                structured_response=getattr(response, "structured_response", None),
+            )
+        except Exception:
+            return response
 
     @staticmethod
     def _emit_dedup_event(tool_call_id: str) -> None:
@@ -444,6 +609,29 @@ class ToolDedupMiddleware(AgentMiddleware):
 
         cache_key = _make_cache_key(tool_name, tool_args)
 
+        # G24: the context (Coordinator session / this expert delegation) is
+        # resolved once per call — the repeat counters, the termination set
+        # and the termination check must all agree on it.
+        try:
+            hit_key = self._hit_context_key(request)
+        except Exception:
+            hit_key = "coordinator"
+
+        # ── G24-T: terminated context (v3.43.0) ──
+        # Once this context exhausted its repeat budget, no further tool call
+        # is dispatched.  The check sits BEFORE the cache lookup on purpose: a
+        # terminated loop must not be resumable with different arguments —
+        # with the observation shape that caused it (script-dispatch tools
+        # returning execution logs), every new target produces the same useless
+        # result and the same repeat pattern.
+        if hit_key in self._terminated_contexts:
+            logger.warning("去重终止级拒绝(上下文%s): %s", hit_key, cache_key)
+            return ToolMessage(
+                content=_REPEAT_TERMINATE_RECEIPT,
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
+
         # ── P0: In-memory cache lookup + circuit breaker ──
         if cache_key in self._tool_call_cache:
             cached_msg, fail_count = self._tool_call_cache[cache_key]
@@ -452,9 +640,6 @@ class ToolDedupMiddleware(AgentMiddleware):
                 self._emit_dedup_event(tool_call_id)
                 full = cached_msg.content if isinstance(
                     cached_msg.content, str) else str(cached_msg.content)
-                # G24: count the hit in THIS context (Coordinator session
-                # or this expert delegation).
-                hit_key = self._hit_context_key(request)
                 counts = self._dedup_hit_counts.setdefault(hit_key, {})
                 # v3.37.4 (P0/P1): an IDENTICAL repeat inside the SAME
                 # context carries no new information — the original result
@@ -470,6 +655,21 @@ class ToolDedupMiddleware(AgentMiddleware):
                 # force an unnecessary read_file round-trip.
                 if cache_key in counts:
                     counts[cache_key] += 1
+                    # G24-T: the escalation ladder now ends.  A receipt-level
+                    # block was measured 167 times in a row (2026-10-21) with
+                    # the model re-issuing the call immediately after each
+                    # one — the pattern, not the call, is the failure.
+                    if counts[cache_key] >= _DEDUP_REPEAT_TERMINATE:
+                        self._terminated_contexts.add(hit_key)
+                        logger.warning(
+                            "去重终止级(上下文%s 重复%d次): %s",
+                            hit_key, counts[cache_key], cache_key,
+                        )
+                        return ToolMessage(
+                            content=_REPEAT_TERMINATE_RECEIPT,
+                            tool_call_id=tool_call_id,
+                            name=cached_msg.name or tool_name,
+                        )
                     logger.warning(
                         "去重拦截(上下文%s 重复%d次): %s",
                         hit_key, counts[cache_key], cache_key,
@@ -486,12 +686,24 @@ class ToolDedupMiddleware(AgentMiddleware):
                 )
             # Previous call(s) failed → this is a retry
             if fail_count >= _TOOL_FAILURE_BREAKER:
+                cached_text = (cached_msg.content
+                               if isinstance(cached_msg.content, str)
+                               else str(cached_msg.content))
+                # v3.43.0: name the reason instead of a generic "network may
+                # be unreachable".  The reason is the EVIDENCE the model
+                # needs (an unresolvable name is a finding, not a tool bug),
+                # and a receipt that contradicts what the model can see is a
+                # direct trigger for one more retry.
+                reason = failure_reason(cached_text)
+                detail = f"：{reason}" if reason else "。"
                 logger.warning("熔断: %s (连续失败%d次)", cache_key, fail_count)
                 return ToolMessage(
                     content=(
                         f"⛔ [系统熔断] {tool_name} 已连续失败"
-                        f"{fail_count}次，网络可能不可达。"
-                        "禁止重试此工具，请基于已有证据继续诊断。"
+                        f"{fail_count}次{detail}\n"
+                        "重试不会改变结果——请把该失败本身当作证据"
+                        "（目标不可达/域名不可解析/权限不足/资源不存在等），"
+                        "改换查询参数或换维度取证，基于已有证据继续诊断。"
                     ),
                     tool_call_id=tool_call_id,
                     name=cached_msg.name,
@@ -508,16 +720,20 @@ class ToolDedupMiddleware(AgentMiddleware):
             if isinstance(result, ToolMessage):
                 new_content = (result.content if isinstance(result.content, str)
                                else str(result.content))
-                if _is_tool_failure(new_content):
+                if (getattr(result, "status", "success") == "error"
+                        or _is_tool_failure(new_content)):
+                    reason = failure_reason(new_content)
+                    detail = f"：{reason}" if reason else ""
                     return ToolMessage(
                         content=(
                             f"{new_content}\n\n"
-                            f"⚠ [系统提示] {tool_name} 第{fail_count + 1}次调用仍失败，"
-                            f"后续同参数调用将被熔断（禁止重试）；"
+                            f"⚠ [系统提示] {tool_name} 第{fail_count + 1}次调用仍失败"
+                            f"{detail}，后续同参数调用将被熔断（禁止重试）；"
                             "如需数据请调整查询参数，或基于已有证据继续诊断。"
                         ),
                         tool_call_id=tool_call_id,
                         name=result.name or tool_name,
+                        status="error",
                     )
             return result
 
