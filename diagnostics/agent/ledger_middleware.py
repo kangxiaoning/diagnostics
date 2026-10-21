@@ -966,15 +966,19 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
     lines.append("")
 
     # ── 2. Hypothesis findings ──
+    # Status buckets stay at function scope: `unfinished` is also consumed by
+    # the report template in section 4, so keeping it inside the `if
+    # hypotheses` branch raised UnboundLocalError on any session that ended
+    # without a single hypothesis (e.g. model never called propose).
+    confirmed = [(hid, h) for hid, h in hypotheses.items()
+                 if h.get("status") == "confirmed"]
+    refuted = [(hid, h) for hid, h in hypotheses.items()
+               if h.get("status") == "refuted"]
+    unfinished = [(hid, h) for hid, h in hypotheses.items()
+                  if h.get("status") in ("pending", "inconclusive")]
+    root_ids = set(ledger.get("root_hypothesis_ids", []))
     if hypotheses:
         lines.append("## 2. 假设验证结果综合")
-        confirmed = [(hid, h) for hid, h in hypotheses.items()
-                     if h.get("status") == "confirmed"]
-        refuted = [(hid, h) for hid, h in hypotheses.items()
-                   if h.get("status") == "refuted"]
-        unfinished = [(hid, h) for hid, h in hypotheses.items()
-                      if h.get("status") in ("pending", "inconclusive")]
-        root_ids = set(ledger.get("root_hypothesis_ids", []))
 
         if confirmed:
             lines.append("### ✅ 已确认假设")
@@ -1030,9 +1034,6 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
 
     # ── 3. Best conclusions ──
     lines.append("## 3. 最佳结论建议")
-    confirmed = [(hid, h) for hid, h in hypotheses.items()
-                 if h.get("status") == "confirmed"]
-    root_ids = set(ledger.get("root_hypothesis_ids", []))
     root_causes = ledger.get("root_causes", [])
     if confirmed:
         for i, (hid, node) in enumerate(
