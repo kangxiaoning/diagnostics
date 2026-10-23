@@ -7,6 +7,7 @@ classifier (tools/mock/argus.py).
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 
 from langchain_openai import ChatOpenAI
 
@@ -33,6 +34,58 @@ _REASONING_EFFORT = os.getenv("DIAGNOSTICS_REASONING_EFFORT", "").strip().lower(
 # the operator opts in — same discipline as the thinking switch above.
 _KEEP_ALIVE = os.getenv("DIAGNOSTICS_KEEP_ALIVE", "").strip()
 
+# ── Reasoning-loop guard (v3.45.11) ──────────────────────────────────
+# Local thinking models get stuck repeating a long block inside their
+# reasoning.  Measured four times on 2026-10-22/23: 22,385 / 25,990 / 30,041
+# characters of reasoning that re-emitted the same paragraph, always ending in
+# a timeout with zero content and zero tool calls (ollama logged
+# ``context canceled``).  Every occurrence was in a decision phase
+# (hypothesize / evaluate) — the phases that compare candidates rather than
+# execute tools.
+#
+# This is the same failure the industry documents for local/MoE thinking
+# models ("runaway reasoning loops where the model repeats itself inside a
+# reasoning block", Reasoning Guard; dsh-loop-detector's anchor-block check),
+# and the documented remedy is a deterministic streaming check plus a hard
+# stop — not another prompt request.
+_LOOP_MIN_CHARS = int(os.getenv("DIAGNOSTICS_LOOP_MIN_CHARS", "8000"))
+"""Reasoning length before loop detection engages (normal turns stay < 8k)."""
+
+_LOOP_ANCHOR_CHARS = int(os.getenv("DIAGNOSTICS_LOOP_ANCHOR_CHARS", "256"))
+"""Length of the tail block that must reappear earlier in the same response."""
+
+_LOOP_SCAN_LIMIT = int(os.getenv("DIAGNOSTICS_LOOP_SCAN_LIMIT", "24000"))
+"""Rolling buffer cap; older text is dropped so the scan stays O(n)."""
+
+_REASONING_BUF: ContextVar[str] = ContextVar("reasoning_stream_buf", default="")
+"""Per-request reasoning buffer (contextvars keeps concurrent calls apart)."""
+
+
+class ReasoningLoopError(RuntimeError):
+    """A single response repeated a long reasoning block (v3.45.11).
+
+    Raised from the streaming hook so it propagates out of the model call and
+    lands in the G7' retry path, whose second attempt already disables
+    thinking (v3.45.7) — the combination turns an infinite loop into one
+    bounded retry instead of a 480 s timeout.
+    """
+
+
+def _guard_reasoning_stream(delta: str) -> None:
+    """Accumulate reasoning deltas and raise when a long block repeats."""
+    buf = _REASONING_BUF.get() + delta
+    if len(buf) > _LOOP_SCAN_LIMIT:
+        buf = buf[-_LOOP_SCAN_LIMIT:]
+    _REASONING_BUF.set(buf)
+    if len(buf) < _LOOP_MIN_CHARS:
+        return
+    tail = buf[-_LOOP_ANCHOR_CHARS:]
+    if buf[:-_LOOP_ANCHOR_CHARS].find(tail) != -1:
+        raise ReasoningLoopError(
+            f"reasoning repeated a {_LOOP_ANCHOR_CHARS}-char block "
+            f"after {len(buf)} chars — stopping the response instead of "
+            f"letting it run into the timeout")
+
 
 class OllamaChatOpenAI(ChatOpenAI):
     """Emit legacy top-level ``max_tokens`` alongside ``max_completion_tokens``.
@@ -58,6 +111,9 @@ class OllamaChatOpenAI(ChatOpenAI):
     reasoning_effort_override: str | None = None
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        # Each request starts with an empty reasoning buffer: the loop guard
+        # must judge one response at a time, never carry state across turns.
+        _REASONING_BUF.set("")
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         mct = payload.get("max_completion_tokens")
         if mct is not None and "max_tokens" not in payload:
@@ -159,7 +215,14 @@ class OllamaChatOpenAI(ChatOpenAI):
                 reason = delta.get("reasoning_content") or delta.get("reasoning")
                 if isinstance(reason, str) and reason:
                     result.message.additional_kwargs["reasoning_content"] = reason
+                    # v3.45.11: stop a looping response instead of letting it
+                    # consume the whole call budget (see the guard's docstring).
+                    _guard_reasoning_stream(reason)
                     break
+        except ReasoningLoopError:
+            # Must propagate: the generic swallow below would turn the guard
+            # into a no-op.
+            raise
         except Exception:
             pass
         return result

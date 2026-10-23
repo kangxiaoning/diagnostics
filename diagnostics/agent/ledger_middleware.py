@@ -488,7 +488,29 @@ def _refute_root_candidate(hypothesis: dict) -> str:
 
 
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
-_REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
+_REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report
+
+# ── Decision-phase budget (v3.45.11) ─────────────────────────────────
+# Eight timeouts recorded on 2026-10-22/23 fell EXCLUSIVELY into
+# hypothesize (3) and evaluate (5); understand / verify / report never timed
+# out.  Those two phases compare candidates instead of executing tools, so
+# they legitimately need more thinking — the industry pattern is the same
+# ("allocate maximum reasoning compute to planning and verification, reduced
+# compute to execution").  The execution phases keep the tighter budget so a
+# genuinely stuck tool loop still fails fast.
+_DECISION_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_DECISION_TIMEOUT", "600"))
+"""Budget (seconds) for hypothesize / evaluate."""
+
+_DECISION_PHASES = frozenset({"hypothesize", "evaluate"})
+
+
+def _phase_timeout(phase: str) -> int:
+    """Per-phase model-call budget: report > decision > execution."""
+    if phase == "report":
+        return _REPORT_PHASE_TIMEOUT
+    if phase in _DECISION_PHASES:
+        return _DECISION_PHASE_TIMEOUT
+    return _MODEL_CALL_TIMEOUT
 # ── 专家侧模型调用超时（v3.44.0）──
 # Coordinator 的每次尝试受 _MODEL_CALL_TIMEOUT 约束，专家侧此前没有包裹：
 # 实测（2026-10-22 场景 7 冒烟）一次委派内的模型调用持续 19 分钟无返回，
@@ -1451,6 +1473,10 @@ _RETRYABLE_EXC_NAMES = frozenset({
     "ConnectError", "ReadError", "WriteError",
     "ConnectTimeout", "ReadTimeout", "PoolTimeout",
     "RemoteProtocolError", "ServiceUnavailableError",
+    # v3.45.11: a reasoning loop is worth exactly one more attempt — the
+    # second attempt runs with thinking disabled (v3.45.7), which breaks the
+    # loop instead of burning the whole timeout again.
+    "ReasoningLoopError",
 })
 
 
@@ -2991,11 +3017,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if _phase_tools is not None:
             _overrides["tools"] = _phase_tools
         _call_request = request.override(**_overrides) if _overrides else request
-        _effective_timeout = (
-            _REPORT_PHASE_TIMEOUT
-            if _phase(ledger) == "report"
-            else _MODEL_CALL_TIMEOUT
-        )
+        _effective_timeout = _phase_timeout(_phase(ledger))
         # ── G7' transient-failure retry (design document §8) ──
         # Each attempt gets its own full timeout.  Retryable failures
         # (timeout / connection break / 5xx / 429) back off exponentially
