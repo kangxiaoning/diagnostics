@@ -1,6 +1,12 @@
 ---
 name: control-plane-diagnosis
-description: "Kubernetes 控制面故障（apiserver/controller-manager/scheduler）：kubectl 超时、节点从集群消失、Pod 长期 Pending"
+description: >
+  Diagnoses Kubernetes control plane component failures — kube-apiserver
+  (etcd connection, TLS cert expiry, request throttling), kube-controller-manager
+  (leader election, garbage collection), and kube-scheduler (pod scheduling
+  failures, resource starvation). Use when `kubectl` returns timeouts,
+  nodes disappear from cluster, or pods remain Pending despite available
+  resources.
 ---
 
 # Control Plane Component Diagnosis
