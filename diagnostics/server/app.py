@@ -364,6 +364,23 @@ def _save_result(
                      "text_delta" if content else "ledger.report")
 
 
+def _should_emit_tree_fallback(
+    report_text: list[str], structured_seen: bool,
+) -> bool:
+    """Whether the tree's answer snapshot should be forwarded as a delta.
+
+    The tree buffers tokens for the graph view; ``TreeBuilder.finalize()``
+    returns a ``token`` snapshot when it never saw answer text.  Forwarding
+    it unconditionally duplicates the report whenever the answer arrived
+    through another channel — measured 2026-10-22 (scenario 7): a 24k-char
+    pseudo report built from earlier reasoning was appended after the real
+    6.9k report (30.8% duplicated blocks in the answer area).  The tree is
+    a visualization aid, so the server — which owns the authoritative
+    report text — decides whether the fallback is needed at all.
+    """
+    return not "".join(report_text).strip() and not structured_seen
+
+
 def _serialize_tree(tree: TreeBuilder) -> list[dict[str, Any]]:
     """Extract tree nodes as a serializable list."""
     import datetime as _dt
@@ -625,6 +642,7 @@ async def _chat_event_stream(
     tree = TreeBuilder()
     latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
     final_root_cause: str | None = None           # authoritative from structured_response
+    structured_seen: bool = False                 # a structured report was received
 
     logger.info("[session=%s] Chat stream started, message=%r",
                 session_id, request.message[:120])
@@ -679,8 +697,12 @@ async def _chat_event_stream(
                     if event.payload.get("phase") == "answering":
                         report_text.append(event.payload["text"])
                 # Feed text tokens to tree for think/answer buffer.
+                # `phase` decides which buffer receives the token: the tree
+                # used to have no answering signal at all, which made its
+                # answer fallback fire on every session.
                 for tok_evt in tree.handle_token(
                     event.payload.get("text", ""),
+                    phase=event.payload.get("phase", ""),
                 ):
                     if tok_evt.get("type") in ("tree_snapshot", "tree_delta"):
                         yield _tree_sse(tok_evt)
@@ -749,6 +771,7 @@ async def _chat_event_stream(
 
             elif event.name == "structured_response":
                 logger.info("[session=%s] Structured response received", session_id)
+                structured_seen = True
                 final_root_cause = event.payload.get("root_cause") or final_root_cause
                 yield sse("structured_response", event.payload)
 
@@ -792,10 +815,23 @@ async def _chat_event_stream(
                 yield sse("error", event.payload)
 
         # Finalize tree
+        _tree_fallback_ok = _should_emit_tree_fallback(report_text, structured_seen)
         for snap in tree.finalize():
             if snap.get("type") in ("tree_snapshot", "tree_delta"):
                 yield _tree_sse(snap)
             elif snap.get("type") == "token":
+                if not _tree_fallback_ok:
+                    # The answer already streamed (or a structured report
+                    # arrived): forwarding the tree snapshot would append a
+                    # second pseudo report built from the think transcript.
+                    logger.info(
+                        "[session=%s] Dropped tree answer fallback "
+                        "(%d chars): answer already streamed "
+                        "(report=%d chars, structured=%s)",
+                        session_id, len(snap.get("text", "")),
+                        len("".join(report_text)), structured_seen,
+                    )
+                    continue
                 # Fallback answer text from tree — emit as answering phase
                 yield sse("text_delta", {
                     "text": snap["text"],

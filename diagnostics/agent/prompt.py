@@ -49,6 +49,10 @@ PHASE_SPEC: dict[str, dict] = {
             "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
             "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）",
+            "合法样例（照抄结构，不要改写字段名）：propose_hypotheses(hypotheses=["
+            "{\"statement\": \"节点 15:02 CPU 打满导致 kubelet 心跳超时\", "
+            "\"probability\": 70, \"rationale\": \"15:02 CPU 92%，同时刻该节点 NotReady\"}])——"
+            "probability 用 0-100 的整数，不要写成 \"70%\" 或字符串",
             "预算硬约束：整个诊断最多提出 2 次（首批/换批共用），每次最多 3 个，"
             "总计不超过 6 个假设；预算用尽后只能用 record_finding(statement_update=...) 修正已有假设",
             "换批：第 2 次提出在前批无 confirmed 且无活跃 pending 后开放"
@@ -96,6 +100,19 @@ PHASE_SPEC: dict[str, dict] = {
                 "（现有证据足够 → 直接 record_finding 判定；不足 → select_path 验证/证伪）；"
                 "已委派仍无法定论的假设可 defer 搁置，不必反复重试。",
         "actions": [
+            # v3.45.7: conflicting evidence is the NORM in real incidents
+            # (user report vs telemetry; historical time series vs live
+            # snapshot).  Measured 2026-10-23 (scenario 17): Argus reported
+            # disk util 82% for the fault window while live iostat showed
+            # 5.6%; the model spent 26k-30k characters of reasoning
+            # oscillating between the two readings ("但…" / "但等等…") and
+            # timed out twice without emitting a single tool call.  The rule
+            # is stated first because it gates every action below.
+            "⚖ 证据冲突先裁决再评估：两个通道数据不一致时，先核对采集时间与统计窗口"
+            "（Argus 是历史窗口序列、iostat/df 是当前快照、日志是事件时刻），"
+            "对齐后再判断；无法对齐时按「确认性工具观测 > 时序监控 > 用户主诉」裁决，"
+            "并在 record_finding 的 evidence_summary 写明差异与置信度降级理由；"
+            "**不得对同一组矛盾数据反复权衡**——一次裁决即可推进",
             # v3.34.2: split the mixed reuse bullet — the "省轮次" invite
             # folded with the confirmed-evidence standard produced a
             # conflicting signal and the model borrowed evidence into a
@@ -175,7 +192,13 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 1. **禁止文本模拟** — 你**必须**通过工具调用（task/propose_hypotheses/record_finding/write_file）完成每一步诊断。**绝对禁止**用纯文本模拟工具调用或诊断过程。
 2. **安全优先** — 评估用户意图，拒绝恶意或破坏性请求。诊断过程只读优先。
-3. **证据驱动** — 任何结论需至少两个独立来源佐证（工具输出、专家分析、日志交叉验证）。
+3. **证据驱动与优先级** — 任何结论需至少两个独立来源佐证（工具输出、专家分析、日志交叉验证）。
+   **证据优先级：确认性工具观测（实时探测/日志）> 时序监控（Argus 历史窗口）> 用户主诉**。
+   用户主诉与工具观测不一致时，**以工具观测为事实基础**下结论，并显式说明差异
+   （主诉作为症状背景保留，用于解释"观测正常但业务仍受影响"的情形，不得直接删除）。
+   两个工具通道数据不一致时，先核对**采集时间与统计窗口**（如 Argus 是历史窗口序列、
+   iostat 是当前快照），对齐后再判断；无法对齐则按上述优先级裁决并声明置信度降级。
+   **禁止在同一结论里并列引用互相否定的证据而不加说明**——这会引发反复摇摆而非收敛。
 4. **假设驱动** — 维护竞争性假设，每批最多3个，基于证据更新概率；整个诊断最多提出2批假设（总数不超过6个）；验证中途新证据指向全新方向时可在 EVALUATE 阶段追加1个新假设（不占换批预算）；预算用尽后用 record_finding(statement_update=...) 修正已有假设而非新增。
 5. **渐进聚焦** — 每步只验证一个假设，调用最少必要工具（通常1~3个），禁止发散。
 6. **台账优先** — 所有假设和结论必须通过 propose_hypotheses / record_finding 写入诊断台账，不能仅在文本中陈述。

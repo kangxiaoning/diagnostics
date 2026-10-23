@@ -124,3 +124,42 @@ class OllamaChatOpenAI(ChatOpenAI):
         except Exception:
             pass
         return result
+
+    # ── Preserve provider reasoning on the STREAMING path (v3.44.0) ──
+    # The hook above only covers `invoke`: it post-processes a complete
+    # response.  The agent runs on `astream`, where every chunk is built by
+    # `_convert_chunk_to_generation_chunk`, and that helper drops
+    # provider-specific delta fields — the class docstring states the scope
+    # ("non-standard response fields ... are not extracted") and issues
+    # #34706 / #36413 record the same gap for third-party endpoints.
+    # Measured on this backend (2026-10-22): the wire chunk carries
+    # `{"delta": {"reasoning": "..."}}`, so without this hook the thinking
+    # stream never reaches the frontend and the think section renders the
+    # answer text instead (indistinguishable from a repeated turn).
+    #
+    # Written into `additional_kwargs` only.  `_convert_message_to_dict`
+    # does not forward non-standard keys, so the model never sees its own
+    # reasoning echoed back — this is an observability hook, not a
+    # behaviour change; extraction failures stay swallowed for the same
+    # reason as the non-streaming hook.
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk,
+        default_chunk_class,
+        base_generation_info,
+    ):
+        result = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if result is None:
+            return None
+        try:
+            for choice in (chunk or {}).get("choices") or []:
+                delta = (choice or {}).get("delta") or {}
+                reason = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reason, str) and reason:
+                    result.message.additional_kwargs["reasoning_content"] = reason
+                    break
+        except Exception:
+            pass
+        return result

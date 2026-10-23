@@ -177,20 +177,36 @@ class TreeBuilder:
         logger.info("Tree: started (first phase created)")
         return [self._snapshot_event()]
 
-    def handle_token(self, text: str, round_num: int = 0) -> list[dict[str, Any]]:
-        """Feed a text token for think/answer buffer. Phase creation is driven
-        by handle_round_start (round-start events from LangGraph)."""
+    def handle_token(
+        self, text: str, round_num: int = 0, phase: str = "",
+    ) -> list[dict[str, Any]]:
+        """Feed a text token for the think/answer buffer.
+
+        ``phase`` is the streaming layer's channel ("thinking" /
+        "answering") and is the authority for which buffer receives the
+        token.  Before v3.44.0 nothing ever moved ``state`` to
+        "answering", so ``answer_buffer`` stayed empty and ``finalize()``
+        re-emitted the whole think transcript as the answer — the
+        frontend rendered a second pseudo report built from earlier
+        reasoning (measured 2026-10-22: 24k chars against a 6.9k real
+        report, 30.8% duplicated blocks in the answer area).
+        """
         if self.state == "done":
             return []
 
+        if phase == "answering":
+            self.state = "answering"
+        elif self.state == "answering":
+            # Think text after answer text means the answer turn is over
+            # (next round or a tool trace) — stop accumulating answer text.
+            self.state = "thinking"
+
         self._current_response_text.append(text)
-        if self.state in ("thinking", "executing"):
-            self.think_buffer.append(text)
-            return [{"type": "think_token", "text": text}]
         if self.state == "answering":
             self.answer_buffer.append(text)
             return [{"type": "token", "text": text}]
-        return []
+        self.think_buffer.append(text)
+        return [{"type": "think_token", "text": text}]
 
     def handle_round_start(self, round_num: int) -> list[dict[str, Any]]:
         """Create a new phase for an upcoming LLM round.

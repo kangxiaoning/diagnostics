@@ -179,11 +179,102 @@ def _extract_text(message: Any) -> str:
 
 
 def _extract_reasoning_text(message: Any) -> str:
+    """Reasoning text carried by a chunk or a full message.
+
+    Two spellings exist in the wild: DeepSeek-style providers use
+    ``reasoning_content``; this project's own model wrapper stores the
+    provider field as ``reasoning`` (see ollama_chat's response hook).
+    Reading a single spelling silently drops the thinking stream on the
+    other backend, and the fallback path (content rendered as thinking)
+    then hands the model's own reasoning back as assistant history.
+    """
     addl = getattr(message, "additional_kwargs", {}) or {}
-    rc = addl.get("reasoning_content", "")
-    if isinstance(rc, str):
-        return rc
+    for key in ("reasoning_content", "reasoning"):
+        rc = addl.get(key)
+        if isinstance(rc, str) and rc:
+            return rc
     return ""
+
+
+# ── Duplicate-emission guards (streaming/reporting layer) ────────────
+# LangGraph's messages channel replays a full AIMessage at on_llm_end in
+# addition to the token chunks (langgraph/pregel/_messages.py).  Its own
+# dedupe is keyed on message.id, so a provider that returns no stable id
+# on streaming chunks turns that replay into a second complete copy — the
+# frontend appends both and the think body shows one turn twice.  Two
+# scoped guards:
+#   ① id ledger: a full snapshot contributes only its unseen tail;
+#   ② snapshot guard: an id-less replay of a block already rendered in
+#      full this round is dropped.
+# Token-level deltas are NEVER filtered — genuine model repetition inside
+# a turn is evidence and must stay visible.
+_DUP_BLOCK_MIN_CHARS = 64
+
+_REASONING_ALERT_CHARS = 12000
+"""Per-turn reasoning length that triggers an overthinking warning (v3.45.7).
+
+Measured 2026-10-23: normal turns 125-7,882 characters; the two timed-out
+turns 25,990 and 30,041.  12k leaves ~50% headroom above the normal ceiling
+while staying well below the failure regime.
+"""
+
+
+def _resolve_new_text(
+    state: "_EventState",
+    text: str,
+    *,
+    message_id: str,
+    channel: str,
+    round_no: int,
+    agent_key: str,
+    snapshot: bool,
+) -> str:
+    """Return the portion of *text* not emitted yet ("" when fully seen).
+
+    Display-side only: the ledgers never feed back into the model context.
+    """
+    if not text:
+        return ""
+
+    # ① Per-message ledger (channel-scoped: reasoning and content of the
+    #    same message id are different streams).
+    key = f"{message_id}:{channel}" if message_id else ""
+    if key:
+        prev = state._sent_by_msg_id.get(key, "")
+        if prev:
+            if text.startswith(prev) and (snapshot or len(text) > len(prev)):
+                # Snapshot, or a cumulative-snapshot chunk: only the tail
+                # we have not shown is new.  An equal-length repeat on the
+                # chunk channel is a genuine model repetition and stays.
+                text = text[len(prev):]
+            elif snapshot and prev.startswith(text):
+                # Shorter replay of a block already emitted in full.
+                return ""
+            if not text:
+                return ""
+        state._sent_by_msg_id[key] = prev + text
+
+    # ② Snapshot guard.  Only whole snapshots are checked, and only when
+    #    a block of at least _DUP_BLOCK_MIN_CHARS was already rendered, so
+    #    a genuine repeated sentence inside the token stream is preserved.
+    round_key = (round_no, agent_key)
+    if snapshot and len(text) >= _DUP_BLOCK_MIN_CHARS:
+        sent = state._sent_by_round.get(round_key, "")
+        if sent:
+            if text.strip() in sent:
+                return ""
+            # Whitespace-normalised comparison: a replay whose only
+            # difference is line-break/space normalisation is still the
+            # same block.  Direction is one-way (new inside sent), so a
+            # snapshot that extends the turn is never dropped here.
+            import re
+            _new = re.sub(r"\s+", "", text)
+            if _new and _new in re.sub(r"\s+", "", sent):
+                return ""
+
+    state._sent_by_round[round_key] = (
+        state._sent_by_round.get(round_key, "") + text)
+    return text
 
 
 def _extract_tool_name(tc: Any) -> str:
@@ -247,6 +338,12 @@ class _EventState:
     # In _finalize, only text from the LAST round is emitted — intermediate
     # reasoning and step descriptions belong in per-round think sections.
     _coordinator_text: list[tuple[str, int]] = field(default_factory=list)
+    # Duplicate-emission guards (see _resolve_new_text): text already sent,
+    # keyed by "<message_id>:<channel>" and by (round, agent).  Display-side
+    # bookkeeping only — never fed back into the model context, never used
+    # to decide phases or evidence.
+    _sent_by_msg_id: dict[str, str] = field(default_factory=dict)
+    _sent_by_round: dict[tuple[int, str], str] = field(default_factory=dict)
 
 
 async def stream_agent_events(
@@ -421,10 +518,47 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
         msg_type = _message_type(message)
 
         if msg_type in ("AIMessageChunk", "AIMessage"):
-            # ① Extract reasoning_content from additional_kwargs (DeepSeek-R1)
-            reasoning_text = _extract_reasoning_text(message)
+            # A full AIMessage is a snapshot of the whole turn, not a delta
+            # (LangGraph emits one at on_llm_end); it must only contribute
+            # the part the token stream has not shown yet.
+            is_snapshot = msg_type == "AIMessage"
+            msg_id = getattr(message, "id", "") or ""
+
+            # ① Reasoning channel (reasoning_content / reasoning)
+            reasoning_raw = _extract_reasoning_text(message)
+            # ② Content channel
+            content_raw = _extract_text(message)
+            if (reasoning_raw and content_raw.strip()
+                    and content_raw.strip() == reasoning_raw.strip()):
+                # Provider mirrors the reasoning stream into content: the
+                # same chunk on both channels would render twice.
+                content_raw = ""
+
+            reasoning_text = _resolve_new_text(
+                state, reasoning_raw,
+                message_id=msg_id, channel="reasoning",
+                round_no=state.round_number, agent_key=agent_key,
+                snapshot=is_snapshot,
+            )
             if reasoning_text:
                 state._has_reasoning = True
+                # v3.45.7 overthinking observability: a turn that spends its
+                # budget on reasoning emits no tool call, so the failure looks
+                # like "nothing happened".  Measured 2026-10-23 (scenario 17,
+                # evaluate): 25,990 / 30,041 characters of reasoning with zero
+                # content and zero tool calls, twice.  Normal turns stay under
+                # ~8k characters, so crossing the threshold is the earliest
+                # visible signal of analysis paralysis.
+                _rc = getattr(state, "_reasoning_chars", 0) + len(reasoning_text)
+                state._reasoning_chars = _rc
+                if (_rc > _REASONING_ALERT_CHARS
+                        and not getattr(state, "_reasoning_alerted", False)):
+                    state._reasoning_alerted = True
+                    logger.warning(
+                        "[round=%d] Reasoning length %d chars exceeds %d "
+                        "(hedged/looping reasoning usually follows) — "
+                        "output budget is being consumed without a decision",
+                        state.round_number, _rc, _REASONING_ALERT_CHARS)
                 logger.debug("[round=%d] Reasoning chunk: %d chars, first 200: %r",
                              state.round_number, len(reasoning_text), reasoning_text[:200])
                 events.append(AgentEvent("text_delta", {
@@ -432,8 +566,12 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     "round": state.round_number, "phase": "thinking",
                 }))
 
-            # ② Extract content text
-            text = _extract_text(message)
+            text = _resolve_new_text(
+                state, content_raw,
+                message_id=msg_id, channel="content",
+                round_no=state.round_number, agent_key=agent_key,
+                snapshot=is_snapshot,
+            )
             tool_calls = getattr(message, "tool_calls", None)
 
             if text:
@@ -747,6 +885,12 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 new_round = data.get("round", 0)
                 if new_round > state.round_number:
                     state.round_number = new_round
+                    # Duplicate-guard buffers are per round; older entries
+                    # can never be consulted again (cross-round similarity
+                    # is deliberately NOT collapsed — it is evidence).
+                    for _key in [k for k in state._sent_by_round
+                                 if k[0] < new_round]:
+                        state._sent_by_round.pop(_key, None)
                     logger.info("[round=%d] Round transition from before_model hook",
                                 state.round_number)
                 events.append(AgentEvent("round_transition", data))

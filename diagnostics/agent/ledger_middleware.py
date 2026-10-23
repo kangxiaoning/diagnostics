@@ -93,6 +93,13 @@ from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源�
 from diagnostics.agent.dedup_middleware import (  # v3.37.0 证据条目失败分类（SSOT）
     _is_tool_failure,
 )
+# v3.45.7: retries must change the generation regime, not just wait longer.
+# `_thinking_off_variant` is the project's existing thinking-disabled variant
+# (expert-side truncation recovery already uses it); no reverse dependency, so
+# a module-level import is safe here.
+from diagnostics.agent.expert_guidance_middleware import (
+    _thinking_off_variant,
+)
 from diagnostics.agent.evidence_ledger import (  # v3.37.0 原始证据层（design document §6.6）
     build_artifact_entry,
     drop_excerpts,
@@ -474,6 +481,138 @@ def _refute_root_candidate(hypothesis: dict) -> str:
 
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report — longer timeout per attempt
+# ── 专家侧模型调用超时（v3.44.0）──
+# Coordinator 的每次尝试受 _MODEL_CALL_TIMEOUT 约束，专家侧此前没有包裹：
+# 实测（2026-10-22 场景 7 冒烟）一次委派内的模型调用持续 19 分钟无返回，
+# 期间会话无日志、无事件、无法收口。专家不重试（重试把最坏耗时翻倍，且与
+# expert_stall_watchdog 的轮次预算叠加），超时即降级为文本返回。
+_SUBAGENT_MODEL_TIMEOUT = max(
+    30, int(os.getenv("DIAGNOSTICS_SUBAGENT_MODEL_TIMEOUT",
+                      str(_MODEL_CALL_TIMEOUT))))
+
+# ── Summary-only retry after a subagent model timeout (v3.45.4) ──
+# The first attempt often dies during the SYNTHESIS call, after the expert has
+# already executed every tool it needs.  Measured 2026-10-22 (scenario 2,
+# rounds 1 and 7): 11 tool calls completed, then the summary call exceeded
+# 480 s → the whole delegation was discarded; the Coordinator re-delegated,
+# hit the HYPOTHESIZE phase gate, and lost ~17 minutes across two such
+# events.  The evidence was still in the subagent's message history the whole
+# time — one bounded, tool-free retry recovers it.
+#
+# Industry rationale: "partial results beat nothing" (timeout-aware agent
+# design / checkpoint-first execution), with a bounded retry budget rather
+# than an unbounded second attempt (retry amplification: per-try timeout
+# should be derived from what remains).
+_SUBAGENT_SUMMARY_TIMEOUT = max(
+    60, int(os.getenv("DIAGNOSTICS_SUBAGENT_SUMMARY_TIMEOUT", "240")))
+"""Budget for the summary-only retry (seconds)."""
+
+_SUMMARY_RETRY_PROMPT = (
+    "[系统] 上一次生成超过了时间上限。你此前调用的工具结果都在上文中，"
+    "不需要（也不允许）再次调用任何工具。\n"
+    "请立即用已有证据输出结论：\n"
+    "- 只引用上文中真实存在的数据；无证据的维度写入 coverage_gaps，"
+    "原因只写观测事实（禁止推断工具能力或编造原因）\n"
+    "- 同一原因导致的多个维度合并为一条，不要逐维重复同一句话\n"
+    "- 证据不足以定论时给出 inconclusive 并说明缺口\n"
+    "- 不要再调用工具，也不要输出与结论无关的推理段落"
+)
+
+# ── G31: Coordinator-side truncated-turn fail-closed (v3.45.1) ──
+# A turn that stops at the output ceiling leaves its tool arguments as a
+# fragment.  LangChain's best-effort parse then yields `{}` for exactly the
+# fields that carry intent, and dispatching such a call is never what the
+# model meant.  Measured 2026-10-22 (production port, round 3/4): three
+# `task` delegations landed with empty arguments, the expert ran 198 s on an
+# empty task and returned a 27k-character "all dimensions unavailable"
+# conclusion; the bloated context then drove the next turn to 326k input
+# tokens and a second `finish_reason=length`, which pushed the session into a
+# forced REPORT.  The industry contract is uniform: never execute a call the
+# model did not finish, and never substitute `{}` for its arguments.
+#
+# Recovery mirrors the expert-side G28 bounce: drop the truncated calls,
+# answer each with a receipt so no tool_call_id is left dangling, and jump
+# back to the model once per phase so the turn can be re-generated smaller.
+_TRUNCATION_RECOVERY_GUIDANCE = (
+    "[系统] 上一轮生成触及输出上限被截断（finish_reason=length），"
+    "该轮残缺的工具调用已作废、不会以残缺参数执行。请重新决策并压缩输出：\n"
+    "- 委派 task：description 只写分析目标与待确认信号（≤300 字），"
+    "不要复述证据、不要预演结论、不要罗列返回字段；\n"
+    "- 写报告：先写主干结论，再分节追加。"
+)
+
+_TRUNCATED_CALL_RECEIPT = (
+    "[系统] 该工具调用未被执行：本轮输出被输出长度上限截断，"
+    "残缺的参数不可信，已作废并重新决策本轮。\n"
+    "如需继续请重新发起调用（不要原样重发同一调用）。"
+)
+
+
+def _tool_result_failed(output: str) -> bool:
+    """Whether a tool result represents a failed execution.
+
+    Three shapes count as failure (design document §6 T1 / §7):
+    - LangChain ToolNode errors ("Error invoking tool …"), e.g. the framework
+      rejecting an unknown `task` argument;
+    - phase-gate / guard receipts ("⛔ …"), i.e. the call never ran;
+    - generic "Error:" payloads.
+
+    Used by the delegation-accounting block: only a delegation that actually
+    reached the subagent may count as coverage.
+    """
+    if not output:
+        return False
+    normalized = output.replace("\n", " ").strip()
+    return (normalized.startswith("Error invoking tool")
+            or normalized.startswith("⛔")
+            or "Error:" in normalized)
+
+
+def _truncated_call_pairs(response: Any) -> list[tuple[str, str]]:
+    """(id, name) of the tool calls declared by a truncated response."""
+    pairs: list[tuple[str, str]] = []
+    try:
+        results = (response.result if isinstance(response.result, list)
+                   else [response.result])
+    except Exception:
+        return pairs
+    for msg in results:
+        for call in (getattr(msg, "tool_calls", None) or []):
+            if isinstance(call, dict):
+                cid, name = call.get("id"), call.get("name", "")
+            else:
+                cid, name = getattr(call, "id", None), getattr(call, "name", "")
+            if cid:
+                pairs.append((cid, name or ""))
+    return pairs
+
+
+def _truncated_call_receipts(pairs: list[tuple[str, str]]) -> list[ToolMessage]:
+    """Placeholder answers so a skipped truncated call never dangles."""
+    return [
+        ToolMessage(content=_TRUNCATED_CALL_RECEIPT, tool_call_id=cid,
+                    name=name or None)
+        for cid, name in pairs
+    ]
+
+
+def _mark_summary_degraded(response: Any, *, elapsed: float) -> None:
+    """Tag a summary-only recovery so post-hoc analysis can tell it apart.
+
+    A recovered conclusion is legitimate but was produced under time pressure
+    (no further tool calls allowed).  Tagging keeps "natural" and "recovered"
+    distinguishable in the ledger / trace without altering the conclusion.
+    """
+    try:
+        results = (response.result if isinstance(response.result, list)
+                   else [response.result])
+    except Exception:
+        return
+    for msg in results:
+        meta = getattr(msg, "response_metadata", None)
+        if isinstance(meta, dict):
+            meta["_summary_degraded"] = True
+            meta["_summary_retry_s"] = elapsed
 
 # ── G7' model-call retry (design document §8) ──
 # A transient failure (timeout / connection break / 5xx / 429) is retried
@@ -591,13 +730,20 @@ def _expert_verdict_from_structured(data: dict) -> str | None:
     return None
 
 
-def _format_expert_summary(output: str) -> str:
+def _format_expert_summary(output: str, effect: str | None = None) -> str:
     """Format a structured expert return (JSON) as readable evidence text.
 
     Falls back to the raw output when it is not a structured JSON object
     (degraded text-format path).  The formatted text keeps the field
     labels used by the text-signal regexes (``假设验证:`` / clarification
     marker) so downstream consumers stay compatible.
+
+    *effect* (v3.45.5) renders an ATTRIBUTED entry: the same expert return
+    is filed against a merely-related hypothesis, so its direction must be
+    the declared effect, not the assigned hypothesis' verdict.  Copying the
+    raw verdict produced self-contradictory ledger lines — measured
+    2026-10-22 (scenario 2): ``H2 [refuted p=0%] 证据: 假设验证: confirmed
+    关键证据: …双盘 I/O 饱和`` — a line the Coordinator sees every round.
     """
     data = _parse_expert_json(output)
     if data is None:
@@ -620,7 +766,16 @@ def _format_expert_summary(output: str) -> str:
         lines.append(clarification)
 
     verdict = data.get("verdict")
-    if verdict:
+    if effect:
+        # Attributed entry: direction = declared effect (v3.45.5).
+        _mapped = {"supports": "confirmed",
+                   "refutes": "refuted"}.get(
+                       str(effect).strip().lower(), "inconclusive")
+        _origin = f"；专家对原假设的判定为 {verdict}" if verdict else ""
+        lines.append(
+            f"假设验证: {_mapped}（按专家声明的相关度方向，"
+            f"不是对原假设的判定{_origin}）")
+    elif verdict:
         lines.append(f"假设验证: {verdict}")
     for label, key in (
         ("突变时间点", "mutation_points"),
@@ -644,7 +799,15 @@ def _format_expert_summary(output: str) -> str:
         ("置信度", "confidence"),
     ):
         value = data.get(key) or ""
-        if value:
+        if not value:
+            continue
+        if effect and key in ("root_cause", "preliminary_judgment"):
+            # The expert's root cause talks about the ASSIGNED hypothesis;
+            # repeating it verbatim under a refuted related hypothesis reads
+            # as "this hypothesis is the root cause too" (v3.45.5).
+            lines.append(
+                f"{label}（专家对原假设的结论，不构成本假设的判定）: {value}")
+        else:
             lines.append(f"{label}: {value}")
     if clarification and _has_data:
         lines.append(f"参数缺口: {clarification}")
@@ -2027,6 +2190,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # onward; consumed by after_model, which moves it into the
         # `_stall_guidance` state field and issues jump_to="model".
         self._pending_guidance: str | None = None
+        # G31 (v3.45.1): one recovery per phase after a length-truncated
+        # turn.  Repeating it inside the same phase would just burn turns —
+        # the same bounded-retry reasoning as the expert-side G28 bounce.
+        self._truncation_recovered_phases: set[str] = set()
+        self._truncation_recovery_pending: bool = False
+        self._truncation_pending_calls: list[tuple[str, str]] = []
         # Safety mechanism tracking
         self._consecutive_task_count: int = 0  # global: stagnation detection
         self._same_delegate_count: int = 0     # per-key: delegation saturation
@@ -2319,13 +2488,178 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
     # non-existent node (verified by a controlled test).
     @hook_config(can_jump_to=["model"])
     def after_model(self, state, runtime) -> dict | None:
+        # G31 (v3.45.1): a length-truncated turn is re-generated, never
+        # dispatched.  The truncated calls are answered here (a dangling
+        # tool_call_id breaks non-tolerant backends), then the loop jumps
+        # back to the model with the compression directive.
+        if self._truncation_recovery_pending:
+            pending = self._truncation_pending_calls
+            self._truncation_recovery_pending = False
+            self._truncation_pending_calls = []
+            self._pending_guidance = None
+            logger.warning(
+                "G31 truncation recovery: jumping back to model "
+                "(%d truncated call(s) answered with a skip receipt)",
+                len(pending))
+            return {
+                "jump_to": "model",
+                "_stall_guidance": _TRUNCATION_RECOVERY_GUIDANCE,
+                "messages": _truncated_call_receipts(pending),
+            }
         if self._pending_guidance:
             guidance = self._pending_guidance
             self._pending_guidance = None
             return {"jump_to": "model", "_stall_guidance": guidance}
         return None
 
+    def _arm_truncation_recovery(
+        self,
+        response: Any,
+        *,
+        phase: str,
+        round_num: int,
+    ) -> None:
+        """Arm G31 for a length-truncated Coordinator turn (fail closed).
+
+        The decision is deliberately deterministic: only the protocol field
+        ``finish_reason == "length"`` gates it, so it stays backend- and
+        model-agnostic (no dependence on a particular tool-call syntax or on
+        guessing whether the arguments "look" truncated).
+
+        Once per phase.  A second truncation in the same phase means the
+        re-generation did not shrink the output either; jumping again would
+        loop forever, so the turn is kept as-is and the existing stall /
+        phase-guard path takes over.
+        """
+        if phase in self._truncation_recovered_phases:
+            logger.warning(
+                "G31 truncation recovery skipped (phase=%s already recovered "
+                "once, round=%d) — turn kept as-is", phase, round_num)
+            return
+        pairs = _truncated_call_pairs(response)
+        self._truncation_recovered_phases.add(phase)
+        self._truncation_recovery_pending = True
+        self._truncation_pending_calls = pairs
+        logger.warning(
+            "G31 truncation recovery armed (phase=%s, round=%d, "
+            "truncated_calls=%d) — the turn will be re-generated instead of "
+            "dispatching truncated arguments", phase, round_num, len(pairs))
+
     # ── Context injection ──
+
+    async def _await_subagent_model(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> tuple[ModelResponse, bool]:
+        """Run one subagent model call under the expert-side timeout.
+
+        Returns ``(response, timed_out)``.  A timeout is deliberately NOT
+        raised: the expert graph must end with a text result so the
+        Coordinator receives a "no conclusion" tool result and can keep
+        driving the state machine.  Raising would surface as a delegation
+        failure and lose the whole expert turn.
+
+        v3.45.4: before degrading to that text result, ONE summary-only
+        retry is attempted on the same message history — the tool results
+        collected so far are still there.  Measured 2026-10-22 (scenario 2,
+        rounds 1 and 7): both delegations died during synthesis after 11
+        successful tool calls, and the Coordinator was told "no conclusion"
+        twice while all the evidence had already been gathered (~17 minutes
+        lost across the two events).
+        """
+        try:
+            response = await asyncio.wait_for(
+                handler(request), timeout=_SUBAGENT_MODEL_TIMEOUT)
+            return response, False
+        except asyncio.TimeoutError:
+            _coord = getattr(self, "_coordinator", None)
+            _led: dict = {}
+            for _cand in (self._current_ledger,
+                          getattr(_coord, "_current_ledger", None)):
+                if isinstance(_cand, dict):
+                    _led = _cand
+                    break
+            _coord_round = _led.get("current_round", 0)
+            logger.warning(
+                "Subagent model call timed out after %ss "
+                "(coordinator_round=%d) — attempting a summary-only retry "
+                "(%ss budget) before degrading",
+                _SUBAGENT_MODEL_TIMEOUT, _coord_round,
+                _SUBAGENT_SUMMARY_TIMEOUT,
+            )
+            recovered = await self._retry_summary_only(
+                request, handler, coordinator_round=_coord_round)
+            if recovered is not None:
+                return recovered, False
+            logger.warning(
+                "Subagent summary-only retry failed (coordinator_round=%d) "
+                "— returning a degraded text response so the delegation "
+                "can end", _coord_round,
+            )
+            return ModelResponse(result=[AIMessage(content=(
+                f"[系统超时] 专家模型调用超过 {_SUBAGENT_MODEL_TIMEOUT}s 未返回"
+                f"（总结重试 {_SUBAGENT_SUMMARY_TIMEOUT}s 亦超时），"
+                "本次委派未产出结论。\n"
+                "请基于已采集的证据判断：有正向确证层证据的写 confirmed；"
+                "无法确证但观测通道已查的按 inconclusive 处理，"
+                "并在 rationale 中说明该结论未经专家确认。"
+            ))]), True
+
+    async def _retry_summary_only(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+        *,
+        coordinator_round: int,
+    ) -> ModelResponse | None:
+        """One tool-free synthesis attempt on the existing history.
+
+        The retry keeps the subagent's messages (all collected tool results)
+        and only appends a directive: stop calling tools, write the
+        conclusion from what is already here.  It is bounded by
+        ``_SUBAGENT_SUMMARY_TIMEOUT`` and never retried twice.
+
+        Returns the recovered response, or ``None`` when the retry also times
+        out / errors — the caller then degrades exactly as before, so the
+        fallback behaviour is unchanged.
+        """
+        _overrides: dict[str, object] = {}
+        try:
+            _overrides["system_message"] = append_to_system_message(
+                request.system_message, _SUMMARY_RETRY_PROMPT)
+        except Exception:  # never let the retry itself become a failure source
+            _overrides = {}
+        retry_request = (request.override(**_overrides)
+                         if _overrides else request)
+
+        import time as _time
+        _started = _time.monotonic()
+        try:
+            response = await asyncio.wait_for(
+                handler(retry_request), timeout=_SUBAGENT_SUMMARY_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Subagent summary-only retry timed out after %ss "
+                "(coordinator_round=%d)",
+                _SUBAGENT_SUMMARY_TIMEOUT, coordinator_round,
+            )
+            return None
+        except Exception as exc:  # backend error / cancellation
+            logger.warning(
+                "Subagent summary-only retry errored "
+                "(coordinator_round=%d): %s", coordinator_round, exc,
+            )
+            return None
+
+        _elapsed = round(_time.monotonic() - _started, 1)
+        _mark_summary_degraded(response, elapsed=_elapsed)
+        logger.warning(
+            "Subagent summary-only retry recovered a conclusion in %.1fs "
+            "(coordinator_round=%d) — delegation preserved",
+            _elapsed, coordinator_round,
+        )
+        return response
 
     async def awrap_model_call(
         self,
@@ -2354,7 +2688,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if self._is_subagent:
             import time as _time_sub
             _sub_started = _time_sub.monotonic()
-            _resp = await handler(request)
+            _resp, _timed_out = await self._await_subagent_model(request, handler)
+            if _timed_out:
+                return _resp
             # ── Truncation observability (design document §8 G28; first
             # added 2026-08-11 for scenario 38) ──
             # A length-truncated turn silently drops the subagent's
@@ -2560,9 +2896,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         _attempts_used = 0
         for _attempt in range(1, _MODEL_MAX_ATTEMPTS + 1):
             _attempts_used = _attempt
+            _attempt_request = _call_request
+            if _attempt > 1:
+                # v3.45.7: same-parameter retries reproduce the same failure.
+                # Measured 2026-10-23 (scenario 17, evaluate): two consecutive
+                # 480 s timeouts, each burning 26k-30k characters of reasoning
+                # on the same contradictory evidence before emitting any
+                # output (finish_reason=None, content=0, tool_calls=0).  The
+                # retry disables thinking so the second attempt is not the
+                # same over-reasoning loop again (CoT-compression practice:
+                # budget-aware early exit rather than a longer deadline).
+                _quiet_model = _thinking_off_variant(
+                    getattr(_attempt_request, "model", None))
+                if _quiet_model is not None:
+                    _attempt_request = _attempt_request.override(
+                        model=_quiet_model)
+                    logger.warning(
+                        "Model retry %d/%d with thinking disabled "
+                        "(round %d, phase=%s) — identical parameters would "
+                        "reproduce the same over-reasoning",
+                        _attempt, _MODEL_MAX_ATTEMPTS,
+                        self._model_call_count, _phase(ledger),
+                    )
             try:
                 response = await asyncio.wait_for(
-                    handler(_call_request),
+                    handler(_attempt_request),
                     timeout=_effective_timeout,
                 )
                 _call_error = None
@@ -2678,6 +3036,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_call_count, _phase(ledger),
                     _tokens_out or "?", _duration,
                 )
+                self._arm_truncation_recovery(
+                    response, phase=_phase(ledger),
+                    round_num=self._model_call_count)
         else:
             # ── G7 fallback: every attempt failed ──
             # NOTE: this recovery path must never crash the stream —
@@ -5070,8 +5431,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                             fmt_hid(target_hid),
                                         )
                                     continue
+                                # v3.45.5: re-render the summary under the
+                                # declared direction.  Copying the assigned
+                                # hypothesis' summary left the attributed
+                                # entry saying "假设验证: confirmed" while its
+                                # node was refuted — a contradiction the
+                                # Coordinator read every round.
+                                _rev_summary = summary
+                                if _structured_expert is not None:
+                                    _rev_summary = _format_expert_summary(
+                                        output, effect=_effect)
                                 _rev = new_evidence(
-                                    source, summary,
+                                    source, _rev_summary,
                                     supports={"supports": True,
                                               "refutes": False}.get(_effect),
                                     tool_call_id=tool_call_id,
@@ -5137,11 +5508,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # cut must not clip the evidence those detectors classify.
             key_findings = ""
             key_findings_full = ""
+            normalized = ""
+            # Tool-level failure (framework error, phase gate, guard receipt).
+            # Hoisted out of the `if output` block: the delegation-accounting
+            # block below must know whether the call actually reached the
+            # subagent (see the ghost-transaction guard there).
+            is_error = False
             if output:
                 normalized = output.replace("\n", " ").strip()
                 key_findings_full = normalized[:4000]
-                is_error = normalized.startswith("Error invoking tool") or \
-                    "Error:" in normalized
+                is_error = _tool_result_failed(output)
                 if is_error:
                     if len(normalized) > 2000:
                         key_findings = normalized[:2000] + " …(truncated)"
@@ -5159,7 +5535,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 expert = (tool_args.get("subagent_type")
                           or tool_args.get("subagent_name")
                           or tool_args.get("name"))
-                if expert:
+                # Ghost-transaction guard (v3.45.2, design document §6 T1):
+                # a delegation that never reached the subagent must NOT count
+                # as "this expert was delegated".  `_coverage_ready` reads this
+                # set to decide the UNDERSTAND→HYPOTHESIZE flip; counting a
+                # failed call advanced the phase while no data existed, and the
+                # follow-up delegation then hit the §7 HYPOTHESIZE gate.
+                # Measured 2026-10-22 (session 14:12, memory_leak): round-1
+                # delegation failed on an unknown `path` argument, round-2
+                # retry was blocked by the phase gate, and the data only
+                # arrived at round 4 — the same failure shape as the
+                # 2026-07-30 f62a11eb incident recorded in `_coverage_ready`.
+                if expert and is_error:
+                    logger.warning(
+                        "Delegation to '%s' failed (%s) — not counted as "
+                        "covered, phase stays in UNDERSTAND (round %d)",
+                        expert, (normalized or "empty result")[:80],
+                        self._model_call_count,
+                    )
+                elif expert:
                     delegated = [expert]
                     # Structured delegation fact (design document
                     # parallel-delegation §5 D2): makes per-hypothesis

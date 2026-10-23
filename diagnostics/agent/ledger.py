@@ -942,7 +942,18 @@ def record_finding(
         node["_statement_only_updates"] = node.get("_statement_only_updates", 0) + 1
         return
 
-    node["probability"] = max(0, min(100, probability_update or 0))
+    # ``probability_update=None`` means "the coordinator did not estimate a
+    # new probability", NOT "the probability becomes 0".  The previous
+    # ``or 0`` conflated the two: a `confirmed` finding without an update
+    # silently dropped the hypothesis to p=0, which can never satisfy S1
+    # (confirmed root with p≥80) — measured 2026-10-22 (scenario 2): H3 was
+    # confirmed with p=0, and 2 of that session's 3 findings omitted the
+    # update.  `refuted` is the one verdict whose default IS 0 (the
+    # hypothesis is excluded); confirmed/inconclusive keep the current value.
+    if probability_update is not None:
+        node["probability"] = max(0, min(100, probability_update))
+    elif verdict == "refuted":
+        node["probability"] = 0
 
     supports = verdict == "confirmed"
     if evidence_summary:
@@ -1198,7 +1209,7 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     experts_delegated: set[str] = set()
     has_delegated = False
     for rd in ledger.get("rounds", []):
-        experts_delegated.update(rd.get("delegated_experts", []))
+        experts_delegated.update(rd.get("delegated_experts") or [])
         if "task" in rd.get("tools_called", []):
             has_delegated = True
     if not has_delegated:
@@ -1241,7 +1252,7 @@ def _serverless_coverage_ready(ledger: DiagnosisLedger) -> bool:
         return False  # topology still pending — keep UNDERSTAND collecting
     experts_delegated: set[str] = set()
     for rd in ledger.get("rounds", []):
-        experts_delegated.update(rd.get("delegated_experts", []))
+        experts_delegated.update(rd.get("delegated_experts") or [])
     required = {
         "serverless-argus-expert", "kmc-argus-expert",
         "sci-argus-expert", "host-argus-expert",
@@ -1351,6 +1362,30 @@ def _support_tag(supports: bool | None) -> str:
     if supports is False:
         return "反驳"
     return "未定性"
+
+
+def _evidence_source_tag(source: str) -> str:
+    """Channel + time semantics of an evidence entry (v3.45.7).
+
+    Two channels routinely disagree for legitimate reasons: Argus returns a
+    time series over the fault window, while live host tools return a CURRENT
+    snapshot.  Measured 2026-10-23 (scenario 17): Argus 82% (window 15:00-15:09)
+    vs live iostat 5.6% (now).  The Coordinator read them as mutually
+    contradicting, oscillated through 26k-30k characters of reasoning
+    ("但…" / "但等等…") and timed out twice without emitting a single tool
+    call.  Labelling the channel in the rendered context removes that
+    ambiguity at its source, and costs one short tag.
+    """
+    src = (source or "").strip()
+    if ":" in src:
+        kind, _, name = src.partition(":")
+        if kind == "expert":
+            return "[Argus 时序]" if "argus" in name else "[专家深度验证]"
+        if kind == "tool":
+            return "[Argus 时序]" if "argus" in name else "[实时快照]"
+    if src == "coordinator":
+        return "[协调员判定]"
+    return ""
 
 
 # ── Context rendering (injected into system message each round) ──
@@ -1633,8 +1668,11 @@ def _render_hypothesis_tree(
                 and e.get("summary", "").strip()[:200] != verdict_text[:200]
             ]
         for ev in evidence_entries:
+            # v3.45.7: channel/time-semantics tag — see `_evidence_source_tag`.
+            _src_tag = _evidence_source_tag(ev.get("source", ""))
             lines.append(
                 f"{prefix}  证据: "
+                f"{f'{_src_tag} ' if _src_tag else ''}"
                 f"{_clean_evidence_text(ev.get('summary', ''), 3000)} "
                 f"({_support_tag(ev.get('supports'))})"
             )

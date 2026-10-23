@@ -15,10 +15,15 @@ from deepagents import (
     register_harness_profile,
 )
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+# Module alias (not a symbol import): the `task` argument schema is swapped
+# below, and `_build_task_tool` resolves the name at call time — patching the
+# module attribute is what makes the swap reach the emitted JSON schema.
+from deepagents.middleware import subagents as _delegation
 
 from diagnostics.agent.ollama_chat import OllamaChatOpenAI
 from diagnostics.agent.prompt import make_system_prompt
 from diagnostics.agent.dedup_middleware import ToolDedupMiddleware
+from diagnostics.agent.delegation_guard import DelegationGuardMiddleware
 from diagnostics.agent.expert_guidance_middleware import ExpertGuidanceMiddleware
 from diagnostics.agent.expert_novelty_gate import ExpertNoveltyGateMiddleware
 from diagnostics.agent.expert_session_ledger import ExpertSessionLedger
@@ -92,11 +97,77 @@ except ImportError:
 # matches.  The previous approach only hid the tool name while the middleware
 # still injected its ~2KB planning prompt on every model call; that middleware
 # is no longer in the stack at all.
+# ── `task` tool description: framework contract vs. project contract ──
+# deepagents' default TaskToolSchema field text tells the model to
+# "specify the expected output format" inside `description`.  That is the
+# exact opposite of the delegation contract (prompt `<delegation_params>`:
+# the expert's return format is predefined by its own instructions — never
+# restate it).  Measured 2026-10-22 with both instructions in force: the
+# model obeyed the tool schema and pre-filled an entire expert conclusion
+# (a 27k-character structured findings object) as the delegation argument;
+# the payload failed to parse, the subagent was dispatched with `args={}`,
+# ran for minutes on an empty task and returned "all dimensions
+# unavailable", while the repeated gap sentences dominated the context.
+#
+# The tool schema wins such conflicts because it is re-loaded on every call
+# and sits closest to the generation point, so the fix belongs here rather
+# than in the prompt.  The override keeps the `{available_agents}`
+# placeholder — without it the model cannot see which experts exist — and
+# replaces the output-format instruction with the project's contract.
+_TASK_TOOL_DESCRIPTION = """委派一个临时子代理执行多步诊断任务。
+
+可用专家类型及其工具面：
+{available_agents}
+
+参数契约（两个参数都必填，且必须使用命名参数）：
+- subagent_type：专家类型名，必须取自上面的列表。
+- description：委派指令，写清分析目标、待验证的问题、需要确认的关键信号。
+
+description 写作规则：
+- 诊断参数（hostname / cluster_name / namespace / pod_name / 时间窗口）由系统自动注入，
+  不要在 description 里重复粘贴。
+- 专家的返回格式由该专家自己的指令预定义。禁止在 description 中罗列返回字段、
+  写 JSON 结构或预演结论——只写要查什么、要确认什么。
+- 不要在 description 中粘贴证据原文、会话基线或历史结论。
+
+用法说明：
+- 多个互相独立的委派可以在同一条消息里并发发起（多个 tool call）。
+- 每次调用都是无状态的：子代理只能看到你写在 description 里的内容。
+- 子代理的报告不会直接展示给用户，需要你自己转述要点。"""
+
+
+# The tool-level description is only one of two carriers: the ARGUMENT field
+# description (`TaskToolSchema.description`) repeats the same instruction —
+# "…and specify the expected output format." — directly next to the argument
+# the model is about to write, which makes it the stronger of the two.
+# Pydantic v2 caches the core schema, so mutating
+# `TaskToolSchema.model_fields[...].description` has NO effect on the JSON
+# schema handed to the model (verified 2026-10-22).  A subclass plus a
+# module-level swap is the only lever that changes what the model receives
+# without forking deepagents; the swap is asserted by the controlled test
+# suite so an upstream rename fails loudly instead of silently restoring the
+# conflict.
+class _ProjectTaskToolSchema(_delegation.TaskToolSchema):
+    """`task` arguments carrying the project's delegation contract."""
+
+    description: str = Field(
+        description=(
+            "委派指令：分析目标 + 待验证的问题 + 需要确认的关键信号。"
+            "诊断参数（hostname/cluster_name/namespace/pod_name/时间窗口）由系统"
+            "自动注入，无需粘贴。禁止罗列返回字段、写 JSON 结构或预演结论——"
+            "返回格式由专家自身的指令预定义。"
+        )
+    )
+
+
+_delegation.TaskToolSchema = _ProjectTaskToolSchema
+
 register_harness_profile(
     "openai",
     HarnessProfile(
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
         excluded_tools=frozenset({"delete"}),
+        tool_description_overrides={"task": _TASK_TOOL_DESCRIPTION},
     ),
 )
 
@@ -150,6 +221,44 @@ def _coerce_list_value(value: Any) -> Any:
     if value is None:
         return []
     return value
+
+
+# ── Wire-level repetition control (design document §8 G30 companion) ──
+# Measured 2026-10-22: an expert emitted the same gap sentence once per
+# dimension ("数据不可用｜当前工具仅支持主机级指标，无趋势详情" × N) — tens of
+# byte-identical array elements that dominated the context and pushed the
+# following round into a template loop.  The repetition is a wire defect, so
+# it is repaired deterministically instead of being asked away in a prompt.
+_LIST_SOFT_LIMIT = 24
+"""Beyond this many items the tail is folded into one counted summary."""
+
+
+def _fold_repeated_items(items: Any) -> Any:
+    """Collapse identical items and fold an over-long tail (deterministic).
+
+    Two stages:
+
+    1. items that are identical after whitespace normalization collapse to
+       their first occurrence — a repeat carries no information;
+    2. beyond ``_LIST_SOFT_LIMIT`` items, the first N-1 survive and one
+       "另有 K 项同类" summary is appended, so a runaway enumeration cannot
+       consume the context budget while its size stays visible.
+    """
+    if not isinstance(items, list):
+        return items
+    seen: set[str] = set()
+    unique: list[Any] = []
+    for item in items:
+        key = " ".join(str(item).split())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    if len(unique) <= _LIST_SOFT_LIMIT:
+        return unique
+    head = unique[:_LIST_SOFT_LIMIT - 1]
+    head.append(f"另有 {len(unique) - (_LIST_SOFT_LIMIT - 1)} 项同类（同因，已折叠）")
+    return head
 
 
 # Deepagents 0.6.10 SubAgent.response_format: when a subagent produces a
@@ -248,9 +357,11 @@ class DeepExpertFindings(BaseModel):
     root_cause: str = Field(
         default="",
         description=(
-            "根因判断：confirmed/inconclusive 且已定位根因时陈述根因结论；"
-            "refuted 时陈述假设被排除的原因及建议转向方向（此时假设本身不是根因）；"
-            "证据不足时说明还需什么数据。方向须与 verdict 一致"
+            "根因判断（**根因承载力字段**）：confirmed/inconclusive 且已定位根因时"
+            "陈述根因结论；refuted 时陈述假设被排除的原因及建议转向方向"
+            "（此时假设本身不是根因）；证据不足时说明还需什么数据。方向须与 verdict 一致。"
+            "根因必须写在本字段——不得只写在报告正文或 preliminary_judgment；"
+            "确实未定位时走 inconclusive 并写清缺口，禁止为填满字段而编造根因"
         ),
     )
     verdict_target: Literal["assigned_hypothesis", "alternative_root_cause"] = Field(
@@ -290,18 +401,23 @@ class DeepExpertFindings(BaseModel):
             "『网络策略：不适用｜本次任务为资源不足』、"
             "『Pod日志：强制收尾｜预算用尽未采集』。"
             "已声明的维度视为已交代，不会因缺数据被要求补采；"
-            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
+            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）。"
+            "原因只写观测事实（如『目标节点无监控数据』『查询返回空』）；"
+            "禁止推断或编造未验证的解释（如『当前工具仅支持主机级指标』这类工具能力断言）。"
+            "同一原因导致的多个维度合并为一条并列出维度清单，"
+            "禁止逐维度重复同一句话"
         ),
     )
 
     @model_validator(mode="before")
     @classmethod
     def _repair_list_fields(cls, data: Any) -> Any:
-        """Deterministic wire repair: str → list[str] (see module note)."""
+        """Deterministic wire repair: str → list[str] + repeat folding."""
         if isinstance(data, dict):
             for name in ("key_evidence", "negative_evidence", "coverage_gaps"):
                 if name in data:
-                    data[name] = _coerce_list_value(data[name])
+                    data[name] = _fold_repeated_items(
+                        _coerce_list_value(data[name]))
         return data
 
 
@@ -352,7 +468,11 @@ class ArgusExpertFindings(BaseModel):
     )
     concurrent_anomalies: list[str] = Field(
         default_factory=list,
-        description="并发异常（数组，每项一条）：同一时间点发生的多个异常（暗示共同根因）",
+        description=(
+            "并发异常（数组，每项一条）：同一时间点发生、且指向共同根因的多个异常。"
+            "同一根因合并为一条（列出受影响维度清单），"
+            "禁止按维度逐个复制同一句话——重复项会被系统折叠，写多无用"
+        ),
     )
     cross_domain: list[str] = Field(
         default_factory=list,
@@ -360,7 +480,12 @@ class ArgusExpertFindings(BaseModel):
     )
     preliminary_judgment: str = Field(
         default="",
-        description="初步判断：基于指标关联的根因推断（一句话）",
+        description=(
+            "初步判断（**根因承载力字段**）：基于指标关联的根因结论，"
+            "根因必须写在这里，不得只写在报告正文或口头总结里。"
+            "证据不足以定位根因时写「未定位」并说明缺口，"
+            "禁止为填满字段而编造根因（无证据的根因陈述会被判定为幻觉）"
+        ),
     )
     confidence: str = Field(
         default="",
@@ -375,19 +500,25 @@ class ArgusExpertFindings(BaseModel):
             "示例：[\"Pod指标：数据不可用｜目标命名空间无 Pod\", "
             "\"网络指标：不适用｜本次任务为存储不足\"]。"
             "已声明的维度视为已交代，不会因缺数据被要求补采；"
-            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）"
+            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）。"
+            "原因只写观测事实（如『查询返回空』『该维度无数据点』）；"
+            "禁止推断或编造未验证的解释（如『当前工具仅支持主机级指标』这类工具能力断言）——"
+            "这类断言会把数据缺口误升级为结论。"
+            "同一原因导致的多个维度合并为一条并列出维度清单，"
+            "禁止逐维度重复同一句话（重复项会被系统折叠）"
         ),
     )
 
     @model_validator(mode="before")
     @classmethod
     def _repair_list_fields(cls, data: Any) -> Any:
-        """Deterministic wire repair: str → list[str] (see module note)."""
+        """Deterministic wire repair: str → list[str] + repeat folding."""
         if isinstance(data, dict):
             for name in ("mutation_points", "anomaly_ranking", "negative_evidence",
                          "concurrent_anomalies", "cross_domain", "coverage_gaps"):
                 if name in data:
-                    data[name] = _coerce_list_value(data[name])
+                    data[name] = _fold_repeated_items(
+                        _coerce_list_value(data[name]))
         return data
 
 
@@ -1097,6 +1228,17 @@ def build_agent(
     # channel can only be reported through this reference.
     guidance.bind_coordinator(ledger_middleware)
 
+    # Delegation parameter guard (design document §8 G30): validates the
+    # Coordinator's `task` arguments BEFORE any downstream bookkeeping.
+    # Rationale: an unparseable or oversized payload degrades to `args={}`
+    # and dispatches an empty delegation — the expert then burns minutes on
+    # a task it never received.  Sitting outermost also means a rejected
+    # call never reaches dedup/ledger, so the caches stay clean and the
+    # model gets a corrective receipt instead of a silent empty run.
+    delegation_guard = DelegationGuardMiddleware(
+        allowed_subagents=[sa["name"] for sa in subagent_configs],
+    )
+
     # ── Inject shared middleware into every subagent ──
     # Subagents use subagent_ledger (P1 disabled) and dedup_subagent
     # (shared cache) instead of the Coordinator's full-featured instances.
@@ -1123,6 +1265,6 @@ def build_agent(
         # diagnosis state stays at the prompt tail.
         skills=["/agent_data/skills/"],
         subagents=subagent_configs,
-        middleware=[dedup_middleware, ledger_middleware],
+        middleware=[delegation_guard, dedup_middleware, ledger_middleware],
         state_schema=DiagnosisLedgerState,
     )
