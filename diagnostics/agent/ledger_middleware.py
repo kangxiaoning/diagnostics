@@ -82,6 +82,14 @@ from diagnostics.agent.ledger import (  # noqa: F401  (相位门控 SSOT，desig
 )
 from diagnostics.agent.ledger import _argus_conflict_signal  # noqa: F401  (C1/C2 argus 冲突信号，design document §8 G13 context)
 from diagnostics.agent.ledger import experts_for_hypothesis  # 假设↔专家归属视图（v3.38.0）
+# Side-effect import: `diagnostics.config` calls `load_dotenv`, and the
+# timeout constants below are evaluated at import time.  Without this, whether
+# `.env` is honoured depends on import order — measured 2026-10-23: `.env`
+# declared `DIAGNOSTICS_MODEL_TIMEOUT=480` while the effective value was the
+# 300 default, so every model call timed out 40% earlier than configured
+# (two 300 s timeouts in one evaluate phase).
+from diagnostics import config as _config  # noqa: F401
+
 from diagnostics.agent.ledger import confirmatory_expert_evidence  # G17 确证层证据判据（v3.42.0）
 from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
