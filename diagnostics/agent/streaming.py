@@ -210,12 +210,16 @@ def _extract_reasoning_text(message: Any) -> str:
 # a turn is evidence and must stay visible.
 _DUP_BLOCK_MIN_CHARS = 64
 
-_REASONING_ALERT_CHARS = 12000
-"""Per-turn reasoning length that triggers an overthinking warning (v3.45.7).
+_REASONING_ALERT_CHARS = 25000
+"""Per-turn CUMULATIVE reasoning length that triggers an overthinking warning.
 
-Measured 2026-10-23: normal turns 125-7,882 characters; the two timed-out
-turns 25,990 and 30,041.  12k leaves ~50% headroom above the normal ceiling
-while staying well below the failure regime.
+The counter accumulates across every model call inside one round, so a normal
+round with three calls lands around 12k even when no single response is long.
+Measured 2026-10-23 (three replays of the same scenario): single-response
+peaks were 4,890-7,882 characters, per-round totals reached ~12k, and the two
+timed-out turns were 25,990 and 30,041 in ONE response.  The threshold is set
+above the normal per-round ceiling and below the failure regime; the earlier
+12k value fired on every healthy round (noise).
 """
 
 
