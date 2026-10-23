@@ -573,7 +573,51 @@ def _tool_result_failed(output: str) -> bool:
     normalized = output.replace("\n", " ").strip()
     return (normalized.startswith("Error invoking tool")
             or normalized.startswith("⛔")
+            # Degraded receipts produced by the expert-side timeout / retry
+            # paths carry no conclusion — they must not count as coverage
+            # either (v3.45.9).
+            or normalized.startswith(_DEGRADED_RECEIPT_PREFIX)
             or "Error:" in normalized)
+
+
+_DEGRADED_RECEIPT_PREFIX = "[系统超时]"
+"""Opening marker of every degraded subagent receipt."""
+
+
+def _response_is_incomplete(response: Any) -> bool:
+    """Whether a subagent model call produced nothing usable (v3.45.9).
+
+    An expert turn must end with either a tool call (keep gathering) or a
+    conclusion (content).  A response carrying neither, **with no
+    ``finish_reason``**, is an interrupted provider response — not a decision
+    to stay silent.
+
+    Measured twice on 2026-10-23 (scenario 17 capture idx 21: reasoning 434;
+    scenario 2 capture idx 9: reasoning 930): ``finish_reason=None``,
+    ``usage=None``, ``content=0``, ``tool_calls=0``.  The expert graph ended
+    immediately (21 s vs 66 s for a real turn), the delegation returned an
+    empty result, and that empty result was still booked as coverage — so the
+    Coordinator re-delegated the same hypothesis and lost a round.
+
+    Only ``finish_reason`` absent/empty counts: an explicit ``stop`` with
+    empty content is the model's own decision and must not be retried.
+    """
+    try:
+        results = (response.result if isinstance(response.result, list)
+                   else [response.result])
+    except Exception:
+        return False
+    for msg in results:
+        if getattr(msg, "tool_calls", None):
+            return False
+        if str(getattr(msg, "content", "") or "").strip():
+            return False
+        meta = getattr(msg, "response_metadata", None) or {}
+        if isinstance(meta, dict):
+            finish = meta.get("finish_reason")
+            if finish not in (None, ""):
+                return False
+    return True
 
 
 def _truncated_call_pairs(response: Any) -> list[tuple[str, str]]:
@@ -2579,6 +2623,30 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         try:
             response = await asyncio.wait_for(
                 handler(request), timeout=_SUBAGENT_MODEL_TIMEOUT)
+            # v3.45.9: an interrupted provider response (finish_reason absent,
+            # no content, no tool calls) is retried verbatim once.  Distinct
+            # from the G32 summary retry below: that one forbids further tool
+            # calls because the expert over-reasoned, whereas here the call
+            # never produced anything, so the expert must stay free to gather.
+            if _response_is_incomplete(response):
+                logger.warning(
+                    "Subagent model response incomplete (finish_reason absent, "
+                    "no content, no tool calls) — retrying verbatim once")
+                recovered = await self._retry_incomplete_subagent(
+                    request, handler)
+                if recovered is not None:
+                    return recovered, False
+                logger.warning(
+                    "Subagent incomplete-response retry produced nothing "
+                    "usable — degrading this delegation")
+                return ModelResponse(result=[AIMessage(content=(
+                    f"{_DEGRADED_RECEIPT_PREFIX} 专家模型返回了不完整响应"
+                    "（无正文、无工具调用、无 finish_reason），重试一次后仍未"
+                    "产出结论，本次委派未产出结论。\n"
+                    "请基于已采集的证据判断：有正向确证层证据的写 confirmed；"
+                    "无法确证但观测通道已查的按 inconclusive 处理，"
+                    "并在 rationale 中说明该结论未经专家确认。"
+                ))]), True
             return response, False
         except asyncio.TimeoutError:
             _coord = getattr(self, "_coordinator", None)
@@ -2667,6 +2735,41 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             "(coordinator_round=%d) — delegation preserved",
             _elapsed, coordinator_round,
         )
+        return response
+
+    async def _retry_incomplete_subagent(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse | None:
+        """One verbatim retry for an interrupted provider response (v3.45.9).
+
+        No extra instruction is appended on purpose.  The failure mode here is
+        a transport-level interruption (``finish_reason`` absent, no content,
+        no tool calls), NOT over-reasoning — so unlike the G32 summary retry,
+        the expert must remain free to call tools on the second attempt.
+
+        Returns ``None`` when the retry also yields nothing usable; the caller
+        then returns a degraded receipt, which the delegation-accounting block
+        treats as a failed delegation (not coverage).
+        """
+        try:
+            response = await asyncio.wait_for(
+                handler(request), timeout=_SUBAGENT_MODEL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Subagent incomplete-response retry timed out after %ss",
+                _SUBAGENT_MODEL_TIMEOUT)
+            return None
+        except Exception as exc:  # backend error / cancellation
+            logger.warning(
+                "Subagent incomplete-response retry errored: %s", exc)
+            return None
+        if _response_is_incomplete(response):
+            return None
+        logger.warning(
+            "Subagent incomplete-response retry recovered a usable turn "
+            "— delegation preserved")
         return response
 
     async def awrap_model_call(
@@ -5554,11 +5657,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # retry was blocked by the phase gate, and the data only
                 # arrived at round 4 — the same failure shape as the
                 # 2026-07-30 f62a11eb incident recorded in `_coverage_ready`.
-                if expert and is_error:
+                # An empty result is as invalid as an error receipt: the
+                # expert produced nothing, so this must not satisfy the
+                # coverage gate (v3.45.9; §6 T1 "transitions only on valid
+                # events").  Restricted to `task` — other tools legitimately
+                # return empty output (e.g. `ls` on an empty directory).
+                _empty_task_result = (tool_name == "task"
+                                      and not (output or "").strip())
+                if expert and (is_error or _empty_task_result):
                     logger.warning(
-                        "Delegation to '%s' failed (%s) — not counted as "
-                        "covered, phase stays in UNDERSTAND (round %d)",
-                        expert, (normalized or "empty result")[:80],
+                        "Delegation to '%s' produced no usable result (%s%s) "
+                        "— not counted as covered, phase stays in UNDERSTAND "
+                        "(round %d)",
+                        expert,
+                        "empty output" if _empty_task_result else "failed",
+                        "" if _empty_task_result
+                        else f": {(normalized or '')[:70]}",
                         self._model_call_count,
                     )
                 elif expert:
