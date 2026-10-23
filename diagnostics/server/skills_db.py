@@ -83,16 +83,25 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     m = re.search(r'^name:\s*(.+)$', fm, re.MULTILINE)
     if m:
         result["name"] = m.group(1).strip()
-    # Extract description (single-line or multi-line with >)
-    m = re.search(r'^description:\s*"?([^"\n]+)"?\s*$', fm, re.MULTILINE)
+    # Extract description.  The FOLDED/LITERAL form (`description: >`) MUST be
+    # tried first: the single-line pattern below happily matches the marker
+    # line itself (`[^"\n]+` swallows ">"), so the old order stored ">" as the
+    # whole description — the skill then carried no trigger words at all and
+    # became unselectable.  Measured 2026-10-23: control-plane-diagnosis
+    # synced with a 1-character description after its front matter was
+    # restored to the folded form.
+    m = re.search(r'^description:\s*[>|][-+]?\s*\n((?:[ \t]+\S.*\n?)*)',
+                  fm, re.MULTILINE)
     if m:
-        result["description"] = m.group(1).strip()
+        # YAML `>` folds newlines into spaces; `|` keeps them.  One-line
+        # descriptions are built either way, so spaces are correct for both.
+        result["description"] = " ".join(
+            line.strip() for line in m.group(1).splitlines() if line.strip()
+        ).strip()
     else:
-        # Multi-line description with >
-        m = re.search(r'^description:\s*>\s*\n((?:\s{2}.+\n?)*)', fm, re.MULTILINE)
+        m = re.search(r'^description:\s*"?([^"\n]+)"?\s*$', fm, re.MULTILINE)
         if m:
-            desc = re.sub(r'\s{2,}', ' ', m.group(1)).strip()
-            result["description"] = desc
+            result["description"] = m.group(1).strip()
     return result
 
 
