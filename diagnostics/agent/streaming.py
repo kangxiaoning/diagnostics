@@ -210,6 +210,15 @@ def _extract_reasoning_text(message: Any) -> str:
 # a turn is evidence and must stay visible.
 _DUP_BLOCK_MIN_CHARS = 64
 
+_RESPONSE_REASONING_ALERT_CHARS = 12000
+"""Per-RESPONSE reasoning length that triggers an overthinking warning.
+
+Distinct from the per-round counter below: one runaway response is the failure
+mode that actually times out (measured 2026-10-23 scenario 2 hypothesize:
+22,385 chars in a single call, no tool call emitted, 480 s timeout).  Normal
+single responses stay under ~7.9k, so 12k is the earliest safe signal.
+"""
+
 _REASONING_ALERT_CHARS = 25000
 """Per-turn CUMULATIVE reasoning length that triggers an overthinking warning.
 
@@ -563,6 +572,29 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         "(hedged/looping reasoning usually follows) — "
                         "output budget is being consumed without a decision",
                         state.round_number, _rc, _REASONING_ALERT_CHARS)
+
+                # v3.45.10 per-response observability.  The round-level counter
+                # above accumulates several calls, so a single runaway response
+                # stays hidden below 25k (measured 2026-10-23 scenario 2:
+                # 22,385 chars in ONE hypothesize response — no alert fired,
+                # and the call timed out at 480 s).  A new ``msg_id`` marks the
+                # start of another model call, which resets this counter.
+                if msg_id and msg_id != getattr(state, "_resp_reasoning_id", None):
+                    state._resp_reasoning_id = msg_id
+                    state._resp_reasoning_chars = 0
+                    state._resp_reasoning_alerted = False
+                _single = (getattr(state, "_resp_reasoning_chars", 0)
+                           + len(reasoning_text))
+                state._resp_reasoning_chars = _single
+                if (_single > _RESPONSE_REASONING_ALERT_CHARS
+                        and not getattr(state, "_resp_reasoning_alerted", False)):
+                    state._resp_reasoning_alerted = True
+                    logger.warning(
+                        "[round=%d] Single-response reasoning reached %d chars "
+                        "(> %d) — looping inside one call; expect no tool call "
+                        "and a possible timeout",
+                        state.round_number, _single,
+                        _RESPONSE_REASONING_ALERT_CHARS)
                 logger.debug("[round=%d] Reasoning chunk: %d chars, first 200: %r",
                              state.round_number, len(reasoning_text), reasoning_text[:200])
                 events.append(AgentEvent("text_delta", {

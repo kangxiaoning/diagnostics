@@ -46,6 +46,17 @@ PHASE_SPEC: dict[str, dict] = {
                 "凡需深查或确证的方向，直接写成假设提出即完成本阶段职责，"
                 "确证在提出后自动进行。",
         "actions": [
+            # v3.45.10: the "merge overlapping hypotheses" duty had no stopping
+            # condition and invited an endless self-check.  Measured 2026-10-23
+            # (scenario 2, hypothesize): the model rewrote the same H1/H2/H3
+            # list 4-5 times inside its reasoning ("但 H1 和 H2 确实有重叠。
+            # 让我合并为一条：…" each time nearly verbatim), reached 22,385
+            # characters, emitted no content and no tool call, and hit the
+            # 480 s ceiling (ollama logged "context canceled").  This rule gives
+            # the check a stopping condition, stated as the first action.
+            "⚖ 重叠判断只做一次：只看两条 statement 的故障机制是否同一；"
+            "判断完直接提交，**不再复核、不在思考中重写假设列表**；"
+            "难以判断时按「不合并」处理（多提一条更安全，验证阶段自会剔除）",
             "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
             "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）",
