@@ -90,16 +90,37 @@ _WRAPUP_THINKING_OFF = os.getenv(
 
 
 def _thinking_off_variant(model: Any) -> Any | None:
-    """Thinking-disabled variant of *model* (None when not applicable)."""
+    """Thinking-disabled variant of *model* (None when not applicable).
+
+    Capability-based on purpose (v3.45.8).  The same OpenAI-compatible client
+    is pointed at ollama locally and at vLLM / SGLang in production; a port
+    that swaps the concrete client class (e.g. to plain ``ChatOpenAI``) used
+    to silently lose the degradation because of an ``isinstance`` check
+    against ``OllamaChatOpenAI``.  Any client carrying the
+    ``reasoning_effort_override`` field now gets a "none" variant, and an
+    unsupported client leaves one explicit log line instead of failing mute —
+    otherwise the retry path looks active while doing nothing.
+
+    NOTE for vLLM / SGLang ports: their thinking switch is not
+    ``reasoning_effort`` but ``chat_template_kwargs.enable_thinking`` (or
+    ``extra_body.thinking``); expose that through a subclass that overrides
+    ``_get_request_payload`` — the capability check here then keeps working
+    without touching this function.
+    """
     if not _WRAPUP_THINKING_OFF:
         return None
+    if getattr(model, "reasoning_effort_override", None):
+        return None
+    fields = getattr(type(model), "model_fields", None) or {}
+    if "reasoning_effort_override" not in fields:
+        logger.warning(
+            "Thinking-off variant unavailable for %s — this client does not "
+            "carry `reasoning_effort_override`; the retry keeps full thinking "
+            "(port note: vLLM/SGLang need chat_template_kwargs.enable_thinking)",
+            type(model).__name__,
+        )
+        return None
     try:
-        from diagnostics.agent.ollama_chat import OllamaChatOpenAI
-
-        if not isinstance(model, OllamaChatOpenAI):
-            return None
-        if getattr(model, "reasoning_effort_override", None):
-            return None
         return model.model_copy(update={"reasoning_effort_override": "none"})
     except Exception:
         return None
