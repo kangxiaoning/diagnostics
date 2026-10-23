@@ -1,6 +1,6 @@
 ---
 name: grpc-connection-leak
-description: "Diagnoses gRPC dead connection / connection leak between kubelet and API server -- when kubelet stops reporting node status and logs show `transport: http2Client.notifyError` or `rpc error: code = Unavailable`. Use when a node suddenly becomes NotReady without clear resource pressure (CPU/memory/disk all normal) and kubelet logs contain gRPC transport errors."
+description: "kubelet↔apiserver gRPC 死连接/泄漏：节点状态停止上报，日志出现 http2Client.notifyError 或 rpc error，Node 转 NotReady"
 ---
 
 # gRPC Dead Connection (Kubelet↔API Server) Diagnosis

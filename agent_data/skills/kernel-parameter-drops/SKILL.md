@@ -1,6 +1,6 @@
 ---
 name: kernel-parameter-drops
-description: Diagnoses packet loss caused by misconfigured kernel parameters — when `net.core.rmem_max` or `tcp_rmem` is too small for high-BDP links, `netdev_max_backlog` is insufficient, or dangerous settings like `tcp_tw_recycle` cause connection resets. Use when TCP throughput is unexpectedly low or connections are dropped without infrastructure-level anomalies.
+description: "内核参数配置不当导致丢包：高 BDP 链路吞吐远低于预期，nstat 显示异常丢包且无网卡错误、无 softirq 饥饿"
 ---
 
 # Kernel Parameter Misconfiguration → Packet Loss
