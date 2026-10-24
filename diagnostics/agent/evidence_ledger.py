@@ -399,7 +399,15 @@ def render_evidence_index(ledger: dict, limit: int = INDEX_LIMIT) -> str:
     """
     arts = iter_artifacts(ledger)
     if not arts:
-        return ""
+        # Fail-loud instead of silently omitting the section: the report
+        # contract conditions EV-id citations on this index being present,
+        # so an empty index must be stated explicitly (otherwise the model
+        # invents plausible-looking ids that resolve to nothing).
+        return (
+            f"## {EVIDENCE_INDEX_TITLE}\n"
+            "- （本次会话未落账任何原始证据条目——报告中不得出现 EV 编号；"
+            "证据锚点请使用工具名 + 实体 + 时间窗）"
+        )
     metric = [info for _k, info in arts if info.get("is_metric")]
     raw = [(k, info) for k, info in arts if not info.get("is_metric")]
     lines = [f"## {EVIDENCE_INDEX_TITLE}"]
@@ -414,6 +422,42 @@ def render_evidence_index(ledger: dict, limit: int = INDEX_LIMIT) -> str:
             lines.append(f"- （共 {len(raw)} 条，此处列最近 {len(shown)} 条）")
         lines.extend(_index_line(info) for _k, info in shown)
     return "\n".join(lines)
+
+
+_EV_ID_RE = re.compile(r"(?:\*\*|__)?EV-r\d+(?:-\d+)+(?:\*\*|__)?")
+
+
+def strip_unissued_evidence_ids(content: str, ledger: dict) -> tuple[str, list[str]]:
+    """Strip EV-id citations the system never issued (verify-before-cite).
+
+    The report contract only allows citing ids from the injected evidence
+    index.  Ids outside ``ledger["tool_results"]`` are unverifiable — they
+    resolve to no artifact — so they are removed from the text and reported
+    back to the caller for a deterministic correction note.  Ids that were
+    issued are left untouched (never rewrites real citations).
+    """
+    issued = {
+        str(info.get("ev_id"))
+        for info in (ledger.get("tool_results") or {}).values()
+        if isinstance(info, dict) and info.get("ev_id")
+    }
+    dropped: list[str] = []
+
+    def _sub(match: re.Match) -> str:
+        text = match.group(0)
+        bare = text.strip("*_")
+        if bare in issued:
+            return text
+        dropped.append(bare)
+        return ""
+
+    if not isinstance(content, str) or not content:
+        return content, dropped
+    cleaned = _EV_ID_RE.sub(_sub, content)
+    # Tidy the empty wrappers a stripped citation may leave behind.
+    cleaned = re.sub(r"\[\s*\]", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned, dropped
 
 
 def _hypothesis_groups(ledger: dict) -> list[tuple[str, dict]]:

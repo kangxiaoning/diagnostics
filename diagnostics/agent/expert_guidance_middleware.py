@@ -720,6 +720,10 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
                 capped = self._terminate_if_turn_cap_reached(state)
                 if capped is not None:
                     return capped
+                # ── Zero-forensics wrap-up (plan text, no tool calls) ──
+                zero = self._zero_forensics_recovery(state)
+                if zero is not None:
+                    return zero
                 # ── G28: length-truncated turn ──
                 # No structured conclusion was parsed — most likely the
                 # response hit the output cap.  Bounce once for a minimal
@@ -826,6 +830,50 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
             len(_pending_tool_calls({"messages": messages_of(response)})),
             duration_s, ",".join(channels) or "?",
         )
+
+    def _zero_forensics_recovery(self, state: Any) -> dict | None:
+        """Bounce a delegation ending with ZERO executed diagnostic calls
+        and no structured conclusion (design document §8 expert guards).
+
+        Observed 2026-10-24 (scenario 17): host-expert returned after ~11s
+        with only "我将按取证策略：概览先行 → …" — a plan, not evidence.
+        That placeholder was still booked as expert evidence, so the
+        guidance layer urged a verdict on data that did not exist and the
+        verify stall guard auto-closed the hypothesis.  One bounded bounce
+        asks for real tool calls; the second miss passes through and the
+        delegation degrades exactly as before (no new failure mode).
+        """
+        try:
+            key = self._key_from_state(state)
+            s = self._ledger.session(key)
+            if s["calls"]:
+                return None            # real forensics already gathered
+            if self._ledger.truncation_count(key):
+                return None            # zero-call truncation belongs to G28
+            if self._ledger.zerocall_bounced(key):
+                return None            # one-shot latch already spent
+            if _pending_tool_calls(state):
+                return None            # legitimate work proposed — let it run
+            for msg in reversed(state.get("messages", []) or []):
+                text = getattr(msg, "content", "")
+                if isinstance(text, str) and text.strip():
+                    if "【需要参数】" in text:
+                        return None    # missing parameters: cannot gather
+                    break
+            self._ledger.mark_zerocall_bounced(key)
+            guidance = (
+                "[系统提示·尚未取证] 本次委派尚未执行任何取证工具调用——"
+                "计划或策略描述不等于证据。请立即调用 1-3 个与任务最相关的"
+                "取证工具获取真实数据，再基于结果提交结论；"
+                "确因缺少必要参数无法取证的，在结论 clarification 中写明缺什么。"
+            )
+            self._ledger.mark_conclusion_hinted(key, guidance)
+            logger.warning(
+                "Zero-forensics delegation %s bounced once before wrap-up "
+                "(turn=%d, executed_calls=0)", key, self._ledger.turns(key))
+            return {"jump_to": "model"}
+        except Exception:
+            return None                # the guard must never break wrap-up
 
     def _truncation_recovery(self, state: Any) -> dict | None:
         """Recover a delegation whose turn(s) hit the output cap.

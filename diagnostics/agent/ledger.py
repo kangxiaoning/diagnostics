@@ -932,7 +932,23 @@ def record_finding(
     node = hypotheses[hypothesis_id]
 
     # Update statement if a more accurate version was found during verification
-    if statement_update:
+    if statement_update and statement_update != node.get("statement"):
+        # Append-only provenance (design document §10): the "state the
+        # refutation via statement_update" channel legitimately rewrites the
+        # statement, but the ORIGINAL wording must stay recoverable — the
+        # report's excluded-hypotheses section and post-hoc audit otherwise
+        # lose what was actually being tested (measured 2026-10-24 scenario
+        # 20: statements became "推翻理由：…" duplicating verdict_reason).
+        history = node.setdefault("statement_history", [])
+        if not history:
+            history.append({
+                "round": node.get("created_at_round", 0),
+                "statement": node.get("statement", ""),
+            })
+        history.append({
+            "round": ledger.get("current_round", 0),
+            "statement": statement_update,
+        })
         node["statement"] = statement_update
 
     # Pure statement refinement (verdict omitted): wording-only update that
@@ -1399,6 +1415,30 @@ _SCAFFOLDING_TOOLS_BUILTIN = frozenset({
     "list_diagnostic_capabilities", "get_os_system_overview",
 })
 
+def original_statement(node: dict) -> str:
+    """The hypothesis wording as first proposed (design document §10).
+
+    ``statement`` may later carry a refinement or a refutation note; the
+    excluded/shelved sections must show WHAT was tested, with the reason
+    supplied separately by ``verdict_reason``/``deferred_reason``.
+    """
+    history = node.get("statement_history") or []
+    if history and isinstance(history[0], dict):
+        first = str(history[0].get("statement") or "").strip()
+        if first:
+            return first
+    return str(node.get("statement") or "")
+
+
+def display_statement(node: dict) -> str:
+    """Statement to show for a node: negative terminals read as the ORIGINAL
+    hypothesis (with the reason carried separately), live/confirmed nodes
+    keep the latest refinement."""
+    if node.get("status") == "refuted" or node.get("deferred"):
+        return original_statement(node)
+    return str(node.get("statement") or "")
+
+
 def render_ledger_context(ledger: DiagnosisLedger | None,
                           report_path: str = "",
                           start_time: str = "",
@@ -1474,7 +1514,7 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             if tr:
                 tag = _TERMINAL_REASON_TAG.get(tr, "已证伪")
             lines.append(
-                f"- [{tag}] {fmt_hid(h['id'])} {h['statement']}: "
+                f"- [{tag}] {fmt_hid(h['id'])} {original_statement(h)}: "
                 f"{_clean_evidence_text(reason, 2000)}"
             )
         for h in deferred:
@@ -1482,7 +1522,7 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                       or "(无记录)")
             lines.append(
                 f"- [搁置待回溯 p={h['probability']}%] {fmt_hid(h['id'])} "
-                f"{h['statement']}: {_clean_evidence_text(reason, 2000)}"
+                f"{original_statement(h)}: {_clean_evidence_text(reason, 2000)}"
             )
         lines.append("")
 
@@ -1650,7 +1690,7 @@ def _render_hypothesis_tree(
         lines.append(
             f"{prefix}### {fmt_hid(node['id'])} [{node['status']}{deferred_tag}"
             f"{_sc_tag} p={node['probability']}%]{marker} "
-            f"{node['statement']}{active_marker}"
+            f"{display_statement(node)}{active_marker}"
         )
         # Evidence.  Once a coordinator verdict exists (verdict_reason
         # set by record_finding), two classes of duplicates are skipped:
@@ -2995,6 +3035,29 @@ def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
     )
 
 
+def has_expert_returns(ledger: DiagnosisLedger) -> bool:
+    """Whether any delegation actually returned expert findings (design
+    document §8 G13), regardless of hypothesis attribution or bookkeeping.
+
+    ``hypotheses[].evidence`` only gains ``expert:*`` entries when a
+    delegation returns while that hypothesis is active, and coordinator
+    entries only via ``record_finding``.  Findings gathered during
+    UNDERSTAND (before any hypothesis exists) therefore never reach that
+    array — they live in ``rounds[].key_findings[_full]``.  A guard that
+    reads only ``evidence`` would mistake "gathered but unrecorded" for
+    "no evidence at all" and terminate the diagnosis instead of driving
+    the verdict-recording escalation.
+    """
+    for entry in ledger.get("rounds", []) or []:
+        if not entry.get("delegated_experts"):
+            continue
+        findings = (entry.get("key_findings_full")
+                    or entry.get("key_findings") or "")
+        if isinstance(findings, str) and findings.strip():
+            return True
+    return False
+
+
 def unrecorded_evidence_hypotheses(
         ledger: DiagnosisLedger) -> list[tuple[str, "HypothesisNode"]]:
     """Undecided hypotheses carrying expert evidence newer than the last
@@ -3170,7 +3233,7 @@ def render_failure_digest(ledger: DiagnosisLedger) -> str:
             counter = ("；关键反证：" + _clean_evidence_text(
                 str(contra[-1].get("summary", "")), 150))
         lines.append(
-            f"- [{tag}] {fmt_hid(hid)} {node.get('statement', '')}："
+            f"- [{tag}] {fmt_hid(hid)} {display_statement(node)}："
             f"{reason}{counter}"
         )
     if not lines:

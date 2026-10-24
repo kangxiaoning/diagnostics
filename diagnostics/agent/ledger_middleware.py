@@ -60,6 +60,7 @@ from diagnostics.agent.ledger import (
     derive_phase,
     finalize_pending_for_report,
     fmt_hid,
+    has_expert_returns,
     is_confirmed_root,
     _round_findings_text,
     ledger_to_json,
@@ -113,6 +114,7 @@ from diagnostics.agent.evidence_ledger import (  # v3.37.0 原始证据层（des
     drop_excerpts,
     is_metric_tool,
     record_artifact,
+    strip_unissued_evidence_ids,
 )
 from deepagents.middleware._utils import append_to_system_message
 
@@ -604,6 +606,25 @@ def _tool_result_failed(output: str) -> bool:
 
 _DEGRADED_RECEIPT_PREFIX = "[系统超时]"
 """Opening marker of every degraded subagent receipt."""
+
+
+def _has_collected_tool_results(request: Any) -> bool:
+    """Whether the delegation's message history already holds tool output.
+
+    Used to gate the summary-only retry (design document §8 G32): without
+    any tool result there is nothing to summarise.  Unknown request shapes
+    fail open to the legacy behaviour (retry), never to a new failure mode.
+    """
+    try:
+        messages = getattr(request, "messages", None)
+        if messages is None:
+            state = getattr(request, "state", None) or {}
+            messages = state.get("messages") if hasattr(state, "get") else None
+        if messages is None:
+            return True
+        return any(isinstance(m, ToolMessage) for m in messages)
+    except Exception:
+        return True
 
 
 def _response_is_incomplete(response: Any) -> bool:
@@ -2099,7 +2120,10 @@ class HypothesisSpec(BaseModel):
     # Field required 错误浪费轮次（场景25 换批提出）。
     statement: str = Field(
         description="假设陈述（必填，每个假设都必须提供，勿遗漏；"
-                    "简洁陈述因果链，如『X 导致 Y』）",
+                    "简洁陈述因果链，如『X 导致 Y』；"
+                    "一条假设只表述一个根因机制——若故障由多个相互独立的机制"
+                    "共同造成（如 CPU 打满与网络丢包并存），必须拆成多条假设分别提出，"
+                    "便于逐条验证与多根因保护）",
     )
     probability: int = Field(description="可能性 0-100", ge=0, le=100)
     rationale: str = Field(default="", description="假设依据")
@@ -2690,8 +2714,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 _SUBAGENT_MODEL_TIMEOUT, _coord_round,
                 _SUBAGENT_SUMMARY_TIMEOUT,
             )
-            recovered = await self._retry_summary_only(
-                request, handler, coordinator_round=_coord_round)
+            # Only a turn that already gathered tool results can benefit from
+            # a summary-only retry: with an empty evidence history there is
+            # literally nothing to summarise, so the retry would just burn
+            # its budget before the same degraded receipt (design document
+            # §8 G32 targets the "all tools done, synthesis timed out" case).
+            if not _has_collected_tool_results(request):
+                logger.warning(
+                    "Subagent model call timed out with NO tool results "
+                    "(coordinator_round=%d) — skipping summary-only retry, "
+                    "degrading immediately", _coord_round)
+                recovered = None
+            else:
+                recovered = await self._retry_summary_only(
+                    request, handler, coordinator_round=_coord_round)
             if recovered is not None:
                 return recovered, False
             logger.warning(
@@ -3411,11 +3447,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             # (level-1), with the ledger stub (level-2) or
                             # the G7 fallback reserved for "LLM unable".
 
-                        elif has_expert:
-                            # Expert evidence exists but no coordinator
+                        elif has_expert or has_expert_returns(ledger):
+                            # Expert findings exist but no coordinator
                             # assessment yet — LLM likely received expert
                             # results but outputs text instead of calling
-                            # record_finding.  Three-level escalation:
+                            # record_finding.  ``has_expert_returns`` also
+                            # covers findings that were gathered before any
+                            # hypothesis existed (UNDERSTAND delegations):
+                            # those never reach ``node["evidence"]``, so a
+                            # verdict-free stall here is "unrecorded", NOT
+                            # "no evidence" — it must take the escalation
+                            # path instead of the terminal branch C below
+                            # (design document §8 G13).
+                            # Three-level escalation:
                             #   1st stall → gentle reminder
                             #   2nd stall → strong reminder with inferred verdict
                             #   3rd stall → auto-decision
@@ -4859,6 +4903,28 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "injected (round %d, %d chars)",
                         self._model_call_count, len(_sc_appendix),
                     )
+                # ── Unissued EV-id citation gate (design document §6.6) ──
+                # Verify-before-cite: the report contract conditions EV-id
+                # citations on the injected evidence index, so any id the
+                # system never issued is unverifiable.  Strip it and append
+                # a deterministic correction note (fail-open: the report is
+                # still written; only the fabricated anchors are removed).
+                if (not _is_stub_echo_write
+                        and isinstance(tool_args.get("content"), str)):
+                    _cleaned, _dropped_ids = strip_unissued_evidence_ids(
+                        tool_args["content"], ledger)
+                    if _dropped_ids:
+                        tool_args["content"] = _cleaned.rstrip() + (
+                            "\n\n---\n\n> 系统校正：以下证据编号并非系统签发、无法"
+                            "回读对应原文，已从正文移除："
+                            + "、".join(sorted(set(_dropped_ids)))
+                            + "。相关证据请以工具名 + 实体 + 时间窗核对。"
+                        )
+                        logger.warning(
+                            "write_file unissued EV-id citations stripped "
+                            "(round %d): %s", self._model_call_count,
+                            sorted(set(_dropped_ids)),
+                        )
                 # NOTE: the ledger-derived appendix channel (evidence
                 # layers / topology mapping / delegated experts /
                 # refuted hypotheses, v3.14.0 - v3.36.0) was REMOVED.
@@ -5356,17 +5422,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # (parsed from the delegation instruction) and a deterministic
                 # verbatim excerpt.  Attribution by code — the LLM never
                 # transports evidence text.
-                if self._current_ledger is not None:
+                _evidence_ledger = self._current_ledger
+                if _evidence_ledger is None:
+                    # for_subagent() snapshots the coordinator's ledger at
+                    # BUILD time (factory wiring), before any session ledger
+                    # exists — the snapshot therefore stays None forever and
+                    # every expert-gathered result silently dropped out of
+                    # the raw-evidence layer (design document §6.6), while
+                    # the offload write above still succeeded.  Resolve the
+                    # session ledger lazily from the coordinator instead.
+                    _ev_coord = getattr(self, "_coordinator", None)
+                    _evidence_ledger = getattr(_ev_coord, "_current_ledger", None)
+                    if _evidence_ledger is None:
+                        logger.warning(
+                            "Evidence entry skipped for %s: no session ledger "
+                            "available (offloaded copy kept)", tool_name)
+                if _evidence_ledger is not None:
                     _hid = ""
                     _delegation = ""
                     if self._is_subagent:
                         _delegation = delegation_key_from_request(request)
                         _hid = _parse_hypothesis_id_from_description(
                             delegation_text_from_request(request),
-                            self._current_ledger.get("hypotheses", {}),
+                            _evidence_ledger.get("hypotheses", {}),
                         ) or ""
                     _entry = build_artifact_entry(
-                        self._current_ledger,
+                        _evidence_ledger,
                         tool=tool_name,
                         args=tool_args,
                         content=content,
@@ -5377,7 +5458,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         delegation=_delegation,
                         is_failure=_is_tool_failure(content),
                     )
-                    _stored = record_artifact(self._current_ledger, cache_key, _entry)
+                    _stored = record_artifact(_evidence_ledger, cache_key, _entry)
                     logger.debug(
                         "evidence entry %s: %s (round=%d, actor=%s, %d chars%s)",
                         _stored.get("ev_id") or "(dedup)",
