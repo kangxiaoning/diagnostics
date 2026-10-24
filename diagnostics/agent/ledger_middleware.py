@@ -2698,7 +2698,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "并在 rationale 中说明该结论未经专家确认。"
                 ))]), True
             return response, False
-        except asyncio.TimeoutError:
+        except BaseException as _exc:
+            # v3.46.1 (design document §8 G7″/G32): the Coordinator's G7 path
+            # already classifies ReasoningLoopError and transient connection
+            # errors as retryable, but this expert wrapper only caught
+            # TimeoutError — the same fault inside a delegation escaped to
+            # the SSE layer and killed the whole session with NO report
+            # (measured 2026-10-24, scenario 28).  One unavailable expert must
+            # not take down the workflow: isolate it here by reusing the G32
+            # summary-retry/degraded path.  Anything not retryable (including
+            # CancelledError) is re-raised unchanged.
+            if (not isinstance(_exc, asyncio.TimeoutError)
+                    and not _is_retryable_model_error(_exc)):
+                raise
             _coord = getattr(self, "_coordinator", None)
             _led: dict = {}
             for _cand in (self._current_ledger,
@@ -2707,12 +2719,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     _led = _cand
                     break
             _coord_round = _led.get("current_round", 0)
+            _is_timeout = isinstance(_exc, asyncio.TimeoutError)
             logger.warning(
-                "Subagent model call timed out after %ss "
-                "(coordinator_round=%d) — attempting a summary-only retry "
-                "(%ss budget) before degrading",
-                _SUBAGENT_MODEL_TIMEOUT, _coord_round,
-                _SUBAGENT_SUMMARY_TIMEOUT,
+                "Subagent model call failed (%s, coordinator_round=%d) — "
+                "attempting a summary-only retry (%ss budget) before degrading",
+                (f"timeout after {_SUBAGENT_MODEL_TIMEOUT}s" if _is_timeout
+                 else type(_exc).__name__),
+                _coord_round, _SUBAGENT_SUMMARY_TIMEOUT,
             )
             # Only a turn that already gathered tool results can benefit from
             # a summary-only retry: with an empty evidence history there is
@@ -2735,10 +2748,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "— returning a degraded text response so the delegation "
                 "can end", _coord_round,
             )
+            if _is_timeout:
+                _degraded_head = (
+                    f"[系统超时] 专家模型调用超过 {_SUBAGENT_MODEL_TIMEOUT}s 未返回"
+                    f"（总结重试 {_SUBAGENT_SUMMARY_TIMEOUT}s 亦超时），"
+                )
+            else:
+                _degraded_head = (
+                    f"[系统降级] 专家模型调用中断（{type(_exc).__name__}，"
+                    f"总结重试 {_SUBAGENT_SUMMARY_TIMEOUT}s 亦未恢复），"
+                )
             return ModelResponse(result=[AIMessage(content=(
-                f"[系统超时] 专家模型调用超过 {_SUBAGENT_MODEL_TIMEOUT}s 未返回"
-                f"（总结重试 {_SUBAGENT_SUMMARY_TIMEOUT}s 亦超时），"
-                "本次委派未产出结论。\n"
+                _degraded_head
+                + "本次委派未产出结论。\n"
                 "请基于已采集的证据判断：有正向确证层证据的写 confirmed；"
                 "无法确证但观测通道已查的按 inconclusive 处理，"
                 "并在 rationale 中说明该结论未经专家确认。"
@@ -4625,6 +4647,50 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # stub writers never go through this tool.
             if ledger:
                 should_exit, reason, _ = check_exit_conditions(ledger)
+
+                def _defer_unrecorded():
+                    """Bounded settle-before-report request (v3.46.1).
+
+                    Only used on paths that would otherwise RELEASE the report:
+                    the blocked paths already have their own R2/R3 unrecorded
+                    evidence directives, which must keep firing (they name the
+                    hypothesis and give a final grace before deterministic
+                    deferral).  Measured 2026-10-24 (scenario 20): an
+                    unrecorded hypothesis was written as "refuted" while the
+                    ledger and the system appendices said "unverified".
+                    """
+                    if ledger.get("report"):
+                        return None
+                    _unrec = unrecorded_evidence_hypotheses(ledger)
+                    if not _unrec:
+                        return None
+                    _unrec_blocks = int(
+                        ledger.get("_unrecorded_block_count", 0) or 0)
+                    if _unrec_blocks >= 2:
+                        return None
+                    ledger["_unrecorded_block_count"] = _unrec_blocks + 1
+                    self._persist_ledger(ledger)
+                    _unrec_ids = ", ".join(fmt_hid(_h) for _h, _n in _unrec)
+                    logger.warning(
+                        "write_file deferred for unrecorded evidence "
+                        "(round %d, hypotheses=%s, block=%d/2)",
+                        self._model_call_count, _unrec_ids, _unrec_blocks + 1)
+                    return ToolMessage(
+                        content=(
+                            f"⛔ 报告暂缓：{_unrec_ids} 已有专家验证证据但尚未 "
+                            "record_finding 落账。\n"
+                            "报告中的假设终态必须与台账一致，请先逐项 "
+                            "record_finding（本阶段已为此开放调用）：\n"
+                            "- 证据支持排除 → verdict=\"refuted\"；支持确认 → "
+                            "verdict=\"confirmed\"（须满足 confirmed 证据标准）；"
+                            "证据不足或方向不明 → verdict=\"inconclusive\"。\n"
+                            "- 若证据属于其它委派的旁支结论，请按其声明方向判定，"
+                            "不要当作对本假设的判定。\n"
+                            "落账完成后再次调用 write_file；确实无法判定的判 "
+                            "inconclusive，系统会在报告中如实披露未验证假设。"
+                        ),
+                        tool_call_id=tool_call_id,
+                    )
                 if not should_exit and not (
                     ledger.get("_forced_terminal") or ledger.get("report")
                 ):
@@ -4645,6 +4711,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     #      proceeds (same outcome as G9, just sooner & targeted).
                     _is_e2 = ("可行动验证" in reason) or ("竞争性根因" in reason)
                     if _is_e2:
+                        # v3.46.1: settle unrecorded evidence BEFORE the
+                        # release-with-disclosure marks them deferred.
+                        _deferred_receipt = _defer_unrecorded()
+                        if _deferred_receipt is not None:
+                            return _deferred_receipt
                         # ── E2' release-with-disclosure (design document
                         # §6.3, v3.6.0) ──
                         # S1 satisfied (root cause confirmed) but unverified
@@ -4839,6 +4910,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 ) + _r2_suffix + _phase_route,
                                 tool_call_id=tool_call_id,
                             )
+                # v3.46.1: last settle-before-report check on every
+                # gate-passing path (natural exit / forced / deterministic
+                # honest-negative).  Bounded by _unrecorded_block_count;
+                # afterwards the disclosure appendices below still apply.
+                _deferred_receipt = _defer_unrecorded()
+                if _deferred_receipt is not None:
+                    return _deferred_receipt
                 # write_file passed the gate (natural exit, forced terminal,
                 # E2' release-with-disclosure, or the v3.8.0 deterministic
                 # honest-negative exit) — reset the generic block counter.
@@ -4999,6 +5077,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if ledger is not None:
                 _phase_now = _phase(ledger)
                 _allow = _PHASE_ALLOWLIST.get(_phase_now, frozenset())
+                # v3.46.1 (design document §6.3 evidence closure): the
+                # write_file gate defers the report while gathered-but-
+                # unrecorded hypotheses remain, so record_finding must stay
+                # callable here — otherwise the deferral is unsatisfiable
+                # and the report body drifts from the ledger (scenario 20,
+                # 2026-10-24: an unrecorded hypothesis was written as
+                # "refuted" while the ledger said "unverified").
+                if (tool_name == "record_finding" and _phase_now == "report"
+                        and not ledger.get("report")
+                        and unrecorded_evidence_hypotheses(ledger)):
+                    _allow = _allow | {"record_finding"}
                 # write_file is governed by the dedicated exit-condition
                 # gate, NOT the phase allowlist (§7/§11); read-only
                 # scaffolding is exempt globally.
@@ -6588,18 +6677,37 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Fire on the FIRST REPORT round so the LLM never wastes
             # cycles on record_finding — all pending hypotheses are
             # already auto-finalized by the Phase guard.
-            warnings.append(
-                "⛔ [系统强制] 已进入 REPORT 阶段"
-                f"（第{self._report_phase_start_round}轮起）。\n"
-                "⛔ 不要输出文本 — 你的唯一任务是立即调用 write_file。\n"
-                "系统已自动终结所有挂起假设，你无需再调用 "
-                "record_finding / propose_hypotheses。\n"
-                "禁止调用任何诊断工具、委派专家、record_finding、"
-                "propose_hypotheses。\n"
-                "禁止输出分析、总结或复盘文字。\n"
-                f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
-                "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
-            )
+            # v3.46.1: when gathered-but-unrecorded evidence remains, the
+            # report must be preceded by settlement — keep the directive
+            # consistent with the record_finding channel opened for it,
+            # instead of forbidding the very action the gate now requires.
+            _unrec_here = unrecorded_evidence_hypotheses(ledger)
+            if _unrec_here:
+                _unrec_ids = ", ".join(fmt_hid(_h) for _h, _n in _unrec_here)
+                warnings.append(
+                    "⛔ [系统强制] 已进入 REPORT 阶段"
+                    f"（第{self._report_phase_start_round}轮起）。\n"
+                    f"⛔ {_unrec_ids} 已采集专家证据但尚未 record_finding 落账。\n"
+                    "请先逐项 record_finding 补落账（本阶段已为此开放），"
+                    "再立即调用 write_file——报告中的假设终态必须与台账一致。\n"
+                    "禁止调用任何诊断工具、委派专家、propose_hypotheses。\n"
+                    "禁止输出分析、总结或复盘文字。\n"
+                    f"落账后必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
+                    "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
+                )
+            else:
+                warnings.append(
+                    "⛔ [系统强制] 已进入 REPORT 阶段"
+                    f"（第{self._report_phase_start_round}轮起）。\n"
+                    "⛔ 不要输出文本 — 你的唯一任务是立即调用 write_file。\n"
+                    "系统已自动终结所有挂起假设，你无需再调用 "
+                    "record_finding / propose_hypotheses。\n"
+                    "禁止调用任何诊断工具、委派专家、record_finding、"
+                    "propose_hypotheses。\n"
+                    "禁止输出分析、总结或复盘文字。\n"
+                    f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
+                    "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
+                )
             if round_num - self._report_phase_start_round >= 1:
                 logger.warning(
                     "Safety: REPORT phase round %d without write_file "
