@@ -797,13 +797,20 @@ class ToolDedupMiddleware(AgentMiddleware):
             if not future.done():
                 future.set_result(None)
             return result
-        except Exception:
+        except BaseException:
             # On failure, resolve with exception so waiters get unblocked
             # and can re-execute (cache was not populated for failures).
+            # BaseException covers cancellation too: a cancelled first call
+            # must not leave every duplicate waiter asleep forever on a
+            # future that nobody will ever complete (2026-10-25 review H1).
             if not future.done():
                 future.set_exception(
-                    RuntimeError("In-flight call failed")
+                    RuntimeError("In-flight call failed or was cancelled")
                 )
             raise
         finally:
+            # Defence in depth: every exit path completes the future.
+            if not future.done():
+                future.set_exception(
+                    RuntimeError("In-flight call did not complete"))
             self._in_flight.pop(cache_key, None)

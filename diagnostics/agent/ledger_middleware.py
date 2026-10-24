@@ -539,6 +539,22 @@ _SUBAGENT_SUMMARY_TIMEOUT = max(
     60, int(os.getenv("DIAGNOSTICS_SUBAGENT_SUMMARY_TIMEOUT", "240")))
 """Budget for the summary-only retry (seconds)."""
 
+_MAX_INFLIGHT_DELEGATIONS = max(
+    1, int(os.getenv("DIAGNOSTICS_MAX_INFLIGHT_DELEGATIONS", "2")))
+"""In-flight expert delegations per session (backpressure, design document §8).
+
+Parallel UNDERSTAND views otherwise all queue behind a serial/limited backend
+and hit the per-call timeout together (measured 2026-10-24, scenario 32: four
+argus experts all timed out at 480s and the session ended with a stub report).
+The semaphore is taken in the task tool wrapper — BEFORE the subagent starts,
+so queueing is never counted as model-call time and works with any backend.
+"""
+
+_DELEGATION_QUEUE_TIMEOUT = max(
+    30, int(os.getenv("DIAGNOSTICS_DELEGATION_QUEUE_TIMEOUT", "600")))
+"""Bounded wait for a delegation slot (seconds).  A stuck in-flight handler
+must not starve every later delegation behind it (head-of-line blocking)."""
+
 _SUMMARY_RETRY_PROMPT = (
     "[系统] 上一次生成超过了时间上限。你此前调用的工具结果都在上文中，"
     "不需要（也不允许）再次调用任何工具。\n"
@@ -600,12 +616,21 @@ def _tool_result_failed(output: str) -> bool:
             # Degraded receipts produced by the expert-side timeout / retry
             # paths carry no conclusion — they must not count as coverage
             # either (v3.45.9).
-            or normalized.startswith(_DEGRADED_RECEIPT_PREFIX)
+            or normalized.startswith(_DEGRADED_RECEIPT_PREFIXES)
             or "Error:" in normalized)
 
 
 _DEGRADED_RECEIPT_PREFIX = "[系统超时]"
 """Opening marker of every degraded subagent receipt."""
+
+_DEGRADED_RECEIPT_PREFIXES = ("[系统超时]", "[系统降级]")
+"""Every degraded receipt prefix (timeout AND isolated model failures).
+
+The v3.46.1 isolation path also emits ``[系统降级]`` for retryable non-timeout
+errors (ReasoningLoopError / connection errors).  Those receipts state "本次
+委派未产出结论" and therefore must count as FAILED for coverage accounting,
+evidence attribution and report findings — never as a successful delegation.
+"""
 
 
 def _has_collected_tool_results(request: Any) -> bool:
@@ -2269,6 +2294,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             "" if is_subagent else _load_agent_memory(self._AGENT_DATA_REAL)
         )
         self._current_ledger: DiagnosisLedger | None = None
+        # In-flight delegation backpressure (see _MAX_INFLIGHT_DELEGATIONS).
+        self._delegation_semaphore = asyncio.Semaphore(_MAX_INFLIGHT_DELEGATIONS)
         self._model_call_count: int = 0
         # ── 模型调用健康度计数（2026-09-10，§8 模型不可用 fail-fast）──
         # attempts（尝试）与 rounds（诊断轮次）分离计量；连续失败达到阈值
@@ -5439,7 +5466,38 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             except Exception:
                 pass
 
-        result = await handler(request)
+        if tool_name == "task" and not self._is_subagent:
+            # Backpressure (design document §8): cap in-flight delegations
+            # before the subagent starts, so a serial/limited backend cannot
+            # turn a parallel fan-out into simultaneous timeouts.  Waiting for
+            # a slot happens outside the subagent's own model-call timeout.
+            # The wait itself is BOUNDED: a stuck holder must not starve the
+            # whole session (queue head-of-line blocking).
+            try:
+                await asyncio.wait_for(
+                    self._delegation_semaphore.acquire(),
+                    timeout=_DELEGATION_QUEUE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Delegation queue wait exceeded %ss (in-flight cap=%d) — "
+                    "degrading instead of starving the session",
+                    _DELEGATION_QUEUE_TIMEOUT, _MAX_INFLIGHT_DELEGATIONS)
+                return ToolMessage(
+                    content=(
+                        f"[系统降级] 委派排队超过 {_DELEGATION_QUEUE_TIMEOUT}s "
+                        f"未获得执行槽位（在途上限 {_MAX_INFLIGHT_DELEGATIONS}），"
+                        "本次委派未产出结论。\n"
+                        "请基于已采集的证据继续；如需该视角，可稍后单独重试"
+                        "或缩小取证范围。"
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            try:
+                result = await handler(request)
+            finally:
+                self._delegation_semaphore.release()
+        else:
+            result = await handler(request)
 
         # ── propose_hypotheses validation-feedback enhancement ──
         # Failure path: append the self-contained field contract (with
@@ -5651,9 +5709,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 str(_structured_expert.get("root_cause") or ""),
                             )
 
-                if summary:
+                if summary and not _tool_result_failed(output):
                     # Diagnostic data arrived — counts as verify-phase
-                    # progress for the verify-stuck safety valve.
+                    # progress for the verify-stuck safety valve.  Degraded
+                    # receipts ("本次委派未产出结论") are NOT evidence: they
+                    # must not satisfy G17, clear F1, feed the unrecorded
+                    # predicate, or count as verify progress (2026-10-25
+                    # mechanism review H3).
                     self._last_evidence_round = self._model_call_count
                     # ── Hypothesis-aware evidence routing ──
                     # Auto-collected tool outputs are recorded with
@@ -5949,7 +6011,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # drives the freshness decay F in the gain<cost model
             # (delegation_value in ledger.py).  Count only successful
             # returns; tool failures never reach this post-handler.
-            if hid != "?":
+            if hid != "?" and not _tool_result_failed(output):
+                # Degraded/failed delegations must not consume the freshness
+                # budget either — they produced no conclusion, so counting
+                # them would push the hypothesis towards economic death on
+                # evidence that does not exist (mechanism review H3).
                 _node = ledger.get("hypotheses", {}).get(hid)
                 if _node is not None:
                     _node["_delegate_count"] = (
@@ -8067,7 +8133,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # them as readable text in the report timeline.
                 if _parse_expert_json(kf) is not None:
                     kf_short = _format_expert_summary(kf).replace("\n", " ")
-                if kf_short:
+                # Degraded/guard receipts are process events, not findings:
+                # keep them out of the evidence timeline (2026-10-24 scenario
+                # 32's stub report was filled with identical timeout receipts).
+                if kf_short and not _tool_result_failed(kf_short):
                     lines.append(
                         f"- **第{r['round']}轮{expert_label}**: {kf_short}"
                     )
