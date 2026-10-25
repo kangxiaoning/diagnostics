@@ -47,7 +47,11 @@ from diagnostics.agent.ledger import (
     _phase_guidance,
     _required_argus,
     activate_hypothesis,
+    argus_view_states,
+    alternative_root_candidate,
+    register_alternative_root_candidate,
     expert_verdict_conflict,
+    f1_arbitration_available,
     add_evidence_to_active,
     add_hypotheses,
     backtrack,
@@ -56,8 +60,12 @@ from diagnostics.agent.ledger import (
     check_exit_conditions,
     compute_next_action,
     compute_report_guidance,
+    confirmed_root_nodes,
+    sync_confirmed_roots,
     delegation_value_for,
     derive_phase,
+    evidence_newer_than_finding,
+    next_commit_sequence,
     finalize_pending_for_report,
     fmt_hid,
     has_expert_returns,
@@ -70,8 +78,10 @@ from diagnostics.agent.ledger import (
     record_round,
     render_failure_digest,
     render_ledger_context,
+    render_argus_coverage_disclosure,
     render_single_channel_limitation_appendix,
     render_unrecorded_evidence_appendix,
+    render_unverified_disclosure,
     resolve_hypothesis_id,
     select_path,
     unrecorded_evidence_hypotheses,
@@ -97,6 +107,7 @@ from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据
 from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
 from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
     delegation_key_from_request,
+    delegation_key_from_text,
     delegation_text_from_request,
 )
 from diagnostics.agent.dedup_middleware import (  # v3.37.0 证据条目失败分类（SSOT）
@@ -354,7 +365,9 @@ def _phase_rejection_suffix(phase: str) -> str:
     return ""
 
 
-def _phase_scoped_tools(tools: object, phase: str) -> list | None:
+def _phase_scoped_tools(
+        tools: object, phase: str,
+        ledger: DiagnosisLedger | None = None) -> list | None:
     """Return *tools* with per-tool phase availability in the description.
 
     Available tools are positively marked; unavailable ones carry the
@@ -378,6 +391,13 @@ def _phase_scoped_tools(tools: object, phase: str) -> list | None:
     allowed = _PHASE_ALLOWLIST.get(phase, frozenset())
     hard_filtered = _PHASE_HARD_FILTER.get(phase, frozenset())
     hint = _gate_hint(phase)
+    if (phase == "report" and ledger is not None
+            and not ledger.get("report")
+            and unrecorded_evidence_hypotheses(ledger)):
+        # Keep the proactive surface identical to the reactive gate: the
+        # model must see record_finding as available before it can settle.
+        allowed = allowed | {"record_finding"}
+        hint = "record_finding（先补落账）→ write_file"
     out: list = []
     changed = False
     for tool in tools:
@@ -631,6 +651,34 @@ errors (ReasoningLoopError / connection errors).  Those receipts state "本次
 委派未产出结论" and therefore must count as FAILED for coverage accounting,
 evidence attribution and report findings — never as a successful delegation.
 """
+
+
+def _tool_execution_succeeded(result: Any) -> bool:
+    """Check handler outcome, including errors nested in a Command.
+
+    Absence of an exception is not success: tool failures may be returned as
+    ToolMessage(status="error") or failure text.  Used before marking a
+    report as complete; other tool paths keep their existing semantics.
+    """
+    if result is None:
+        return False
+    if isinstance(result, ToolMessage):
+        messages = [result]
+    elif isinstance(result, Command):
+        messages = [
+            m for m in result.update.get("messages", [])
+            if isinstance(m, ToolMessage)
+        ]
+    else:
+        return True
+    for message in messages:
+        if getattr(message, "status", "success") == "error":
+            return False
+        content = (message.content if isinstance(message.content, str)
+                   else str(message.content))
+        if _tool_result_failed(content):
+            return False
+    return True
 
 
 def _has_collected_tool_results(request: Any) -> bool:
@@ -1117,12 +1165,11 @@ def _classify_argus_data(ledger: dict) -> str:
 # forbidden k8s-argus-expert) — see design document §11 (2026-08-05).
 
 def _argus_coverage_gap(ledger: dict) -> list[str]:
-    """Current scene's missing argus experts (sorted; SSOT _required_argus)."""
-    required = _required_argus(ledger)
-    delegated: set[str] = set()
-    for r in ledger.get("rounds", []):
-        delegated.update(r.get("delegated_experts", []))
-    return sorted(required - delegated)
+    """Required views still lacking both success and degraded coverage."""
+    return sorted(
+        expert for expert, state in argus_view_states(ledger).items()
+        if state.get("status") not in ("success", "degraded")
+    )
 
 
 def _argus_delegation_desc(expert: str, entity: str, time_hint: str) -> str:
@@ -1259,7 +1306,7 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
                if h.get("status") == "refuted"]
     unfinished = [(hid, h) for hid, h in hypotheses.items()
                   if h.get("status") in ("pending", "inconclusive")]
-    root_ids = set(ledger.get("root_hypothesis_ids", []))
+    root_ids = {hid for hid, _node in confirmed_root_nodes(ledger)}
     if hypotheses:
         lines.append("## 2. 假设验证结果综合")
 
@@ -1317,14 +1364,15 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
 
     # ── 3. Best conclusions ──
     lines.append("## 3. 最佳结论建议")
-    root_causes = ledger.get("root_causes", [])
     if confirmed:
         for i, (hid, node) in enumerate(
             sorted(confirmed, key=lambda x: -x[1].get("probability", 0))
         ):
-            rc_text = root_causes[i] if i < len(root_causes) else node.get("statement", "")
             is_root = hid in root_ids
-            lines.append(f"{i + 1}. {'[根因] ' if is_root else ''}{rc_text}")
+            lines.append(
+                f"{i + 1}. {'[根因] ' if is_root else ''}"
+                f"{node.get('statement', '')}"
+            )
     elif hypotheses:
         refuted_all = all(
             h.get("status") == "refuted" or h.get("deferred")
@@ -1363,9 +1411,13 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
     lines.append("- 故障描述、诊断范围、核心结论（1-2句话）")
     lines.append("## 关键发现")
     lines.append("- 按时间线/严重程度列出关键发现")
-    lines.append("## 根因分析")
-    lines.append("### 主要原因")
-    lines.append("- 根因描述 + 置信度 + 完整证据链")
+    lines.append("## 根因与因果分层")
+    lines.append("### 已确认根因")
+    lines.append("- 仅列满足反事实判据的独立根因 + 置信度 + 完整证据链")
+    lines.append("### 促成或加剧因素")
+    lines.append("- 仅放大影响的因素单列，不计入根因数量")
+    lines.append("### 症状与下游影响")
+    lines.append("- API 只读、NotReady、延迟升高等表现不得写成独立根因")
     if unfinished:
         lines.append("")
         lines.append("### 未验证假设（后续排查建议）")
@@ -1392,11 +1444,32 @@ def _build_diagnostic_synthesis(ledger: dict, max_rounds: int) -> str:
     return "\n".join(lines)
 
 
+def _with_report_disclosures(ledger: DiagnosisLedger, content: str,
+                             skip: bool = False) -> str:
+    """Return final report text with all mandatory disclosures, idempotently.
+
+    Used before every direct/fallback write and by the ledger stub generator;
+    the model is never asked to invent a verdict on these paths.
+    """
+    if skip or not content:
+        return content
+    for renderer, marker in (
+        (render_argus_coverage_disclosure, "覆盖降级（系统披露）"),
+        (render_unverified_disclosure, "未验证竞争假设（系统披露）"),
+        (render_unrecorded_evidence_appendix, "已采集未落账证据"),
+        (render_single_channel_limitation_appendix, "证据局限（系统附录）"),
+    ):
+        extra = renderer(ledger)
+        if extra and marker not in content:
+            content = content.rstrip() + extra
+    return content
+
+
 def _write_report_file(report_path: str, content: str,
-                       agent_data_real: str) -> None:
-    """Write report .md to filesystem.  No-op if path or content is empty."""
+                       agent_data_real: str) -> bool:
+    """Write report .md and return whether durable output really succeeded."""
     if not report_path or not content:
-        return
+        return False
     try:
         import pathlib as _pl
         real = report_path.replace("/agent_data/", str(agent_data_real) + "/")
@@ -1404,8 +1477,10 @@ def _write_report_file(report_path: str, content: str,
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         logger.info("Report written to %s (%d chars)", p, len(content))
+        return True
     except Exception as e:
         logger.warning("Failed to write report: %s", e)
+        return False
 
 
 def _emit_synthetic_write_file_event(report_path: str, report_md: str,
@@ -1445,6 +1520,21 @@ def _emit_synthetic_write_file_event(report_path: str, report_md: str,
         )
     except RuntimeError:
         pass  # stream_writer unavailable outside ToolNode context
+
+
+def _emit_report_write_failure(report_md: str, reason: str = "") -> None:
+    """Deliver report text without claiming it was durably written."""
+    try:
+        from langgraph.config import get_stream_writer
+        sw = get_stream_writer()
+        sw({
+            "type": "report_content",
+            "content": report_md,
+            "write_failed": True,
+            "error": reason or "报告写盘失败；内容为未落盘草稿",
+        })
+    except RuntimeError:
+        pass
 
 
 def _response_ends_loop(response) -> bool:
@@ -2178,6 +2268,11 @@ class ProposeHypothesesInput(BaseModel):
     focus_summary: str = Field(
         default="",
         description="本轮假设形成的依据摘要",
+    )
+    alternative_candidate_id: str = Field(
+        default="",
+        description="仅当系统回执明确给出 ALT-n 时填写：追加该独立根因候选；"
+                    "普通提出/换批/证据追加必须留空",
     )
 
 
@@ -3094,7 +3189,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # Annotate the tool definitions themselves so the phase constraint
         # is present at the decision point (see _phase_scoped_tools).
         _phase_tools = _phase_scoped_tools(
-            getattr(request, "tools", None), _phase(ledger))
+            getattr(request, "tools", None), _phase(ledger), ledger=ledger)
         _overrides: dict[str, object] = {}
         if combined_block:
             _overrides["system_message"] = append_to_system_message(
@@ -3324,11 +3419,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     report_md = ledger["report"]
                 else:
                     report_md = self._generate_report_from_ledger(ledger)
-                    ledger["report"] = report_md
-                    _write_report_file(
-                        self.report_path, report_md,
-                        self._AGENT_DATA_REAL,
-                    )
+                    if _write_report_file(
+                            self.report_path, report_md,
+                            self._AGENT_DATA_REAL):
+                        ledger["report"] = report_md
+                        ledger.pop("report_draft", None)
+                        ledger.pop("_report_write_failed", None)
+                    else:
+                        ledger["report_draft"] = report_md
+                        ledger["_report_write_failed"] = True
                 self._persist_ledger(ledger)
 
                 # ── Inject synthetic write_file call ──
@@ -4390,13 +4489,19 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if _is_substantial_report_text(_salvage_text) and (
                         not report_exists
                         or ledger.get("_report_auto_generated")):
-                    ledger["report"] = _salvage_text
-                    ledger["_report_auto_generated"] = False
-                    _force_report(ledger)
-                    _write_report_file(
-                        self.report_path, _salvage_text,
-                        self._AGENT_DATA_REAL,
-                    )
+                    _salvage_text = _with_report_disclosures(
+                        ledger, _salvage_text)
+                    if _write_report_file(
+                            self.report_path, _salvage_text,
+                            self._AGENT_DATA_REAL):
+                        ledger["report"] = _salvage_text
+                        ledger["_report_auto_generated"] = False
+                        ledger.pop("report_draft", None)
+                        ledger.pop("_report_write_failed", None)
+                        _force_report(ledger)
+                    else:
+                        ledger["report_draft"] = _salvage_text
+                        ledger["_report_write_failed"] = True
                     self._persist_ledger(ledger)
                     logger.warning(
                         "Safety: REPORT salvage (round %d) — LLM text "
@@ -4405,7 +4510,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "auto-generated stub" if report_exists
                         else "missing report",
                     )
-                    report_exists = True
+                    report_exists = bool(ledger.get("report"))
                 if not report_exists:
                     # Level computation anchors on the SYSTEM entry round
                     # (guardrail-forced entry, `_report_forced_enter_round`)
@@ -4443,21 +4548,44 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "alive, no stub yet)",
                             self._model_call_count,
                         )
-                        self._pending_guidance = (
-                            "REPORT 阶段禁止纯文本收尾。\n"
-                            "你必须在下一轮调用 write_file 将完整诊断"
-                            f"报告写入 {self.report_path}。\n"
-                            "禁止调用任何诊断工具，禁止输出纯文本分析。"
-                        )
+                        _unrec_g6 = unrecorded_evidence_hypotheses(ledger)
+                        if _unrec_g6:
+                            _g6_ids = ", ".join(
+                                fmt_hid(_h) for _h, _n in _unrec_g6)
+                            self._pending_guidance = (
+                                "REPORT 阶段禁止纯文本收尾。\n"
+                                f"{_g6_ids} 已有专家证据但尚未落账。"
+                                "请先逐项 record_finding 补落账（本阶段已开放），"
+                                f"再调用 write_file 写入 {self.report_path}；"
+                                "报告中的假设终态必须与台账一致。"
+                            )
+                        else:
+                            self._pending_guidance = (
+                                "REPORT 阶段禁止纯文本收尾。\n"
+                                "你必须在下一轮调用 write_file 将完整诊断"
+                                f"报告写入 {self.report_path}。\n"
+                                "禁止调用任何诊断工具，禁止输出纯文本分析。"
+                            )
                         response = ModelResponse(result=[AIMessage(
                             content="",
                         )])
                     else:
                         # ── Level 2: Auto-generate as last resort ──
-                        report_md = self._generate_report_from_ledger(ledger)
-                        ledger["report"] = report_md
+                        report_md = (ledger.get("report_draft")
+                                     or self._generate_report_from_ledger(ledger))
                         _force_report(ledger)
-                        _write_report_file(self.report_path, report_md, self._AGENT_DATA_REAL)
+                        if _write_report_file(
+                                self.report_path, report_md,
+                                self._AGENT_DATA_REAL):
+                            ledger["report"] = report_md
+                            ledger.pop("report_draft", None)
+                            ledger.pop("_report_write_failed", None)
+                        else:
+                            # Level-2 is the bounded delivery point.  Keep the
+                            # draft and expose the failure instead of locking
+                            # a non-existent file into `ledger.report`.
+                            ledger["report_draft"] = report_md
+                            ledger["_report_write_failed"] = True
                         self._persist_ledger(ledger)
                         logger.warning(
                             "Safety: REPORT-phase stall level-2 "
@@ -4483,15 +4611,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # and let the graph loop END naturally.  The
                 # _chat_event_stream finalization code will emit "done".
                 if report_exists:
-                    _emit_synthetic_write_file_event(
-                        self.report_path,
-                        ledger.get("report", ""),
-                        self._model_call_count,
-                    )
+                    if ledger.get("_report_write_failed"):
+                        _emit_report_write_failure(
+                            ledger.get("report_draft", ""))
+                    elif ledger.get("report"):
+                        _emit_synthetic_write_file_event(
+                            self.report_path,
+                            ledger["report"],
+                            self._model_call_count,
+                        )
                     logger.info(
-                        "REPORT phase complete: report exists (%d chars), "
-                        "round %d — letting graph loop end naturally",
-                        len(ledger.get("report", "")),
+                        "REPORT phase delivery complete (written=%s, "
+                        "write_failed=%s, round=%d) — letting graph loop end",
+                        bool(ledger.get("report")),
+                        bool(ledger.get("_report_write_failed")),
                         self._model_call_count,
                     )
 
@@ -5030,6 +5163,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "(round %d): %s", self._model_call_count,
                             sorted(set(_dropped_ids)),
                         )
+                # Final disclosures are injected BEFORE the actual write on
+                # every gate-passing path.  The post-handler capture must
+                # never mutate a different copy (file / ledger / SSE).
+                if not _is_stub_echo_write and isinstance(
+                        tool_args.get("content"), str):
+                    tool_args["content"] = _with_report_disclosures(
+                        ledger, tool_args["content"])
                 # NOTE: the ledger-derived appendix channel (evidence
                 # layers / topology mapping / delegated experts /
                 # refuted hypotheses, v3.14.0 - v3.36.0) was REMOVED.
@@ -5077,7 +5217,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         if tool_name in ("propose_hypotheses", "backtrack"):
             ledger = self._current_ledger
             if ledger and _phase(ledger) == "report":
-                cids = ledger.get("root_cause_hypothesis_ids", [])
+                cids = [hid for hid, _n in confirmed_root_nodes(ledger)]
                 if cids:
                     # At least one confirmed root cause — no restart
                     logger.warning(
@@ -5325,11 +5465,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # conflict clears and the economic model resumes.
                         _v = delegation_value_for(
                             ledger, _gate_hid, subagent_type)
-                        _f1_conflict = _argus_conflict_signal(
-                            ledger, _gate_hid)
-                        _f1_is_deep = not subagent_type.endswith("-argus-expert")
-                        if _v < KAPPA_STOP and not (
-                                _f1_conflict and _f1_is_deep):
+                        _f1_allowed = f1_arbitration_available(
+                            ledger, _gate_hid, subagent_type)
+                        if _v < KAPPA_STOP and not _f1_allowed:
                             logger.warning(
                                 "Delegation blocked by gain<cost gate: "
                                 "%s value=%.3f < κ=%.2f (delegated=%d, "
@@ -5451,6 +5589,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         request.tool_call["args"] = tool_args
                     except (TypeError, AttributeError, KeyError):
                         pass  # request is immutable; proceed without injection
+
+        _task_delegation = (
+            delegation_key_from_text(tool_args.get("description", ""))
+            if tool_name == "task" and not self._is_subagent else ""
+        )
+        if (tool_name == "task" and ledger and not self._is_subagent
+                and f1_arbitration_available(
+                    ledger, _gate_hid, subagent_type)):
+            # Count at actual dispatch (after every gate, before queueing):
+            # rejected calls consume nothing; timeout/failure still consumes
+            # the single arbitration budget so it cannot be retried forever.
+            _f1_node = ledger["hypotheses"][_gate_hid]
+            _f1_node["_f1_arbitration_attempts"] = (
+                _f1_node.get("_f1_arbitration_attempts", 0) + 1)
+            self._persist_ledger(ledger)
 
         # Emit precise tool timing events via stream_writer
         sw = getattr(request.runtime, "stream_writer", None)
@@ -5671,24 +5824,45 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # whole batch).
                         if (_structured_expert.get("verdict_target")
                                 == "alternative_root_cause"):
-                            _alt_rc = str(
-                                _structured_expert.get("root_cause")
-                                or "")[:120]
+                            _alt_full = str(
+                                _structured_expert.get("root_cause") or "").strip()
+                            _alt = register_alternative_root_candidate(
+                                ledger, _alt_full,
+                                str(tool_args.get("subagent_type", "?")),
+                                self._model_call_count,
+                            )
+                            _alt_rc = _alt_full[:120]
+                            if _alt.get("eligible"):
+                                _alt_action = (
+                                    "② 用 propose_hypotheses 追加 1 个独立假设，并传 "
+                                    f"alternative_candidate_id={_alt['candidate_id']}；"
+                                    "追加后定向验证并 record_finding 落账"
+                                )
+                            elif _alt.get("reason") == "existing":
+                                _alt_action = (
+                                    "② 该表述已有假设 "
+                                    f"{fmt_hid(_alt['hypothesis_id'])}，请直接对该假设验证/落账，"
+                                    "不要重复提出"
+                                )
+                            else:
+                                _alt_action = (
+                                    "② 当前有界追加通道不可用，请将该成因保留为"
+                                    "观测级/待验证证据，不要合并进其他假设，也不要伪造已确认根因"
+                                )
                             summary += (
-                                f"\n⚠️ 结论对象声明：专家证伪了被指派的假设，"
-                                f"并另确证根因「{_alt_rc}」。正确动作序列："
-                                f"① record_finding(被验证假设, refuted) 排除"
-                                f"（专家已自报他因，冲突门控不会拦截）；"
-                                f"② propose_hypotheses 追加 1 个假设收录该"
-                                f"根因（追加假设通道，不占换批预算）——证据"
-                                f"已在手，追加后即可 record_finding confirmed "
-                                f"落账（p≥80 后 write_file 通道自动开放）。"
+                                f"\n⚠️ 结论对象声明：专家另指出了独立根因「{_alt_rc}」。"
+                                "verdict 与 verdict_target 正交："
+                                "① 先按专家对原假设的实际 verdict 落账（不要固定写 refuted）；"
+                                f"{_alt_action}。statement_update 只能精化原机制，"
+                                "不得把该独立根因合并进原假设。"
                             )
                             logger.info(
                                 "alternative-root-cause return: expert=%s "
-                                "root_cause=%.120s (round=%d)",
+                                "root_cause=%.120s eligible=%s reason=%s (round=%d)",
                                 tool_args.get("subagent_type", "?"),
-                                _alt_rc, self._model_call_count,
+                                _alt_rc, _alt.get("eligible"),
+                                _alt.get("reason", "registered"),
+                                self._model_call_count,
                             )
                         # ── Verdict-evidence direction observation
                         # (v3.16.0, design document §8 G21 sibling):
@@ -5742,6 +5916,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             # to detect "awaiting verdict" (expert returned but
                             # record_finding not yet called).
                             node["_last_evidence_round"] = self._model_call_count
+                            node["_last_evidence_event_seq"] = next_commit_sequence(ledger)
                             if tool_name not in node["verification_tools"]:
                                 node["verification_tools"].append(tool_name)
                             # ── v3.37.7 (D+A'): multi-hypothesis attribution ──
@@ -5823,6 +5998,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 _rnode = ledger["hypotheses"][_rid]
                                 _rnode["evidence"].append(_rev)
                                 _rnode["_last_evidence_round"] = self._model_call_count
+                                _rnode["_last_evidence_event_seq"] = next_commit_sequence(ledger)
                                 logger.info(
                                     "multi-hypothesis evidence: %s → %s "
                                     "(effect=%s, via=%s)",
@@ -5949,6 +6125,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 _seq=invocation_seq,
                 delegated_experts=delegated,
                 delegated_for=delegated_for,
+                delegation=_task_delegation,
+                delegation_expert=(expert if tool_name == "task" else ""),
+                delegation_failed=((is_error or _empty_task_result)
+                                   if tool_name == "task" else False),
+                tool_call_id=tool_call_id,
             )
 
         # After ledger management tools, persist and emit snapshot
@@ -6039,49 +6220,31 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # mark on such an echo would disguise the stub as
                     # LLM-authored, permanently disabling the G10
                     # overwrite invitation and the REPORT-stall salvage.
+                    if not _tool_execution_succeeded(result):
+                        # Never turn a failed write into the REPORT completion
+                        # lock.  Keep a draft for the bounded retry/fallback
+                        # path and return the original failure to the model.
+                        if ledger:
+                            ledger["report_draft"] = content
+                            ledger["_report_write_failed"] = True
+                            self._persist_ledger(ledger)
+                        logger.warning(
+                            "write_file failed; report completion not marked "
+                            "(round=%d)", self._model_call_count,
+                        )
+                        return result
+
                     if ledger:
                         _is_stub_echo = (
                             ledger.get("_report_auto_generated")
                             and content == ledger.get("report")
                         )
-                        # Disclosure backstop (design document §6.3,
-                        # v3.6.0): a rewrite with fresh LLM content would
-                        # otherwise silently drop the disclosure section
-                        # injected at gate-release time.  Re-append it
-                        # whenever unresolved hypotheses remain and the
-                        # section is absent — the disclosure obligation
-                        # attaches to the REPORT, not to a single write.
-                        if not _is_stub_echo:
-                            from diagnostics.agent.ledger import (
-                                render_unverified_disclosure as _rud2,
-                            )
-                            _disc = _rud2(ledger)
-                            if (_disc
-                                    and "未验证竞争假设（系统披露）"
-                                    not in content):
-                                content = content.rstrip() + _disc
-                            # Evidence-closure backstop (design document
-                            # §6.3, v3.11.0): a rewrite with fresh content
-                            # must not drop the unrecorded-evidence
-                            # appendix either — the disclosure obligation
-                            # attaches to the report, not a single write.
-                            _apx = render_unrecorded_evidence_appendix(ledger)
-                            if (_apx
-                                    and "已采集未落账证据" not in content):
-                                content = content.rstrip() + _apx
-                            # Single-channel limitation backstop (design
-                            # document §8 G22, v3.41.0): same rule for the
-                            # evidence-limitation section.
-                            _sc_apx = render_single_channel_limitation_appendix(
-                                ledger)
-                            if (_sc_apx
-                                    and "证据局限（系统附录）" not in content):
-                                content = content.rstrip() + _sc_apx
-                            # NOTE: no ledger-derived appendix on the
-                            # rewrite path either (removed, v3.36.0) —
-                            # those sections duplicate the report body
-                            # (design document §9).
+                        # All disclosures were finalized before handler
+                        # execution.  Capture exactly that same content;
+                        # post-write mutation would fork file/ledger/SSE.
                         ledger["report"] = content
+                        ledger.pop("report_draft", None)
+                        ledger.pop("_report_write_failed", None)
                         if not _is_stub_echo:
                             ledger["_report_auto_generated"] = False
 
@@ -6796,6 +6959,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         async def _run(
             hypotheses: list[HypothesisSpec],
             focus_summary: str = "",
+            alternative_candidate_id: str = "",
         ) -> str:
             ledger = mw._current_ledger or new_ledger()
 
@@ -6806,14 +6970,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # gate is closed (active pending) while the append guard is
             # open.  add_hypotheses re-derives the same branch; this local
             # copy only drives the receipt wording.
-            _is_append = (
+            _is_append = bool(alternative_candidate_id) or (
                 bool(ledger.get("hypotheses"))
                 and not can_propose_root_hypotheses(ledger)
                 and can_append_hypothesis(ledger)
             )
 
             try:
-                created = add_hypotheses(ledger, specs)
+                created = add_hypotheses(
+                    ledger, specs,
+                    alternative_candidate_id=alternative_candidate_id,
+                )
             except ValueError as e:
                 return f"假设调用失败: {e}"
 
@@ -6826,8 +6993,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 sel = " ★" if h["selected"] else ""
                 lines.append(f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
             if _is_append:
+                _append_kind = (
+                    "独立根因候选追加" if alternative_candidate_id
+                    else "证据驱动追加"
+                )
                 lines.append(
-                    "（证据驱动追加：新假设已并入当前批，不占用换批预算；"
+                    f"（{_append_kind}：新假设已并入当前批，不占用换批预算；"
                     f"假设总数 {len(ledger.get('hypotheses', {}))}"
                     f"/{MAX_TOTAL_HYPOTHESES}）"
                 )
@@ -6886,11 +7057,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "record_finding，重复提出不会确认任何假设。"
                 "假设为扁平结构（ID 为整数编号如 H1、H2），不支持在某假设下提出子假设；"
                 "如需更具体的表述，用 record_finding(statement_update=...) 修正。"
-                "整个诊断最多提出2次（首批、换批共用此预算），总计不超过6个假设。"
-                "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述。"
+                "整个诊断最多提出2个普通批次（首批、换批共用此预算），总计不超过6个假设。"
+                "预算用尽后如需细化，用record_finding(statement_update=...)修正已有假设表述；"
+                "statement_update 只能精化原机制，不得把另一个独立根因合并进来。"
                 "验证中途新证据指向当前假设集之外的全新方向时，可在 EVALUATE 阶段用本工具"
                 "追加1个新假设（单次仅1个；追加不占用换批预算，但总假设数不超过6个）——"
                 "区别于换批：换批是当前方向全部失败后的重开，追加是当前方向仍在验证中的补充。"
+                "若系统回执明确给出 ALT-n 独立根因候选，可传 alternative_candidate_id=ALT-n "
+                "使用有界追加例外；没有该 ID 时不得编造或自行开启例外。"
                 "提出后系统自动聚焦概率最高的假设。"
             ),
             coroutine=_run,
@@ -7050,8 +7224,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "该假设仍为 pending，后续验证请据此新表述委派专家。"
                 )
 
-            # Capture old statement for root_causes sync
-            old_statement = ""
             # v3.23.0 bugfix: bounded-degrade passes (then G17-E2/C2/G21/
             # G22) must REALLY ledger the finding — previously they
             # returned a "passed with disclosure" message WITHOUT
@@ -7082,7 +7254,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "请用 propose_hypotheses 提出新假设收录（refuted 终态"
                         "不可翻案；新假设可复用该表述与已有证据直接落账）。"
                     )
-                old_statement = hnode.get("statement", "")
 
             # Defect D: Terminal-state guard (v2.7.1 relaxed).
             # Verdict FLIPS remain forbidden — they prevent the LLM from
@@ -7586,10 +7757,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     or (verdict == "confirmed"
                         and _g18_node.get("status") == "confirmed")
                 )
-                _no_new_evidence = (
-                    _g18_node.get("_last_evidence_round", 0)
-                    <= _g18_node.get("_last_finding_round", 0)
-                )
+                _no_new_evidence = not evidence_newer_than_finding(_g18_node)
                 if _same_verdict and _no_new_evidence:
                     _cer_count = _g18_node.get("_ceremonial_count", 0) + 1
                     _g18_node["_ceremonial_count"] = _cer_count
@@ -7678,82 +7846,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # Check exit conditions
             should_exit, reason, confirmed_id = check_exit_conditions(ledger)
 
-            # ── Root-cause tracking (v2.7 flat model) ──
-            # A confirmed root cause requires BOTH confirmed AND p ≥ 80
-            # (design document §6 S1 / record_finding contract) — shared
-            # predicate is_confirmed_root.  A low-confidence confirmed
-            # hypothesis (e.g. a synonymous hypothesis stamped confirmed
-            # with p=0) is NOT a root cause; it stays in hypotheses for
-            # the LLM to either strengthen (p≥80) or re-verify.
-            cids: list[str] = ledger.setdefault("root_cause_hypothesis_ids", [])
-            causes: list[str] = ledger.setdefault("root_causes", [])
-            hypotheses = ledger.get("hypotheses", {})
-            for hid, node in hypotheses.items():
-                if not is_confirmed_root(node):
-                    continue
-                if hid in cids:
-                    continue  # already tracked
-                cids.append(hid)
-                stmt = node["statement"]
-                # Deduplicate: different hypotheses may converge on
-                # the same root cause statement after statement_update.
-                if stmt not in causes:
-                    causes.append(stmt)
-            # Keep backward-compat fields in sync with first entry
-            if cids:
-                ledger["root_cause"] = causes[0]
-                ledger["root_cause_hypothesis_id"] = cids[0]
-
-            # Sync root_causes text when statement was updated for an
-            # already-confirmed hypothesis (e.g. "etcd compaction" → "etcd NOSPACE").
-            if old_statement and statement_update:
-                causes_list = ledger.get("root_causes", [])
-                for i, rc in enumerate(causes_list):
-                    if rc == old_statement:
-                        causes_list[i] = statement_update
-                        break
-                # Also update backward-compat field
-                if ledger.get("root_cause") == old_statement:
-                    ledger["root_cause"] = statement_update
-
-            # ── Cleanup: drop non-confirmed entries ──
-            # Ensures refuted/deprioritized hypotheses never appear as
-            # root causes.  Also drops low-confidence confirmed (p<80)
-            # so the tracker stays aligned with S1 (is_confirmed_root).
-            hypotheses_dict = ledger.get("hypotheses", {})
-            cids[:] = [
-                cid for cid in cids
-                if is_confirmed_root(hypotheses_dict.get(cid, {}))
-            ]
-            # Rebuild root_causes to match cleaned cids
-            causes[:] = [
-                hypotheses_dict[cid]["statement"]
-                for cid in cids
-                if cid in hypotheses_dict
-            ]
-            # Re-sync backward-compat fields after cleanup
-            if cids:
-                ledger["root_cause"] = causes[0] if causes else ""
-                ledger["root_cause_hypothesis_id"] = cids[0]
-            else:
-                ledger.pop("root_cause", None)
-                ledger.pop("root_cause_hypothesis_id", None)
-
-            # ── Defect E: Sort root_cause_hypothesis_ids by probability
-            # descending so the highest-confidence root cause is always
-            # primary, regardless of record_finding call order. ──
-            if len(cids) > 1:
-                cids.sort(
-                    key=lambda _c: hypotheses_dict.get(_c, {}).get("probability", 0),
-                    reverse=True,
-                )
-                causes[:] = [
-                    hypotheses_dict[_c]["statement"]
-                    for _c in cids
-                    if _c in hypotheses_dict
-                ]
-                ledger["root_cause"] = causes[0] if causes else ""
-                ledger["root_cause_hypothesis_id"] = cids[0]
+            # Root-cause fields are a derived projection of the hypothesis
+            # tree (design document §6 S1).  Centralising the projection
+            # avoids ordering drift and also covers automatic-confirmation
+            # paths that do not pass through this tool handler.
+            sync_confirmed_roots(ledger)
 
             # ── Exit is decided SOLELY by check_exit_conditions (§6.3) ──
             # Removed the legacy "propagation-aware" override: its
@@ -7902,7 +7999,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _candidate_hint = ""
             if verdict == "refuted" and not exit_hint:
                 _cand = _refute_root_candidate(
-                    hypotheses_dict.get(hypothesis_id, {}))
+                    ledger.get("hypotheses", {}).get(hypothesis_id, {}))
                 if _cand and can_append_hypothesis(ledger):
                     _candidate_hint = (
                         f"\nℹ 本次证伪证据中专家给出了根因候选：「{_cand}」——"
@@ -8083,7 +8180,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         hypotheses: dict = ledger.get("hypotheses", {})
         rounds_data: list = ledger.get("rounds", [])
-        root_causes: list = ledger.get("root_causes", [])
+        root_causes = [
+            node["statement"] for _hid, node in confirmed_root_nodes(ledger)
+        ]
         lines: list[str] = []
 
         # ── Header ──
@@ -8103,8 +8202,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             h for h in hypotheses.values()
             if h.get("status") == "confirmed"
         ]
-        if confirmed:
-            max_p = max(h.get("probability", 0) for h in confirmed)
+        _root_pairs = confirmed_root_nodes(ledger)
+        if _root_pairs:
+            max_p = max(h.get("probability", 0) for _hid, h in _root_pairs)
             level = (
                 "高" if max_p >= 80
                 else "中" if max_p >= 50
@@ -8151,7 +8251,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             ):
                 hid = h.get("id", "?")
                 prob = h.get("probability", 0)
-                is_root = hid in set(ledger.get("root_hypothesis_ids", []))
+                is_root = hid in {
+                    root_hid for root_hid, _n in confirmed_root_nodes(ledger)
+                }
                 lines.append(f"### {fmt_hid(hid)}{' [根因]' if is_root else ''}"
                              f" — 置信度 {prob}%\n")
                 lines.append(f"{h.get('statement', '')}\n")
@@ -8172,9 +8274,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
         # ── Root cause analysis ──
         if root_causes:
-            lines.append("## 根因分析\n")
+            lines.append("## 已确认根因\n")
             for i, rc in enumerate(root_causes, 1):
                 lines.append(f"{i}. {rc}")
+            lines.append("")
+
+        _other_confirmed = [
+            h for h in confirmed
+            if str(h.get("id")) not in {hid for hid, _n in _root_pairs}
+        ]
+        if _other_confirmed:
+            lines.append("## 其他已确认假设（不自动等同独立根因）\n")
+            for h in _other_confirmed:
+                lines.append(
+                    f"- {h.get('statement', '')}（置信度 "
+                    f"{h.get('probability', 0)}%，未达根因阈值；"
+                    "因果角色按证据说明，不改写为独立根因）"
+                )
             lines.append("")
 
         # ── Excluded / shelved hypotheses ──
@@ -8187,12 +8303,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             h for h in hypotheses.values()
             if h.get("status") == "refuted"
         ]
-        shelved = [
-            h for h in hypotheses.values()
-            if h.get("deferred") and h.get("status") != "refuted"
-        ]
-        if refuted or shelved:
-            lines.append("## 排除的假设\n")
+        if refuted:
+            lines.append("## 已排除假设\n")
             for h in refuted:
                 status_cn = _TERMINAL_REASON_CN.get(
                     h.get("terminal_reason", ""), "已排除")
@@ -8202,14 +8314,6 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     f"- [{status_cn}] {h.get('statement', '')}"
                     f"（概率{h.get('probability', 0)}%）"
                     f"{' — ' + rationale if rationale else ''}"
-                )
-            for h in shelved:
-                reason = (
-                    (h.get("deferred_reason") or h.get("rationale") or ""))[:200]
-                lines.append(
-                    f"- [未验证(搁置)] {h.get('statement', '')}"
-                    f"（概率{h.get('probability', 0)}%）"
-                    f"{' — ' + reason if reason else ''}"
                 )
             lines.append("")
 
@@ -8233,13 +8337,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         lines.append("本报告由系统自动生成，基于诊断台账中的结构化证据。"
                      "LLM 未在 REPORT 阶段调用 write_file，"
                      "报告内容可能缺少手工撰写的叙述细节。")
-        # Single-channel evidence limitation (design document §8 G22,
-        # v3.41.0): disclosed deterministically even on the stub path.
-        _sc_stub = render_single_channel_limitation_appendix(ledger)
-        if _sc_stub:
-            lines.append(_sc_stub)
-
-        return "\n".join(lines)
+        return _with_report_disclosures(ledger, "\n".join(lines))
 
     # ── Persistence ──
 

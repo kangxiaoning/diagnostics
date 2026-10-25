@@ -107,6 +107,17 @@ def _instruction_text(text: str) -> str:
     return text[idx + len(_INSTRUCTION_MARKER):]
 
 
+def delegation_key_from_text(text: str) -> str:
+    """Derive the same identity from an already-wrapped instruction text."""
+    if not text:
+        return _UNKNOWN_KEY
+    digest = hashlib.sha1(
+        text.encode("utf-8", "replace")
+    ).hexdigest()[:_DIGEST_LEN]
+    slug = _WS_RE.sub(" ", _instruction_text(text).strip())[:_SLUG_LEN]
+    return f"del:{digest}:{slug}" if slug else f"del:{digest}"
+
+
 def delegation_key(state: Any) -> str:
     """Per-delegation key shared by every subagent middleware.
 
@@ -116,14 +127,7 @@ def delegation_key(state: Any) -> str:
     guards by context instead of by delegation).  Labels come from the
     instruction when the message carries the wrapper marker.
     """
-    text = _first_human_text(state)
-    if not text:
-        return _UNKNOWN_KEY
-    digest = hashlib.sha1(
-        text.encode("utf-8", "replace")
-    ).hexdigest()[:_DIGEST_LEN]
-    slug = _WS_RE.sub(" ", _instruction_text(text).strip())[:_SLUG_LEN]
-    return f"del:{digest}:{slug}" if slug else f"del:{digest}"
+    return delegation_key_from_text(_first_human_text(state))
 
 
 def delegation_key_from_request(request: Any) -> str:

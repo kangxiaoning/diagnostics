@@ -86,6 +86,10 @@ is flat (no sub-hypotheses), so this is simply the per-batch cap."""
 # keeps termination intact when hypotheses are added mid-diagnosis.
 MAX_TOTAL_HYPOTHESES = MAX_PROPOSE_CALLS * MAX_LAYER_SIZE
 
+# Independent alternative-root discoveries get a small, separate append
+# budget.  The total cap remains the outer convergence invariant.
+MAX_ALTERNATIVE_ROOT_APPENDS = 2
+
 # Statuses that permanently close a hypothesis with a negative verdict.
 # (dead_end merged into refuted in the 5-state model.)
 _HARD_FAILED_STATUSES = frozenset({"refuted"})
@@ -109,6 +113,64 @@ def is_confirmed_root(node: dict) -> bool:
         node.get("status") == "confirmed"
         and node.get("probability", 0) >= CONFIRMED_ROOT_MIN_PROBABILITY
     )
+
+
+def confirmed_root_nodes(ledger: DiagnosisLedger) -> list[tuple[str, HypothesisNode]]:
+    """Derived, tree-wide confirmed-root view (single source of truth).
+
+    The hypothesis tree is authoritative; the arrays below are compatibility
+    projections only.  Sorting is shared by S1/report consumers so automatic
+    confirmation paths cannot silently disappear from the report.
+    """
+    pairs = [
+        (str(hid), node)
+        for hid, node in (ledger.get("hypotheses") or {}).items()
+        if is_confirmed_root(node)
+    ]
+    return sorted(
+        pairs,
+        key=lambda pair: -int(pair[1].get("probability", 0) or 0),
+    )
+
+
+def sync_confirmed_roots(ledger: DiagnosisLedger) -> list[tuple[str, HypothesisNode]]:
+    """Refresh backward-compatible root fields from ``confirmed_root_nodes``."""
+    pairs = confirmed_root_nodes(ledger)
+    ids = [hid for hid, _node in pairs]
+    causes = [str(node.get("statement") or "") for _hid, node in pairs]
+    ledger["root_cause_hypothesis_ids"] = ids
+    ledger["root_causes"] = causes
+    if pairs:
+        ledger["root_cause_hypothesis_id"] = ids[0]
+        ledger["root_cause"] = causes[0]
+    else:
+        ledger.pop("root_cause_hypothesis_id", None)
+        ledger.pop("root_cause", None)
+    return pairs
+
+def next_commit_sequence(ledger: DiagnosisLedger) -> int:
+    """Monotonic sequence assigned when a fact is committed to the ledger."""
+    seq = int(ledger.get("_event_seq", 0) or 0) + 1
+    ledger["_event_seq"] = seq
+    return seq
+
+
+def evidence_newer_than_finding(node: HypothesisNode) -> bool:
+    """Whether expert evidence arrived after the latest formal verdict.
+
+    Round numbers alone cannot order concurrent tool completions.  Commit
+    sequences break the tie; legacy same-round/missing-sequence nodes are
+    treated conservatively as unclosed (bounded recovery, never a hard lock).
+    """
+    evidence_round = node.get("_last_evidence_round", 0) or 0
+    finding_round = node.get("_last_finding_round", 0) or 0
+    if evidence_round != finding_round:
+        return evidence_round > finding_round
+    evidence_seq = node.get("_last_evidence_event_seq")
+    finding_seq = node.get("_last_finding_event_seq")
+    if evidence_seq is None or finding_seq is None:
+        return True
+    return evidence_seq > finding_seq
 
 # ── Quantified exit model (design document §6, v2.1) ──
 # 退出时机 = 继续验证的期望信息增益 < 成本，且当前把握足够。
@@ -600,7 +662,72 @@ def can_propose_root_hypotheses(ledger: DiagnosisLedger) -> bool:
     return True
 
 
-def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
+def _normalized_root_statement(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def review_alternative_root_candidate(
+        ledger: DiagnosisLedger, statement: str) -> dict:
+    """Read-only candidate lookup/eligibility derivation for renderers."""
+    statement = str(statement or "").strip()
+    normalized = _normalized_root_statement(statement)
+    if not normalized:
+        return {"eligible": False, "reason": "empty"}
+    for hid, node in (ledger.get("hypotheses") or {}).items():
+        if _normalized_root_statement(node.get("statement", "")) == normalized:
+            return {
+                "eligible": False, "reason": "existing",
+                "hypothesis_id": str(hid), "statement": statement,
+            }
+    for candidate in ledger.get("_alternative_root_candidates", []):
+        if candidate["statement_key"] == normalized:
+            return dict(candidate)
+    if len(ledger.get("hypotheses") or {}) >= MAX_TOTAL_HYPOTHESES:
+        return {"eligible": False, "reason": "total_cap", "statement": statement}
+    if (ledger.get("_alternative_append_count", 0)
+            >= MAX_ALTERNATIVE_ROOT_APPENDS):
+        return {"eligible": False, "reason": "alternative_cap", "statement": statement}
+    return {"eligible": False, "reason": "unregistered", "statement": statement}
+
+
+def register_alternative_root_candidate(
+        ledger: DiagnosisLedger, statement: str, expert: str,
+        round_num: int) -> dict:
+    """Register an evidence-backed independent root for a bounded append.
+
+    Returns an instruction-facing descriptor.  Exact duplicates are routed to
+    the existing hypothesis/candidate; capacity/budget exhaustion returns an
+    ineligible descriptor so guidance never promises an impossible append.
+    """
+    statement = str(statement or "").strip()
+    normalized = _normalized_root_statement(statement)
+    review = review_alternative_root_candidate(ledger, statement)
+    if review.get("reason") != "unregistered":
+        return review
+    seq = int(ledger.get("_alternative_root_seq", 0) or 0) + 1
+    ledger["_alternative_root_seq"] = seq
+    candidate = {
+        "candidate_id": f"ALT-{seq}",
+        "statement": statement,
+        "statement_key": normalized,
+        "expert": expert,
+        "round": round_num,
+        "eligible": True,
+    }
+    ledger.setdefault("_alternative_root_candidates", []).append(candidate)
+    return dict(candidate)
+
+
+def alternative_root_candidate(
+        ledger: DiagnosisLedger, candidate_id: str) -> dict | None:
+    for candidate in ledger.get("_alternative_root_candidates", []):
+        if candidate.get("candidate_id") == candidate_id:
+            return candidate
+    return None
+
+
+def can_append_hypothesis(
+        ledger: DiagnosisLedger, alternative_candidate_id: str = "") -> bool:
     """Check if ONE evidence-driven hypothesis may be appended to the
     current batch (design document §5 T10′, v3.10.0).
 
@@ -631,6 +758,13 @@ def can_append_hypothesis(ledger: DiagnosisLedger) -> bool:
         return False
     if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
         return False
+    if alternative_candidate_id:
+        return (
+            alternative_root_candidate(ledger, alternative_candidate_id)
+            is not None
+            and ledger.get("_alternative_append_count", 0)
+            < MAX_ALTERNATIVE_ROOT_APPENDS
+        )
     if ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS:
         return False
     if ledger.get("_root_propose_count", 0) >= MAX_ROOT_PROPOSE_BATCHES:
@@ -656,6 +790,7 @@ def _propose_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
 def add_hypotheses(
     ledger: DiagnosisLedger,
     hypothesis_specs: list[dict],
+    alternative_candidate_id: str = "",
 ) -> list[HypothesisNode]:
     """Add up to 3 ROOT hypotheses (v2.7 flat model). Returns created nodes.
 
@@ -716,7 +851,44 @@ def add_hypotheses(
     # joins the current batch WITHOUT consuming the batch budget (the
     # MAX_TOTAL_HYPOTHESES cap is the outer convergence bound).
     append_mode = False
-    if not can_propose_root_hypotheses(ledger):
+    alternative_mode = False
+    if alternative_candidate_id:
+        # Evidence-triggered exception (T10″): a structured expert return
+        # may discover an independent root AFTER another root is confirmed
+        # or the retry-batch budget is exhausted.  Only the registered
+        # candidate may use this path; total/append caps still bound it.
+        candidate = alternative_root_candidate(ledger, alternative_candidate_id)
+        if candidate is None:
+            raise ValueError(
+                f"独立根因候选 {alternative_candidate_id} 不存在或已处理，"
+                "请按最新系统指引操作，不要自行编造候选 ID。"
+            )
+        if len(hypothesis_specs) != 1:
+            raise ValueError("alternative-root 追加通道单次仅限 1 个独立根因假设。")
+        proposed_key = _normalized_root_statement(
+            hypothesis_specs[0].get("statement", ""))
+        candidate_key = candidate["statement_key"]
+        if (not proposed_key
+                or (proposed_key not in candidate_key
+                    and candidate_key not in proposed_key)):
+            raise ValueError(
+                "alternative_candidate_id 与 statement 不匹配：追加内容必须"
+                "对应该独立根因候选，不得借 ALT 例外提交无关假设。"
+            )
+        if len(hypotheses) >= MAX_TOTAL_HYPOTHESES:
+            raise ValueError(
+                f"假设总数已达上限 {MAX_TOTAL_HYPOTHESES} 个，不可追加。"
+                "请保留该成因为观测级证据，或用 record_finding 处理已有假设。"
+            )
+        if (ledger.get("_alternative_append_count", 0)
+                >= MAX_ALTERNATIVE_ROOT_APPENDS):
+            raise ValueError(
+                f"独立根因追加预算已用尽（{MAX_ALTERNATIVE_ROOT_APPENDS} 次），"
+                "请将剩余成因保留为观测级/待验证证据，不要合并进其他假设。"
+            )
+        append_mode = True
+        alternative_mode = True
+    elif not can_propose_root_hypotheses(ledger):
         if (ledger.get("_propose_count", 0) >= MAX_PROPOSE_CALLS
                 or ledger.get("_root_propose_count", 0)
                 >= MAX_ROOT_PROPOSE_BATCHES):
@@ -757,9 +929,17 @@ def add_hypotheses(
             )
 
     if append_mode:
-        # T10′ append: consume NO batch budget; the appended hypothesis
-        # JOINS the current batch (root_hypothesis_ids extended below).
+        # T10′/T10″ append: consume NO retry-batch budget; the appended
+        # hypothesis JOINS the current batch.  Alternative candidates are
+        # single-use and have their own small budget.
         ledger["_append_count"] = ledger.get("_append_count", 0) + 1
+        if alternative_mode:
+            ledger["_alternative_append_count"] = (
+                ledger.get("_alternative_append_count", 0) + 1)
+            ledger["_alternative_root_candidates"] = [
+                c for c in ledger.get("_alternative_root_candidates", [])
+                if c.get("candidate_id") != alternative_candidate_id
+            ]
     else:
         ledger["_root_propose_count"] = ledger.get("_root_propose_count", 0) + 1
 
@@ -1014,6 +1194,7 @@ def record_finding(
     # _g17_blocked_round is cleared (the G17 recovery path is resolved).
     # These feed compute_next_action's "awaiting verdict" detection.
     node["_last_finding_round"] = ledger.get("current_round", 0)
+    node["_last_finding_event_seq"] = next_commit_sequence(ledger)
     node["_g17_blocked_round"] = None
 
     if new_insights:
@@ -1045,6 +1226,15 @@ def add_evidence_to_active(
     if structured is not None:
         _ev["structured"] = structured
     node["evidence"].append(_ev)
+    if structured is not None:
+        # Candidate registration belongs to the evidence-commit event, not
+        # to renderers.  This keeps every later guidance path read-only.
+        if (structured.get("verdict_target") == "alternative_root_cause"
+                and str(structured.get("root_cause") or "").strip()):
+            register_alternative_root_candidate(
+                ledger, str(structured["root_cause"]), source,
+                ledger.get("current_round", 0),
+            )
     if tool_name and tool_name not in node["verification_tools"]:
         node["verification_tools"].append(tool_name)
 
@@ -1201,6 +1391,102 @@ def _required_argus(ledger: DiagnosisLedger) -> set[str]:
     return {"host-argus-expert", "k8s-argus-expert"}
 
 
+def _valid_delegation_artifacts(ledger: DiagnosisLedger, delegation: str) -> list[dict]:
+    """Valid raw artifacts linked to one delegation (minimum evidence contract)."""
+    if not delegation:
+        return []
+    out = []
+    for info in (ledger.get("tool_results") or {}).values():
+        refs = info.get("delegation_refs")
+        if refs is None:
+            refs = ([{"delegation": info.get("delegation")}]
+                    if info.get("delegation") else [])
+        if not any(ref.get("delegation") == delegation for ref in refs):
+            continue
+        if (info.get("actor") == "expert"
+                and not info.get("is_failure")
+                and not info.get("is_empty")
+                and info.get("path")
+                and (info.get("chars", 0) > 0 or info.get("preview"))):
+            out.append(info)
+    return out
+
+
+def argus_view_states(ledger: DiagnosisLedger) -> dict[str, dict]:
+    """Derive per-required-view coverage from delegation + artifact provenance.
+
+    ``success`` means a valid expert conclusion returned.  ``degraded`` means
+    the conclusion failed but valid raw evidence exists; it is NEVER written
+    into ``delegated_experts`` and is disclosed separately.  No-data failure
+    stays ``failed`` and cannot satisfy coverage.  Legacy rounds without the
+    new provenance fields retain their historical success semantics.
+    """
+    required = (
+        {"serverless-argus-expert", "kmc-argus-expert",
+         "sci-argus-expert", "host-argus-expert"}
+        if _is_serverless_topology(ledger) else _required_argus(ledger)
+    )
+    states = {
+        expert: {"status": "pending", "attempts": 0,
+                 "has_raw_evidence": False, "degraded": False}
+        for expert in required
+    }
+    for rd in ledger.get("rounds", []):
+        if "task" not in (rd.get("tools_called") or []):
+            continue
+        if "delegation_expert" not in rd:
+            # Backward compatibility for old ledgers/fixtures: a successful
+            # delegated_experts entry was already the coverage contract then.
+            for expert in rd.get("delegated_experts") or []:
+                if expert in states:
+                    states[expert]["status"] = "success"
+                    states[expert]["succeeded"] = True
+                    states[expert]["attempts"] += 1
+            continue
+        expert = rd.get("delegation_expert") or ""
+        if expert not in states:
+            continue
+        state = states[expert]
+        state["attempts"] += 1
+        artifacts = _valid_delegation_artifacts(
+            ledger, rd.get("delegation") or "")
+        if artifacts:
+            state["has_raw_evidence"] = True
+            state["artifact_count"] = state.get("artifact_count", 0) + len(artifacts)
+        if rd.get("delegation_failed"):
+            state["failed"] = True
+        else:
+            state["succeeded"] = True
+    for state in states.values():
+        if state.get("succeeded"):
+            state["status"] = "success"
+        elif state.get("has_raw_evidence"):
+            state["status"] = "degraded"
+            state["degraded"] = True
+        elif state.get("failed"):
+            state["status"] = "failed"
+        else:
+            state["status"] = "pending"
+    return states
+
+
+def render_argus_coverage_disclosure(ledger: DiagnosisLedger) -> str:
+    """Disclose degraded (raw-data-only) coverage without calling it success."""
+    degraded = [
+        expert for expert, state in argus_view_states(ledger).items()
+        if state.get("status") == "degraded"
+    ]
+    if not degraded:
+        return ""
+    return (
+        "\n\n---\n\n## 覆盖降级（系统披露）\n"
+        "> 以下视角已有有效原始数据落盘，但专家总结未成功返回："
+        + "、".join(sorted(degraded))
+        + "。这些视角按降级覆盖继续诊断，未计为成功委派；"
+        "相关结论仅基于已采集原始数据，未包含完整专家分析。"
+    )
+
+
 def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     """UNDERSTAND→HYPOTHESIZE gate (T1): required Argus data collected.
 
@@ -1222,12 +1508,10 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     # flow continues with domain experts collecting evidence.
     if ledger.get("_argus_unavailable"):
         return True
-    experts_delegated: set[str] = set()
-    has_delegated = False
-    for rd in ledger.get("rounds", []):
-        experts_delegated.update(rd.get("delegated_experts") or [])
-        if "task" in rd.get("tools_called", []):
-            has_delegated = True
+    has_delegated = any(
+        "task" in (rd.get("tools_called") or [])
+        for rd in ledger.get("rounds", [])
+    )
     if not has_delegated:
         # Data-free grace — restricted to scenarios with NO resolved
         # Argus target.  When the entity resolved (Argus data IS
@@ -1247,10 +1531,11 @@ def _coverage_ready(ledger: DiagnosisLedger) -> bool:
     # topology failure (_topology_unavailable) degrade to argus-only.
     if _is_serverless_topology(ledger):
         return _serverless_coverage_ready(ledger)
-    if ledger.get("entity_type", "") == "host":
-        return "host-argus-expert" in experts_delegated
-    return ("host-argus-expert" in experts_delegated
-            and "k8s-argus-expert" in experts_delegated)
+    states = argus_view_states(ledger)
+    return all(
+        state.get("status") in ("success", "degraded")
+        for state in states.values()
+    )
 
 
 def _serverless_coverage_ready(ledger: DiagnosisLedger) -> bool:
@@ -1266,14 +1551,11 @@ def _serverless_coverage_ready(ledger: DiagnosisLedger) -> bool:
     """
     if not ledger.get("_topology_unavailable") and not ledger.get("topology"):
         return False  # topology still pending — keep UNDERSTAND collecting
-    experts_delegated: set[str] = set()
-    for rd in ledger.get("rounds", []):
-        experts_delegated.update(rd.get("delegated_experts") or [])
-    required = {
-        "serverless-argus-expert", "kmc-argus-expert",
-        "sci-argus-expert", "host-argus-expert",
-    }
-    return required.issubset(experts_delegated)
+    states = argus_view_states(ledger)
+    return all(
+        state.get("status") in ("success", "degraded")
+        for state in states.values()
+    )
 
 
 def finalize_pending_for_report(ledger: DiagnosisLedger) -> bool:
@@ -1526,8 +1808,9 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             )
         lines.append("")
 
-    # Root causes (multi-root support)
-    root_causes: list[str] = ledger.get("root_causes", [])
+    # Root causes (multi-root support): derived from the hypothesis tree so
+    # automatic confirmations cannot leave the context stale.
+    root_causes = [node["statement"] for _hid, node in confirmed_root_nodes(ledger)]
     if root_causes:
         if len(root_causes) == 1:
             lines.append(f"## 根因: {root_causes[0]}")
@@ -2327,7 +2610,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # exit was already ruled out by derive_phase (evaluate reached),
         # so exactly one of select/refine/backtrack/retry applies.
         pending_hint = ""
-        root_cause_hyp_ids = ledger.get("root_cause_hypothesis_ids", [])
+        root_cause_hyp_ids = [hid for hid, _n in confirmed_root_nodes(ledger)]
         # Scan ALL hypotheses (not just the current batch): a revived
         # prior-batch hypothesis is undecided too and must appear here
         # (v2.8.4 — the exit model scans tree-wide, the hint must agree).
@@ -2467,13 +2750,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
             + _retry_option
             + _append_option +
-            "- 多根因场景：证据支持的假设即使非主根因也应标记为 confirmed（次要根因/加剧因素），"
-            "refuted 仅用于证据明确证伪的假设。多个假设可同为 confirmed。\n"
-            "- ⚠ 独立故障源识别：当证据显示多个独立故障源同时存在"
-            "（如多个进程/配置异常各自被观测到），即使某故障源非主症状的"
-            "直接因果原因，也应作为独立根因 confirmed 或在报告中明确列为"
-            "次要根因——不得仅因『非主症状直接原因』而 refuted 一个客观"
-            "存在的独立故障（refuted 仅用于因果链被证据明确证伪）。\n"
+            "- 根因与角色：只有证据支持且满足反事实判据（移除该因素后故障"
+            "不再发生或显著缓解）才列为独立根因；仅放大影响的因素列为促成/"
+            "加剧因素，下游表现列为症状与影响。confirmed 只表示验证状态，"
+            "不自动证明因果角色；refuted 仅用于证据明确证伪。\n"
+            "- ⚠ 独立故障源识别：多个进程/配置异常各自被观测到且相互独立时，"
+            "应分别建假设、验证和登记；不得用 statement_update 把新独立机制"
+            "并入已有假设，也不得仅因『非主症状直接原因』而 refuted 客观存在"
+            "的独立故障。仅属促成因素时不得改写成独立根因。\n"
             "- ⚠ 概率判断原则：若核心因果关系已由证据确认"
             "（如「异常进程占满资源→服务响应超时」），"
             "仅次要细节未知（如触发者、启动源），"
@@ -2490,7 +2774,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + parallel_hint
         )
     if phase == "report":
-        n_causes = len(ledger.get("root_causes", []))
+        n_causes = len(confirmed_root_nodes(ledger))
         summary_req = spec.get("summary", "")
         multi_hint = (
             f"\n- 已确认 {n_causes} 个根因，报告中需分别列出每个根因的证据链和修复建议"
@@ -2566,6 +2850,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
 
 def ledger_to_json(ledger: DiagnosisLedger) -> str:
     """Serialize ledger to JSON string."""
+    sync_confirmed_roots(ledger)
     return json.dumps(ledger, ensure_ascii=False, indent=2, default=str)
 
 
@@ -2587,6 +2872,10 @@ def record_round(
     _seq: int = 0,
     delegated_experts: list[str] | None = None,
     delegated_for: str | None = None,
+    delegation: str = "",
+    delegation_expert: str = "",
+    delegation_failed: bool = False,
+    tool_call_id: str = "",
 ) -> None:
     """Record a tool call within the current diagnosis round.
 
@@ -2614,6 +2903,13 @@ def record_round(
         entry["delegated_experts"] = delegated_experts
     if delegated_for:
         entry["delegated_for"] = delegated_for
+    if delegation:
+        entry["delegation"] = delegation
+    if delegation_expert:
+        entry["delegation_expert"] = delegation_expert
+        entry["delegation_failed"] = bool(delegation_failed)
+    if tool_call_id:
+        entry["tool_call_id"] = tool_call_id
     if key_findings_full:
         # Untruncated expert return (design document §9): signal
         # detectors (argus conflict / param-clarification) must read the
@@ -2756,6 +3052,36 @@ def delegation_value_for(
     )
 
 
+MAX_F1_ARBITRATIONS = 1
+"""Actual deep-arbitration delegations allowed per F1-conflicted hypothesis."""
+
+
+def f1_arbitration_available(
+        ledger: DiagnosisLedger, hid: str, expert: str = "") -> bool:
+    """Whether a bounded, executable F1 arbitration action remains.
+
+    The raw EIG/c value is intentionally unchanged.  Availability depends on
+    an unresolved conflict, a deep candidate and actual dispatch budget;
+    failed/timeout delegations consume that budget just like successful ones.
+    """
+    if _argus_conflict_signal(ledger, hid) is None:
+        return False
+    node = (ledger.get("hypotheses") or {}).get(hid) or {}
+    if node.get("_f1_arbitration_attempts", 0) >= MAX_F1_ARBITRATIONS:
+        return False
+    candidates = [
+        e for e in _parallel_candidates(ledger, hid, node)
+        if not e.endswith("-argus-expert")
+    ]
+    if expert:
+        if expert.endswith("-argus-expert"):
+            return False
+        # A concrete task already proves the expert is assembled.  When a
+        # scene directory is present, still require an uncovered candidate.
+        return not candidates or expert in candidates
+    return bool(candidates)
+
+
 def _economically_dead(ledger: DiagnosisLedger, hid: str) -> bool:
     """软终态（v2.9）：未决但验证增益已低于成本（best-case delegation value < κ）。
 
@@ -2792,7 +3118,7 @@ def _economically_dead(ledger: DiagnosisLedger, hid: str) -> bool:
     # hypothesis stays alive for deep delegation; once a deep expert
     # returns, evidence is no longer all-argus, the conflict clears and
     # the economic model resumes normally (self-healing).
-    if _argus_conflict_signal(ledger, hid) is not None:
+    if f1_arbitration_available(ledger, hid):
         return False
     return delegation_value_for(ledger, hid) < KAPPA_STOP
 
@@ -2823,9 +3149,16 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
         if node.get("status") == "pending" and node.get("probability", 0) <= 15:
             continue
         v = delegation_value_for(ledger, hid)
+        f1_action = f1_arbitration_available(ledger, hid)
+        if f1_action:
+            # Policy lower bound for an explicit arbitration action, not a
+            # fabricated EIG/c measurement.  Exhaustion restores raw value.
+            v = max(v, KAPPA_STOP)
         if v > best_v:
             best_v = v
             best_d = (
+                f"F1 冲突仲裁（剩余 {MAX_F1_ARBITRATIONS} 次预算内委派）"
+                if f1_action else
                 f"委派验证 {fmt_hid(hid)} (p={node.get('probability')}%, "
                 f"已委派{node.get('_delegate_count', 0)}次/"
                 f"inconclusive {node.get('_inconclusive_count', 0)}次)"
@@ -2882,10 +3215,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     # E2/E2′ stay batch-scoped internally (exhaustion of the CURRENT
     # direction); their `not confirmed_ids` precondition now correctly
     # suppresses them whenever any confirmation exists tree-wide.
-    confirmed_ids = [
-        hid for hid, node in hypotheses.items()
-        if is_confirmed_root(node)
-    ]
+    confirmed_ids = [hid for hid, _node in confirmed_root_nodes(ledger)]
 
     # ── E2 exhaustion (fast lane): all roots refuted, budget spent ──
     if root_ids and not confirmed_ids:
@@ -2920,7 +3250,7 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
             if survivors and all(
                     node.get("status") in ("pending", "inconclusive")
                     and not node.get("deferred")
-                    and delegation_value_for(ledger, hid) < KAPPA_STOP
+                    and _economically_dead(ledger, hid)
                     for hid, node in survivors):
                 return True, (
                     f"假设穷尽: {MAX_ROOT_PROPOSE_BATCHES} 批假设预算用尽，"
@@ -3077,9 +3407,7 @@ def unrecorded_evidence_hypotheses(
             str(e.get("source", "")).startswith("expert:")
             for e in node.get("evidence", [])
         )
-        if (has_expert
-                and node.get("_last_evidence_round", 0)
-                > node.get("_last_finding_round", 0)):
+        if has_expert and evidence_newer_than_finding(node):
             out.append((hid, node))
     return out
 
@@ -3474,6 +3802,19 @@ def _argus_conflict_signal(ledger: DiagnosisLedger, hid: str) -> str | None:
     return None
 
 
+def _iter_g21_terminal_evidence(node: HypothesisNode):
+    """Deep-expert terminal returns only (Argus stays in F1/G20, not G21)."""
+    for ev in node.get("evidence", []):
+        source = str(ev.get("source", ""))
+        if not source.startswith("expert:"):
+            continue
+        expert = source[len("expert:"):].split(":", 1)[0]
+        if expert.endswith("-argus-expert"):
+            continue
+        if (ev.get("structured") or {}).get("verdict") in ("confirmed", "refuted"):
+            yield ev
+
+
 def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
                             new_verdict: str) -> dict | None:
     """Detect a terminal expert-verdict conflict on hypothesis *hid*
@@ -3494,10 +3835,8 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
     if new_verdict not in ("confirmed", "refuted"):
         return None
     node = ledger.get("hypotheses", {}).get(hid) or {}
-    for ev in reversed(node.get("evidence", [])):
+    for ev in reversed(list(_iter_g21_terminal_evidence(node))):
         source = str(ev.get("source", ""))
-        if not source.startswith("expert:"):
-            continue
         structured = ev.get("structured") or {}
         prev = structured.get("verdict")
         if prev in ("confirmed", "refuted") and prev != new_verdict:
@@ -3797,7 +4136,7 @@ def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
     # Priority 1: expert evidence exists but hasn't been formalized via
     # record_finding (ev_round > find_round).  This is the "awaiting
     # verdict" state — the LLM owes a record_finding call.
-    if has_expert and ev_round > find_round:
+    if has_expert and evidence_newer_than_finding(node):
         stall = cur_round - ev_round
         if g17_round and g17_round < ev_round:
             # G17 previously blocked confirmed, then the expert was
@@ -3976,7 +4315,7 @@ def compute_report_guidance(ledger: DiagnosisLedger) -> str | None:
             "报告证据链须如实引用这些证据（不得遗漏）；"
             "写盘时系统将自动注入「已采集未落账证据」附录。"
         )
-    has_confirmed = bool(ledger.get("root_cause_hypothesis_ids"))
+    has_confirmed = bool(confirmed_root_nodes(ledger))
     if not has_confirmed:
         parts.append(
             "⚠ 本次退出为无确认根因——报告正文不得声称"
@@ -4156,21 +4495,35 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                     "",
                 )
                 if _alt_rc:
+                    _alt = review_alternative_root_candidate(ledger, _alt_rc)
+                    if _alt.get("eligible"):
+                        _alt_action = (
+                            "② propose_hypotheses 追加 1 个独立假设并传 "
+                            f"alternative_candidate_id={_alt['candidate_id']}，"
+                            "追加后定向验证并 record_finding 落账"
+                        )
+                    elif _alt.get("reason") == "existing":
+                        _alt_action = (
+                            f"② 该表述已有假设 {fmt_hid(_alt['hypothesis_id'])}，"
+                            "请直接对该假设验证/落账，不要重复提出"
+                        )
+                    else:
+                        _alt_action = (
+                            "② 有界追加通道不可用，请将该成因保留为观测级/待验证"
+                            "证据，不要合并进其他假设或伪造已确认根因"
+                        )
                     directive = (
-                        f"⚠ {fmt_hid(active_id)} 的验证专家证伪了该假设并另"
-                        f"确证根因：「{_alt_rc[:120]}」。正确动作序列："
-                        f"① record_finding({fmt_hid(active_id)}, refuted) "
-                        f"排除当前假设（专家已自报结论对象为他因，冲突门控"
-                        f"不会拦截）；② propose_hypotheses 追加 1 个假设"
-                        f"收录该根因（追加假设通道，不占换批预算）——证据"
-                        f"已在手，追加后即可 record_finding confirmed 落账，"
-                        f"落账成功（p≥80）后 write_file 通道自动开放。"
+                        f"⚠ {fmt_hid(active_id)} 的验证专家另指出了独立根因："
+                        f"「{_alt_rc[:120]}」。verdict 与 verdict_target 正交："
+                        f"① 先按专家对 {fmt_hid(active_id)} 的实际 verdict 落账"
+                        "（不要固定写 refuted）；"
+                        f"{_alt_action}。statement_update 只能精化原机制，"
+                        "不得把该独立根因合并进原假设。"
                     )
                 _terminal_vs = {
                     (e.get("structured") or {}).get("verdict")
-                    for e in node.get("evidence", [])
-                    if str(e.get("source", "")).startswith("expert:")
-                    and (e.get("structured") or {}).get("verdict_target")
+                    for e in _iter_g21_terminal_evidence(node)
+                    if (e.get("structured") or {}).get("verdict_target")
                     != "alternative_root_cause"
                 }
                 if not _alt_rc and {"confirmed", "refuted"} <= _terminal_vs:
@@ -4224,7 +4577,8 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
             _deep_candidates = [
                 e for e in _parallel_candidates(ledger, active_id, node)
                 if not e.endswith("-argus-expert")
-                and delegation_value_for(ledger, active_id, e) >= KAPPA_STOP
+                and (delegation_value_for(ledger, active_id, e) >= KAPPA_STOP
+                     or f1_arbitration_available(ledger, active_id, e))
             ]
             _deep_names = _format_expert_names(_deep_candidates[:3])
             if _deep_names:

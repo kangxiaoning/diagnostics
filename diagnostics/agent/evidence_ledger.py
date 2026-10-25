@@ -282,6 +282,8 @@ def build_artifact_entry(
         "is_metric": is_metric_tool(tool),
         "hypothesis_id": hypothesis_id or "",
         "delegation": delegation or "",
+        "delegation_refs": ([{"delegation": delegation, "round": round_no}]
+                            if delegation else []),
         "target": extract_target(args),
         "is_failure": bool(is_failure),
         "is_empty": is_empty_result(content),
@@ -291,6 +293,17 @@ def build_artifact_entry(
     if not dedup_hit and len(content) >= DIGEST_MIN_CONTENT:
         entry["digest"] = artifact_digest(content)
     return entry
+
+
+def _merge_delegation_refs(prev: dict, entry: dict) -> list[dict]:
+    """Union artifact consumers without losing the original delegation."""
+    refs: dict[str, dict] = {}
+    for ref in (prev.get("delegation_refs") or []) + (entry.get("delegation_refs") or []):
+        delegation = str(ref.get("delegation") or "")
+        if delegation:
+            refs[delegation] = {"delegation": delegation,
+                                "round": ref.get("round", 0)}
+    return list(refs.values())
 
 
 def record_artifact(ledger: dict, cache_key: str, entry: dict) -> dict:
@@ -311,6 +324,7 @@ def record_artifact(ledger: dict, cache_key: str, entry: dict) -> dict:
     if entry.get("dedup_hit"):
         merged["dedup_hits"] = int(prev.get("dedup_hits", 0)) + 1
         merged["last_seen_round"] = entry.get("round", prev.get("round", 0))
+        merged["delegation_refs"] = _merge_delegation_refs(prev, entry)
         bucket[cache_key] = merged
         return merged
 
@@ -319,6 +333,7 @@ def record_artifact(ledger: dict, cache_key: str, entry: dict) -> dict:
     merged["round"] = prev.get("round", entry.get("round", 0))
     merged["actor"] = prev.get("actor") or entry.get("actor") or ""
     merged["dedup_hits"] = int(prev.get("dedup_hits", 0))
+    merged["delegation_refs"] = _merge_delegation_refs(prev, entry)
     bucket[cache_key] = merged
     return merged
 
@@ -465,9 +480,10 @@ def _hypothesis_groups(ledger: dict) -> list[tuple[str, dict]]:
     hypotheses = ledger.get("hypotheses", {}) or {}
     ordered: list[tuple[str, dict]] = []
     seen: set[str] = set()
-    for hid in ledger.get("root_cause_hypothesis_ids", []) or []:
-        node = hypotheses.get(str(hid))
-        if node is not None and str(hid) not in seen:
+    from diagnostics.agent.ledger import confirmed_root_nodes  # local: avoid import cycle
+
+    for hid, node in confirmed_root_nodes(ledger):
+        if str(hid) not in seen:
             ordered.append((str(hid), node))
             seen.add(str(hid))
     for hid, node in hypotheses.items():
@@ -488,10 +504,15 @@ def _hypothesis_groups(ledger: dict) -> list[tuple[str, dict]]:
 def _pack_block(hid: str, node: dict, arts: list[tuple[str, dict]],
                 metric_count: int = 0) -> list[str]:
     """Evidence block for one hypothesis (verbatim excerpts)."""
-    from diagnostics.agent.ledger import fmt_hid  # local: avoid import cycle
+    from diagnostics.agent.ledger import fmt_hid, is_confirmed_root  # local: avoid import cycle
 
     status = node.get("status", "")
-    mark = "根因" if status == "confirmed" else "已排除"
+    if is_confirmed_root(node):
+        mark = "根因"
+    elif status == "confirmed":
+        mark = "已确认假设（未达根因阈值）"
+    else:
+        mark = "已排除"
     lines = [
         f"### {fmt_hid(hid)} {node.get('statement', '')}"
         f"（{mark}，置信度 {node.get('probability')}%）"
