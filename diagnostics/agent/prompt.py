@@ -42,6 +42,23 @@ PHASE_SPEC: dict[str, dict] = {
                 "均属同一因果链，应合并为一条（深层机制/具体落点作为 statement 细化，不并列），"
                 "报告时再区分根因、促成因素与症状；"
                 "仅当证据显示相互独立的故障源并存时才拆成多条；statement_update 只精化原机制，独立故障源分别成条。"
+                # v3.50.0: two rules used to collide exactly here — "merge
+                # upstream/downstream" vs "independent mechanisms must be
+                # separate entries".  For a mutually-causal pair (disk full ↔
+                # memory leak) BOTH applied and there was no arbiter: measured
+                # 2026-10-26 scenario 28, round 2 — 10,014 chars oscillating
+                # between "memory leak → log flood → disk full" and "disk
+                # full → IO/swap pressure → OOM", zero tool calls, cut by the
+                # loop guard.  The arbiter is FORM-based (description level),
+                # never severity-based: merge only when both texts name the
+                # SAME mechanism at different granularity; mutually-causal
+                # distinct mechanisms become competing hypotheses and the
+                # evidence decides the direction in VERIFY.
+                "两段表述若指向**同一机制的不同描述层级**（现象 / 机制 / 具体落点），"
+                "合并为一条；若两个机制**互为因果且无法判定执行链的初始触发端**"
+                "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
+                "它们属于竞争性假设——分别成条、各自给 probability，"
+                "由验证阶段的证据裁决方向，不要在本阶段自行裁决。"
                 "假设是基于监控筛查证据的竞争性候选——是待验证的猜测、非已确认结论，"
                 "probability 即表达不确定性；提出只是记录候选、非断定根因。"
                 "凡需深查或确证的方向，直接写成假设提出即完成本阶段职责，"
@@ -55,9 +72,16 @@ PHASE_SPEC: dict[str, dict] = {
             # characters, emitted no content and no tool call, and hit the
             # 480 s ceiling (ollama logged "context canceled").  This rule gives
             # the check a stopping condition, stated as the first action.
-            "⚖ 重叠判断只做一次：只看两条 statement 的故障机制是否同一；"
-            "判断完直接提交当前假设列表；"
-            "难以判断时按「不合并」处理（多提一条更安全，验证阶段自会剔除）",
+            # v3.50.0: the stopping condition now covers the CAUSAL DIRECTION
+            # question too, not just overlap.  The 2026-08 loop this rule was
+            # written for was overlap-driven; the 2026-10-26 scenario-28 loop
+            # was direction-driven ("which end is the initial trigger"), and
+            # the old wording left it unbounded.  Fallback stays "separate
+            # entries" — a redundant hypothesis is cheaper than a lost
+            # independent failure path.
+            "⚖ 重叠/因果方向判断只做一次：只看两条 statement 的故障机制是否同一、"
+            "以及两个机制是否互为因果；判断完直接提交当前假设列表；"
+            "难以判断时按「分别成条」处理（多提一条更安全，验证阶段自会剔除）",
             "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
             "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）；"
@@ -396,6 +420,8 @@ HYPOTHESIZE:
   (字段契约：每条假设必须含 statement/probability/rationale，statement 必填——缺失会导致调用失败)
   (同源合并：上例 H1"内存超限"与"容器 memory limit 配置过低"若证据互为表里，应合并为一条 statement，
    而非拆成两条——同一条根因的两个方面，不是独立故障源)
+  (互为因果的**独立**机制（如"磁盘写满↔内存泄漏"）相反：分别成条、各给 probability，
+   方向由 VERIFY 的证据裁决——不要在本阶段先选定一端)
   (系统自动聚焦 H1 进入 VERIFY)
 
 VERIFY (聚焦 H1, 委派当前场景领域专家):

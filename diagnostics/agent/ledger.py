@@ -2436,9 +2436,17 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "（失败不消耗提出预算，修正后重新提交即可）；"
             "若该假设对应已观察且不能由其他假设解释的独立异常/独立故障源，"
             "请加 independent_anomaly=true，低概率也不会被系统按噪声跳过\n"
-            "- ⚠ 同源合并：若多个候选描述的是同一故障的机制/因果链上下游"
-            "（如\"内存超限 OOMKilled\"与\"memory limit 配置过低\"互为表里），"
-            "应合并为一条假设；仅当证据显示独立故障源并存时才提出多条\n"
+            "- ⚠ 同源合并：若多个候选描述的是同一机制的不同描述层级"
+            "（现象 / 机制 / 具体落点，如\"内存超限 OOMKilled\"与"
+            "\"memory limit 配置过低\"互为表里），应合并为一条假设；"
+            "仅当证据显示独立故障源并存时才提出多条\n"
+            # v3.50.0 (same arbiter as PHASE_SPEC.duty): mutually-causal
+            # mechanisms have no determinable initial trigger from screening
+            # data, so they are COMPETING hypotheses, not a merge candidate.
+            "- ⚖ 互为因果的裁决：两个机制若互为因果且无法判定执行链的初始触发端"
+            "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
+            "按竞争性假设分别成条、各自给 probability；"
+            "方向判断只做一次，难以判断时按「分别成条」处理\n"
             "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
             "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
             "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
