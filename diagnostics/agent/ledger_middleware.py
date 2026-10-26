@@ -108,6 +108,7 @@ from diagnostics import config as _config  # noqa: F401
 
 from diagnostics.agent.ledger import confirmatory_expert_evidence  # G17 确证层证据判据（v3.42.0）
 from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
+from diagnostics.agent.ledger import exit_block_is_actionable  # v3.48.0 退出阻塞判据（确定性谓词，不再匹配文案子串）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
 from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
 from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
@@ -654,6 +655,62 @@ evidence attribution and report findings — never as a successful delegation.
 """
 
 
+def _append_tool_result_note(result: Any, note: str) -> Any:
+    """Append a system note to a tool receipt (v3.48.0).
+
+    Discloses dropped hypothesis attributions.  The ledger already discards
+    declarations whose id does not exist (``parse_hid`` guard below), but the
+    RAW expert JSON was still delivered to the Coordinator verbatim — so it
+    read ``related_hypotheses: [{H1}, {H2}]`` while the hypothesis tree was
+    empty and went looking for data instead of proposing (2026-10-26 session
+    4edf7296 round 2).  Receipt text must agree with ledger state.
+    """
+    if not note:
+        return result
+    if isinstance(result, ToolMessage):
+        content = (result.content if isinstance(result.content, str)
+                   else str(result.content))
+        if note in content:
+            return result
+        return result.model_copy(update={"content": content + note})
+    return result
+
+
+_HYPHEN_TOKEN_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+")
+"""Hyphenated identifier shape (worker-4 / prod-web-01 / kmc-prod-01).
+
+Used only for observability: reasoning that cites identifiers ABSENT from
+the context is either hallucinated or cross-session bleed (2026-10-26
+session 4edf7296: 9,545 chars of round-2 reasoning quoted netem/stress-ng
+CPU drop numbers, etcd leader flips and "0.5 GiB available" — none of which
+existed anywhere in the 55 KB context).  Reported, never blocked.
+"""
+
+
+def _observe_context_foreign_entities(
+        reasoning: str, context_text: str, round_no: int, phase: str) -> list[str]:
+    """Log hyphenated identifiers that appear in reasoning but not context."""
+    if not reasoning:
+        return []
+    haystack = (context_text or "").lower()
+    counts: dict[str, int] = {}
+    for _m in _HYPHEN_TOKEN_RE.finditer(reasoning.lower()):
+        _tok = _m.group(0)
+        if len(_tok) < 5 or _tok in haystack:
+            continue
+        counts[_tok] = counts.get(_tok, 0) + 1
+    suspects = sorted(
+        (t for t, n in counts.items() if n >= 2),
+        key=lambda t: counts[t], reverse=True)
+    if suspects:
+        logger.warning(
+            "reasoning cites %d identifier(s) absent from context "
+            "(round=%d, phase=%s): %s",
+            len(suspects), round_no, phase, suspects[:8],
+        )
+    return suspects
+
+
 def _tool_execution_succeeded(result: Any) -> bool:
     """Check handler outcome, including errors nested in a Command.
 
@@ -954,14 +1011,18 @@ def _format_expert_summary(output: str, effect: str | None = None) -> str:
 
     verdict = data.get("verdict")
     if effect:
-        # Attributed entry: direction = declared effect (v3.45.5).
-        _mapped = {"supports": "confirmed",
-                   "refutes": "refuted"}.get(
-                       str(effect).strip().lower(), "inconclusive")
+        # v3.47.4: an attributed entry is a lead about ANOTHER hypothesis,
+        # never a verdict for this one.  Rendering it as
+        # "假设验证: confirmed/refuted" made the model treat incidental
+        # support as already confirmed (3 G17 blocks on 2026-10-26).
+        # Keep the direction visible, but label its provenance explicitly.
+        _effect_txt = {
+            "supports": "支持", "refutes": "不支持",
+        }.get(str(effect).strip().lower(), "方向不明")
         _origin = f"；专家对原假设的判定为 {verdict}" if verdict else ""
         lines.append(
-            f"假设验证: {_mapped}（按专家声明的相关度方向，"
-            f"不是对原假设的判定{_origin}）")
+            f"旁支方向声明: {_effect_txt}（按专家声明的相关度方向；"
+            f"该专家未被派来验证本假设，不是本假设的验证结论{_origin}）")
     elif verdict:
         lines.append(f"假设验证: {verdict}")
     for label, key in (
@@ -3335,6 +3396,28 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     self._model_attempts_total
                 self._current_ledger["model_success_rounds"] = \
                     self._model_success_rounds
+            # ── Reasoning-vs-context provenance (v3.48.0, observability) ──
+            # Reasoning may cite entities that exist nowhere in the context
+            # (hallucination or cross-session bleed).  Logged only — a
+            # behavioural gate here would need a model-specific threshold,
+            # which the project forbids.
+            try:
+                _reasoning_text = ""
+                for _rm in (response.result if isinstance(response.result, list)
+                            else [response.result]):
+                    _rk = getattr(_rm, "additional_kwargs", None) or {}
+                    _rv = _rk.get("reasoning_content") or _rk.get("reasoning")
+                    if isinstance(_rv, str):
+                        _reasoning_text += _rv
+                if _reasoning_text:
+                    _ctx_text = "\n".join(
+                        str(getattr(_cm, "content", "") or "")
+                        for _cm in (getattr(request, "messages", None) or []))
+                    _observe_context_foreign_entities(
+                        _reasoning_text, _ctx_text,
+                        self._model_call_count, _phase(ledger))
+            except Exception:
+                pass  # observability must never become a failure source
             # ── Per-round inference metrics ──
             import time as _time2
             _duration = round(_time2.monotonic() - self._inference_start, 1)
@@ -4804,6 +4887,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         tool_name = request.tool_call.get("name", "")
         tool_call_id = request.tool_call.get("id", "")
         tool_args = request.tool_call.get("args", {})
+        # v3.48.0: hypothesis ids cited by an expert receipt that do not
+        # exist in the ledger (collected below, disclosed at return).
+        _invalid_rel_ids: list[str] = []
 
         # ── Malformed file-tool call observability ──
         # The streaming layer cannot warn on empty args (they may arrive
@@ -4929,7 +5015,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     #   L3 deterministic defer — shelve the blocking hypothesis
                     #      so the exit condition is satisfied and REPORT
                     #      proceeds (same outcome as G9, just sooner & targeted).
-                    _is_e2 = ("可行动验证" in reason) or ("竞争性根因" in reason)
+                    # v3.48.0: ledger-derived predicate instead of a substring
+                    # test on the verdict wording — renaming the clause used
+                    # to silently turn release-with-disclosure into a block.
+                    _is_e2 = exit_block_is_actionable(ledger)
                     if _is_e2:
                         # v3.46.1: settle unrecorded evidence BEFORE the
                         # release-with-disclosure marks them deferred.
@@ -5912,6 +6001,32 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if tool_name == "task":
                     _structured_expert = _parse_expert_json(output)
                     if _structured_expert is not None:
+                        # v3.48.0: collect hypothesis ids the expert cited
+                        # that the ledger does not have.  The raw receipt is
+                        # delivered to the Coordinator verbatim, so leaving
+                        # them in place made it read attributions for an
+                        # EMPTY hypothesis tree (2026-10-26 session
+                        # 4edf7296 round 2: expert said H1/H2, tree was
+                        # empty, the model went reading files instead of
+                        # proposing).
+                        _rel_declared = (
+                            _structured_expert.get("related_hypotheses")
+                            if isinstance(_structured_expert, dict)
+                            else getattr(_structured_expert,
+                                         "related_hypotheses", None)
+                        ) or []
+                        for _rel_decl in _rel_declared:
+                            if isinstance(_rel_decl, dict):
+                                _decl_id = str(
+                                    _rel_decl.get("id") or "").strip()
+                            else:
+                                _decl_id = str(getattr(
+                                    _rel_decl, "id", "") or "").strip()
+                            if (_decl_id
+                                    and parse_hid(
+                                        _decl_id,
+                                        ledger.get("hypotheses", {})) is None):
+                                _invalid_rel_ids.append(_decl_id)
                         summary = _format_expert_summary(output)
                         # ── Alternative-root-cause receipt guidance
                         # (v3.23.0, A1, design document §9): the expert
@@ -6489,6 +6604,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             "duration_s": _tool_duration,
         })
 
+        # v3.48.0: receipt text must agree with ledger state.  The ledger
+        # already drops non-existent hypothesis ids, but the raw expert JSON
+        # reached the Coordinator unchanged — a receipt citing H1/H2 with an
+        # empty hypothesis tree is a contradiction the model then reasons
+        # about instead of acting.
+        if _invalid_rel_ids:
+            result = _append_tool_result_note(
+                result,
+                "\n\n[系统] 专家引用了不存在的假设 ID "
+                + "、".join(dict.fromkeys(_invalid_rel_ids))
+                + "（当前台账无此假设，该归属声明已忽略）。",
+            )
+            logger.warning(
+                "receipt cited non-existent hypothesis ids %s — attribution "
+                "dropped (tool=%s, round=%d)",
+                _invalid_rel_ids, tool_name, self._model_call_count,
+            )
+
         return result
 
     # ── Safety mechanisms: max-round, loop detection, stagnation fallback ──
@@ -6719,29 +6852,46 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "用户输入与已记录的正常基线调用 "
                                 "propose_hypotheses 提出假设。"
                             )
-                    elif round_num >= 3 and _phase(ledger) == "hypothesize":
-                        # Coverage gate already opened (phase derives to
-                        # hypothesize) but the LLM still hasn't proposed —
-                        # a genuine stagnation signal.  Round-2 exemption:
-                        # on the normal path the LLM proposes in its round-2
-                        # response, so a round-2 directive is always a
-                        # false positive.  When the gate has NOT opened yet
-                        # (still understand), the partial-coverage branch
-                        # above owns the corrective message instead — telling
-                        # the LLM to propose here would be rejected by the
-                        # phase tool gate.
-                        warnings.append(
-                            "⛔ [系统强制] 数据采集已完成，当前已是第"
-                            f"{round_num}轮，你仍未提出任何假设。\n"
-                            "禁止继续调用诊断工具。\n"
-                            "立即基于已有 Argus 数据调用 propose_hypotheses，"
-                            "否则诊断将提前终止。"
-                        )
+                    elif (_phase(ledger) == "hypothesize"
+                          and not ledger.get("hypotheses")):
+                        # v3.48.0: event-driven instead of round-number
+                        # driven.  The previous `round_num >= 3` guard
+                        # skipped round 2 on the assumption that the normal
+                        # path always proposes there; measured 2026-10-26
+                        # (session 4edf7296) the assumption failed — round 2
+                        # spent 75 s reading four offloaded tool results and
+                        # proposed nothing, so the correction arrived one
+                        # full round late.  The predicate is now the STATE
+                        # itself (phase owes a propose, hypothesis tree still
+                        # empty), so the first hypothesize turn is corrected
+                        # immediately.
+                        #
+                        # Wording is a positive recipe, not a prohibition
+                        # (design document §9): the read-only scaffolding is
+                        # hard-filtered in this phase, so "禁止继续调用诊断
+                        # 工具" would name an action the model cannot take
+                        # anyway — the remaining signal is WHAT to do.
+                        _nudges = int(ledger.get("_hypo_nudge_count", 0) or 0)
+                        if _nudges == 0:
+                            warnings.append(
+                                "【本阶段唯一动作】propose_hypotheses。"
+                                "证据已就绪（摘要见上方「已有工具调用结果」），"
+                                "本轮直接提出 1-3 条假设；证据不足用低概率"
+                                "表达，确证在提出之后自动进行。"
+                            )
+                        else:
+                            warnings.append(
+                                "【本阶段唯一动作】propose_hypotheses（第"
+                                f"{round_num} 轮仍未提出）。"
+                                "请基于已有摘要立即提出 1-3 条假设，证据不足"
+                                "用低概率表达；继续取证会推迟本次诊断。"
+                            )
+                        ledger["_hypo_nudge_count"] = _nudges + 1
+                        mutated = True
                         logger.warning(
-                            "Safety: hypothesize stagnation with data (round %d, "
-                            "no hypotheses) — forcing propose",
-                            round_num,
-                        )
+                            "Safety: hypothesize owes a propose (round %d, "
+                            "no hypotheses, nudge #%d) — naming the single "
+                            "action", round_num, _nudges + 1)
             else:
                 # No data collected.  _coverage_ready treats "never
                 # delegated" as ready (ledger.py), so at round>=2 the
@@ -8167,8 +8317,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             description=(
                 "记录假设验证结论（VERIFY 阶段验证后必须调用；EVALUATE 阶段亦可调用——"
                 "confirmed 强化、次要根因确认、statement_update 精化）。"
-                "verdict: confirmed(已证实——须以对应领域专家验证结论为依据（expert 证据），"
-                "仅有监控数据不足支撑 confirmed，无专家证据的 confirmed 将被系统拦截；"
+                "verdict: confirmed(已证实——须以针对本假设的直接专家验证结论为依据"
+                "（expert:<type> 且无 related_via）；旁支 supports 仅作补充，"
+                "需一次定向验证后再 confirmed；仅有监控数据不足支撑，"
+                "无直接专家证据的 confirmed 会被系统拦截；"
                 "以 argus 监控专家结论 confirmed 时，结论范围须限定于指标直接可观测的事实"
                 "——机制性断言（为何发生）须委派深度专家确证，或在报告中标注为推断；"
                 "可同时存在多个确认的根因/加剧因素)"

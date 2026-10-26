@@ -1835,7 +1835,16 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
     # executed tools, avoiding redundant re-execution across rounds.
     tool_results = ledger.get("tool_results", {})
     if tool_results:
-        lines.append("## 已有工具调用结果 (可通过 read_file/grep 查阅)  ←禁止重复调用")
+        # v3.48.0: the block used to end every row with a copy-paste
+        # `read_file(path="...")` recipe.  In a phase whose single legal
+        # action is propose_hypotheses that turned the ledger into 13
+        # competing action recipes (2026-10-26 session 4edf7296 round 2: the
+        # model read four of them and proposed nothing).  The summary line
+        # is the decision-grade form; the path stays for verification use,
+        # without presenting it as the next action.
+        lines.append(
+            "## 已有工具调用结果 (摘要；原文路径仅在需要核对时查阅)"
+            "  ←禁止重复调用")
         for cache_key, info in sorted(
             tool_results.items(), key=lambda x: x[1].get("round", 0)
         ):
@@ -1843,10 +1852,10 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
             preview = info.get("preview", "")[:80]
             path = info.get("path", "")
             fail = " ⚠失败" if info.get("is_failure") else ""
+            ref = f"原文: {path}" if path else "(未落盘)"
             lines.append(
                 f"- [{tool_name}] 第{info['round']}轮: {preview}... "
-                f"({info.get('lines', '?')}行) → `read_file(path=\"{path}\")`"
-                f"{fail}"
+                f"({info.get('lines', '?')}行) → {ref}{fail}"
             )
         lines.append("")
 
@@ -2130,7 +2139,24 @@ _PHASE_ALLOWLIST: dict[str, frozenset[str]] = {
 # 判断质量类护栏（G17/G22 等）永不入此表：模型必须看见工具才能理解
 # 职责，Verifier 语义要求"可尝试、系统校验"。
 _PHASE_HARD_FILTER: dict[str, frozenset[str]] = {
-    "hypothesize": frozenset({"task"}),
+    # v3.48.0: HYPOTHESIZE owes exactly ONE action, so the read-only
+    # scaffolding that used to be globally exempt is filtered here too.
+    # Measured 2026-10-26 (session 4edf7296, round 2): the phase guidance
+    # named only propose_hypotheses, yet the model still saw ten tools and
+    # spent 75 s reading four /tool_results files (the ledger's tool-result
+    # block carried 13 copy-paste `read_file(path=...)` recipes, while the
+    # "must call propose_hypotheses" line appeared twice).  Result:
+    # hypotheses=0 at the end of the round, corrected only one round later
+    # by the stagnation guard.  Insufficient evidence is expressed as a
+    # low-prior hypothesis (the phase contract already states this: "凡需
+    # 深查或确证的方向，直接写成假设提出即完成本阶段职责"), never by
+    # gathering more data inside this phase.  write_file stays exempt (its
+    # own exit-condition gate owns it) and edit_file joins the filter
+    # because nothing legitimate edits files while forming hypotheses.
+    "hypothesize": frozenset({
+        "task", "read_file", "ls", "grep", "glob", "write_todos",
+        "edit_file",
+    }),
 }
 
 # Human-facing rendering of the same allowlist — consumed by the
@@ -2467,11 +2493,31 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         #   state 2 (delegated, no expert evidence back): phase exit contract.
         #   state 3 (expert evidence back): harvest-nudge already covers it.
         _delegated = active.get("_delegate_count", 0) or 0
-        _has_expert_ev = any(
-            str(e.get("source", "")).startswith("expert:")
-            for e in active.get("evidence", [])
-        )
-        if _delegated == 0:
+        _expert_evs = [
+            e for e in active.get("evidence", [])
+            if str(e.get("source", "")).startswith("expert:")
+        ]
+        _direct_evs = [e for e in _expert_evs if not e.get("related_via")]
+        _incidental_evs = [e for e in _expert_evs if e.get("related_via")]
+        _has_direct_ev = bool(_direct_evs)
+        _has_incidental_ev = bool(_incidental_evs)
+        if _has_incidental_ev and not _has_direct_ev:
+            # v3.47.4: incidental support is a lead, not a verdict for THIS
+            # hypothesis.  State the distinction at the decision point; the
+            # previous branch said "据其方向正常落账即可", which directly
+            # invited the G17 blocks observed on 2026-10-26 (28/H2,H3 and
+            # 29/H3: all incidental-only at the moment of confirmed).
+            _rel_from = "、".join(sorted({
+                fmt_hid(e.get("related_via")) for e in _incidental_evs
+            }))
+            _record_hint = (
+                f"- ℹ 当前只有**旁支证据**（来自 {_rel_from} 的委派顺带归因）："
+                "它是方向线索，不能单独支撑 confirmed。\n"
+                "- confirmed 需要一次针对本假设的直接 task；"
+                "若现有证据已明确证伪，可直接判 refuted/inconclusive"
+                "（三要素齐备）。\n"
+            )
+        elif _delegated == 0:
             _record_hint = (
                 "- ⚠ 若现有监控证据已明确证伪该假设，可直接 record_finding 判"
                 " refuted/inconclusive（confirmed 须以专家验证结论为依据，"
@@ -2498,7 +2544,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "未经跨通道复核）——如需强化结论，可在落账前补第二通道"
                 "交叉验证\n"
             )
-        elif _has_expert_ev:
+        elif _has_direct_ev:
             # v3.38.3 (S1: decision-point guidance).  This branch used to be
             # SILENT, so the first thing to tell the model about G17-E2's
             # conflict check was the block itself (2026-09-11 session
@@ -2508,7 +2554,8 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             # motivated violation; a success criterion becomes the model's
             # own target).
             _record_hint = (
-                "- ⚠ 落账 confirmed 前自检：①证据来源须为 expert:<type>；"
+                "- ⚠ 落账 confirmed 前自检：①证据来源须为 expert:<type> "
+                "的直接条目（无 related_via，专家被派来验证本假设）；"
                 "②同一假设**无相互冲突的证据通道**（如 argus 指标与日志/事件"
                 "矛盾）——冲突未澄清时 confirmed 会被系统拦截\n"
             )
@@ -2526,9 +2573,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                     {fmt_hid(e.get("related_via")) for e in _rel_ev}
                 ))
                 _record_hint += (
-                    f"- ℹ 本假设含**旁支归因**证据（由 {_rel_from} 的委派结果"
-                    "顺带归因而来）：其方向以该证据的 effect 为准，不受来源假设"
-                    "的 verdict 影响——据其方向正常落账即可，无需回避\n"
+                    f"- ℹ 本假设另有**旁支归因**证据（由 {_rel_from} 的委派结果"
+                    "顺带归因而来）：其方向以该证据的 effect 为准，仅作补充，"
+                    "不替代针对本假设的直接验证\n"
                 )
         else:
             # v3.38.3 (S1).  State 2 = delegated but no expert conclusion has
@@ -2557,13 +2604,26 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             (h, n) for h, n in ledger.get("hypotheses", {}).items()
             if h != active_id and n.get("status") == "pending"
         ]
-        _others_pending = [fmt_hid(h) for h, _ in _others_pending_pairs]
+        _other_status: list[str] = []
+        for _h, _n in _others_pending_pairs:
+            _evs = [
+                e for e in _n.get("evidence", [])
+                if str(e.get("source", "")).startswith("expert:")
+            ]
+            _direct = any(not e.get("related_via") for e in _evs)
+            _incidental = any(e.get("related_via") for e in _evs)
+            _status = (
+                "直接验证可用" if _direct
+                else "旁支支持，需定向 task" if _incidental
+                else "无专家证据，需 task"
+            )
+            _other_status.append(f"{fmt_hid(_h)} {_status}")
         _attribution_hint = ""
-        if _others_pending:
+        if _other_status:
             _attribution_hint = (
-                "- ⚠ confirmed 使用针对本假设的直接委派结论；其他假设"
-                f"（{'、'.join(_others_pending)}）的旁支 supports 仅作补充，"
-                "仍需定向委派该假设的验证\n"
+                "- ⚠ confirmed 使用针对本假设的直接委派结论；其他未决假设"
+                f"（{'；'.join(_other_status)}）按其状态定向验证；"
+                "旁支 supports 仅作补充\n"
             )
         # v3.38.1: supply side of the v3.37.7 multi-hypothesis attribution.
         # The landing path has always been implemented (declared ids get their
@@ -2713,11 +2773,17 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         elif _directive:
             exit_banner = "\n## 退出条件诊断（系统计算，无需你判断）\n" + _directive + "\n"
         else:
+            # v3.48.0: field-style verdict (pilot for the single decision
+            # block).  Same state, one fact per line; the previous single
+            # clause chain mixed the action value, the blocking object and
+            # the residual-uncertainty reading, and the model quoted it
+            # verbatim while oscillating (2026-10-26 session 88db7745).
             exit_banner = (
-                f"\n- 出口判据当前未满足——{_exit_reason}，仍属 EVALUATE"
-                "（即使台账已列出「根因」）。\n"
-                "  判据满足后系统自动进入 REPORT 并提示写入报告；"
-                "当前请按下方路径菜单处理未决假设。"
+                "\n## 退出判据（系统计算，无需你判断）\n"
+                "- 结果: 未满足（台账出现「根因」不代表可以写报告）\n"
+                f"- 依据: {_exit_reason}\n"
+                "  判据满足后系统自动进入 REPORT；本轮下一步动作见下方"
+                "「唯一动作」一行，其后仅为本相位合法动作清单。\n"
             )
         # State-driven action recommendation (v3.10.2, P7): compute the
         # single most valuable next action from ledger state and inject
@@ -2727,7 +2793,17 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         _eval_hint = compute_evaluate_action(ledger)
         _eval_rec = ""
         if _eval_hint:
-            _eval_rec = f"- ⭐ 系统推荐：{_eval_hint.reason}\n"
+            # v3.48.0: name the tool AND its arguments.  Only ``reason`` used
+            # to be rendered, so a hint saying "（传 alternative_candidate_id）"
+            # never named propose_hypotheses — the model spent reasoning
+            # guessing which tool to call (2026-10-26 session 88db7745).
+            _hint_args = getattr(_eval_hint, "args", None) or {}
+            _hint_call = str(_eval_hint.action or "?")
+            if _hint_args:
+                _hint_call += "(" + ", ".join(
+                    f'{_k}="{_v}"' for _k, _v in _hint_args.items()) + ")"
+            _eval_rec = (
+                f"- ⭐ 唯一动作：{_hint_call}｜理由：{_eval_hint.reason}\n")
         # Pre-write report constraint (v3.10.2, P7 proactive): inject the
         # consistency constraint BEFORE the LLM calls write_file, not after.
         # Anthropic Context Engineering: "pre-generation constraint injection,
@@ -3193,9 +3269,13 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
         # fabricated EIG value; it prevents S2 from closing the report while
         # an evidence-backed independent root is still waiting for a decision.
         best_v = KAPPA_STOP
+        # v3.48.0: label the policy floor where the value is produced, so
+        # downstream renderers never present 0.150 as an estimate that
+        # merely brushes the 0.15 threshold; clip on a clause boundary.
         best_d = (
             f"追加独立根因候选 {_alt_candidate.get('candidate_id')}"
-            f"（{str(_alt_candidate.get('statement', ''))[:80]}）")
+            f"（策略下界 {KAPPA_STOP:.2f}；"
+            f"{_clip_sentence(_alt_candidate.get('statement', ''), 80)}）")
     if (ledger.get("root_hypothesis_ids") and can_propose_root_hypotheses(ledger)
             and not has_confirmed):
         v = 1.0 / COST_BATCH_PROPOSE  # fresh batch: U=1, D=1, F=1
@@ -3318,10 +3398,27 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
     best_v, best_d = max_action_value(ledger)
     r = residual_uncertainty(ledger)
     if best_v >= KAPPA_STOP:
+        # v3.48.0: two blocking universes used to be rendered as ONE clause
+        # chain ("最高动作价值 0.150 ≥ 阈值 0.15 … 仍有可行动验证（残余不确定
+        # 性 R=0.00）").  Because R only counts undecided HYPOTHESES while the
+        # action value also counts an unfiled independent-root CANDIDATE, the
+        # sentence read as self-contradictory and the model quoted it while
+        # its reasoning looped (2026-10-26 session 88db7745 round 7).  Split
+        # by blocker kind and state R's role explicitly (design document §5:
+        # R is observability only, never an exit gate).
+        _alt_block = next_alternative_root_candidate(ledger)
+        _hyp_blocker = _exit_blocker(ledger)
+        if _alt_block is not None and _hyp_blocker is None:
+            return False, (
+                f"已有确认根因 {fmt_hid(confirmed_ids[0])}；阻塞项为独立根因"
+                f"候选 {_alt_block.get('candidate_id')}（尚未建档：策略下界 "
+                f"{KAPPA_STOP:.2f}，属策略性阻塞、与阈值精度无关）；"
+                f"残余不确定性 R={r:.2f}（仅观测，不参与判定）"
+            ), confirmed_ids[0]
         return False, (
             f"已有确认根因 {fmt_hid(confirmed_ids[0])}，但最高动作价值 "
-            f"{best_v:.3f} ≥ 阈值 {KAPPA_STOP}（{best_d}），仍有可行动验证"
-            f"（残余不确定性 R={r:.2f}），继续验证以避免漏掉竞争性根因"
+            f"{best_v:.3f} ≥ 阈值 {KAPPA_STOP}（{best_d}），仍有待验证假设；"
+            f"残余不确定性 R={r:.2f}（仅观测，不参与判定）"
         ), confirmed_ids[0]
 
     best = hypotheses[confirmed_ids[0]]
@@ -3332,6 +3429,22 @@ def check_exit_conditions(ledger: DiagnosisLedger) -> tuple[bool, str, str | Non
         f"残余不确定性 R={r:.2f} 源于经济上已死的未决假设，"
         f"报告中标注为未验证）"
     ), confirmed_ids[0]
+
+
+def exit_block_is_actionable(ledger: DiagnosisLedger) -> bool:
+    """True when the exit block is "S1 satisfied, work still available" (E2').
+
+    Deterministic replacement for the write_file gate's substring test on
+    ``check_exit_conditions``' human-readable reason ("可行动验证" in reason).
+    Wording is not a contract: renaming that clause silently flipped the gate
+    from release-with-disclosure to hard block (2026-10-26 — the E1 release
+    path in the rendered-verdict test broke purely because the clause was
+    reworded).  Anchor the decision on ledger state instead.
+    """
+    if not any(n.get("status") == "confirmed"
+               for n in ledger.get("hypotheses", {}).values()):
+        return False
+    return max_action_value(ledger)[0] >= KAPPA_STOP
 
 
 def _exit_blocker(ledger: DiagnosisLedger) -> dict | None:
@@ -3607,20 +3720,56 @@ def unrecorded_evidence_hypotheses(
     return out
 
 
-def report_readiness_blockers(ledger: DiagnosisLedger) -> list[str]:
-    """Residual work that must settle before entering REPORT (v3.47.3).
+def _unrecorded_evidence_layer(node: HypothesisNode) -> str:
+    """Evidence layer of an unrecorded expert entry (v3.49.0).
 
-    REPORT entry is the eligibility gate.  ``write_file`` must never have
-    to discover these conditions after the phase has already started.
+    ``direct``      — a non-attributed ``expert:`` entry exists, so the
+                      evidence can carry a ``confirmed`` verdict (G17).
+    ``incidental``  — only attributed (``related_via``) entries exist; the
+                     落账 obligation is identical but the allowed verdict is
+                      ``inconclusive`` only.
+    """
+    for ev in node.get("evidence") or []:
+        if (str(ev.get("source", "")).startswith("expert:")
+                and not ev.get("related_via")):
+            return "direct"
+    return "incidental"
+
+
+def report_readiness_blockers(ledger: DiagnosisLedger) -> list[str]:
+    """Residual FACTS that must settle before entering REPORT (v3.49.0).
+
+    REPORT entry is the eligibility gate; ``write_file`` must never discover
+    these conditions after the phase has already started.
+
+    v3.49.0 — facts only, no action verbs: the list used to carry imperative
+    clauses ("请先逐项落账" / "请先 propose_hypotheses(...)"), which made it a
+    SECOND instruction source competing with the single-action line.  Measured
+    2026-10-26 scenario 25 rounds 5 and 6: the list said "先落账 H2/H3" while
+    the single action said propose_hypotheses(ALT-1); each round burned 8001
+    chars of reasoning on the ordering question and was cut by the loop guard.
+    Actions are owned by ``compute_evaluate_action`` (one step at the decision
+    point); this function only names what is still open.
+
+    Evidence layer is stated per hypothesis because "落账" is only executable
+    in the allowed direction: incidental-only evidence can carry
+    ``inconclusive``, never ``confirmed`` (G17).
     """
     blockers: list[str] = []
     unrecorded = unrecorded_evidence_hypotheses(ledger)
     if unrecorded:
-        ids = "、".join(fmt_hid(hid) for hid, _ in unrecorded)
-        blockers.append(
-            f"{ids} 已有专家验证证据但尚未 record_finding 落账；"
-            "请先逐项落账，再进入 REPORT"
-        )
+        direct, incidental = [], []
+        for hid, node in unrecorded:
+            layer = _unrecorded_evidence_layer(node)
+            (direct if layer == "direct" else incidental).append(fmt_hid(hid))
+        if direct:
+            blockers.append(
+                f"{'、'.join(direct)} 有未落账的直接专家证据"
+                "（可直接支撑 confirmed）")
+        if incidental:
+            blockers.append(
+                f"{'、'.join(incidental)} 有未落账的旁支归因证据"
+                "（只能支撑 inconclusive；confirmed 需针对本假设的直接专家结论）")
 
     for hid, node in ledger.get("hypotheses", {}).items():
         if node.get("status") not in ("pending", "inconclusive"):
@@ -3631,16 +3780,16 @@ def report_readiness_blockers(ledger: DiagnosisLedger) -> list[str]:
                 or delegation_value_for(ledger, hid) >= KAPPA_STOP):
             _stmt = str(node.get("statement", "")).strip()
             _label = f"{fmt_hid(hid)}「{_stmt}」" if _stmt else fmt_hid(hid)
+            _val = delegation_value_for(ledger, hid)
             blockers.append(
-                f"{_label} 仍未验证且仍有验证价值；"
-                "请先 task 验证、record_finding 终结或明确 defer"
-            )
+                f"{_label} 未验证且仍有验证价值"
+                f"（委派价值 {_val:.2f} ≥ 阈值 {KAPPA_STOP:.2f}）")
 
     candidate = next_alternative_root_candidate(ledger)
     if candidate is not None and not confirmed_root_nodes(ledger):
         blockers.append(
-            f"独立根因候选 {candidate.get('candidate_id', 'ALT')} 尚未追加；"
-            "请先 propose_hypotheses(alternative_candidate_id=...) 并验证"
+            f"独立根因候选 {candidate.get('candidate_id', 'ALT')} 未建档"
+            f"（来源 {candidate.get('expert', '?')}，与既有假设相互独立）"
         )
     return blockers
 
@@ -3651,15 +3800,24 @@ def report_ready(ledger: DiagnosisLedger) -> bool:
 
 
 def render_report_readiness(ledger: DiagnosisLedger) -> str:
-    """Positive pre-report checklist (single next action, no write block)."""
+    """Fact-only pre-report gap list (no action verbs — v3.49.0).
+
+    The action for this decision point is rendered once, by
+    ``compute_evaluate_action`` ("⭐ 唯一动作").  Keeping imperatives out of
+    the gap list removes the second instruction source; the pointer line tells
+    the model where the single action lives so the list is never a dead end.
+    """
     blockers = report_readiness_blockers(ledger)
     if not blockers:
         return ""
-    lines = ["## 报告就绪检查（未满足）"]
+    lines = [
+        "## 报告就绪检查（未满足）",
+        "系统检测到以下未收口事实（不含动作指令）：",
+    ]
     lines.extend(f"- {item}" for item in blockers)
     lines.append(
-        "完成以上项目后，系统自动进入 REPORT；"
-        "REPORT 内只生成和写入报告，不再做资格拦截。"
+        "下一步动作见本轮「⭐ 唯一动作」一行；执行后系统按新状态重算本清单，"
+        "全部收口后自动进入 REPORT。"
     )
     return "\n".join(lines)
 
@@ -4394,11 +4552,41 @@ def render_parallel_suggestion(ledger: DiagnosisLedger) -> str:
 # external scaffolding for belief revision.
 
 
+def _clip_sentence(text: str, limit: int) -> str:
+    """Clip *text* at a clause boundary instead of mid-word (v3.48.0).
+
+    A plain 120-char slice cut the alternative-root statement
+    "…4 个 stress-ng-cpu 进程各占 100% CPU" down to "各占", and the
+    action note that followed then read as that verb's object
+    (2026-10-26 session 88db7745 round 7).  Prefer the last clause
+    punctuation inside the budget; fall back to a hard cut WITH an
+    ellipsis so truncation is visible instead of silently half-sentenced.
+    """
+    t = " ".join(str(text or "").split())
+    if len(t) <= limit:
+        return t
+    head = t[:limit]
+    cut = max(
+        head.rfind("。"), head.rfind("；"), head.rfind("，"),
+        head.rfind(";"), head.rfind(". "), head.rfind("、"),
+    )
+    if cut >= max(1, limit // 2):
+        return head[: cut + 1].rstrip("，、；;") + "…"
+    return head + "…"
+
+
 class ActionHint(NamedTuple):
     """Computed next action for a hypothesis (pure derivation, not persisted)."""
     action: str          # "record_finding" | "task" | None
     urgency: str         # "critical" | "high" | "normal"
     reason: str          # human-readable justification (Chinese)
+    # v3.48.0: tool arguments for the recommended call.  Rendering used to
+    # print only ``reason``, so a hint whose text said "（传
+    # alternative_candidate_id）" never named the tool — the model had to
+    # guess it (2026-10-26 session 88db7745 round 7: "也许要用
+    # propose_hypotheses").  Trailing default keeps every existing
+    # three-argument construction valid.
+    args: dict | None = None
 
 
 def compute_next_action(ledger: DiagnosisLedger, hid: str) -> ActionHint | None:
@@ -4539,17 +4727,44 @@ def compute_evaluate_action(ledger: DiagnosisLedger) -> ActionHint | None:
             if hint and hint.action == "record_finding":
                 return hint  # "先落账已有专家证据的假设"
 
+    # Priority 1a (v3.49.0): unrecorded expert evidence always owes a
+    # record_finding — including incidental-only entries, whose allowed
+    # verdict is inconclusive.  Priority 1 above only fires for DIRECT
+    # evidence (confirmatory_expert_evidence), so an incidental-only gap was
+    # invisible to the recommendation while the readiness list still asked for
+    # it: two sources, opposite actions (2026-10-26 scenario 25 rounds 5/6).
+    for _hid, _node in unrecorded_evidence_hypotheses(ledger):
+        _layer = _unrecorded_evidence_layer(_node)
+        return ActionHint(
+            "record_finding", "high",
+            f"{fmt_hid(_hid)} 有未落账的"
+            + ("旁支归因证据（可判 inconclusive；confirmed 需针对本假设的"
+               "直接专家结论）"
+               if _layer == "incidental" else "直接专家证据（可直接落账）"),
+        )
+
     # Priority 1b: a registered, unconsumed independent-root candidate is an
     # evidence-backed actionable direction.  Without this branch it could sit
     # in the candidate list while every hypothesis is terminal, and S2 would
     # incorrectly declare "no executable action" (scenario 25 netem).
     _alt_candidate = next_alternative_root_candidate(ledger)
     if _alt_candidate is not None:
+        _alt_cid = _alt_candidate.get("candidate_id")
+        # v3.48.0: three fixes in one hint —
+        #   * clause-boundary clipping (the hard 120-char slice landed on
+        #     "各占", making the parenthetical read as its object);
+        #   * argument carried structurally instead of as prose, so the
+        #     renderer can name propose_hypotheses(alternative_candidate_id=);
+        #   * the prohibition "不得直接确认" became the positive sequence
+        #     used by the receipt path ("先定向验证并 record_finding 落账").
+        #     The behaviour itself is enforced by the G17 evidence gate, so
+        #     the hint only has to name what to do (design document §9).
         return ActionHint(
             "propose_hypotheses", "high",
-            f"追加独立根因候选 {_alt_candidate.get('candidate_id')}："
-            f"{str(_alt_candidate.get('statement', ''))[:120]}"
-            "（传 alternative_candidate_id；追加后定向验证，不得直接确认）",
+            f"追加独立根因候选 {_alt_cid}："
+            f"{_clip_sentence(_alt_candidate.get('statement', ''), 120)}"
+            "（追加后先定向验证并 record_finding 落账）",
+            {"alternative_candidate_id": _alt_cid},
         )
 
     # Priority 2: rank pending (non-deferred, non-dead) by value
