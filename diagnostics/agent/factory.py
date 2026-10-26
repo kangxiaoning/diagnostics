@@ -301,7 +301,11 @@ class RelatedHypothesis(BaseModel):
         default="unclear",
         description=(
             "本次证据对该假设的作用方向：supports（支持）/ refutes（排除）"
-            "/ unclear（暂不明确）"
+            "/ unclear（暂不明确）。\n"
+            "⚠ refutes 具有落账效力：系统会把它记为**该假设的直接负证据**"
+            "（该假设随即可被判 refuted，无需再为它单独委派一轮）。因此只在"
+            "你本次的数据本身足以排除该假设时声明 refutes，并把它所依据的反证"
+            "写进 negative_evidence；若只是\"看起来更可能是另一条\"，请用 unclear。"
         ),
     )
 

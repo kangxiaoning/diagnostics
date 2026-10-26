@@ -397,11 +397,20 @@ def _index_line(info: dict) -> str:
     if info.get("dedup_hits"):
         flags += f"（重复调用 {info['dedup_hits']} 次）"
     path = info.get("path") or ""
-    ref = f"read_file(path=\"{path}\")" if path else "(未落盘)"
+    # v3.53.0: the row used to end with a copy-paste ``read_file(path="...")``
+    # recipe.  In REPORT that turned the index into 17 competing action
+    # recipes: measured 2026-10-26 scenario 28 rounds 6-7, nine /tool_results
+    # files were read one by one before the report was written (two rounds
+    # spent).  Same defect and same fix as the ledger's tool-result block in
+    # v3.48.0 — the summary is decision-grade, the path is for verification,
+    # and it must not be presented as the next action.  Few-shot evidence
+    # (promptlabster; Lacuna "shortcut biases") shows concrete call examples
+    # shape FORM far more than abstract instructions do.
+    ref = f"原文: {path}" if path else "(未落盘)"
     return (
         f"- {ev_id} | {actor}{('/' + hid) if hid else ''} | {tool} | "
         f"{fmt_target(info.get('target') or {})} | "
-        f"{info.get('lines', '?')}行{flags} → `{ref}`"
+        f"{info.get('lines', '?')}行{flags} → {ref}"
     )
 
 
@@ -426,6 +435,20 @@ def render_evidence_index(ledger: dict, limit: int = INDEX_LIMIT) -> str:
     metric = [info for _k, info in arts if info.get("is_metric")]
     raw = [(k, info) for k, info in arts if not info.get("is_metric")]
     lines = [f"## {EVIDENCE_INDEX_TITLE}"]
+    # v3.53.0: state the reading policy once, at the section head.  Rows carry
+    # paths for verification only — measured 2026-10-26 scenario 28, the model
+    # copied the recipe form and read nine files before writing the report.
+    lines.append(
+        "- （撰写报告使用本索引的摘要 + 工具名/实体锚点即可；仅在核对具体"
+        "数值或原文措辞时，才按「原文」路径查阅，不要逐条回读）")
+    # v3.54.0: state the citation rule at the TOP of the section, before any
+    # row is read.  It used to live only in the report contract far upstream;
+    # measured 2026-10-26 run1, the model invented EV ids (`EV-r1-Argus-CPU`)
+    # that the deterministic stripper then removed — post-hoc correction of a
+    # rule the model never saw at the citation point.
+    lines.append(
+        "- 引用 EV 编号时**只使用本表中的编号**；表外编号视为未签发，"
+        "写入前会被系统清洗")
     if metric:
         lines.append(
             f"- （Argus 指标时序数据 {len(metric)} 条按设计不注入"
@@ -519,6 +542,11 @@ def _pack_block(hid: str, node: dict, arts: list[tuple[str, dict]],
         mark = "根因"
     elif status == "confirmed":
         mark = "已确认假设（未达根因阈值）"
+    elif node.get("terminal_reason") == "superseded_by":
+        # v3.51.0: absorbed mechanism — terminal but not excluded.
+        mark = "并入其他假设（非排除）"
+    elif node.get("_refutation_basis") == "inference_only":
+        mark = "已排除（推断性，无直接负证据）"
     else:
         mark = "已排除"
     lines = [

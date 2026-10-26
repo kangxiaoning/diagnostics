@@ -48,7 +48,12 @@ HypothesisStatus = Literal[
 #   "evidence_saturated" — 3 consecutive inconclusive verdicts (former dead_end)
 #   "timeout_unreached"  — session interrupted before verification (former dead_end)
 #   "auto_finalized"     — closed by a safety valve / report-time finalize
-TerminalReason = Literal["evidence_saturated", "timeout_unreached", "auto_finalized"]
+#   "superseded_by"      — the MECHANISM is absorbed by another hypothesis (v3.51.0).
+#                          Terminal for convergence, but NOT "excluded": no
+#                          negative evidence was produced against it, so the
+#                          report must not list it under "已排除".
+TerminalReason = Literal["evidence_saturated", "timeout_unreached",
+                         "auto_finalized", "superseded_by"]
 
 Verdict = Literal["confirmed", "refuted", "inconclusive"]
 
@@ -347,6 +352,8 @@ def new_hypothesis(
         deferred=False,          # v2.1: scheduling mark (ex-deprioritized)
         deferred_reason="",      # why the LLM shelved this hypothesis
         terminal_reason="",      # refuted sub-classification (ex-dead_end)
+        superseded_by="",        # v3.51.0: target hypothesis absorbing this
+                                 # mechanism (terminal_reason="superseded_by")
         _delegate_count=0,       # successful expert delegations targeting it
         _inconclusive_count=0,   # inconclusive verdicts on this node (D6)
         _statement_only_updates=0,  # pure wording refinements (verdict omitted)
@@ -1090,6 +1097,84 @@ def activate_hypothesis(ledger: DiagnosisLedger, hid: str) -> None:
     ledger["active_path"] = [hid]
 
 
+# v3.52.0: coordinator-collected RAW observations that can carry a
+# factual `confirmed` without a second opinion.  Whitelist is deliberately
+# limited to real-time probes / logs — time-series metrics stay
+# screening-layer (§6.2 two-stage model) and never qualify.
+_OBSERVATION_EVIDENCE_TOOLS = frozenset({
+    "get_os_kernel_dmesg_err",
+    "get_os_kernel_journalctl_period",
+    "get_os_kernel_sysctl_grep",
+    "get_os_mem_oom",
+    "get_os_mem_top_process",
+})
+
+
+def corroborating_observation_evidence(
+        ledger: DiagnosisLedger, hid: str) -> bool:
+    """Whether *hid* holds coordinator-collected raw observation evidence.
+
+    v3.52.0 — the evidence standard is about VERIFIABILITY, not about who
+    collected it.  Audit standard (国家审计准则 §86): "直接获取的审计证据比
+    间接获取的审计证据更可靠", and direct evidence is what proves a
+    conclusion WITHOUT inference — a `dmesg` line ("java invoked
+    oom-killer") or `/dev/sda1 100%` is that; an expert's narrative about
+    the same fact is the processed form.
+
+    G17 previously accepted only `expert:` entries, so a coordinator who
+    had already read the kernel log still had to re-delegate before it
+    could conclude: measured 2026-10-26 scenario 28 — H2 (disk full) had
+    `dmesg ext4 journal abort` + `disk.util 96%` in hand at round 5, was
+    blocked, and needed rounds 6-7 to re-obtain the same fact through an
+    expert.
+
+    Scope is deliberately narrow (defence against self-certification):
+      * only real-time probes / logs (whitelist above), never time-series
+        metrics (screening layer, §6.2);
+      * only entries collected directly for THIS hypothesis (no
+        ``related_via``);
+      * mechanism-level attribution (WHY it happened) still requires an
+        expert — the receipt and the report carry the evidence tier.
+    """
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    for ev in node.get("evidence") or []:
+        src = str(ev.get("source", ""))
+        if not src.startswith("tool:"):
+            continue
+        if ev.get("related_via"):
+            continue
+        if src[len("tool:"):] in _OBSERVATION_EVIDENCE_TOOLS:
+            return True
+    return False
+
+
+def direct_negative_expert_evidence(
+        ledger: DiagnosisLedger, hid: str) -> bool:
+    """Whether *hid* holds a DIRECT expert entry with negative direction.
+
+    Direct = ``expert:`` source without ``related_via`` (same symmetry as
+    ``confirmatory_expert_evidence`` / G17).  Negative = ``supports is False``
+    or a structured verdict of ``refuted``.
+
+    v3.51.0: this is the evidence standard for EXCLUSION.  "Another
+    hypothesis explains the symptom better" is not negative evidence — a
+    coexisting mechanism (comorbidity / second independent fault) is not
+    refuted by a stronger competing explanation.
+    """
+    node = ledger.get("hypotheses", {}).get(hid) or {}
+    for ev in node.get("evidence") or []:
+        if not str(ev.get("source", "")).startswith("expert:"):
+            continue
+        if ev.get("related_via"):
+            continue
+        if ev.get("supports") is False:
+            return True
+        st = ev.get("structured")
+        if isinstance(st, dict) and str(st.get("verdict") or "") == "refuted":
+            return True
+    return False
+
+
 def record_finding(
     ledger: DiagnosisLedger,
     hypothesis_id: str,
@@ -1098,6 +1183,7 @@ def record_finding(
     probability_update: int | None,
     new_insights: str = "",
     statement_update: str = "",
+    superseded_by: str = "",
 ) -> None:
     """Record a verification finding for a hypothesis.
 
@@ -1115,6 +1201,21 @@ def record_finding(
     hypothesis_id = resolve_hypothesis_id(ledger, hypothesis_id)
 
     node = hypotheses[hypothesis_id]
+
+    # v3.51.0: explicit "absorbed by another hypothesis" channel.  Refuting a
+    # hypothesis because a stronger explanation covers the same symptom is not
+    # exclusion — the mechanism may still coexist (second independent fault).
+    # Resolve the target up-front so an invalid id fails loud instead of
+    # silently booking an exclusion.
+    _superseded_target = ""
+    if superseded_by:
+        _superseded_target = parse_hid(superseded_by, hypotheses)
+        if not _superseded_target:
+            raise ValueError(
+                f"superseded_by={superseded_by!r} 不是台账中的假设 ID；"
+                "如需排除请改为补充针对本假设的负证据，或省略该参数")
+        if _superseded_target == hypothesis_id:
+            raise ValueError("superseded_by 不能指向本假设自身")
 
     # Update statement if a more accurate version was found during verification
     if statement_update and statement_update != node.get("statement"):
@@ -1181,6 +1282,23 @@ def record_finding(
         node["selected"] = False  # terminal — no longer the focus
         node["deferred"] = False
         ledger["_inconclusive_streak"] = 0
+        if _superseded_target:
+            # Absorbed, not excluded: terminal for convergence, rendered as
+            # "并入 Hx" instead of "已证伪" (see _TERMINAL_REASON_TAG).
+            node["terminal_reason"] = "superseded_by"
+            node["superseded_by"] = _superseded_target
+        elif not direct_negative_expert_evidence(ledger, hypothesis_id):
+            # No DIRECT negative evidence: the exclusion is inferential.
+            # Deliberately NOT downgraded — the tool contract allows
+            # monitor-based refutation ("监控反证即可直接判定"), so a hard
+            # downgrade would break legitimate exclusions and every caller
+            # that constructs terminal states.  Disclose the basis instead:
+            # the ledger tag and the report appendix say the exclusion is
+            # inferential.  Measured 2026-10-26 scenario 28: H2 (memory leak)
+            # was booked as refuted purely because H1's wording covered the
+            # symptom; the report then presented an unverified direction as
+            # excluded.
+            node["_refutation_basis"] = "inference_only"
     else:  # inconclusive
         ledger["_inconclusive_streak"] += 1
         node["_inconclusive_count"] = node.get("_inconclusive_count", 0) + 1
@@ -1783,6 +1901,8 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
         "evidence_saturated": "证据饱和",
         "timeout_unreached": "未及验证(超时)",
         "auto_finalized": "系统自动关闭",
+        # v3.51.0: mechanism absorbed by another hypothesis — NOT excluded.
+        "superseded_by": "并入其他假设",
     }
     refuted = [h for h in ledger["hypotheses"].values()
                if h["status"] == "refuted"]
@@ -1800,8 +1920,15 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                       or "(无记录)")
             tag = "已证伪"
             tr = h.get("terminal_reason")
-            if tr:
+            if tr == "superseded_by":
+                # Name the absorbing hypothesis so the model/report can say
+                # "并入 H1" instead of the false "已排除".
+                _absorber = fmt_hid(h.get("superseded_by"))
+                tag = f"并入 {_absorber}" if _absorber else "并入其他假设"
+            elif tr:
                 tag = _TERMINAL_REASON_TAG.get(tr, "已证伪")
+            elif h.get("_refutation_basis") == "inference_only":
+                tag = "已证伪(推断性，无直接负证据)"
             lines.append(
                 f"- [{tag}] {fmt_hid(h['id'])} {original_statement(h)}: "
                 f"{_clean_evidence_text(reason, 2000)}"
@@ -2447,6 +2574,27 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
             "按竞争性假设分别成条、各自给 probability；"
             "方向判断只做一次，难以判断时按「分别成条」处理\n"
+            # v3.53.0: same family as the two judgements above — the polishing
+            # loop (2026-10-26 scenario 28 round 2: 10,860 chars rewriting the
+            # same statements/probabilities, zero tool calls, cut by the loop
+            # guard).  Stated next to the generation point because the rules
+            # live in the system prompt and this phase has the shortest
+            # attention budget.
+            "- ✍ 表述只写一次：statement 与 probability 写定即提交，"
+            "不在本阶段反复润色；不精确留给 VERIFY 用 "
+            "record_finding(statement_update=…) 修正\n"
+            # v3.54.0 (P0-1)：预演的前置引导（if-then 形式，写在动作之前）。
+            # 三次复跑实证：round 2 用 9,347 字符预演清单、round 3 达
+            # 25,007 字符，零工具调用。事后只有 25k/12k 告警与 8k 守卫。
+            "- ⏱ 若你准备在 reasoning 里写出完整的假设清单或最终表述 → "
+            "直接把内容写进 propose_hypotheses 的参数即可：本阶段不需要在"
+            "思考中预演最终文本（预演会耗尽输出预算且不产生动作）\n"
+            # v3.54.0 (P1-1)：把最小字段骨架放到本步要求里（run3 round 2 因
+            # 三条假设全缺 statement 而浪费一轮；字段契约原本只在 system
+            # prompt 中段）。
+            "- 字段骨架（照抄并填值）：propose_hypotheses(hypotheses=["
+            '{"statement": "一句完整根因表述（必填）", "probability": 70, '
+            '"rationale": "依据"}])——每条都必须含 statement 与 probability\n'
             "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
             "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
             "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
@@ -2664,11 +2812,71 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 + "）——专家据此声明 related_hypotheses，系统把本次证据同时"
                 "归档到这些假设（后续对它们判 confirmed 时不会因「缺少专家"
                 "证据」被拦）\n"
+                # v3.56.0: one delegation may SETTLE several candidates when
+                # they share the same evidence domain (differential diagnosis:
+                # one workup can exclude several alternatives).  Explicitly
+                # asking for it turns that ability on — previously the expert
+                # declared directions anyway, but they were booked as
+                # incidental and the excluded hypothesis still needed its own
+                # delegation round.
+                "- ⏱ 同一证据域内的未决假设可在本次一并裁决：若你的数据足以"
+                "**明确排除**其中某条，请在 related_hypotheses 标 effect=refutes "
+                "并把反证写入 negative_evidence——系统会记为该假设的直接负证据，"
+                "无需再为它单独委派一轮；仅\"另一条更可能\"时请用 unclear\n"
             )
+        # v3.54.0 (P0-2): G17 的判据前移。当假设**只有旁支归因证据**时，
+        # 先写明当前可落账的 verdict 范围，而不是等 record_finding 被拦截
+        # 后再解释。实测 2026-10-26 run2/run3 各有一次 "confirmed on H2
+        # without expert evidence (incidental-only)"，均发生在模型不知道
+        # 旁支证据不能承载 confirmed 的时候。门控保留为兜底。
+        _related_verdict_hint = ""
+        _rel_all = [e for e in active.get("evidence", []) if e.get("related_via")]
+        _direct_all = [
+            e for e in active.get("evidence", [])
+            if str(e.get("source", "")).startswith("expert:")
+            and not e.get("related_via")
+        ]
+        if _rel_all and not _direct_all:
+            _related_verdict_hint = (
+                "- ⏱ 本假设当前只有旁支归因证据 → 可直接落账的 verdict 是 "
+                "**inconclusive**；若证据已足以 confirmed，请先补一次针对本假设"
+                f"的直接 task 验证（description 写明「验证假设{disp_id}」），"
+                "专家结论回来后再落账\n")
+        # v3.55.0 (D)：把"会话中已有的可引用原始观测"直接摆到动作之前。
+        # 实证 2026-10-26 run4：round 4 已采集 dmesg/OOM/进程快照，但因挂在
+        # active 假设下，H2/H3 三次 confirmed 全被 G17 拦——模型不知道可以
+        # 引用这些观测编号。这里列出最近 3 条并给出可执行写法。
+        _obs_hint = ""
+        if not _direct_all:
+            _obs_refs = [
+                (str(_info.get("ev_id") or ""), str(_info.get("tool") or ""))
+                for _k, _info in (ledger.get("tool_results") or {}).items()
+                if str(_info.get("ev_id") or "")
+                and str(_info.get("tool") or "") in _OBSERVATION_EVIDENCE_TOOLS
+            ]
+            if _obs_refs:
+                _recent = "、".join(
+                    f"{_ev}（{_tool}）" for _ev, _tool in _obs_refs[-3:])
+                _obs_hint = (
+                    "- ℹ 会话中已有可直接引用的原始观测：" + _recent
+                    + "——若其中某条正是本假设的直接证据，可在 record_finding 里传 "
+                    "evidence_refs=[\"<编号>\"]，系统会把它归属到本假设，"
+                    "confirmed 便不再被判「无证据」\n")
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
+            + _related_verdict_hint
+            + _obs_hint
+            # v3.54.0: if-then 预演引导（deliberation-over-observation 在
+            # VERIFY 的形态）。实测 2026-10-26 run3 round 7：单响应
+            # 12,002 / 12,004 字符两次、零工具调用，最终靠 thinking-off
+            # 重试才产出动作。引导前移到动作之前，不新增任何门控。
+            # 首行必须仍是"本阶段动作"（最靠近生成点的唯一动作声明）；
+            # ⏱ 预演引导紧随其后。
             + f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('verify')}\n"
+            + "- ⏱ 若你准备在 reasoning 里预写委派描述或最终结论 → 直接调用 "
+            "task（描述写进 description）或 record_finding（结论写进 "
+            "evidence_summary）即可；本阶段不需要在思考中预演文本\n"
             + f"- {duty}\n"
             + expert_map
             + "- 委派时明确\"验证假设"
@@ -3500,6 +3708,10 @@ def _report_role_sections(content: str) -> list[tuple[str, str, list[str]]]:
         title = match.group(2).strip().strip("*` ")
         if "已确认根因" in title or "确认根因" in title or title == "根因":
             role = "root"
+        elif any(k in title for k in ("并入", "被覆盖", "覆盖于", "被吸收")):
+            # v3.51.0: absorbed mechanisms get their own section role so a
+            # report can say "并入 H1" without being flagged as "已排除".
+            role = "superseded"
         elif "排除" in title and not any(
                 k in title for k in ("未验证", "待验证", "观测级", "未证实")):
             # A combined heading such as "已排除与未验证" is ambiguous; its
@@ -3528,6 +3740,13 @@ def report_status_manifest(ledger: DiagnosisLedger) -> dict[str, list[str]]:
     refuted = [
         f"H{hid}" for hid, n in ledger.get("hypotheses", {}).items()
         if n.get("status") == "refuted"
+        # v3.51.0: an absorbed mechanism is terminal but NOT excluded; it has
+        # its own report role so prose cannot book it as "已排除".
+        and n.get("terminal_reason") != "superseded_by"
+    ]
+    superseded = [
+        f"H{hid}" for hid, n in ledger.get("hypotheses", {}).items()
+        if n.get("terminal_reason") == "superseded_by"
     ]
     unverified = [
         f"H{hid}" for hid, n in ledger.get("hypotheses", {}).items()
@@ -3538,6 +3757,7 @@ def report_status_manifest(ledger: DiagnosisLedger) -> dict[str, list[str]]:
     return {
         "root": sorted(roots, key=lambda x: int(x[1:])),
         "refuted": sorted(refuted, key=lambda x: int(x[1:])),
+        "superseded": sorted(superseded, key=lambda x: int(x[1:])),
         "unverified": sorted(unverified, key=lambda x: int(x[1:])),
     }
 
@@ -3568,6 +3788,17 @@ def report_manifest_violations(
                 errors.append(
                     f"「{heading}」包含非 refuted 假设 {'、'.join(wrong)}；"
                     f"台账已排除为 {('、'.join(manifest['refuted']) or '无')}")
+        elif role == "superseded":
+            # The section legitimately cites the ABSORBING hypothesis too
+            # ("H2 并入 H1"), so root ids are allowed here; only ids that are
+            # neither absorbed nor root indicate a real misplacement.
+            allowed = set(manifest["superseded"]) | root_set
+            wrong = sorted(set(ids) - allowed)
+            if wrong:
+                errors.append(
+                    f"「{heading}」包含既非「并入」也非根因的假设 "
+                    f"{'、'.join(wrong)}；台账并入项为 "
+                    f"{('、'.join(manifest['superseded']) or '无')}")
     return errors
 
 
@@ -3581,7 +3812,11 @@ def render_report_status_manifest(
         raw = hid[1:]
         node = nodes.get(raw, {})
         status = node.get("status", "?")
-        if node.get("deferred"):
+        if node.get("terminal_reason") == "superseded_by":
+            _tgt = fmt_hid(node.get("superseded_by"))
+            status = (f"并入 {_tgt}（机制被覆盖，非排除）" if _tgt
+                      else "并入其他假设（非排除）")
+        elif node.get("deferred"):
             status += "，已搁置"
         return (f"- **{hid}**（{status}，p={node.get('probability', '?')}）："
                 f"{node.get('statement', '')}")
@@ -3596,6 +3831,7 @@ def render_report_status_manifest(
     for label, key in (
         ("已确认根因", "root"),
         ("已排除", "refuted"),
+        ("并入/被覆盖（非排除）", "superseded"),
         ("未验证/观测级", "unverified"),
     ):
         ids = manifest[key]
@@ -4303,6 +4539,18 @@ def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
         structured = ev.get("structured") or {}
         prev = structured.get("verdict")
         if prev in ("confirmed", "refuted") and prev != new_verdict:
+            # v3.56.0: DIRECT-ONLY (symmetric with G17).  An entry carrying
+            # ``related_via`` merely RESTATES another delegation's declared
+            # direction — v3.47.4 already re-labelled those as "旁支方向声明"
+            # precisely because the expert was never sent to verify this
+            # hypothesis.  Treating one as a "prior verdict" and blocking the
+            # refutation made G21 overturn nothing: measured 2026-10-26
+            # scenario 28 round 9, H3 (delegate_count=0, provenance
+            # related_via:H1) was blocked, cost one round, and the model had
+            # to smuggle a retraction reason through statement_update to
+            # escape.
+            if ev.get("related_via"):
+                continue
             # v3.23.0 (A3): a prior confirmed return SELF-DECLARED as
             # "alternative_root_cause" means the expert actually REFUTED
             # the assigned hypothesis and confirmed a DIFFERENT root

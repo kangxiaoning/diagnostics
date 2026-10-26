@@ -82,6 +82,30 @@ PHASE_SPEC: dict[str, dict] = {
             "⚖ 重叠/因果方向判断只做一次：只看两条 statement 的故障机制是否同一、"
             "以及两个机制是否互为因果；判断完直接提交当前假设列表；"
             "难以判断时按「分别成条」处理（多提一条更安全，验证阶段自会剔除）",
+            # v3.53.0: third member of the same family — "overlap" (v3.45.10),
+            # "causal direction" (v3.50.0), now "wording polish".  Measured
+            # 2026-10-26 scenario 28 round 2: 10,860 chars, zero tool calls,
+            # content=0, cut by the loop guard; reconstruction shows the model
+            # rewriting the SAME statements and probabilities
+            # ("…they might be independent or partially related… Let me
+            # refine: H1 … Probability: 70%"), i.e. polishing prose rather
+            # than deciding anything.  Statement text is not final here —
+            # VERIFY owns refinement via record_finding(statement_update=…)
+            # and has the evidence to do it.  Polishing in HYPOTHESIZE buys
+            # nothing and has no natural stop.
+            "✍ 表述只写一次：statement 与 probability 写定即提交，"
+            "不在本阶段反复润色；表述不精确留给 VERIFY 用 "
+            "record_finding(statement_update=…) 修正（该阶段才有证据）",
+            # v3.54.0: 预演（deliberation over observation）的 if-then 前置
+            # 引导。实测 2026-10-26 三次复跑：round 2 用 9,347 字符预演最终
+            # 假设清单、round 3 达 25,007 字符、round 7 单响应 12,002/12,004
+            # 两次，全部零工具调用，被 8k 守卫或超时收走。根因不是"想得多"，
+            # 而是在"一次廉价工具调用就能落地"的地方继续用推理重建输出。
+            # if-then 形式（Gollwitzer & Sheeran 2006, 94 项研究 d≈.65）比
+            # 事后禁令有效；正向配方，不写"禁止"。
+            "⏱ 若你准备在 reasoning 里写出完整的假设清单或最终表述 → "
+            "直接把内容写进 propose_hypotheses 的参数字段即可：本阶段不需要"
+            "在思考中预演最终文本，预演会耗尽输出预算且不产生任何动作",
             "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
             "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
             "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）；"
@@ -109,11 +133,33 @@ PHASE_SPEC: dict[str, dict] = {
         "duty": "聚焦验证当前活动假设，每步只验证一个。你是调度者——通过委派获取验证结论。",
         "actions": [
             "委派哪个专家验证当前假设，由系统按当前场景确定——每轮「本步要求」给出当前场景的专家委派映射（与场景可用专家一致）",
+            # v3.54.0: 同一反模式在 VERIFY 的形态——在 reasoning 里预写委派
+            # 描述或最终结论，而不是直接调用 task / record_finding。实测
+            # 2026-10-26 run3 round 7：单响应 12,002 / 12,004 字符两次、零
+            # 工具调用；专家侧同型（summary-only 重试 167s 才回收）。
+            "⏱ 若你准备在 reasoning 里预写委派描述或最终结论 → 直接调用 "
+            "task（描述写进 description）或 record_finding（结论写进 "
+            "evidence_summary）：本阶段不需要在思考中预演文本",
             "每轮聚焦验证一个假设。优先单专家委派、record_finding 后再推进；"
             "当系统提示某假设单视角证据不足（inconclusive）时，可同轮并行委派系统建议的"
             "多个互补视角专家——并行委派须全部指向同一假设、description 含「验证假设Hx」字样，"
             "证据齐后 record_finding 综合判定",
-            "委派时明确\"验证假设X\"并传入所需参数（hostname / cluster_name / namespace）",
+            # v3.54.0 (P0-2)：委派描述模板化。三次复跑里 5 次委派描述因复述
+            # 系统上下文被剥离（1600→500 字符），说明模型不知道台账已注入
+            # 专家上下文，只能靠复述"带上"。描述收敛为三段即可。
+            "委派描述写成三段即可：①「验证假设X：<一句话陈述>」"
+            "②待覆盖的证据通道（指标/日志/事件）③实体参数"
+            "（hostname / cluster_name / namespace）——系统已把台账与假设树"
+            "注入专家上下文，无需在 description 里复述",
+            # v3.56.0: batched exclusion.  A single workup can settle several
+            # candidates when they share the same evidence domain (differential
+            # diagnosis parallel testing; MJA 2017).  Declared refutations are
+            # booked as direct negative evidence, so they save a delegation
+            # round — while `supports` stays incidental (never enough for
+            # confirmed).
+            "同一证据域内的其它未决假设可在本次一并裁决：若本次检查能**明确"
+            "排除**其中某条，专家会以 effect=refutes 声明并附反证，系统据此"
+            "直接落账该假设（省一次委派）；仅\"另一条更可能\"时用 unclear",
             "confirmed 判定须以对应领域专家的验证结论为依据（专家证据）——监控数据可直接支撑"
             " refuted（明确证伪）或 inconclusive（证据不足），但单独不足以支撑 confirmed；"
             "若同一假设存在相互冲突的证据通道（如 argus 指标与日志/事件矛盾），须先澄清冲突再落账",
@@ -327,10 +373,11 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 （按诊断步骤描述关键发现；每条关键证据给出**可核验锚点**——工具名 + 实体（Pod/节点/集群）+ 时间窗，并标注置信度；指标类证据以**时序总结**表述；引用证据编号时，仅使用本阶段系统注入的「原始证据索引」中逐字列出的编号（如 EV-r6-2）；未注入索引时，以工具名+实体+时间窗作为锚点。报告使用外部可核验信息，内部文件路径留给系统台账）
 
 ## 根因与因果分层
-- **已确认根因**：仅列满足反事实判据（移除该因素后故障不再发生或显著缓解）的独立根因；多条分别列出，每条以 Hn 标注对应假设，并标注证据层级（【深度确证】/【指标直接观测】）与置信度
+- **已确认根因**：仅列满足反事实判据（移除该因素后故障不再发生或显著缓解）的独立根因；多条分别列出，每条以 Hn 标注对应假设，并标注证据层级（【深度确证】/【工具直接观测】/【指标直接观测】）与置信度——【工具直接观测】指协调员直采的实时探测/日志原始输出（dmesg、journalctl、OOM 计数器等），只能支撑事实性断言，机制性归因仍须【深度确证】
 - **促成或加剧因素**：仅放大故障影响、但移除后核心故障仍存在的因素；独立成节并标注证据层级，不计入根因数量
 - **症状与下游影响**：如 API 只读、Pod NotReady、延迟升高等表现，保持症状角色单独列出
 - **排除的假设**：仅列已判定 refuted 的竞争性假设及排除原因，每条以 Hn 标注；未验证或已搁置的假设写入「未验证」章节或后续排查建议，并保持其未验证状态（台账中标注「单通道证伪」的假设，须在原因后注明「证据局限：仅由单一专家通道支撑，未经跨通道复核」；系统另会在报告末尾自动补入该书面披露段）
+- **并入/被覆盖的机制**：某假设的机制被另一假设的表述吸收、但没有针对它的负证据时（台账 `terminal_reason=superseded_by`），写入本小节并注明「并入 Hx（机制被覆盖，非独立根因）」，**不要写入「排除的假设」**——被覆盖不等于被证伪，该机制可能仍并存
 - **观测级/待验证成因**：有证据但尚未完成假设验证的独立成因保留在此层，每条以 Hn 或 ALT 候选编号标注，保持未验证状态并保留在报告中
 - **证据链**：工具A发现X → 工具B确认Y → 专家C验证Z
 

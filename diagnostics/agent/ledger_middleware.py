@@ -109,6 +109,9 @@ from diagnostics import config as _config  # noqa: F401
 from diagnostics.agent.ledger import confirmatory_expert_evidence  # G17 确证层证据判据（v3.42.0）
 from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/2 皆可（v3.38.2）
 from diagnostics.agent.ledger import exit_block_is_actionable  # v3.48.0 退出阻塞判据（确定性谓词，不再匹配文案子串）
+from diagnostics.agent.ledger import corroborating_observation_evidence  # v3.52.0 工具原始观测可作确证层证据
+from diagnostics.agent.ledger import _OBSERVATION_EVIDENCE_TOOLS  # v3.55.0 实时探测/日志工具白名单（EV 归属校验）
+from diagnostics.agent.evidence_ledger import iter_artifacts  # v3.55.0 原始观测条目查询（EV 编号 → 工具/轮次）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
 from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
 from diagnostics.agent.delegation_key import (  # v3.37.0 证据归属（单源派生）
@@ -264,9 +267,39 @@ def _unknown_hypothesis_fields(tool_args: dict) -> list[str]:
     return unknown
 
 
-def _enhance_propose_error_receipt(content: str, unknown: list[str]) -> str:
+def _missing_required_hypothesis_fields(tool_args: dict) -> list[str]:
+    """Which required per-hypothesis fields are absent (v3.54.0).
+
+    Measured 2026-10-26 run3 round 2: all three hypotheses carried
+    probability/rationale/independent_anomaly but omitted ``statement``, and
+    the receipt could only say "通常是漏填了 statement" (a guess) — one full
+    recovery round spent on re-discovery.  Naming the actual gap turns the
+    retry into a mechanical fill-in.
+    """
+    missing: list[str] = []
+    for i, h in enumerate((tool_args or {}).get("hypotheses") or []):
+        if not isinstance(h, dict):
+            continue
+        for field in ("statement", "probability"):
+            if field not in h or h.get(field) in (None, ""):
+                entry = f"hypotheses[{i}].{field}"
+                if entry not in missing:
+                    missing.append(entry)
+    return missing
+
+
+def _enhance_propose_error_receipt(
+        content: str, unknown: list[str],
+        missing: list[str] | None = None) -> str:
     """Append a self-contained field contract to a framework validation
     error for propose_hypotheses (content starts with 'Error invoking tool')."""
+    miss = ""
+    if missing:
+        miss = (
+            "\n- **本次缺失的必填字段**："
+            + "、".join(missing)
+            + "——补齐这些字段后原样重试即可（其余内容无需改动）"
+        )
     extra = ""
     if unknown:
         extra = (
@@ -280,8 +313,9 @@ def _enhance_propose_error_receipt(content: str, unknown: list[str]) -> str:
         "每条假设必须且仅含以下三个字段：\n"
         '  {"statement": "一句完整根因表述（必填，如『X 导致 Y』）", '
         '"probability": 0-100 的整数, "rationale": "假设依据"}\n'
-        "失败通常是漏填了某条假设的 statement，或把第二层依据写成了"
-        "非规范字段。" + extra
+        + miss
+        + "最常见的失败是漏填 statement，或把第二层依据写成了非规范字段。"
+        + extra
     )
 
 
@@ -394,8 +428,14 @@ def _phase_scoped_tools(
     if not tools or not isinstance(tools, (list, tuple)):
         return None
     allowed = _PHASE_ALLOWLIST.get(phase, frozenset())
+    # v3.55.0: REPORT's business allowlist is empty by design, but the
+    # write_file deferral (v3.46.1) requires record_finding to stay callable
+    # while gathered evidence is unrecorded — mirror the gate's own exception
+    # so the deferral is satisfiable (same source, no drift).
+    if (phase == "report" and ledger is not None
+            and unrecorded_evidence_hypotheses(ledger)):
+        allowed = allowed | {"record_finding"}
     hard_filtered = _PHASE_HARD_FILTER.get(phase, frozenset())
-    hint = _gate_hint(phase)
     # v3.47.3: REPORT is an execution phase.  Unrecorded evidence must be
     # settled in EVALUATE before the phase transition; once in REPORT, the
     # model completes and writes the report.  Forced/terminal entries use
@@ -417,10 +457,15 @@ def _phase_scoped_tools(
             if not name or name == "write_file" or name in _READONLY_SCOPES:
                 out.append(tool)
                 continue
-            if name in allowed:
-                prefix = _PHASE_TOOL_OK_MARK
-            else:
-                prefix = f"{_PHASE_TOOL_BLOCKED_MARK}（当前阶段动作：{hint}）"
+            if name not in allowed:
+                # v3.55.0：白名单暴露（替代"可见但标注不可用"）。
+                # 实证：2026-10-26 run4 round 3 在 VERIFY 调用 select_path 被
+                # allowlist 拦，白耗 1 轮；v3.48.0 对 HYPOTHESIZE 已得同一结论
+                # （标注 100% 送达仍被调用）。不在本相位可用集的业务工具直接
+                # 从模型可见集移除；allowlist 门控仍是幻觉调用的兜底。
+                changed = True
+                continue
+            prefix = _PHASE_TOOL_OK_MARK
             if isinstance(tool, dict):
                 desc = str(tool.get("description") or "")
                 new_tool = dict(tool)
@@ -687,6 +732,100 @@ existed anywhere in the 55 KB context).  Reported, never blocked.
 """
 
 
+_FOREIGN_TOKEN_STOPWORDS = frozenset({
+    # English hyphenated compounds that the token regex mistakes for entity
+    # ids.  Measured 2026-10-26 run3: `node-level` (appeared twice in EN
+    # reasoning while the context said 节点级) was reported as an entity
+    # absent from context — pure noise that pollutes the hallucination
+    # baseline (v3.53.0).
+    "node-level", "pod-level", "host-level", "container-level",
+    "cluster-level", "service-level", "system-level", "process-level",
+    "read-only", "read-write", "real-time", "long-term", "short-term",
+    "high-level", "low-level", "mid-level", "end-to-end", "well-known",
+    "self-healing", "self-hosted", "cross-node", "cross-pod", "top-level",
+    "non-root", "one-shot", "two-step", "multi-step", "state-of-the-art",
+})
+
+
+def _attach_observation_refs(
+        ledger: DiagnosisLedger, hid: str,
+        refs: list[str]) -> tuple[list[str], list[str]]:
+    """Attach cited raw-observation artifacts to *hid* (v3.55.0).
+
+    The record_finding channel used to decide "does this hypothesis have
+    confirmatory evidence" purely by what was attached to ITS node, while
+    every coordinator-collected tool result is attached to the ACTIVE
+    hypothesis only (``add_evidence_to_active``).  Measured 2026-10-26 run4:
+    round-4 ``get_os_kernel_dmesg_err`` / ``get_os_mem_oom`` /
+    ``get_os_mem_top_process`` were attached to H1, so H2/H3 carried zero
+    ``tool:`` entries and G17 blocked three ``confirmed`` attempts even though
+    the raw observation existed in the session.
+
+    An id is accepted only when it resolves to an artifact produced by a
+    whitelisted real-time probe / log tool (the same standard as
+    ``corroborating_observation_evidence``).  Returns (accepted, rejected).
+    """
+    wanted = [str(r).strip() for r in (refs or []) if str(r).strip()]
+    if not wanted:
+        return [], []
+    node = ledger.get("hypotheses", {}).get(hid)
+    if node is None:
+        return [], wanted
+    by_id: dict[str, dict] = {}
+    for _key, info in iter_artifacts(ledger):
+        _ev = str(info.get("ev_id") or "")
+        if _ev:
+            by_id[_ev] = info
+    accepted: list[str] = []
+    rejected: list[str] = []
+    existing = {str(e.get("shared_from") or "")
+                for e in node.get("evidence") or []}
+    for ref in wanted:
+        info = by_id.get(ref)
+        tool = str((info or {}).get("tool") or "")
+        if info is None or tool not in _OBSERVATION_EVIDENCE_TOOLS:
+            rejected.append(ref)
+            continue
+        if ref in existing:
+            accepted.append(ref)
+            continue
+        node.setdefault("evidence", []).append({
+            "id": f"ev_shared_{ref}",
+            "source": f"tool:{tool}",
+            "summary": (f"[共享观测 {ref}] "
+                        + str(info.get("preview") or ""))[:300],
+            "supports": None,
+            "shared_from": ref,
+            "round": info.get("round", 0),
+        })
+        node["_last_evidence_round"] = max(
+            int(node.get("_last_evidence_round") or 0),
+            int(info.get("round") or 0))
+        accepted.append(ref)
+    return accepted, rejected
+
+
+def _provenance_context_text(request: Any) -> str:
+    """Full model-visible text for provenance checks (v3.51.0).
+
+    ``ModelRequest`` keeps the system prompt in ``system_message``, OUTSIDE
+    ``messages``.  Concatenating only ``messages`` dropped ~37k chars of
+    system text and made identifiers living there look like hallucinations —
+    measured 2026-10-26 scenario 28 round 5: ``k8s-argus`` appeared 3× in the
+    system prompt and 0× in messages, and was reported as "absent from
+    context".  OpenTelemetry GenAI conventions keep the same split
+    (``gen_ai.system_instructions`` vs ``gen_ai.input.messages``), so an
+    observer must read both or it reports its own blind spot as model error.
+    """
+    parts: list[str] = []
+    sys_msg = getattr(request, "system_message", None)
+    if sys_msg is not None:
+        parts.append(str(getattr(sys_msg, "content", "") or ""))
+    for m in (getattr(request, "messages", None) or []):
+        parts.append(str(getattr(m, "content", "") or ""))
+    return "\n".join(parts)
+
+
 def _observe_context_foreign_entities(
         reasoning: str, context_text: str, round_no: int, phase: str) -> list[str]:
     """Log hyphenated identifiers that appear in reasoning but not context."""
@@ -696,11 +835,13 @@ def _observe_context_foreign_entities(
     counts: dict[str, int] = {}
     for _m in _HYPHEN_TOKEN_RE.finditer(reasoning.lower()):
         _tok = _m.group(0)
-        if len(_tok) < 5 or _tok in haystack:
+        if len(_tok) < 5 or _tok in haystack or _tok in _FOREIGN_TOKEN_STOPWORDS:
             continue
         counts[_tok] = counts.get(_tok, 0) + 1
+    # v3.54.0: threshold 2 → 3.  Real cross-entity bleed repeats (worker-4 ×N,
+    # kmc-prod-01 ×N); a single incidental compound does not.
     suspects = sorted(
-        (t for t, n in counts.items() if n >= 2),
+        (t for t, n in counts.items() if n >= 3),
         key=lambda t: counts[t], reverse=True)
     if suspects:
         logger.warning(
@@ -2433,6 +2574,26 @@ class RecordFindingInput(BaseModel):
             "留空表示不修改原表述。"
         ),
     )
+    superseded_by: str = Field(
+        default="",
+        description=(
+            "仅当本假设的**机制被另一假设覆盖**（不是被证据证伪）时填写目标"
+            "假设 ID（如 H1），同时 verdict 仍传 refuted。系统会记为"
+            "「并入 H1（机制被覆盖，非排除）」，报告写入并入小节而不是"
+            "「已排除」。若确实有针对本假设的负证据，请留空并改用"
+            "evidence_summary 说明该证据。"
+        ),
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "本结论所依据的**原始观测**编号（如 EV-r4-6，取自「原始证据索引」）。"
+            "当该观测是为其它假设采集、但同样构成本假设的直接证据时填写——"
+            "系统会把这条观测归属到本假设，confirmed 判定因此有据（否则会被"
+            "G17 证据标准拦截）。仅接受实时探测/日志类工具（dmesg、journalctl、"
+            "OOM 计数器等）签发的编号。"
+        ),
+    )
 
 
 # ── Middleware ──
@@ -3410,11 +3571,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     if isinstance(_rv, str):
                         _reasoning_text += _rv
                 if _reasoning_text:
-                    _ctx_text = "\n".join(
-                        str(getattr(_cm, "content", "") or "")
-                        for _cm in (getattr(request, "messages", None) or []))
+                    # v3.51.0: include system_message — it is where the
+                    # expert roster and phase contracts live, and omitting it
+                    # made existing identifiers look hallucinated.
                     _observe_context_foreign_entities(
-                        _reasoning_text, _ctx_text,
+                        _reasoning_text, _provenance_context_text(request),
                         self._model_call_count, _phase(ledger))
             except Exception:
                 pass  # observability must never become a failure source
@@ -5866,7 +6027,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _unknown = _unknown_hypothesis_fields(tool_args)
             if _content.startswith("Error invoking tool"):
                 result.content = _enhance_propose_error_receipt(
-                    _content, _unknown
+                    _content, _unknown,
+                    _missing_required_hypothesis_fields(tool_args),
                 )
                 logger.warning(
                     "propose_hypotheses schema validation failed "
@@ -6220,7 +6382,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     # one (guardrail-bleed fix).
                                     _rev["structured"] = attributed_structured(
                                         _structured_expert, _effect)
-                                    _rev["related_via"] = target_hid
+                                    # v3.56.0: `effect=refutes` is a NEGATIVE
+                                    # FINDING on the declared hypothesis, not a
+                                    # "restated direction".  The delegation
+                                    # contract now asks the expert to declare
+                                    # an exclusion ONLY when its own data
+                                    # settles it; such a declaration becomes a
+                                    # DIRECT negative entry (supports=False, no
+                                    # related_via) so the hypothesis can be
+                                    # booked as refuted without spending
+                                    # another delegation round.  `supports`
+                                    # and `unclear` keep the incidental
+                                    # semantics — a direction declaration is
+                                    # never enough for a confirmed verdict
+                                    # (v3.47.4).
+                                    if _effect == "refutes":
+                                        _rev["supports"] = False
+                                        _rev["_declared_refutation"] = True
+                                    else:
+                                        _rev["related_via"] = target_hid
                                 _rnode = ledger["hypotheses"][_rid]
                                 _rnode["evidence"].append(_rev)
                                 _rnode["_last_evidence_round"] = self._model_call_count
@@ -7431,6 +7611,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             probability_update: int | None = None,
             new_insights: str = "",
             statement_update: str = "",
+            superseded_by: str = "",
+            evidence_refs: list[str] | None = None,
         ) -> str:
             ledger = mw._current_ledger
             if ledger is None:
@@ -7590,6 +7772,26 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # an already-confirmed node (it already carries expert
             # evidence by construction); scenes with no assembled experts
             # (deadlock prevention).
+            # v3.55.0: attach cited raw observations BEFORE the G17 check —
+            # the gap this closes is precisely "the evidence exists but was
+            # gathered for another hypothesis".
+            _ref_accepted: list[str] = []
+            _ref_rejected: list[str] = []
+            if evidence_refs and verdict:
+                _ref_accepted, _ref_rejected = _attach_observation_refs(
+                    ledger, hypothesis_id, evidence_refs)
+            # v3.55.0: computed BEFORE the G17 gate so a blocked verdict can
+            # explain why the citation did not help.
+            _ref_note = ""
+            if _ref_accepted:
+                _ref_note = ("\nℹ 已把引用的原始观测归属到本假设："
+                             + "、".join(_ref_accepted)
+                             + "（该观测同时保留在原归属假设下）")
+            if _ref_rejected:
+                _ref_note += (
+                    "\n⚠ 以下编号不是实时探测/日志类观测（或不在证据索引中），"
+                    "未采纳：" + "、".join(_ref_rejected)
+                    + "；可用编号见「原始证据索引」")
             if (verdict == "confirmed"
                     and hypothesis_id in ledger.get("hypotheses", {})):
                 _g17_node = ledger["hypotheses"][hypothesis_id]
@@ -7612,6 +7814,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # — exactly what this receipt names.
                     _has_expert = confirmatory_expert_evidence(
                         ledger, hypothesis_id)
+                    # v3.52.0: coordinator-collected RAW observations
+                    # (dmesg / journalctl / OOM counters) also satisfy the
+                    # confirmatory layer for FACTUAL claims.  The evidence
+                    # standard is verifiability, not collector identity — an
+                    # audit standard ("直接获取的审计证据比间接获取的更可靠")
+                    # and the same reason a dmesg line needs no second
+                    # opinion.  Mechanism-level attribution still requires an
+                    # expert; the receipt and the report carry the tier.
+                    _observation_confirmed = False
+                    if (not _has_expert
+                            and corroborating_observation_evidence(
+                                ledger, hypothesis_id)):
+                        _has_expert = True
+                        _observation_confirmed = True
+                        _g17_node["_observation_confirmed"] = True
                     _experts = ledger.get("scene_experts") or []
                     # ── G17-E2: conflicted argus evidence ≠ confirmatory ──
                     # (2026-08-11 scenario 38, design document §8 G17 —
@@ -7768,6 +7985,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             "（注：专家在验证其他假设时发现的相关事实记在该"
                             "假设名下，不计入本假设的专家验证证据——confirmed "
                             "须以针对本假设的委派验证结论为依据。）"
+                            # v3.55.0: 若本次带了 evidence_refs，把采纳/拒绝结果
+                            # 一并回执——否则模型不知道它引用的编号为何没生效。
+                            + _ref_note
                         )
 
             # ── C2: argus-conflict refute guard (reactive backstop,
@@ -7865,9 +8085,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _sc_signal = (
                 single_channel_refute_signal(ledger, hypothesis_id)
                 if (verdict == "refuted"
+                    and not superseded_by
                     and hypothesis_id in ledger.get("hypotheses", {}))
                 else None
             )
+            # v3.52.0: "absorbed" is not "excluded" — a superseded_by verdict
+            # must not carry a single-channel-refute disclosure (the report
+            # never lists it under 已排除, so the disclosure has no object).
             _single_channel_hint = ""
             # ── G21: expert-verdict conflict arbitration (reactive
             # backstop, design document §8, v3.16.0; 2026-08-21 scenario
@@ -8055,10 +8279,35 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 record_finding(
                     ledger, hypothesis_id, verdict,
                     evidence_summary, probability_update, new_insights,
-                    statement_update,
+                    statement_update, superseded_by=superseded_by,
                 )
             except ValueError as e:
                 return f"记录失败: {e}"
+
+            # v3.51.0: disclose HOW a refuted verdict was booked.  "Another
+            # hypothesis explains it" is absorption, not exclusion; and a
+            # never-tested hypothesis is not excluded at all (it is shelved).
+            _refutation_note = ""
+            _rn = ledger.get("hypotheses", {}).get(hypothesis_id) or {}
+            if _rn.get("terminal_reason") == "superseded_by":
+                _refutation_note = (
+                    f"\nℹ 已记为「并入 {fmt_hid(_rn.get('superseded_by'))}」"
+                    "（机制被其他假设覆盖，非排除）：报告写入并入小节，"
+                    "不要写「已排除」。")
+            elif _rn.get("_refutation_basis") == "inference_only":
+                _refutation_note = (
+                    "\nℹ 该排除为推断性（无针对本假设的直接负证据），"
+                    "系统已在报告中标注该证据局限。若其机制实际被另一假设"
+                    "覆盖而非被证伪，请改传 superseded_by=<假设ID>，"
+                    "系统会记为「并入」而不是「排除」。")
+            # v3.52.0: state the evidence tier when a factual confirmed rests
+            # on coordinator-collected raw observations.
+            _evidence_tier_note = (
+                "\nℹ 本次 confirmed 由协调员直采的**工具原始观测**支撑"
+                "（未经专家复核）：报告中须标注证据层级【工具直接观测】；"
+                "机制性归因（为何发生）请委派专家确证后标注【深度确证】。"
+                if _rn.get("_observation_confirmed") else "")
+
 
             # ── Single-channel refute disclosure (v3.41.0, design
             # document §8 G22): the verdict landed — record the evidence
@@ -8310,6 +8559,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 f"已记录验证结果: {fmt_hid(hypothesis_id)} → {verdict} (p={probability_update}%)\n"
                 f"{evidence_summary}{stmt_hint}{exit_hint}{_impact_hint}{_candidate_hint}{_g18_warn}"
                 f"{_constraint_pin}{_degraded_hint}{_single_channel_hint}"
+                f"{_refutation_note}{_evidence_tier_note}{_ref_note}"
             )
 
         return StructuredTool.from_function(
@@ -8318,13 +8568,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 "记录假设验证结论（VERIFY 阶段验证后必须调用；EVALUATE 阶段亦可调用——"
                 "confirmed 强化、次要根因确认、statement_update 精化）。"
                 "verdict: confirmed(已证实——须以针对本假设的直接专家验证结论为依据"
-                "（expert:<type> 且无 related_via）；旁支 supports 仅作补充，"
+                "（expert:<type> 且无 related_via）；**事实性断言**也可由协调员直采的"
+                "实时探测/日志原始观测支撑（dmesg/journalctl/oom 计数器等，报告中标注"
+                "【工具直接观测】）；若该观测是为其它假设采集的，用 "
+                "evidence_refs=[\"EV-rX-Y\"] 引用即可把它归属到本假设；"
+                "机制性归因（为何发生）仍须专家确证；旁支 supports 仅作补充，"
                 "需一次定向验证后再 confirmed；仅有监控数据不足支撑，"
                 "无直接专家证据的 confirmed 会被系统拦截；"
                 "以 argus 监控专家结论 confirmed 时，结论范围须限定于指标直接可观测的事实"
                 "——机制性断言（为何发生）须委派深度专家确证，或在报告中标注为推断；"
                 "可同时存在多个确认的根因/加剧因素)"
-                " | refuted(证据明确证伪，该假设不成立——监控反证即可直接判定)"
+                " | refuted(证据明确证伪，该假设不成立——监控反证即可直接判定；"
+                "若只是机制被另一假设覆盖而非被证伪，改传 superseded_by=<假设ID>，"
+                "系统记为「并入」而非「排除」；从未获得本假设专家证据的 refuted "
+                "会被系统降级为 inconclusive 搁置)"
                 " | inconclusive(证据不足)。"
                 "注意：多个假设可以同时为confirmed（多根因场景），refuted仅用于证据明确否定的假设。"
                 "⚠ 若假设仅**部分不成立**（因果链中某一环节被证伪，但核心机制已被证据确认"
