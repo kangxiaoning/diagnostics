@@ -1062,6 +1062,13 @@ function onTextDelta(payload) {
     answerRawText += payload.text;
     if (activeAnswerBody) {
       activeAnswerBody.innerHTML = renderMarkdown(answerRawText);
+      if (payload.write_failed) {
+        const warning = document.createElement("div");
+        warning.className = "report-write-warning";
+        warning.textContent = "⚠ " + (payload.error || "报告写盘失败，以下为未落盘草稿");
+        warning.style.cssText = "margin:0 0 12px;padding:10px 12px;border:1px solid #d97706;border-radius:6px;background:#fff7ed;color:#92400e;font-weight:600;";
+        activeAnswerBody.insertBefore(warning, activeAnswerBody.firstChild);
+      }
       if (!activeCursor) {
         activeCursor = document.createElement("span");
         activeCursor.className = "streaming-cursor";
@@ -1186,16 +1193,9 @@ function onStructuredResponse(payload) {
     activeAnswerBody.innerHTML = renderMarkdown(html);
   }
 
-  // Update ledger root_cause from structured response (authoritative final conclusion).
-  // The ledger's root_cause was snapshotted when the first hypothesis was confirmed,
-  // but the LLM may reach a different conclusion after full REPORT-phase analysis.
-  if (payload.root_cause && currentLedger && currentLedger.root_cause !== payload.root_cause) {
-    console.log(`[DIAG] structured_response root_cause updated: "${(currentLedger.root_cause||'').substring(0,40)}..." -> "${payload.root_cause.substring(0,40)}..."`);
-    currentLedger.root_cause = payload.root_cause;
-    // Re-render hypothesis banner to show the corrected root cause.
-    // renderHypothesisTree does incremental DOM diff, so only the banner updates.
-    renderHypothesisTree(currentLedger);
-  }
+  // Root causes are derived from ledger_snapshot.  structured_response is
+  // display/telemetry only; overwriting the ledger here made a subagent
+  // payload a second authoritative root-cause writer.
 }
 
 // ═══════════════════ Tree Snapshot Handler ═══════════════════

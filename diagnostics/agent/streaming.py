@@ -913,6 +913,8 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                         "path": ["coordinator"],
                         "round": state.round_number,
                         "phase": "answering",
+                        "write_failed": bool(data.get("write_failed")),
+                        "error": data.get("error", ""),
                     }))
             # ── Custom events from middleware hooks ──
             elif data.get("type") == "round_transition":

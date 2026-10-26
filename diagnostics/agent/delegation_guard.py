@@ -45,8 +45,14 @@ model-invented key: it is stripped before dispatch (never forwarded to the
 subagent) and its content is folded into `description` when it is a short
 scalar, so the intent behind the invented key is not silently lost."""
 
-_MERGE_VALUE_LIMIT = 200
-"""Longest unknown-key value worth folding into `description`."""
+_INSTRUCTION_ALIASES = frozenset({"prompt", "instructions", "task"})
+"""Model conventions that carry the actual task instruction."""
+
+_CONFIG_ONLY_KEYS = frozenset({
+    "path", "skills", "mode", "system_prompt", "tools", "model",
+    "middleware", "permissions", "response_format", "interrupt_on",
+})
+"""SubAgent definition-time fields; never valid as runtime task arguments."""
 
 _BASELINE_MARKER = "## 诊断会话基线"
 """Opening line of the system-injected session baseline block."""
@@ -126,14 +132,14 @@ _RECEIPT_EMPTY = (
     "委派被拒绝：task 参数为空或无法解析（参数可能在生成时被截断）。\n"
     "请用两个命名参数重发："
     "task(subagent_type=\"<专家名>\", description=\"<分析目标 + 要确认的信号>\")。\n"
-    "不要在参数里罗列返回字段或写结论——专家的返回格式由其自身指令预定义。"
+    "description 聚焦分析目标与关键信号；专家返回格式由其自身指令定义。"
 )
 
 _RECEIPT_TOO_LARGE = (
     "委派被拒绝：参数共 {size} 字节，超过上限 {limit} 字节。\n"
     "description 只写「查什么 + 验证哪个假设 + 看哪个信号」；"
-    "诊断参数（hostname/cluster_name/namespace/pod_name/时间窗口）由系统自动注入，无需粘贴。\n"
-    "禁止粘贴结构化结论、证据原文、JSON 结构或会话基线。"
+    "诊断参数（hostname/cluster_name/namespace/pod_name/时间窗口）由系统自动注入。\n"
+    "结构化结论、证据原文、JSON 结构与会话基线由系统管理。"
 )
 
 _RECEIPT_DESC_TOO_LONG = (
@@ -151,6 +157,12 @@ _RECEIPT_UNKNOWN_TYPE = (
 
 _RECEIPT_MISSING_DESC = (
     "委派被拒绝：缺少 description。请写明分析目标与需要确认的信号。"
+)
+
+_RECEIPT_UNKNOWN_KEYS = (
+    "本次 task 未执行：参数中包含未支持字段 {keys}。"
+    "请用标准两参数重发：subagent_type=专家名，description=任务目标与关键信号；"
+    "需要技能时在 description 写明技能名。"
 )
 
 
@@ -206,51 +218,64 @@ class DelegationGuardMiddleware(AgentMiddleware):
                 size=len(description), limit=self._max_desc)
         return None
 
-    def _fold_unknown_keys(self, tool_call: dict) -> None:
-        """Strip keys outside the delegation contract (design document §7).
+    def _fold_unknown_keys(self, tool_call: dict) -> str | None:
+        """Classify unknown keys without silently losing real instructions.
 
-        Observed 2026-10-22: the model added ``path: "/agent_data/skills"`` to
-        a ``task`` call — the skills directory it had seen in the system
-        prompt.  deepagents rejects unknown keys, so the whole delegation
-        failed with an English framework error, the coverage gate still
-        counted that expert as delegated, and the retry hit the HYPOTHESIZE
-        phase gate (three rounds burned).  §7 already requires this class of
-        error to be caught here "to avoid an opaque failure inside the task
-        tool wasting a round".
+        - instruction aliases (``prompt``/``instructions``/``task``):
+          append to description with neutral framing;
+        - SubAgent definition fields (``path``/``skills``/``mode``...):
+          drop, never merge (they are not runtime instructions);
+        - anything else: return an actionable tool error so the model can
+          resend with the two-field contract.
 
-        Shape: strip the key (it must never reach the subagent), fold a short
-        scalar value into ``description`` so the intent survives, and log the
-        fold.  No receipt is returned because the call still runs.
+        2026-10-25 evidence: eight identical ``path=/agent_data/skills``
+        occurrences showed the old "merge every short unknown value" policy
+        both polluted the description and hid the invalid key from the model.
+        deepagents>=0.7.29 now rejects unknown task keys itself; this guard
+        must not recreate the older silent-drop behavior for long prompts.
         """
         args = tool_call.get("args")
         if not isinstance(args, dict) or not args:
-            return
+            return None
         unknown = [key for key in args if key not in _ALLOWED_ARGS]
         if not unknown:
-            return
+            return None
 
         description = args.get("description")
         description = description if isinstance(description, str) else ""
         merged: list[str] = []
         dropped: list[str] = []
+        rejected: list[str] = []
         for key in unknown:
             value = args.pop(key)
-            text = str(value).strip() if isinstance(
-                value, (str, int, float, bool)) else ""
-            if text and len(text) <= _MERGE_VALUE_LIMIT:
-                merged.append(f"{key}={text}")
-            else:
+            if key in _CONFIG_ONLY_KEYS:
                 dropped.append(key)
+                continue
+            if key in _INSTRUCTION_ALIASES and isinstance(value, str):
+                text = value.strip()
+                if text:
+                    if description:
+                        description = (
+                            f"{description}\n\n[补充任务指令]\n{text}")
+                    else:
+                        description = text
+                    merged.append(key)
+                else:
+                    dropped.append(key)
+                continue
+            rejected.append(key)
 
         if merged:
-            suffix = "（系统合并自额外参数：" + "；".join(merged) + "）"
-            args["description"] = (
-                f"{description}\n{suffix}" if description else suffix)
+            args["description"] = description
         tool_call["args"] = args
         logger.warning(
-            "委派参数未知键已处理: merged=%s dropped=%s (合法参数: %s)",
-            merged, dropped, ", ".join(_ALLOWED_ARGS),
+            "委派参数未知键已处理: aliases=%s dropped=%s rejected=%s "
+            "(合法参数: %s)",
+            merged, dropped, rejected, ", ".join(_ALLOWED_ARGS),
         )
+        if rejected:
+            return _RECEIPT_UNKNOWN_KEYS.format(keys=", ".join(rejected))
+        return None
 
     def _normalize_description(self, tool_call: dict) -> None:
         """Strip a duplicated system-context block before measuring length.
@@ -281,7 +306,13 @@ class DelegationGuardMiddleware(AgentMiddleware):
         tool_call = getattr(request, "tool_call", None) or {}
         if tool_call.get("name") != _TASK_TOOL:
             return None
-        self._fold_unknown_keys(tool_call)
+        unknown_problem = self._fold_unknown_keys(tool_call)
+        if unknown_problem is not None:
+            return ToolMessage(
+                content=unknown_problem,
+                tool_call_id=tool_call.get("id", ""),
+                name=_TASK_TOOL,
+            )
         self._normalize_description(tool_call)
         problem = self._violation(tool_call)
         if problem is None:

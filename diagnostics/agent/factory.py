@@ -123,12 +123,14 @@ _TASK_TOOL_DESCRIPTION = """委派一个临时子代理执行多步诊断任务�
 - subagent_type：专家类型名，必须取自上面的列表。
 - description：委派指令，写清分析目标、待验证的问题、需要确认的关键信号。
 
+技能选择：技能已在专家侧预配置。需要专家使用某技能时，在 description 写明技能名；
+task 的参数为 subagent_type 与 description。
+
 description 写作规则：
 - 诊断参数（hostname / cluster_name / namespace / pod_name / 时间窗口）由系统自动注入，
-  不要在 description 里重复粘贴。
-- 专家的返回格式由该专家自己的指令预定义。禁止在 description 中罗列返回字段、
-  写 JSON 结构或预演结论——只写要查什么、要确认什么。
-- 不要在 description 中粘贴证据原文、会话基线或历史结论。
+  description 聚焦分析目标与关键信号。
+- 专家的返回格式由该专家自己的指令预定义。description 只写要查什么、要确认什么。
+- description 保留本次任务指令；证据原文、会话基线与历史结论由系统注入。
 
 用法说明：
 - 多个互相独立的委派可以在同一条消息里并发发起（多个 tool call）。
@@ -154,7 +156,7 @@ class _ProjectTaskToolSchema(_delegation.TaskToolSchema):
         description=(
             "委派指令：分析目标 + 待验证的问题 + 需要确认的关键信号。"
             "诊断参数（hostname/cluster_name/namespace/pod_name/时间窗口）由系统"
-            "自动注入，无需粘贴。禁止罗列返回字段、写 JSON 结构或预演结论——"
+            "自动注入。description 只写要查什么、要确认什么；"
             "返回格式由专家自身的指令预定义。"
         )
     )
@@ -290,8 +292,7 @@ class RelatedHypothesis(BaseModel):
     id: str = Field(
         description=(
             "受本次取证影响的其他假设编号（如 H2，写 2 亦可——系统两种写法都认）。"
-            "**必须使用假设编号**（H1/H2…），不要写描述性名称（如 control_plane_"
-            "resource_bottleneck）——后者无法归因，会被系统丢弃。仅填写委派描述中"
+            "**使用假设编号**（H1/H2…）；描述性名称无法归因，系统会丢弃。仅填写委派描述中"
             "出现的假设编号；没有其他受影响假设、或本次委派发生在假设提出之前"
             "（数据采集阶段），留空数组"
         ),
@@ -349,7 +350,7 @@ class DeepExpertFindings(BaseModel):
         default_factory=list,
         description=(
             "负证据必报：与假设矛盾、或未找到目标对象的证据（如目标 Pod 不存在/目标组件正常），"
-            "与阳性证据同等重要，不得省略。"
+            "与阳性证据同等重要，请完整列入。"
             "⚠ 判 refuted 时本字段是主体：证伪事实（如「目标 Pod OOMKilled、RESTARTS=3」）写在这里；"
             "此时 key_evidence 应为空或仅含排除性说明"
         ),
@@ -360,8 +361,8 @@ class DeepExpertFindings(BaseModel):
             "根因判断（**根因承载力字段**）：confirmed/inconclusive 且已定位根因时"
             "陈述根因结论；refuted 时陈述假设被排除的原因及建议转向方向"
             "（此时假设本身不是根因）；证据不足时说明还需什么数据。方向须与 verdict 一致。"
-            "根因必须写在本字段——不得只写在报告正文或 preliminary_judgment；"
-            "确实未定位时走 inconclusive 并写清缺口，禁止为填满字段而编造根因"
+            "根因写在本字段；报告正文与 preliminary_judgment 作为摘要。"
+            "确实未定位时走 inconclusive 并写清缺口；无证据的根因陈述按幻觉判定"
         ),
     )
     verdict_target: Literal["assigned_hypothesis", "alternative_root_cause"] = Field(
@@ -371,8 +372,8 @@ class DeepExpertFindings(BaseModel):
             "assigned_hypothesis（默认——本次结论针对被指派假设本身）/ "
             "alternative_root_cause（你另发现了真正根因或真正故障对象时必须填此项）。"
             "本字段与 verdict **正交**：verdict 说'被指派假设是否成立'，本字段说"
-            "'你的证据靶向谁'——**两种 verdict 都可搭配本项**，"
-            "不要为迁就本字段而改写 verdict。\n"
+            "'你的证据靶向谁'——**两种 verdict 都可搭配本项**。"
+            "先按证据确定 verdict，再填写本字段。\n"
             "✓ 完整示例（他因形态，最常见）：{\"verdict\": \"refuted\", "
             "\"verdict_target\": \"alternative_root_cause\", \"key_evidence\": "
             "[\"目标 Pod OOMKilled（Exit 137），RESTARTS=3\"], \"negative_evidence\": "
@@ -401,11 +402,10 @@ class DeepExpertFindings(BaseModel):
             "『网络策略：不适用｜本次任务为资源不足』、"
             "『Pod日志：强制收尾｜预算用尽未采集』。"
             "已声明的维度视为已交代，不会因缺数据被要求补采；"
-            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）。"
+            "类型按真实原因填写：强制收尾写「强制收尾」，真实缺数据写「数据不可用」。"
             "原因只写观测事实（如『目标节点无监控数据』『查询返回空』）；"
-            "禁止推断或编造未验证的解释（如『当前工具仅支持主机级指标』这类工具能力断言）。"
-            "同一原因导致的多个维度合并为一条并列出维度清单，"
-            "禁止逐维度重复同一句话"
+            "工具能力以工具实际返回为准，未验证解释写入缺口说明。"
+            "同一原因导致的多个维度合并为一条并列出维度清单，每个维度使用对应证据表述"
         ),
     )
 
@@ -446,7 +446,7 @@ class ArgusExpertFindings(BaseModel):
             "参数缺失澄清：若因缺少必要参数（如 hostname/monitor_name）无法执行任何查询，"
             f"以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数；否则为空字符串。"
             "部分成功规则：已查到的维度照常填写各字段交付（含正常项），"
-            "本字段写剩余所需参数——禁止只回澄清而丢弃已采发现。"
+            "本字段写剩余所需参数；已采发现在同一回执中完整交付。"
         ),
     )
     # 多值字段统一形态契约：字符串数组，每项一条完整短句（P1 前置形态
@@ -470,8 +470,8 @@ class ArgusExpertFindings(BaseModel):
         default_factory=list,
         description=(
             "并发异常（数组，每项一条）：同一时间点发生、且指向共同根因的多个异常。"
-            "同一根因合并为一条（列出受影响维度清单），"
-            "禁止按维度逐个复制同一句话——重复项会被系统折叠，写多无用"
+            "同一根因合并为一条（列出受影响维度清单），每个维度使用对应证据表述；"
+            "重复项会被系统折叠"
         ),
     )
     cross_domain: list[str] = Field(
@@ -482,9 +482,8 @@ class ArgusExpertFindings(BaseModel):
         default="",
         description=(
             "初步判断（**根因承载力字段**）：基于指标关联的根因结论，"
-            "根因必须写在这里，不得只写在报告正文或口头总结里。"
-            "证据不足以定位根因时写「未定位」并说明缺口，"
-            "禁止为填满字段而编造根因（无证据的根因陈述会被判定为幻觉）"
+            "根因写在这里；报告正文与口头总结作为摘要。"
+            "证据不足以定位根因时写「未定位」并说明缺口；无证据的根因陈述按幻觉判定"
         ),
     )
     confidence: str = Field(
@@ -500,12 +499,10 @@ class ArgusExpertFindings(BaseModel):
             "示例：[\"Pod指标：数据不可用｜目标命名空间无 Pod\", "
             "\"网络指标：不适用｜本次任务为存储不足\"]。"
             "已声明的维度视为已交代，不会因缺数据被要求补采；"
-            "强制收尾类不要写成数据不可用（Coordinator 须区分护栏阻断与真实数据不可用）。"
+            "类型按真实原因填写：强制收尾写「强制收尾」，真实缺数据写「数据不可用」。"
             "原因只写观测事实（如『查询返回空』『该维度无数据点』）；"
-            "禁止推断或编造未验证的解释（如『当前工具仅支持主机级指标』这类工具能力断言）——"
-            "这类断言会把数据缺口误升级为结论。"
-            "同一原因导致的多个维度合并为一条并列出维度清单，"
-            "禁止逐维度重复同一句话（重复项会被系统折叠）"
+            "工具能力以工具实际返回为准，未验证解释写入缺口说明，保持数据缺口为缺口。"
+            "同一原因导致的多个维度合并为一条并列出维度清单，每个维度使用对应证据表述"
         ),
     )
 
@@ -545,7 +542,7 @@ _EXPERT_RETURN_SUFFIX = (
     "结论通过 `DeepExpertFindings` 结构化交付（字段契约见工具 schema："
     "方向契约、结论对象声明、负证据必报均在字段说明中）。\n"
     "\n**取证策略**:\n"
-    "- 避免冗余枚举：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
+    "- 概览后聚焦：概览类工具返回批量数据后，仅对**显示异常**的资源用深度工具核查"
     "（多个异常则全部核查）；同一指标同一时间窗口一次调用拿全量再筛选，不拆分多次查询；"
     "grep 多关键字用一条正则一次完成。\n"
     "- 收益递减时立即收尾：关键证据已足够做出置信度判断时立即返回；"
@@ -597,7 +594,7 @@ _ARGUS_EXPERT_RETURN_SUFFIX = (
     "见工具 schema，含部分成功规则与未取证维度声明）；"
     "聚焦关键指标，不复述工具原始输出；信息完整、指标覆盖完整即收束。\n"
     "- 文本回退：若因缺少必要参数无法执行任何查询，"
-    f"回复以 {ARGUS_CLARIFICATION_MARKER} 开头并列出所需参数，禁止臆造参数。\n"
+    f"回复以 {ARGUS_CLARIFICATION_MARKER} 开头并列出工具契约中实际需要的参数。\n"
 )
 
 
@@ -667,11 +664,10 @@ def _build_subagents(
                 "2. 消息开头的「Argus 诊断上下文（工具参数契约）」JSON 区块（Serverless 场景；"
                 "hostname 参数取 hosts[].host_name，诊断目标落点主机取 target_landing_hosts）\n"
                 "3. Coordinator 的 task 描述\n"
-                "hostname 参数必须是主机名（host_name），禁止填写节点 IP（node_name）。\n"
-                "如果以上都未提供足够的参数导致任何查询都无法执行，回复'需要 hostname 参数'——"
-                "不要模拟工具调用。若已能执行部分查询，必须照常交付已采集的发现"
-                "（结构化返回），并在其中说明剩余所需参数——禁止以参数澄清"
-                "替代已可交付的采集结果。\n\n"
+                "hostname 参数使用主机名（host_name）；节点维度使用 node_name/节点 IP。\n"
+                "如果以上都未提供足够的参数导致任何查询都无法执行，回复'需要 hostname 参数'。"
+                "已能执行的部分查询照常交付已采集的发现（结构化返回），"
+                "剩余所需参数写入 clarification 字段，与已采数据同时交付。\n\n"
                 "诊断原则：\n"
                 "- **首轮先调用 get_argus_os_overview_metrics**（一次拿到全部 11 维"
                 "——CPU/内存/磁盘/网络/NAS/PING/TCP/内核/负载/时间同步——的维度级突变信号），"
@@ -721,9 +717,9 @@ def _build_subagents(
                 "1. 消息开头的「系统已预解析的诊断实体」区块（直接提供 monitor_name/cluster_name 参数值，优先级最高）\n"
                 "2. Coordinator 的 task 描述\n"
                 "如果两处都未提供足够的参数导致任何查询都无法执行，回复'需要 "
-                "monitor_name/cluster_name 参数'——不要模拟工具调用。"
-                "若已能执行部分查询，必须照常交付已采集的发现（结构化返回），"
-                "并在其中说明剩余所需参数——禁止以参数澄清替代已可交付的采集结果。\n\n"
+                "monitor_name/cluster_name 参数'。"
+                "已能执行的部分查询照常交付已采集的发现（结构化返回），"
+                "剩余所需参数与已采数据在同一回执中交付。\n\n"
                 "诊断原则：\n"
                 "- **首轮必须先调用 get_argus_k8s_cluster_metrics（集群概览）**取维度级突变信号，"
                 "再只对概览标记突变的维度与委派指定对象下钻 node/workload/pod/master；"
@@ -906,9 +902,9 @@ def _build_subagents(
                 "- monitor_name / cluster_name / 时间窗 ← tool_params（唯一来源）\n"
                 "- 诊断目标 namespace / workload_type / workload_name / pod_name ← diagnostic_target\n"
                 "- 目标物理落点 pod_name / node_name ← landings；其余资源参数 ← inventory.serverless_views（resource / physical_pods）\n"
-                "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
-                "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
-                "禁止只回参数澄清而丢弃已采集数据。\n\n"
+                "参数只取上述契约；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'。"
+                "已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
+                "已采集数据与澄清信息在同一回执中交付。\n\n"
                 "诊断原则：\n"
                 "- 先查集群概览（cluster 维度），异常时按维度深入（node/workload/pod）\n"
                 "- 逻辑集群 API 异常时用 master 维度查控制面组件（跨层关联输入）\n"
@@ -963,9 +959,9 @@ def _build_subagents(
                 "- monitor_name / cluster_name / 时间窗 ← tool_params（唯一来源）\n"
                 "- 诊断目标及其控制面落点 ← diagnostic_target / landings\n"
                 "- 其余资源参数 ← inventory.kmc_views（kmc_resource(kind/ns/name/node_name)）\n"
-                "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
-                "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
-                "禁止只回参数澄清而丢弃已采集数据。\n\n"
+                "参数只取上述契约；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'。"
+                "已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
+                "已采集数据与澄清信息在同一回执中交付。\n\n"
                 "诊断原则：\n"
                 "- 识别 KMC 节点健康、控制面组件 CPU/内存、etcd 指标突变时间点\n"
                 "- 控制面组件高负载可解释逻辑集群 API 延迟（跨层关联）\n"
@@ -1024,9 +1020,9 @@ def _build_subagents(
                 "- 诊断目标 SCI Pod ← diagnostic_target.derived_sci_pod；落点 ← landings\n"
                 "- boundary.target_sci_pod_absent=true 表示目标在 SCI 物理侧缺席（可能为同步链路故障本体），按缺席事实分析关联指标\n"
                 "- 其余资源参数 ← inventory.sci_views（sci_pod.name / sci_pod.node_name）\n"
-                "不自造参数；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'，"
-                "不要模拟工具调用；已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
-                "禁止只回参数澄清而丢弃已采集数据。\n\n"
+                "参数只取上述契约；若区块未提供足够参数导致任何查询都无法执行，回复'需要 <参数名>'。"
+                "已能执行的查询照常交付其发现（结构化返回中说明剩余所需参数），"
+                "已采集数据与澄清信息在同一回执中交付。\n\n"
                 "诊断原则：\n"
                 "- 识别 SCI 节点健康、工作负载 Pod 资源/重启/OOM 突变时间点\n"
                 "- 工作负载 Pod 名前缀 burst-（逻辑 Pod 的物理形态）\n"

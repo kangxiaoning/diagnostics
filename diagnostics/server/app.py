@@ -641,8 +641,8 @@ async def _chat_event_stream(
     report_text: list[str] = []   # only answering-phase text → .md file
     tree = TreeBuilder()
     latest_ledger: dict[str, Any] | None = None  # tracks latest ledger snapshot
-    final_root_cause: str | None = None           # authoritative from structured_response
     structured_seen: bool = False                 # a structured report was received
+    report_write_failed: str | None = None        # draft delivered, not persisted
 
     logger.info("[session=%s] Chat stream started, message=%r",
                 session_id, request.message[:120])
@@ -693,9 +693,16 @@ async def _chat_event_stream(
                 if is_coordinator:
                     assistant_text.append(event.payload["text"])
                     trace.llm_text(event.payload.get("round", 0), event.payload["text"])
-                    # Separate report content (answering phase) for .md file
+                    # Separate report content (answering phase) for .md file.
+                    # A failed write is a draft for display only: never feed it
+                    # to the durable .md writer, and keep the failure visible.
                     if event.payload.get("phase") == "answering":
-                        report_text.append(event.payload["text"])
+                        if event.payload.get("write_failed"):
+                            report_write_failed = (
+                                event.payload.get("error")
+                                or "报告写盘失败；内容为未落盘草稿")
+                        else:
+                            report_text.append(event.payload["text"])
                 # Feed text tokens to tree for think/answer buffer.
                 # `phase` decides which buffer receives the token: the tree
                 # used to have no answering signal at all, which made its
@@ -772,7 +779,9 @@ async def _chat_event_stream(
             elif event.name == "structured_response":
                 logger.info("[session=%s] Structured response received", session_id)
                 structured_seen = True
-                final_root_cause = event.payload.get("root_cause") or final_root_cause
+                # Display/telemetry only.  Root causes are derived from the
+                # ledger snapshot; a structured expert/subagent payload must
+                # never become a second authoritative root-cause writer.
                 yield sse("structured_response", event.payload)
 
             elif event.name == "ledger_snapshot":
@@ -848,22 +857,18 @@ async def _chat_event_stream(
         # Report .md file: only answering-phase text (captured from write_file)
         report_content = "".join(report_text).strip()
 
-        # If structured_response arrived with a root_cause that differs from
-        # the ledger's eagerly-snapshotted value, overwrite it.  The LLM may
-        # change its conclusion between hypothesis confirmation and final report.
-        if final_root_cause and latest_ledger and latest_ledger.get("root_cause") != final_root_cause:
-            logger.info("[session=%s] Overwriting ledger root_cause: %r -> %r",
-                        session_id, latest_ledger.get("root_cause"), final_root_cause)
-            latest_ledger["root_cause"] = final_root_cause
-            yield sse("ledger_snapshot", {"ledger": latest_ledger})
-
         elapsed = time.monotonic() - t_start
         logger.info("[session=%s] Stream completed in %.1fs, events: %s, assistant_text=%d chars, report=%d chars",
                     session_id, elapsed, dict(event_counters), len(content), len(report_content))
+        if report_write_failed:
+            logger.warning(
+                "[session=%s] Report was not durably persisted: %s",
+                session_id, report_write_failed)
         _save_result(report_path, tree,
                      request.entity_type, request.entity_name,
                      elapsed, event_counters, len(content),
-                     ledger=latest_ledger, content=report_content)
+                     ledger=latest_ledger,
+                     content="" if report_write_failed else report_content)
         trace.finalize()
         yield sse("done", {"session_id": session_id})
 

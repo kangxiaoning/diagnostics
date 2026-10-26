@@ -357,32 +357,20 @@ def confirmatory_expert_evidence(ledger: DiagnosisLedger, hid: str) -> bool:
     """Whether *hid* holds expert evidence able to carry a ``confirmed``
     verdict (design document §8 G17, evidence-standard gate; v3.42.0).
 
-    Two families of ``expert:*`` entries exist on a hypothesis:
+    v3.47.3: confirmed requires a **direct** expert conclusion for this
+    hypothesis (no ``related_via``).  An incidental entry — an expert
+    restating another delegation's declared ``effect`` toward this
+    hypothesis — is supplementary context, not per-hypothesis
+    confirmatory evidence.  This matches the user-facing rule
+    "confirmed 须以针对本假设的专家验证结论为依据" and avoids the
+    H4/H5 asymmetry observed 2026-10-25: H4 was blocked while H5 passed
+    only because an incidental ``supports`` entry existed.
 
-    * **direct** (no ``related_via``) — an expert was SENT to verify this
-      hypothesis.  It always counts: whether its conclusion agrees with a
-      later verdict is the *conflict* question (G21), not the *evidence
-      standard* question.
-    * **incidental** (``related_via`` set, v3.37.7 multi-hypothesis
-      attribution) — the entry restates ANOTHER delegation's declared
-      ``effect`` toward this hypothesis.  It counts only when that
-      declared direction is POSITIVE (``supports`` true / restated
-      verdict ``confirmed``): a direction declaration that refutes (or
-      leaves unclear) the hypothesis is not confirmatory-layer evidence
-      for it.
-
-    Why the direction matters (2026-09-13 session ac7e7551, scenario 17):
-    host-expert verified H1 and declared
-    ``related_hypotheses=[{H2, effect=refutes}]``; the restated entry made
-    H2 count as "has expert evidence", so a ``confirmed`` resting on
-    metric-layer reasoning passed the G17 precondition and was then
-    blocked by G21 — which reads the *opposite* direction as a
-    cross-expert verdict conflict and offers "re-grade to inconclusive"
-    among its exits.  The same polluted entry also disabled G17-E2 (the
-    argus-conflict signal requires ALL expert views to be metric-layer).
-    One bad provenance thus closed the correct gate and armed the wrong
-    one; the substantive gap was "no direct verification", which is what
-    G17's receipt already names (v3.38.0 direct-vs-incidental view).
+    Why the direction alone is insufficient: in the 2026-09-13 incident
+    an incidental entry made a metric-layer ``confirmed`` pass G17 and
+    then be rejected by G21; one bad provenance simultaneously closed
+    the correct gate and armed the wrong one.  Direct verification is
+    the evidence standard; direction remains relevant only to G21.
 
     Pure derivation from the evidence list (single source of truth); no
     storage field is added.
@@ -392,10 +380,6 @@ def confirmatory_expert_evidence(ledger: DiagnosisLedger, hid: str) -> bool:
         if not str(e.get("source", "")).startswith("expert:"):
             continue
         if not e.get("related_via"):
-            return True
-        if e.get("supports") is True:
-            return True
-        if (e.get("structured") or {}).get("verdict") == "confirmed":
             return True
     return False
 
@@ -775,6 +759,25 @@ def can_append_hypothesis(
     return True
 
 
+def next_alternative_root_candidate(
+        ledger: DiagnosisLedger) -> dict | None:
+    """First unconsumed alternative-root candidate, if append is possible."""
+    if len(ledger.get("hypotheses") or {}) >= MAX_TOTAL_HYPOTHESES:
+        return None
+    if (ledger.get("_alternative_append_count", 0)
+            >= MAX_ALTERNATIVE_ROOT_APPENDS):
+        return None
+    for candidate in ledger.get("_alternative_root_candidates", []) or []:
+        if candidate.get("eligible", True) and candidate.get("statement"):
+            return candidate
+    return None
+
+
+def alternative_append_available(ledger: DiagnosisLedger) -> bool:
+    """Whether an evidence-backed independent-root append remains executable."""
+    return next_alternative_root_candidate(ledger) is not None
+
+
 def _propose_budget_exhausted_message(ledger: DiagnosisLedger) -> str:
     """Shared rejection text when the global propose budget is spent."""
     return (
@@ -968,6 +971,8 @@ def add_hypotheses(
             round_num=ledger["current_round"],
             rationale=spec.get("rationale", ""),
         )
+        if spec.get("independent_anomaly"):
+            node["independent_anomaly"] = True
         hypotheses[hid] = node
         created.append(node)
         ledger["root_hypothesis_ids"].append(hid)
@@ -1329,14 +1334,16 @@ def derive_phase(ledger: DiagnosisLedger) -> DiagnosisPhase:
                 for hid in root_ids)):
         if can_propose_root_hypotheses(ledger):
             return "hypothesize"
-        return "report"  # T9 == E2
+        return "report" if report_ready(ledger) else "evaluate"  # T9 == E2
 
-    # 5. Exit conditions E1-E3 → report; otherwise evaluate.
+    # 5. Exit conditions E1-E3 → report only after the pre-report
+    #    settlement checklist is clean.  Readiness is a phase-entry
+    #    condition, not a write_file condition (v3.47.3).
     if ledger.get("exhausted"):
-        return "report"
+        return "report" if report_ready(ledger) else "evaluate"
     should_exit, _reason, _cid = check_exit_conditions(ledger)
     if should_exit:
-        return "report"
+        return "report" if report_ready(ledger) else "evaluate"
     return "evaluate"
 
 
@@ -2400,7 +2407,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
             "- ⚠ 字段契约：每条假设必须含 statement/probability/rationale 三字段，"
             "statement 必填且为一句完整根因表述——缺失会导致调用失败"
-            "（失败不消耗提出预算，修正后重新提交即可）\n"
+            "（失败不消耗提出预算，修正后重新提交即可）；"
+            "若该假设对应已观察且不能由其他假设解释的独立异常/独立故障源，"
+            "请加 independent_anomaly=true，低概率也不会被系统按噪声跳过\n"
             "- ⚠ 同源合并：若多个候选描述的是同一故障的机制/因果链上下游"
             "（如\"内存超限 OOMKilled\"与\"memory limit 配置过低\"互为表里），"
             "应合并为一条假设；仅当证据显示独立故障源并存时才提出多条\n"
@@ -2552,9 +2561,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         _attribution_hint = ""
         if _others_pending:
             _attribution_hint = (
-                "- ⚠ 专家证据按假设归属：验证本假设的专家结论不能作为其他"
-                f"未决假设（{'、'.join(_others_pending)}）的 confirmed 依据"
-                "——confirmed 它们须定向委派该假设的验证\n"
+                "- ⚠ confirmed 使用针对本假设的直接委派结论；其他假设"
+                f"（{'、'.join(_others_pending)}）的旁支 supports 仅作补充，"
+                "仍需定向委派该假设的验证\n"
             )
         # v3.38.1: supply side of the v3.37.7 multi-hypothesis attribution.
         # The landing path has always been implemented (declared ids get their
@@ -2695,8 +2704,13 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # placed FIRST so the LLM sees the blocker + phase-appropriate actions
         # before anything else (primacy — avoids the buried-banner dilution
         # observed in scenario 32 where the LLM looped on unproductive actions).
+        _readiness_banner = render_report_readiness(ledger)
         _directive = render_exit_directive(ledger, "evaluate")
-        if _directive:
+        if _readiness_banner:
+            # v3.47.3: REPORT eligibility is surfaced HERE, before the
+            # phase transition.  write_file no longer owns this check.
+            exit_banner = "\n" + _readiness_banner + "\n"
+        elif _directive:
             exit_banner = "\n## 退出条件诊断（系统计算，无需你判断）\n" + _directive + "\n"
         else:
             exit_banner = (
@@ -2941,8 +2955,10 @@ def residual_uncertainty(ledger: DiagnosisLedger) -> float:
     are explicitly shelved by the LLM — their residual uncertainty does
     not count against "把握足够" (D4); they remain backtrackable and
     re-enter R when re-activated (deferred cleared by select_path /
-    activate_hypothesis / backtrack).  Low-probability pending nodes
-    (p ≤ 15) are excluded on the same grounds as the legacy E1 rule.
+    activate_hypothesis / backtrack).  Ordinary low-probability pending nodes
+    (p ≤ 15) are excluded on the same grounds as the legacy E1 rule; an
+    explicitly marked independent anomaly remains included because its prior
+    is not a reliable reason to drop a second remediation path.
     (v2.7 flat model: no ancestor shield — there are no sub-hypotheses.)
     """
     total = 0.0
@@ -2951,7 +2967,9 @@ def residual_uncertainty(ledger: DiagnosisLedger) -> float:
             continue
         if node.get("deferred"):
             continue
-        if node.get("status") == "pending" and node.get("probability", 0) <= 15:
+        if (node.get("status") == "pending"
+                and node.get("probability", 0) <= 15
+                and not node.get("independent_anomaly")):
             continue
         total += _uncertainty(node)
     return total
@@ -3146,7 +3164,12 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
             continue
         if node.get("deferred"):
             continue
-        if node.get("status") == "pending" and node.get("probability", 0) <= 15:
+        if (node.get("status") == "pending"
+                and node.get("probability", 0) <= 15
+                and not node.get("independent_anomaly")):
+            # Ordinary low-prior noise stays pruned.  An explicitly marked
+            # independent anomaly is different: its prior is unreliable and
+            # missing it can leave a second remediation untouched.
             continue
         v = delegation_value_for(ledger, hid)
         f1_action = f1_arbitration_available(ledger, hid)
@@ -3163,6 +3186,16 @@ def max_action_value(ledger: DiagnosisLedger) -> tuple[float, str]:
                 f"已委派{node.get('_delegate_count', 0)}次/"
                 f"inconclusive {node.get('_inconclusive_count', 0)}次)"
             )
+    _alt_candidate = next_alternative_root_candidate(ledger)
+    if _alt_candidate is not None and KAPPA_STOP > best_v:
+        # A registered alternative root is an executable next step even when
+        # every hypothesis is already terminal.  Policy lower bound, not a
+        # fabricated EIG value; it prevents S2 from closing the report while
+        # an evidence-backed independent root is still waiting for a decision.
+        best_v = KAPPA_STOP
+        best_d = (
+            f"追加独立根因候选 {_alt_candidate.get('candidate_id')}"
+            f"（{str(_alt_candidate.get('statement', ''))[:80]}）")
     if (ledger.get("root_hypothesis_ids") and can_propose_root_hypotheses(ledger)
             and not has_confirmed):
         v = 1.0 / COST_BATCH_PROPOSE  # fresh batch: U=1, D=1, F=1
@@ -3329,19 +3362,131 @@ def _exit_blocker(ledger: DiagnosisLedger) -> dict | None:
     return best
 
 
-def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
-    """Render the system-injected disclosure section listing unverified
-    competing hypotheses (design document §6.3 E2' release-with-disclosure,
-    v3.6.0).
+_REPORT_H_ID_RE = re.compile(r"(?<![A-Za-z0-9_])H([0-9]+)(?![A-Za-z0-9_])")
+_REPORT_HEADING_RE = re.compile(r"(?m)^(#{2,4})\s+(.+?)\s*$")
 
-    Appended to the report content by the write_file gate (release) and
-    by the report-capture path (rewrite backstop) whenever unresolved
-    hypotheses remain — multi-root-cause protection via deterministic
-    DISCLOSURE (code-injected, does not depend on LLM compliance)
-    instead of blocking.  Lists ALL unresolved hypotheses regardless of
-    deferred state (a shelved hypothesis is still an unverified fact the
-    reader must see); Returns "" when no unresolved hypotheses remain.
+
+def _report_role_sections(content: str) -> list[tuple[str, str, list[str]]]:
+    """Return (role, heading, H-ids) for explicit terminal-status sections.
+
+    Only headings that explicitly declare a terminal role participate.  IDs
+    mentioned in evidence tables or free prose are never classified, which
+    keeps this a contradiction check rather than an NLP parser.
     """
+    matches = list(_REPORT_HEADING_RE.finditer(content or ""))
+    out: list[tuple[str, str, list[str]]] = []
+    for idx, match in enumerate(matches):
+        title = match.group(2).strip().strip("*` ")
+        if "已确认根因" in title or "确认根因" in title or title == "根因":
+            role = "root"
+        elif "排除" in title and not any(
+                k in title for k in ("未验证", "待验证", "观测级", "未证实")):
+            # A combined heading such as "已排除与未验证" is ambiguous; its
+            # H-ids are not assigned to either side rather than falsely
+            # flagging every unresolved hypothesis.
+            role = "refuted"
+        elif any(k in title for k in ("未验证", "待验证", "观测级", "未证实")):
+            role = "unverified"
+        else:
+            continue
+        level = len(match.group(1))
+        end = len(content or "")
+        for nxt in matches[idx + 1:]:
+            if len(nxt.group(1)) <= level:
+                end = nxt.start()
+                break
+        body = content[match.end():end]
+        ids = [f"H{m.group(1)}" for m in _REPORT_H_ID_RE.finditer(body)]
+        out.append((role, title, ids))
+    return out
+
+
+def report_status_manifest(ledger: DiagnosisLedger) -> dict[str, list[str]]:
+    """Derive the report's terminal-state manifest from the ledger."""
+    roots = [f"H{hid}" for hid, _n in confirmed_root_nodes(ledger)]
+    refuted = [
+        f"H{hid}" for hid, n in ledger.get("hypotheses", {}).items()
+        if n.get("status") == "refuted"
+    ]
+    unverified = [
+        f"H{hid}" for hid, n in ledger.get("hypotheses", {}).items()
+        if n.get("status") in ("pending", "inconclusive")
+        or (n.get("status") == "confirmed"
+            and f"H{hid}" not in roots)
+    ]
+    return {
+        "root": sorted(roots, key=lambda x: int(x[1:])),
+        "refuted": sorted(refuted, key=lambda x: int(x[1:])),
+        "unverified": sorted(unverified, key=lambda x: int(x[1:])),
+    }
+
+
+def report_manifest_violations(
+        content: str, ledger: DiagnosisLedger) -> list[str]:
+    """Detect explicit report-section/ledger terminal-state contradictions.
+
+    This is intentionally narrow: it checks H-ids placed under headings that
+    declare "confirmed root" or "excluded".  Unrecognised prose is left to
+    the report contract; the system manifest remains the deterministic
+    backstop.
+    """
+    manifest = report_status_manifest(ledger)
+    root_set = set(manifest["root"])
+    refuted_set = set(manifest["refuted"])
+    errors: list[str] = []
+    for role, heading, ids in _report_role_sections(content):
+        if role == "root":
+            wrong = sorted(set(ids) - root_set)
+            if wrong:
+                errors.append(
+                    f"「{heading}」包含非根因假设 {'、'.join(wrong)}；"
+                    f"台账根因为 {('、'.join(manifest['root']) or '无')}")
+        elif role == "refuted":
+            wrong = sorted(set(ids) - refuted_set)
+            if wrong:
+                errors.append(
+                    f"「{heading}」包含非 refuted 假设 {'、'.join(wrong)}；"
+                    f"台账已排除为 {('、'.join(manifest['refuted']) or '无')}")
+    return errors
+
+
+def render_report_status_manifest(
+        ledger: DiagnosisLedger, issues: list[str] | None = None) -> str:
+    """Deterministic terminal-state appendix used when prose diverges."""
+    manifest = report_status_manifest(ledger)
+    nodes = ledger.get("hypotheses", {})
+
+    def _line(hid: str) -> str:
+        raw = hid[1:]
+        node = nodes.get(raw, {})
+        status = node.get("status", "?")
+        if node.get("deferred"):
+            status += "，已搁置"
+        return (f"- **{hid}**（{status}，p={node.get('probability', '?')}）："
+                f"{node.get('statement', '')}")
+
+    lines = ["\n\n---\n\n## 报告终态校验（系统附录）\n"]
+    if issues:
+        lines.append(
+            "> 正文分节与台账终态存在不一致，系统已保留原始报告并在此"
+            "给出权威台账视图：\n")
+        lines.extend(f"> - {item}" for item in issues)
+        lines.append("")
+    for label, key in (
+        ("已确认根因", "root"),
+        ("已排除", "refuted"),
+        ("未验证/观测级", "unverified"),
+    ):
+        ids = manifest[key]
+        if not ids:
+            continue
+        lines.append(f"**{label}**\n")
+        lines.extend(_line(hid) for hid in ids)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _unverified_hypotheses_block(ledger: DiagnosisLedger) -> str:
     lines = []
     for hid, n in ledger.get("hypotheses", {}).items():
         if n.get("status") in ("pending", "inconclusive"):
@@ -3351,6 +3496,8 @@ def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
                 _st = "未验证"
             if n.get("deferred"):
                 _st += "，已搁置"
+            if n.get("independent_anomaly"):
+                _st += "，独立异常"
             lines.append(
                 f"- **{fmt_hid(hid)}**（概率 {n.get('probability')}%，{_st}）："
                 f"{n.get('statement', '')}"
@@ -3358,11 +3505,59 @@ def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
     if not lines:
         return ""
     return (
-        "\n\n---\n\n## 未验证竞争假设（系统披露）\n\n"
+        "## 未验证竞争假设（系统披露）\n\n"
         "> 本报告在确认根因后生成；以下竞争假设尚未完成验证，系统已将其搁置。"
         "若故障症状持续或复发，建议优先针对以下方向继续排查：\n\n"
         + "\n".join(lines)
     )
+
+
+def _alternative_candidate_block(ledger: DiagnosisLedger) -> str:
+    candidate_lines = []
+    for candidate in ledger.get("_alternative_root_candidates", []) or []:
+        statement = str(candidate.get("statement", "")).strip()
+        if not statement:
+            continue
+        candidate_lines.append(
+            f"- **{candidate.get('candidate_id', 'ALT')}**"
+            f"（独立根因候选，尚未追加为假设并验证；来源 "
+            f"{candidate.get('expert', 'expert')}）：{statement}"
+        )
+    if not candidate_lines:
+        return ""
+    return (
+        "## 未验证独立根因候选（系统披露）\n\n"
+        "> 以下独立根因候选已有专家证据，但尚未追加为假设或完成验证；"
+        "不得将其误写为已确认根因，也不得因未验证而省略：\n\n"
+        + "\n".join(candidate_lines)
+    )
+
+
+def render_unverified_hypotheses_disclosure(
+        ledger: DiagnosisLedger) -> str:
+    """Unverified competing hypotheses only (idempotent marker block)."""
+    block = _unverified_hypotheses_block(ledger)
+    return "\n\n---\n" + block if block else ""
+
+
+def render_alternative_candidate_disclosure(
+        ledger: DiagnosisLedger) -> str:
+    """Unconsumed alternative-root candidates only (separate marker block)."""
+    block = _alternative_candidate_block(ledger)
+    return "\n\n---\n" + block if block else ""
+
+
+def render_unverified_disclosure(ledger: DiagnosisLedger) -> str:
+    """Combined disclosure for direct callers (two idempotent blocks)."""
+    blocks = [
+        block for block in (
+            _unverified_hypotheses_block(ledger),
+            _alternative_candidate_block(ledger),
+        ) if block
+    ]
+    if not blocks:
+        return ""
+    return "\n\n---\n" + "\n\n".join(blocks)
 
 
 def has_expert_returns(ledger: DiagnosisLedger) -> bool:
@@ -3410,6 +3605,63 @@ def unrecorded_evidence_hypotheses(
         if has_expert and evidence_newer_than_finding(node):
             out.append((hid, node))
     return out
+
+
+def report_readiness_blockers(ledger: DiagnosisLedger) -> list[str]:
+    """Residual work that must settle before entering REPORT (v3.47.3).
+
+    REPORT entry is the eligibility gate.  ``write_file`` must never have
+    to discover these conditions after the phase has already started.
+    """
+    blockers: list[str] = []
+    unrecorded = unrecorded_evidence_hypotheses(ledger)
+    if unrecorded:
+        ids = "、".join(fmt_hid(hid) for hid, _ in unrecorded)
+        blockers.append(
+            f"{ids} 已有专家验证证据但尚未 record_finding 落账；"
+            "请先逐项落账，再进入 REPORT"
+        )
+
+    for hid, node in ledger.get("hypotheses", {}).items():
+        if node.get("status") not in ("pending", "inconclusive"):
+            continue
+        if node.get("deferred"):
+            continue
+        if (node.get("independent_anomaly")
+                or delegation_value_for(ledger, hid) >= KAPPA_STOP):
+            _stmt = str(node.get("statement", "")).strip()
+            _label = f"{fmt_hid(hid)}「{_stmt}」" if _stmt else fmt_hid(hid)
+            blockers.append(
+                f"{_label} 仍未验证且仍有验证价值；"
+                "请先 task 验证、record_finding 终结或明确 defer"
+            )
+
+    candidate = next_alternative_root_candidate(ledger)
+    if candidate is not None and not confirmed_root_nodes(ledger):
+        blockers.append(
+            f"独立根因候选 {candidate.get('candidate_id', 'ALT')} 尚未追加；"
+            "请先 propose_hypotheses(alternative_candidate_id=...) 并验证"
+        )
+    return blockers
+
+
+def report_ready(ledger: DiagnosisLedger) -> bool:
+    """True when REPORT is the natural next phase (no settle work owed)."""
+    return not report_readiness_blockers(ledger)
+
+
+def render_report_readiness(ledger: DiagnosisLedger) -> str:
+    """Positive pre-report checklist (single next action, no write block)."""
+    blockers = report_readiness_blockers(ledger)
+    if not blockers:
+        return ""
+    lines = ["## 报告就绪检查（未满足）"]
+    lines.extend(f"- {item}" for item in blockers)
+    lines.append(
+        "完成以上项目后，系统自动进入 REPORT；"
+        "REPORT 内只生成和写入报告，不再做资格拦截。"
+    )
+    return "\n".join(lines)
 
 
 def render_unrecorded_evidence_appendix(ledger: DiagnosisLedger) -> str:
@@ -3641,9 +3893,9 @@ def render_exit_directive(ledger: DiagnosisLedger, phase: DiagnosisPhase) -> str
             # not fit a phase where only propose_hypotheses is legal).
             actions = (
                 "请选择（HYPOTHESIZE 可用动作）：\n"
-                "  ① propose_hypotheses 提出新批次假设——若根因方向已明，"
-                "直接收录为新假设（证据在手可随后 record_finding confirmed "
-                "落账，p≥80 后 write_file 通道自动开放）\n"
+                "  ① propose_hypotheses 提出新假设；系统进入 VERIFY 后，"
+                "先定向 task 验证新假设，专家结论归属该假设后再 "
+                "record_finding confirmed\n"
                 "⛔ 不要直接 write_file——无确认根因时会被拦截。"
             )
         else:
@@ -3813,6 +4065,51 @@ def _iter_g21_terminal_evidence(node: HypothesisNode):
             continue
         if (ev.get("structured") or {}).get("verdict") in ("confirmed", "refuted"):
             yield ev
+
+
+MAX_G21_ARBITRATIONS = 1
+"""One bounded conflict-recheck delegation per hypothesis."""
+
+
+def g21_arbitration_expert(
+        ledger: DiagnosisLedger, hid: str,
+        node: HypothesisNode | None = None) -> str:
+    """Single deep expert for a bounded G21 conflict recheck (or "").
+
+    Prefer a deep expert not yet delegated for this hypothesis.  When every
+    deep view was already used, permit exactly one targeted recheck by the
+    first conflicting deep expert; after that (or when no conflicting
+    expert exists) the coordinator must use disclosed inconclusive.
+    """
+    node = node or (ledger.get("hypotheses") or {}).get(hid) or {}
+    if not node:
+        return ""
+    if node.get("_g21_arbitration_attempts", 0) >= MAX_G21_ARBITRATIONS:
+        return ""
+    terminal = [
+        ev for ev in _iter_g21_terminal_evidence(node)
+        if (ev.get("structured") or {}).get("verdict_target")
+        != "alternative_root_cause"
+    ]
+    verdicts = {
+        (ev.get("structured") or {}).get("verdict") for ev in terminal
+    }
+    if not {"confirmed", "refuted"} <= verdicts:
+        return ""
+    unused = [
+        e for e in _parallel_candidates(ledger, hid, node)
+        if not e.endswith("-argus-expert")
+        and delegation_value_for(ledger, hid, e) >= KAPPA_STOP
+    ]
+    if unused:
+        return unused[0]
+    for ev in terminal:
+        source = str(ev.get("source", ""))
+        if source.startswith("expert:"):
+            expert = source.split("expert:", 1)[-1].split(":", 1)[0]
+            if not expert.endswith("-argus-expert"):
+                return expert
+    return ""
 
 
 def expert_verdict_conflict(ledger: DiagnosisLedger, hid: str,
@@ -4242,6 +4539,19 @@ def compute_evaluate_action(ledger: DiagnosisLedger) -> ActionHint | None:
             if hint and hint.action == "record_finding":
                 return hint  # "先落账已有专家证据的假设"
 
+    # Priority 1b: a registered, unconsumed independent-root candidate is an
+    # evidence-backed actionable direction.  Without this branch it could sit
+    # in the candidate list while every hypothesis is terminal, and S2 would
+    # incorrectly declare "no executable action" (scenario 25 netem).
+    _alt_candidate = next_alternative_root_candidate(ledger)
+    if _alt_candidate is not None:
+        return ActionHint(
+            "propose_hypotheses", "high",
+            f"追加独立根因候选 {_alt_candidate.get('candidate_id')}："
+            f"{str(_alt_candidate.get('statement', ''))[:120]}"
+            "（传 alternative_candidate_id；追加后定向验证，不得直接确认）",
+        )
+
     # Priority 2: rank pending (non-deferred, non-dead) by value
     _pending = []
     for hid, node in ledger.get("hypotheses", {}).items():
@@ -4527,17 +4837,41 @@ def render_verify_directive(ledger: DiagnosisLedger) -> str:
                     != "alternative_root_cause"
                 }
                 if not _alt_rc and {"confirmed", "refuted"} <= _terminal_vs:
-                    directive = (
-                        f"⚠ {fmt_hid(active_id)} 的专家结论方向冲突：多个深度"
-                        f"专家对同一假设给出相反终局结论（confirmed 与 "
-                        f"refuted 并存，证据见上方）——落账任一终局判定等于"
-                        f"单方面采信一侧。当前唯一推荐动作：先仲裁——复检矛盾"
-                        f"数据源（委派第三方视角专家复核两侧对同一物理量的"
-                        f"观测差异），或改判 inconclusive 并在 new_insights "
-                        f"披露两侧矛盾；确有把握推翻某侧结论时，携带 "
-                        f"statement_update（推翻理由）落账，通道立即开放、"
-                        f"不会被拦截。"
-                    )
+                    # v3.47.1: one action only.  Multiple co-equal exits in
+                    # the same conflict card made the coordinator oscillate
+                    # between "confirmed+refine" and "cannot confirm while
+                    # conflicted" (2026-10-25 scenario 28: 18,259 reasoning
+                    # chars, zero tool calls).  Prefer an unused direct view;
+                    # when all views were already used, allow exactly one
+                    # targeted recheck by the first conflicting expert.
+                    # Exhausted or absent channels -> disclosed inconclusive.
+                    # The coordinator still decides and executes; the system
+                    # never auto-dispatches a delegation.
+                    _g21_expert = g21_arbitration_expert(
+                        ledger, active_id, node)
+                    if _g21_expert:
+                        directive = (
+                            f"⚠ {fmt_hid(active_id)} 的专家结论方向冲突："
+                            "多个深度专家给出相反终局结论（confirmed 与 "
+                            "refuted 并存，证据见上方）。当前唯一合法动作："
+                            f"task(subagent_type=\"{_g21_expert}\", "
+                            f"description=\"验证假设 {fmt_hid(active_id)}："
+                            "复检冲突双方对同一实体、同一故障时间窗的观测"
+                            "差异；直接测量优先于当前状态或间接推断\")。"
+                            "本步不得 record_finding，也不得用 statement_update "
+                            "单方面推翻一侧。本次为一次有界复核；返回后按新"
+                            "证据重新判定，若仍冲突则按未验证缺口披露收口。"
+                        )
+                    else:
+                        directive = (
+                            f"⚠ {fmt_hid(active_id)} 的专家结论方向冲突，"
+                            "且当前假设的深度复核通道/仲裁预算已耗尽。"
+                            "当前唯一合法动作：record_finding(verdict="
+                            "inconclusive, new_insights=[明确记录双方结论、"
+                            "各自实体/时间窗差异及证据缺口])。不得再委派、"
+                            "不得强行 confirmed/refuted，也不得用 "
+                            "statement_update 单方面推翻一侧。"
+                        )
                 # Evidence-scope calibration (design document §9,
                 # v3.13.0): when every expert conclusion so far is
                 # metric-layer (argus-class) and no conflict fired, the

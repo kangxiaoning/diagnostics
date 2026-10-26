@@ -51,6 +51,7 @@ from diagnostics.agent.ledger import (
     alternative_root_candidate,
     register_alternative_root_candidate,
     expert_verdict_conflict,
+    g21_arbitration_expert,
     f1_arbitration_available,
     add_evidence_to_active,
     add_hypotheses,
@@ -80,8 +81,12 @@ from diagnostics.agent.ledger import (
     render_ledger_context,
     render_argus_coverage_disclosure,
     render_single_channel_limitation_appendix,
+    render_alternative_candidate_disclosure,
     render_unrecorded_evidence_appendix,
     render_unverified_disclosure,
+    render_unverified_hypotheses_disclosure,
+    report_manifest_violations,
+    render_report_status_manifest,
     resolve_hypothesis_id,
     select_path,
     unrecorded_evidence_hypotheses,
@@ -241,7 +246,7 @@ _HOST_ARGUS_TOOLS: frozenset[str] = frozenset({
 # surface them via the error receipt (failure path) or a warning log
 # (success path, observability only).
 _HYPOTHESIS_CONTRACT_FIELDS: frozenset[str] = frozenset(
-    {"statement", "probability", "rationale"}
+    {"statement", "probability", "rationale", "independent_anomaly"}
 )
 
 
@@ -344,10 +349,9 @@ def _phase_rejection_suffix(phase: str) -> str:
     """
     if phase == "hypothesize":
         return (
-            "正确动作：propose_hypotheses 提出新批次假设"
-            "（若根因方向已明，直接收录为新假设——证据在手"
-            "可随后 record_finding confirmed 落账，落账成功"
-            "（p≥80）后 write_file 通道自动开放）。"
+            "正确动作：propose_hypotheses 提出新假设；系统进入 VERIFY 后，"
+            "先定向 task 验证新假设，专家结论归属该假设后再 record_finding "
+            "confirmed。"
         )
     if phase == "verify":
         return (
@@ -391,13 +395,10 @@ def _phase_scoped_tools(
     allowed = _PHASE_ALLOWLIST.get(phase, frozenset())
     hard_filtered = _PHASE_HARD_FILTER.get(phase, frozenset())
     hint = _gate_hint(phase)
-    if (phase == "report" and ledger is not None
-            and not ledger.get("report")
-            and unrecorded_evidence_hypotheses(ledger)):
-        # Keep the proactive surface identical to the reactive gate: the
-        # model must see record_finding as available before it can settle.
-        allowed = allowed | {"record_finding"}
-        hint = "record_finding（先补落账）→ write_file"
+    # v3.47.3: REPORT is an execution phase.  Unrecorded evidence must be
+    # settled in EVALUATE before the phase transition; once in REPORT, the
+    # model completes and writes the report.  Forced/terminal entries use
+    # deterministic disclosure appendices instead of reopening record_finding.
     out: list = []
     changed = False
     for tool in tools:
@@ -789,6 +790,24 @@ def _mark_summary_degraded(response: Any, *, elapsed: float) -> None:
 # inside awrap_model_call — before_model has already executed — so round
 # and safety counters are untouched; model calls are side-effect-free
 # (tools have not executed), which makes retrying safe.
+def _malformed_tool_name(name: str) -> bool:
+    """Detect a model that serialized arguments into the function name.
+
+    Seen on 2026-10-25 scenario 28: the model emitted
+    ``task(subagent_type=..., description=...)`` as the tool *name* with
+    empty arguments; the generic phase-allowlist rejection did not explain
+    the format error, so the malformed call repeated for 29 rounds.
+    Tool names are identifiers, so parentheses/XML parameter markers or
+    newlines are never legitimate.
+    """
+    text = str(name or "")
+    return (
+        "(" in text or ")" in text
+        or "<parameter" in text or "</parameter" in text
+        or "\n" in text or "\r" in text
+    )
+
+
 _MODEL_MAX_ATTEMPTS = max(1, int(os.getenv("DIAGNOSTICS_MODEL_MAX_ATTEMPTS", "3")))  # total attempts (1 initial + retries); floor 1
 _MODEL_RETRY_BACKOFF_BASE = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BASE", "2"))  # backoff base seconds (doubles per attempt)
 _MODEL_RETRY_BACKOFF_MAX = float(os.getenv("DIAGNOSTICS_MODEL_RETRY_BACKOFF_MAX", "30"))  # backoff cap seconds
@@ -1453,9 +1472,22 @@ def _with_report_disclosures(ledger: DiagnosisLedger, content: str,
     """
     if skip or not content:
         return content
+    content, _dropped_ids = strip_unissued_evidence_ids(content, ledger)
+    if _dropped_ids and "系统校正：以下证据编号" not in content:
+        content = content.rstrip() + (
+            "\n\n---\n\n> 系统校正：以下证据编号并非系统签发、无法"
+            "回读对应原文，已从正文移除："
+            + "、".join(sorted(set(_dropped_ids)))
+            + "。相关证据请以工具名 + 实体 + 时间窗核对。"
+        )
+        logger.warning(
+            "unissued EV-id citations stripped from report: %s",
+            sorted(set(_dropped_ids)),
+        )
     for renderer, marker in (
         (render_argus_coverage_disclosure, "覆盖降级（系统披露）"),
-        (render_unverified_disclosure, "未验证竞争假设（系统披露）"),
+        (render_unverified_hypotheses_disclosure, "未验证竞争假设（系统披露）"),
+        (render_alternative_candidate_disclosure, "未验证独立根因候选（系统披露）"),
         (render_unrecorded_evidence_appendix, "已采集未落账证据"),
         (render_single_channel_limitation_appendix, "证据局限（系统附录）"),
     ):
@@ -1614,6 +1646,17 @@ _RETRYABLE_EXC_NAMES = frozenset({
     # loop instead of burning the whole timeout again.
     "ReasoningLoopError",
 })
+
+
+def _retry_uses_thinking_off(exc: BaseException) -> bool:
+    """Only a reasoning loop justifies switching the retry to no-thinking.
+
+    Transport failures (timeout / connection / 5xx / 429) may be unrelated to
+    the generation regime; changing thinking there adds an unnecessary
+    behaviour change.  Name matching matches the existing retry classifier and
+    avoids an import cycle.
+    """
+    return type(exc).__name__ == "ReasoningLoopError"
 
 
 def _resolved_model_base_url() -> str:
@@ -2242,6 +2285,14 @@ class HypothesisSpec(BaseModel):
     )
     probability: int = Field(description="可能性 0-100", ge=0, le=100)
     rationale: str = Field(default="", description="假设依据")
+    independent_anomaly: bool = Field(
+        default=False,
+        description=(
+            "该假设是否对应一个已观察到、且不能由本批其他假设机制解释的"
+            "独立异常/独立故障源。即使概率低也请如实标记；独立异常不会被"
+            "低概率剪枝跳过，以便验证或明确披露。普通竞争方向填 false。"
+        ),
+    )
 
 
 class DeprioritizedSpec(BaseModel):
@@ -3207,18 +3258,17 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         response = None
         _call_error: BaseException | None = None
         _attempts_used = 0
+        _retry_without_thinking = False
         for _attempt in range(1, _MODEL_MAX_ATTEMPTS + 1):
             _attempts_used = _attempt
             _attempt_request = _call_request
-            if _attempt > 1:
-                # v3.45.7: same-parameter retries reproduce the same failure.
-                # Measured 2026-10-23 (scenario 17, evaluate): two consecutive
-                # 480 s timeouts, each burning 26k-30k characters of reasoning
-                # on the same contradictory evidence before emitting any
-                # output (finish_reason=None, content=0, tool_calls=0).  The
-                # retry disables thinking so the second attempt is not the
-                # same over-reasoning loop again (CoT-compression practice:
-                # budget-aware early exit rather than a longer deadline).
+            if _attempt > 1 and _retry_without_thinking:
+                # v3.47.1: change the generation regime only when the failure
+                # was an actual reasoning loop.  Unconditionally disabling
+                # thinking also changed ordinary transport/5xx retries, where
+                # the same context was not the cause.  Once a loop is seen,
+                # subsequent attempts stay quiet even if the quiet attempt
+                # hits a different transient failure.
                 _quiet_model = _thinking_off_variant(
                     getattr(_attempt_request, "model", None))
                 if _quiet_model is not None:
@@ -3226,8 +3276,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         model=_quiet_model)
                     logger.warning(
                         "Model retry %d/%d with thinking disabled "
-                        "(round %d, phase=%s) — identical parameters would "
-                        "reproduce the same over-reasoning",
+                        "(round %d, phase=%s) — previous attempt raised "
+                        "ReasoningLoopError; identical thinking parameters "
+                        "would reproduce the over-reasoning",
                         _attempt, _MODEL_MAX_ATTEMPTS,
                         self._model_call_count, _phase(ledger),
                     )
@@ -3244,6 +3295,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 if not _is_retryable_model_error(_exc):
                     raise  # 4xx / programming errors — retrying cannot help
                 _call_error = _exc
+                if _retry_uses_thinking_off(_exc):
+                    _retry_without_thinking = True
                 _err_label = (
                     f"timeout after {_effective_timeout}s"
                     if isinstance(_exc, asyncio.TimeoutError)
@@ -4806,7 +4859,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # any synthetic write_file injection (G7), and system-side
             # stub writers never go through this tool.
             if ledger:
-                should_exit, reason, _ = check_exit_conditions(ledger)
+                if _phase(ledger) == "report":
+                    # v3.47.3: REPORT entry already passed report_ready (or
+                    # is a forced/terminal degradation).  Once here, write_file
+                    # is an execution action: no readiness gate, no unrecorded
+                    # deferral, no manifest block.  Only real I/O errors remain.
+                    should_exit, reason = True, ""
+                else:
+                    should_exit, reason, _ = check_exit_conditions(ledger)
 
                 def _defer_unrecorded():
                     """Bounded settle-before-report request (v3.46.1).
@@ -5044,10 +5104,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             _phase_route = ""
                             if _phase(ledger) == "hypothesize":
                                 _phase_route = (
-                                    "\n正确动作：propose_hypotheses 提出新批次"
-                                    "假设（若根因方向已明，直接收录为新假设——"
-                                    "证据在手可随后 record_finding confirmed "
-                                    "落账，落账成功（p≥80）后本通道自动开放）。"
+                                    "\n正确动作：propose_hypotheses 提出新假设；"
+                                    "系统进入 VERIFY 后，先定向 task 验证新假设，"
+                                    "专家结论归属该假设后再 record_finding "
+                                    "confirmed。"
                                 )
                             logger.warning(
                                 "write_file blocked by exit-condition gate "
@@ -5070,13 +5130,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 ) + _r2_suffix + _phase_route,
                                 tool_call_id=tool_call_id,
                             )
-                # v3.46.1: last settle-before-report check on every
-                # gate-passing path (natural exit / forced / deterministic
-                # honest-negative).  Bounded by _unrecorded_block_count;
-                # afterwards the disclosure appendices below still apply.
-                _deferred_receipt = _defer_unrecorded()
-                if _deferred_receipt is not None:
-                    return _deferred_receipt
+                # v3.47.3: REPORT must not defer write_file for readiness.
+                # In non-REPORT phases the premature-write gate above already
+                # returned; a REPORT write always proceeds.  Unrecorded
+                # evidence (forced/terminal entry only) is disclosed by the
+                # deterministic appendix below instead of blocking delivery.
                 # write_file passed the gate (natural exit, forced terminal,
                 # E2' release-with-disclosure, or the v3.8.0 deterministic
                 # honest-negative exit) — reset the generic block counter.
@@ -5095,6 +5153,29 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     and isinstance(tool_args.get("content"), str)
                     and tool_args["content"] == ledger.get("report")
                 )
+                # ── Report terminal-state manifest gate (v3.47.1) ──
+                # The report body is LLM-authored, but terminal states are
+                # ledger facts.  Detect explicit section/status contradictions
+                # (e.g. an inconclusive/deferred hypothesis placed under
+                # "excluded").  One corrective rewrite is requested; if the
+                # second attempt still diverges, the report is written with a
+                # deterministic authoritative appendix instead of blocking
+                # delivery forever.
+                _report_manifest_issues: list[str] = []
+                if (not _is_stub_echo_write
+                        and isinstance(tool_args.get("content"), str)):
+                    _report_manifest_issues = report_manifest_violations(
+                        tool_args["content"], ledger)
+                    # v3.47.3: no retry/block in REPORT.  The authoritative
+                    # terminal-state appendix below always accompanies a
+                    # mismatching body (information preservation + disclosure).
+                    if _report_manifest_issues:
+                        logger.warning(
+                            "report terminal-state mismatch disclosed, not "
+                            "blocked (round=%d): %s",
+                            self._model_call_count,
+                            " | ".join(_report_manifest_issues),
+                        )
                 # ── Evidence-closure appendix (design document §6.3,
                 # v3.11.0) — gathered-but-unrecorded expert evidence is
                 # deterministically disclosed on EVERY gate-passing write
@@ -5141,28 +5222,9 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         "injected (round %d, %d chars)",
                         self._model_call_count, len(_sc_appendix),
                     )
-                # ── Unissued EV-id citation gate (design document §6.6) ──
-                # Verify-before-cite: the report contract conditions EV-id
-                # citations on the injected evidence index, so any id the
-                # system never issued is unverifiable.  Strip it and append
-                # a deterministic correction note (fail-open: the report is
-                # still written; only the fabricated anchors are removed).
-                if (not _is_stub_echo_write
-                        and isinstance(tool_args.get("content"), str)):
-                    _cleaned, _dropped_ids = strip_unissued_evidence_ids(
-                        tool_args["content"], ledger)
-                    if _dropped_ids:
-                        tool_args["content"] = _cleaned.rstrip() + (
-                            "\n\n---\n\n> 系统校正：以下证据编号并非系统签发、无法"
-                            "回读对应原文，已从正文移除："
-                            + "、".join(sorted(set(_dropped_ids)))
-                            + "。相关证据请以工具名 + 实体 + 时间窗核对。"
-                        )
-                        logger.warning(
-                            "write_file unissued EV-id citations stripped "
-                            "(round %d): %s", self._model_call_count,
-                            sorted(set(_dropped_ids)),
-                        )
+                # EV-id verification is centralized in
+                # `_with_report_disclosures`, so normal writes, salvage and
+                # stub delivery share one sanitizer.
                 # Final disclosures are injected BEFORE the actual write on
                 # every gate-passing path.  The post-handler capture must
                 # never mutate a different copy (file / ledger / SSE).
@@ -5170,6 +5232,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         tool_args.get("content"), str):
                     tool_args["content"] = _with_report_disclosures(
                         ledger, tool_args["content"])
+                    if _report_manifest_issues:
+                        # The one repair turn did not resolve the explicit
+                        # contradiction.  Keep the authored body (information
+                        # preservation) and append the authoritative ledger
+                        # view so the reader is never misled.
+                        tool_args["content"] = (
+                            tool_args["content"].rstrip()
+                            + render_report_status_manifest(
+                                ledger, _report_manifest_issues)
+                        )
+                        ledger["_report_manifest_issues"] = list(
+                            _report_manifest_issues)
+                        self._persist_ledger(ledger)
+                        logger.warning(
+                            "report written with authoritative terminal-state "
+                            "appendix after unresolved manifest issues "
+                            "(round=%d)", self._model_call_count,
+                        )
                 # NOTE: the ledger-derived appendix channel (evidence
                 # layers / topology mapping / delegated experts /
                 # refuted hypotheses, v3.14.0 - v3.36.0) was REMOVED.
@@ -5239,6 +5319,25 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # message.  read_file/write_todos/ls/grep/glob are always allowed
         # (read-only scaffolding).  Only Coordinator is gated — subagents
         # own their expert toolsets.
+        if _malformed_tool_name(tool_name):
+            logger.warning(
+                "Malformed tool name (round=%d, phase=%s, len=%d): %r",
+                self._model_call_count,
+                _phase(self._current_ledger or {}),
+                len(str(tool_name)), str(tool_name)[:160],
+            )
+            return ToolMessage(
+                content=(
+                    "⛔ 工具调用格式错误：参数被写进了工具名。工具名必须只是"
+                    " `task`，`subagent_type` 与 `description` 必须放在 JSON "
+                    "arguments 中，示例："
+                    '{"name":"task","arguments":{"subagent_type":"host-expert",'
+                    '"description":"验证假设 H1 ..."}}。请重新发起标准 task '
+                    "调用；不要把括号或 <parameter> 放进工具名。"
+                ),
+                tool_call_id=tool_call_id,
+            )
+
         if not self._is_subagent:
             ledger = self._current_ledger
             if ledger is not None:
@@ -5604,6 +5703,18 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _f1_node["_f1_arbitration_attempts"] = (
                 _f1_node.get("_f1_arbitration_attempts", 0) + 1)
             self._persist_ledger(ledger)
+
+        if (tool_name == "task" and ledger and not self._is_subagent
+                and _gate_hid in (ledger.get("hypotheses") or {})):
+            _g21_node = ledger["hypotheses"][_gate_hid]
+            # Equal pay for equal work: an actual G21 recheck consumes the
+            # one-shot budget even if it times out.  Rejected/gated calls
+            # never reach this point.
+            if (_g21_node.get("_g21_arbitration_attempts", 0) == 0
+                    and subagent_type == g21_arbitration_expert(
+                        ledger, _gate_hid, _g21_node)):
+                _g21_node["_g21_arbitration_attempts"] = 1
+                self._persist_ledger(ledger)
 
         # Emit precise tool timing events via stream_writer
         sw = getattr(request.runtime, "stream_writer", None)
@@ -6991,7 +7102,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             lines = [f"已提出 {len(created)} 个假设:"]
             for h in created:
                 sel = " ★" if h["selected"] else ""
-                lines.append(f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} {h['statement']}")
+                lines.append(
+                    f"  {fmt_hid(h['id'])} [{h['status']} p={h['probability']}%]{sel} "
+                    f"{h['statement']}"
+                    "（证据：尚无针对本假设的直接专家结论 → 先 task 验证）"
+                )
             if _is_append:
                 _append_kind = (
                     "独立根因候选追加" if alternative_candidate_id

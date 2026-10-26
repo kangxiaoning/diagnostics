@@ -439,7 +439,15 @@ def render_evidence_index(ledger: dict, limit: int = INDEX_LIMIT) -> str:
     return "\n".join(lines)
 
 
-_EV_ID_RE = re.compile(r"(?:\*\*|__)?EV-r\d+(?:-\d+)+(?:\*\*|__)?")
+# Match every EV-id-shaped token before checking whether it was issued.
+# The old pattern only accepted numeric suffixes, so shorthand/placeholder
+# forms such as `EV-r6` or `EV-r4-oom` bypassed verify-before-cite entirely
+# (2026-10-25 scenario 28 cited seven such ids).
+_EV_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:\*\*|__)?"
+    r"(EV-r(?:[0-9]+|[A-Z]+)(?:-[A-Za-z0-9]+)*)"
+    r"(?:\*\*|__)?(?![A-Za-z0-9_-])"
+)
 
 
 def strip_unissued_evidence_ids(content: str, ledger: dict) -> tuple[str, list[str]]:
