@@ -2596,6 +2596,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "  | 难以判断 | 分别成条 |\n"
             "  独立故障源并存时各条给合理 probability（≥30%）；"
             "probability 按证据强度选档：高 ≥70 / 中 40–69 / 低 <40\n"
+            # v3.59.0 (F)：事实与机制分层。实测 2026-10-27 run2：H2 的 statement
+            # 把「磁盘 100% 满」（事实）与「是独立首因」（因果断言）捆在一句里，
+            # k8s-expert 的「MemoryPressure 先于 DiskPressure」一否掉因果，整条
+            # 被 refuted，磁盘满这个客观故障也随之从报告消失。
+            "  事实与机制分层：可观测事实（如「磁盘 100% 满、ext4 journal abort」）"
+            "与因果机制（如「日志写满磁盘导致…」）分别成条——事实型可由直接观测"
+            "confirmed，机制型需专家机制证据；合并成一条时，方向证据一旦否掉机制，"
+            "事实也会一起丢失\n"
             # v3.58.0 (A2)：给判定一个确定性落点——"独立还是因果链"由参数
             # 承载，写好即固定。实测 2026-10-27 run2：模型在同一条判定上反复
             # 重算（`独立`×37、`因果链`×15、`按规则分别成条`×8），因为判定
@@ -2849,6 +2857,18 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "**inconclusive**；若证据已足以 confirmed，请先补一次针对本假设"
                 f"的直接 task 验证（description 写明「验证假设{disp_id}」），"
                 "专家结论回来后再落账\n")
+        # v3.59.0 (B1)：单通道前置。实测 2026-10-27 两次复跑各出现 1 次
+        # `single-channel refute on H2`（只有 k8s 通道），落账后才由 G22
+        # 披露——把"当前只覆盖一个通道"写在动作之前，让补通道成为默认路径。
+        _sc_pre = (single_channel_refute_signal(ledger, active_id)
+                   if active_id != "?" else None)
+        _sc_hint = ""
+        if _sc_pre:
+            _sc_label = "、".join(_sc_pre.get("channel_labels") or []) or "?"
+            _sc_hint = (
+                f"- ⏱ 本假设当前证据仅覆盖单一通道（{_sc_label}）：判 refuted 前"
+                "建议补一个通道类别不同的委派（host_os ↔ k8s_events/k8s_logs）"
+                "交叉验证；直接判 refuted 会被系统披露该局限\n")
         # v3.55.0 (D)：把"会话中已有的可引用原始观测"直接摆到动作之前。
         # 实证 2026-10-26 run4：round 4 已采集 dmesg/OOM/进程快照，但因挂在
         # active 假设下，H2/H3 三次 confirmed 全被 G17 拦——模型不知道可以
@@ -2873,6 +2893,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
             + _related_verdict_hint
+            + _sc_hint
             + _obs_hint
             # v3.54.0: if-then 预演引导（deliberation-over-observation 在
             # VERIFY 的形态）。实测 2026-10-26 run3 round 7：单响应

@@ -564,14 +564,19 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                 # visible signal of analysis paralysis.
                 _rc = getattr(state, "_reasoning_chars", 0) + len(reasoning_text)
                 state._reasoning_chars = _rc
+                # v3.59.0: 轮级计数只做观测，不再 WARNING。实测 2026-10-27
+                # run1/run2：25,001 / 25,002 字符分别由 21 / 17 次模型调用
+                # 累加而成，单响应最大未超 12k（12k 告警 0 次）——这是正常
+                # 工作量，把它报成 "looping" 属误报。真正的失控信号是单响应
+                # 超长（下方 12k 告警）与重复块检测（ReasoningLoopError）。
                 if (_rc > _REASONING_ALERT_CHARS
                         and not getattr(state, "_reasoning_alerted", False)):
                     state._reasoning_alerted = True
-                    logger.warning(
-                        "[round=%d] Reasoning length %d chars exceeds %d "
-                        "(hedged/looping reasoning usually follows) — "
-                        "output budget is being consumed without a decision",
-                        state.round_number, _rc, _REASONING_ALERT_CHARS)
+                    logger.debug(
+                        "[round=%d] cumulative reasoning %d chars over this "
+                        "round's calls (observability only; per-response "
+                        "budget guard is separate)",
+                        state.round_number, _rc)
 
                 # v3.45.10 per-response observability.  The round-level counter
                 # above accumulates several calls, so a single runaway response

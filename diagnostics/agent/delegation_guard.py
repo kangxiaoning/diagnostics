@@ -40,6 +40,28 @@ logger = logging.getLogger(__name__)
 _TASK_TOOL = "task"
 
 _ALLOWED_ARGS = ("subagent_type", "description")
+
+# v3.59.0: 委派描述剥离量（before/after 字符数），**按 tool_call_id 关联**。
+# 剥离发生在 DelegationGuardMiddleware（无法访问 ledger），协调员中间件在
+# task 回执处读取——把"你写的 X 字被丢弃"变成可见反馈（外部反馈才驱动自我
+# 修正）。实测 2026-10-27 16:01:58：同一秒发生两条剥离（并行委派两个专家），
+# 若用单一全局槽，后者会覆盖前者、先返回的 task 读到错误的量、后返回的读空
+# ——按 id 关联才不会被并发串号。
+STRIPPED_BY_CALL: dict[str, dict[str, int]] = {}
+
+
+def remember_strip(tool_call_id: str, before: int, after: int) -> None:
+    """Record a description strip for one delegation call."""
+    if tool_call_id and before > after:
+        STRIPPED_BY_CALL[str(tool_call_id)] = {
+            "before": int(before), "after": int(after)}
+
+
+def take_strip(tool_call_id: str) -> dict[str, int]:
+    """Pop the strip record for *tool_call_id* (empty dict when none)."""
+    if not tool_call_id:
+        return {}
+    return STRIPPED_BY_CALL.pop(str(tool_call_id), {})
 """The two parameters the delegation contract defines.  Anything else is a
 model-invented key: it is stripped before dispatch (never forwarded to the
 subagent) and its content is folded into `description` when it is a short
@@ -297,6 +319,9 @@ class DelegationGuardMiddleware(AgentMiddleware):
             return
         args["description"] = cleaned
         tool_call["args"] = args
+        # v3.59.0: 按 tool_call_id 记录剥离量，供对应 task 回执反馈。
+        remember_strip(
+            str(tool_call.get("id") or ""), len(description), len(cleaned))
         logger.warning(
             "委派描述已剥离重复的系统上下文: %d → %d 字符",
             len(description), len(cleaned),

@@ -111,6 +111,7 @@ from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/
 from diagnostics.agent.ledger import exit_block_is_actionable  # v3.48.0 退出阻塞判据（确定性谓词，不再匹配文案子串）
 from diagnostics.agent.ledger import corroborating_observation_evidence  # v3.52.0 工具原始观测可作确证层证据
 from diagnostics.agent.ledger import _OBSERVATION_EVIDENCE_TOOLS  # v3.55.0 实时探测/日志工具白名单（EV 归属校验）
+from diagnostics.agent.delegation_guard import take_strip  # v3.59.0 委派描述剥离反馈（按 tool_call_id）
 from diagnostics.agent.evidence_ledger import iter_artifacts  # v3.55.0 原始观测条目查询（EV 编号 → 工具/轮次）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
 from diagnostics.agent.ledger import single_channel_refute_signal  # v3.41.0 单通道证伪信号（披露用，不再阻断；design document §8 G22）
@@ -289,6 +290,30 @@ def _canonical_hypothesis_field(name: str) -> str | None:
     is strictly better than letting the field vanish.
     """
     return _HYPOTHESIS_FIELD_ALIASES.get(str(name or "").strip().lower())
+
+
+def _decode_hypotheses_payload(tool_args: dict) -> bool:
+    """Decode a string-encoded ``hypotheses`` payload (v3.59.0).
+
+    Measured 2026-10-27 run2 round 7: the model submitted
+    ``{"hypotheses": "[{\\"probability\\":30,…"}'`` — the array was
+    serialised into a string, so schema validation failed and one round was
+    spent re-sending the identical content as a proper list.  The payload is
+    unambiguous (it is a JSON array), so decoding it once is deterministic.
+    """
+    if not isinstance(tool_args, dict):
+        return False
+    raw = tool_args.get("hypotheses")
+    if not isinstance(raw, str):
+        return False
+    try:
+        decoded = json.loads(raw)
+    except Exception:
+        return False
+    if isinstance(decoded, list):
+        tool_args["hypotheses"] = decoded
+        return True
+    return False
 
 
 def _normalize_hypothesis_fields(tool_args: dict) -> list[str]:
@@ -553,6 +578,36 @@ def _phase_scoped_tools(
             changed = True
         except Exception:  # noqa: BLE001 — guidance must never raise
             out.append(tool)
+    # v3.59.0 (B′): 把 handoff 契约写进 task 的 description **参数说明**——
+    # schema 是离生成点最近的契约。此前"台账已注入专家上下文"只写在协调员
+    # prompt 中段，而模型的通用先验是"子代理不继承上下文"，于是把台账复述
+    # 进 description（实测 1562→514、1541→522 被剥离）。
+    _TASK_PAYLOAD_NOTE = (
+        "系统已把台账与假设树注入专家上下文，无需复述；只写三段："
+        "①验证假设Hx：<一句话陈述> ②待覆盖的证据通道 ③实体参数"
+        "（hostname/cluster_name/namespace）；需专家归档到其他未决假设时，"
+        "附其编号与一句话陈述"
+    )
+    for _t in out:
+        _nm = _t.get("name") if isinstance(_t, dict) else getattr(_t, "name", None)
+        if _nm != "task":
+            continue
+        _schema = (_t.get("args_schema") if isinstance(_t, dict)
+                   else getattr(_t, "args_schema", None))
+        _flds = getattr(_schema, "model_fields", None)
+        if not _flds:
+            continue
+        _fld = _flds.get("description")
+        if _fld is None:
+            continue
+        _cur = str(getattr(_fld, "description", "") or "")
+        if "无需复述" in _cur:
+            continue
+        try:
+            _fld.description = f"{_cur}。{_TASK_PAYLOAD_NOTE}".strip("。")
+            changed = True
+        except Exception:
+            pass
     return out if changed else None
 
 # Tools that are scaffolding (not diagnostic). "task" is included because
@@ -895,16 +950,57 @@ def _provenance_context_text(request: Any) -> str:
     return "\n".join(parts)
 
 
+# v3.59.0: system-issued identifiers are not entities — `ALT-1` lives in the
+# candidate channel, `H2` / `EV-r3-1` are ledger ids.  Measured 2026-10-27
+# run2 round 6/7: `alt-1` was reported as "absent from context" while the
+# capture shows `ALT-1` three times in the system prompt — the report was
+# noise, and system ids should never be part of a cross-entity check.
+_SYSTEM_ID_RE = re.compile(
+    r"^(alt-\d+|h\d+|ev-r\d+-\d+|ev-shared-.*|g\d+)$")
+
+
+def _known_entities(ledger: DiagnosisLedger | None) -> set[str]:
+    """Entities the session legitimately knows about (v3.59.0).
+
+    The cross-session-bleed check used to ask "does this string appear in the
+    current context text" — which misfires whenever the identifier lives in the
+    system prompt (as `ALT-1` does) or was summarised away.  The real question
+    is "is this an entity the ledger knows", so compare against the collected
+    entity set instead of raw text.
+    """
+    if not ledger:
+        return set()
+    out: set[str] = set()
+    for key in ("entity_name", "hostname", "cluster_name", "namespace",
+                "pod_name", "workload_name", "node_name"):
+        val = str(ledger.get(key) or "").strip().lower()
+        if val:
+            out.add(val)
+    for _key, info in (ledger.get("tool_results") or {}).items():
+        tgt = info.get("target") or {}
+        if isinstance(tgt, dict):
+            for val in tgt.values():
+                s = str(val or "").strip().lower()
+                if s:
+                    out.add(s)
+    return out
+
+
 def _observe_context_foreign_entities(
-        reasoning: str, context_text: str, round_no: int, phase: str) -> list[str]:
-    """Log hyphenated identifiers that appear in reasoning but not context."""
+        reasoning: str, context_text: str, round_no: int, phase: str,
+        ledger: DiagnosisLedger | None = None) -> list[str]:
+    """Log hyphenated identifiers that are neither known entities nor in context."""
     if not reasoning:
         return []
     haystack = (context_text or "").lower()
+    entities = _known_entities(ledger)
     counts: dict[str, int] = {}
     for _m in _HYPHEN_TOKEN_RE.finditer(reasoning.lower()):
         _tok = _m.group(0)
         if len(_tok) < 5 or _tok in haystack or _tok in _FOREIGN_TOKEN_STOPWORDS:
+            continue
+        # v3.59.0: skip system-issued ids and entities the ledger already knows.
+        if _SYSTEM_ID_RE.match(_tok) or _tok in entities:
             continue
         counts[_tok] = counts.get(_tok, 0) + 1
     # v3.54.0: threshold 2 → 3.  Real cross-entity bleed repeats (worker-4 ×N,
@@ -3655,7 +3751,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     # made existing identifiers look hallucinated.
                     _observe_context_foreign_entities(
                         _reasoning_text, _provenance_context_text(request),
-                        self._model_call_count, _phase(ledger))
+                        self._model_call_count, _phase(ledger), ledger=ledger)
             except Exception:
                 pass  # observability must never become a failure source
             # ── Per-round inference metrics ──
@@ -5140,7 +5236,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         #    run1 round 2 三条假设全缺，浪费一整轮）；用 rationale 首句代填，
         #    并在完成回执里说明可用 statement_update 修正。
         if tool_name == "propose_hypotheses":
-            _arg_fixes = _normalize_hypothesis_fields(tool_args)
+            _arg_fixes = []
+            if _decode_hypotheses_payload(tool_args):
+                _arg_fixes.append("hypotheses←JSON 字符串解包")
+            _arg_fixes += _normalize_hypothesis_fields(tool_args)
             _arg_fixes += _backfill_statements(tool_args)
             if _arg_fixes:
                 logger.info(
@@ -6108,6 +6207,22 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 self._delegation_semaphore.release()
         else:
             result = await handler(request)
+
+        # v3.59.0: 委派描述剥离反馈——把"你写的 X 字被丢弃"变成可见结果。
+        # 剥离此前是静默的（仅 WARNING 日志），模型无从得知，于是每轮继续
+        # 复述台账（实测 1562→514、1541→522）；自我修正只在拿到外部反馈时
+        # 才发生，故把结果写进 task 回执。
+        if tool_name == "task" and isinstance(result, ToolMessage):
+            # 按 tool_call_id 取，避免并行委派时串号（实测 16:01:58 两条剥离）。
+            _strip = take_strip(tool_call_id)
+            if _strip and _strip.get("before", 0) > _strip.get("after", 0):
+                _dropped = _strip["before"] - _strip["after"]
+                result = result.model_copy(update={"content": (
+                    f"{result.content}\n\n"
+                    f"ℹ 你的委派描述有 {_dropped} 字与已注入专家上下文的台账"
+                    "重复，系统已剥离——专家看得到台账，无需复述。"
+                    "下次只写：①验证假设Hx ②待覆盖通道 ③实体参数。"
+                )})
 
         # ── propose_hypotheses validation-feedback enhancement ──
         # Failure path: append the self-contained field contract (with
@@ -7156,11 +7271,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                 "表达，确证在提出之后自动进行。"
                             )
                         else:
+                            # v3.59.0: 去掉"仍未提出"——它把"没调用"与"提交了但
+                            # 被 schema 拒"混为一谈（实测 2026-10-27 两次复跑：
+                            # round 2 已提交、因缺字段被拒，回执却说"仍未提出"，
+                            # 误导模型重复提交而非修正字段）。
                             warnings.append(
                                 "【本阶段唯一动作】propose_hypotheses（第"
-                                f"{round_num} 轮仍未提出）。"
-                                "请基于已有摘要立即提出 1-3 条假设，证据不足"
-                                "用低概率表达；继续取证会推迟本次诊断。"
+                                f"{round_num} 轮）。"
+                                "请基于已有摘要提出 1-3 条假设，证据不足用"
+                                "低概率表达；提交后系统校验，缺字段会点名返回。"
                             )
                         ledger["_hypo_nudge_count"] = _nudges + 1
                         mutated = True

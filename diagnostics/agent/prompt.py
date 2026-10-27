@@ -96,7 +96,13 @@ PHASE_SPEC: dict[str, dict] = {
             "难以判断 → 分别成条；独立故障源并存时各给合理 probability（≥30%），"
             "多根因保护按假设计数；probability 按证据强度选档"
             "（高 ≥70 / 中 40–69 / 低 <40）；判定结论写进 "
-            "independent_anomaly（独立→true、因果链→false），写完即固定",
+            "independent_anomaly（独立→true、因果链→false），写完即固定；"
+            # v3.59.0 (F)：事实与机制分层——事实型假设的 confirmed 不受因果
+            # 方向证据影响，避免"否掉机制 = 事实一起消失"。并入本条的同一段
+            # 文本，不新增条目（保持 6 条上限）。
+            "事实与机制分层：可观测事实（磁盘 100% 满、OOM 事件）与因果机制"
+            "（日志写满磁盘导致…）分别成条——事实型可由直接观测 confirmed，"
+            "机制型需专家机制证据",
             # v3.57.0: 原「✍ 表述只写一次（不在本阶段反复润色）」改为不含
             # 行为提及的正向单句——"反复润色"本身也是被点名的行为。
             "一次写定：statement 与 probability 写出即提交；"
@@ -146,10 +152,13 @@ PHASE_SPEC: dict[str, dict] = {
             # v3.54.0 (P0-2)：委派描述模板化。三次复跑里 5 次委派描述因复述
             # 系统上下文被剥离（1600→500 字符），说明模型不知道台账已注入
             # 专家上下文，只能靠复述"带上"。描述收敛为三段即可。
-            "委派描述写成三段即可：①「验证假设X：<一句话陈述>」"
-            "②待覆盖的证据通道（指标/日志/事件）③实体参数"
-            "（hostname / cluster_name / namespace）——系统已把台账与假设树"
-            "注入专家上下文，无需在 description 里复述",
+            # v3.59.0: 撤销“≤300 字”（与 _ddx_hint 要求写其他假设编号冲突，
+            # 且比有效内容 514 字还短），改为**可复制模板**——示例塑造形式
+            # 强于抽象限制，且不挤压 multi-hypothesis 声明。
+            "委派描述照抄模板：task(subagent_type=\"host-expert\", "
+            "description=\"验证假设Hx｜通道=host_os,k8s_events｜"
+            "hostname=<实体>\")——系统已把台账与假设树注入专家上下文，"
+            "无需在 description 里复述",
             # v3.56.0: batched exclusion.  A single workup can settle several
             # candidates when they share the same evidence domain (differential
             # diagnosis parallel testing; MJA 2017).  Declared refutations are
