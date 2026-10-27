@@ -1184,6 +1184,7 @@ def record_finding(
     new_insights: str = "",
     statement_update: str = "",
     superseded_by: str = "",
+    supersede_reason: str = "",
 ) -> None:
     """Record a verification finding for a hypothesis.
 
@@ -1216,6 +1217,21 @@ def record_finding(
                 "如需排除请改为补充针对本假设的负证据，或省略该参数")
         if _superseded_target == hypothesis_id:
             raise ValueError("superseded_by 不能指向本假设自身")
+        # v3.58.0: 并入需要**方向证据**（v3.58.0 D1）。只凭"另一条更能解释"
+        # 就合并，会把独立并存的第二故障源抹掉——实测 2026-10-27 场景 28：
+        # H3（磁盘满）被判「非独立故障源、而是因果链」，而手上只有两条同步
+        # 上升的曲线（mem 62→92%、disk 78→96%），没有任何方向证据；同一场景
+        # 八次复跑 root_causes 呈 1-2-1-2 交替，即模型在无判据时随机倒向一侧。
+        # 方法学：相关性只说明"同时变动"，区分上游原因与下游症状必须依赖方向
+        # （PlayerZero《Causal Inference in Incident Analysis》）；"同步发生
+        # 不等于存在传导因果"。因此要求给出时间先后或机制解释之一。
+        if len(str(supersede_reason or "").strip()) < 10:
+            raise ValueError(
+                "并入（superseded_by）需要 supersede_reason 给出**方向证据**："
+                "①时间先后——本假设的异常起始时刻晚于目标假设且同源；"
+                "②机制解释——目标假设的机制能解释本假设的量级。"
+                "两者都没有说明方向未定：请改判 inconclusive，"
+                "或用 independent_anomaly=true 保留为独立根因")
 
     # Update statement if a more accurate version was found during verification
     if statement_update and statement_update != node.get("statement"):
@@ -2510,8 +2526,9 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 f"\n- ⚠ 这是第 {ledger.get('_propose_count', 0) + 1}"
                 f"/{MAX_PROPOSE_CALLS} 次假设提出（最后一次）。"
                 "前一批已全部证伪/验证价值耗尽。\n"
-                "  新假设必须基于排除证据换方向推断，"
-                "禁止与已排除假设重复或仅换措辞。"
+                # v3.57.0: 去负面表述（"禁止…重复或仅换措辞"点名了回避行为），
+                # 改为正向的方向说明。
+                "  新假设基于排除证据换方向推断，机制与已排除假设不同。"
             ) + digest
         # v3.11.1: data-gap remedy hint (design document §9) — when a
         # required argus expert was delegated but returned a parameter
@@ -2543,63 +2560,53 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         if not ledger.get("hypotheses"):
             _conflicts = argus_conflict_pending(ledger)
             if _conflicts:
+                # v3.57.0: 去掉"无需先补查"这句——它点名了一个回避动作，
+                # 在《Semantic Gravity Wells》的机制下反而提高其可及性。
                 conflict_hint = (
                     f"\n- ⚠ 监控读数自相矛盾：{'；'.join(_conflicts)}。\n"
                     "  指标层看不见 Pod 事件状态（OOMKilled 不体现在指标曲线里），"
-                    "这类矛盾应**直接写成假设**（例如“读数归属于另一副本 / "
+                    "这类读数可写成一条假设（例如“读数归属于另一副本 / "
                     "目标实体并非故障对象”），probability 体现不确定性；"
-                    "VERIFY 阶段委派深度专家查日志与事件定向裁决。"
-                    "本阶段职责不变：提出假设，无需先补查。"
+                    "VERIFY 阶段委派深度专家查日志与事件裁决。"
                 )
+        # v3.57.0: 本步要求由 12 条收紧为 6 条，并清除"点名被禁行为"的
+        # 负面表述。依据：
+        #  ①《Semantic Gravity Wells》(arXiv:2601.08070)：负面约束一旦点名
+        #    被禁行为，注意力落在该行为上（target-mention focus > negation
+        #    focus），抑制反被启动；实测成功遵守时压低 22.8pp、失败时仅
+        #    5.2pp（4.4 倍不对称）。
+        #  ②《Don't Think of the White Bear》(arXiv:2511.12381)：强否定在
+        #    高认知负荷下更易反弹。
+        #  ③ IFScale：并列条目越多越易漏项与混淆（12 → 6）。
+        # 原「⏱ 若你准备在 reasoning 里写出完整的假设清单或最终表述 →…
+        # 预演最终文本」把要避免的动作完整描述了两遍，是最强的启动源。
         return (
             "你当前处于 HYPOTHESIZE 阶段。\n"
             f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('hypothesize')}\n"
-            f"- {duty}\n"
-            f"- 提出预算：全程最多 {MAX_PROPOSE_CALLS} 次"
-            f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
-            "预算用尽后只能用 record_finding(statement_update=...) 修正已有假设\n"
-            "- ⚠ 字段契约：每条假设必须含 statement/probability/rationale 三字段，"
-            "statement 必填且为一句完整根因表述——缺失会导致调用失败"
-            "（失败不消耗提出预算，修正后重新提交即可）；"
-            "若该假设对应已观察且不能由其他假设解释的独立异常/独立故障源，"
-            "请加 independent_anomaly=true，低概率也不会被系统按噪声跳过\n"
-            "- ⚠ 同源合并：若多个候选描述的是同一机制的不同描述层级"
-            "（现象 / 机制 / 具体落点，如\"内存超限 OOMKilled\"与"
-            "\"memory limit 配置过低\"互为表里），应合并为一条假设；"
-            "仅当证据显示独立故障源并存时才提出多条\n"
-            # v3.50.0 (same arbiter as PHASE_SPEC.duty): mutually-causal
-            # mechanisms have no determinable initial trigger from screening
-            # data, so they are COMPETING hypotheses, not a merge candidate.
-            "- ⚖ 互为因果的裁决：两个机制若互为因果且无法判定执行链的初始触发端"
-            "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
-            "按竞争性假设分别成条、各自给 probability；"
-            "方向判断只做一次，难以判断时按「分别成条」处理\n"
-            # v3.53.0: same family as the two judgements above — the polishing
-            # loop (2026-10-26 scenario 28 round 2: 10,860 chars rewriting the
-            # same statements/probabilities, zero tool calls, cut by the loop
-            # guard).  Stated next to the generation point because the rules
-            # live in the system prompt and this phase has the shortest
-            # attention budget.
-            "- ✍ 表述只写一次：statement 与 probability 写定即提交，"
-            "不在本阶段反复润色；不精确留给 VERIFY 用 "
-            "record_finding(statement_update=…) 修正\n"
-            # v3.54.0 (P0-1)：预演的前置引导（if-then 形式，写在动作之前）。
-            # 三次复跑实证：round 2 用 9,347 字符预演清单、round 3 达
-            # 25,007 字符，零工具调用。事后只有 25k/12k 告警与 8k 守卫。
-            "- ⏱ 若你准备在 reasoning 里写出完整的假设清单或最终表述 → "
-            "直接把内容写进 propose_hypotheses 的参数即可：本阶段不需要在"
-            "思考中预演最终文本（预演会耗尽输出预算且不产生动作）\n"
-            # v3.54.0 (P1-1)：把最小字段骨架放到本步要求里（run3 round 2 因
-            # 三条假设全缺 statement 而浪费一轮；字段契约原本只在 system
-            # prompt 中段）。
             "- 字段骨架（照抄并填值）：propose_hypotheses(hypotheses=["
             '{"statement": "一句完整根因表述（必填）", "probability": 70, '
-            '"rationale": "依据"}])——每条都必须含 statement 与 probability\n'
-            "- ⚠ 多根因场景：当证据显示多个独立故障源同时存在时，"
-            "不要默认奥卡姆剃刀给多根因/叠加假设赋低概率——应给合理概率"
-            "（≥30%），否则会在主根因确认后被退出判据结构性搁置，"
-            "导致漏判独立故障源。\n"
-            f"- 完成后必须调用 propose_hypotheses 提出假设（{exit_txt}）"
+            '"rationale": "依据"}])——每条必须含 statement 与 probability'
+            "（缺失会导致调用失败；失败不消耗提出预算，修正后重试即可）；"
+            "独立故障源请加 independent_anomaly=true（低概率也不会被按噪声跳过）\n"
+            f"- {duty}\n"
+            "- 机制关系判定（只做一次，按表处理）：\n"
+            "  | 情形 | 处理 |\n"
+            "  | 同一机制的不同描述层级（现象/机制/落点） | 合并为 1 条 |\n"
+            "  | 两个机制互为因果、初始触发端未知 | 分别成条，各给 probability |\n"
+            "  | 难以判断 | 分别成条 |\n"
+            "  独立故障源并存时各条给合理 probability（≥30%）；"
+            "probability 按证据强度选档：高 ≥70 / 中 40–69 / 低 <40\n"
+            # v3.58.0 (A2)：给判定一个确定性落点——"独立还是因果链"由参数
+            # 承载，写好即固定。实测 2026-10-27 run2：模型在同一条判定上反复
+            # 重算（`独立`×37、`因果链`×15、`按规则分别成条`×8），因为判定
+            # 结果没有落到任何字段，只能在 reasoning 里一次次重来。
+            "  判定结论写进 independent_anomaly（独立→true、因果链→false），"
+            "写完即固定，后续不再重判\n"
+            f"- 提出预算：全程最多 {MAX_PROPOSE_CALLS} 次"
+            f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
+            "一次写定：statement 与 probability 写出即提交，后续精化用 "
+            "record_finding(statement_update=…)（预算用尽后仅此通道）\n"
+            f"- 完成后调用 propose_hypotheses（{exit_txt}）"
             + retry_hint
             + gap_hint
             + conflict_hint
@@ -2871,12 +2878,18 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             # VERIFY 的形态）。实测 2026-10-26 run3 round 7：单响应
             # 12,002 / 12,004 字符两次、零工具调用，最终靠 thinking-off
             # 重试才产出动作。引导前移到动作之前，不新增任何门控。
-            # 首行必须仍是"本阶段动作"（最靠近生成点的唯一动作声明）；
-            # ⏱ 预演引导紧随其后。
+            # 首行必须仍是"本阶段动作"（最靠近生成点的唯一动作声明）。
             + f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('verify')}\n"
-            + "- ⏱ 若你准备在 reasoning 里预写委派描述或最终结论 → 直接调用 "
-            "task（描述写进 description）或 record_finding（结论写进 "
-            "evidence_summary）即可；本阶段不需要在思考中预演文本\n"
+            # v3.57.0：原「⏱ 若你准备在 reasoning 里预写委派描述或最终结论
+            # →…预演文本」点名了回避行为，按同一原则改为正向单句。
+            + "- 本阶段一步到位：调用 task（描述写进 description）或 "
+            "record_finding（结论写进 evidence_summary）\n"
+            # v3.58.0 (D2)：并入判据前移。方向证据不足时保留独立根因，
+            # 而不是默认合并——实测同场景八次复跑 root_causes 在 1/2 之间
+            # 交替，根因是"并入 vs 独立"缺判据（只有两条同步上升的曲线）。
+            + "- 判「并入/被覆盖」需方向证据（时间先后或机制解释）；"
+            "方向未定时用 independent_anomaly=true 保留为独立根因——"
+            "多一条冗余假设的成本低于漏掉一条独立故障源\n"
             + f"- {duty}\n"
             + expert_map
             + "- 委派时明确\"验证假设"

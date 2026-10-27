@@ -31,7 +31,10 @@ PHASE_SPEC: dict[str, dict] = {
     },
     "hypothesize": {
         "title": "阶段 2: HYPOTHESIZE（形成假设）",
-        "duty": "基于已收集证据，一次性提出最多 3 个可能性最大的假设（按概率降序），"
+        # v3.58.0 (A3)：去掉"一次性"的完整性暗示——它诱导模型在提交前
+        # 把所有候选推演完整（实测 2026-10-27 两次 round 2 都在"要不要
+        # 加第三条"上反复）。允许先提 1–2 条，VERIFY 可补充。
+        "duty": "基于已收集证据，提出 1–3 个可能性最大的假设（按概率降序；证据只支持 1–2 条时先提这些，VERIFY 阶段可补充），"
                 "每个必须包含 statement（一句完整根因表述，必填）、probability(0-100)、"
                 "rationale 三个字段，缺一不可。适用于两种场景：首批、换批（前批全部证伪后"
                 "换方向）。假设为扁平结构（ID 为整数编号如 H1、H2），不支持子假设。"
@@ -58,7 +61,9 @@ PHASE_SPEC: dict[str, dict] = {
                 "合并为一条；若两个机制**互为因果且无法判定执行链的初始触发端**"
                 "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
                 "它们属于竞争性假设——分别成条、各自给 probability，"
-                "由验证阶段的证据裁决方向，不要在本阶段自行裁决。"
+                # v3.57.0：去掉"不要在本阶段自行裁决"（负面提及），
+                # 方向归属已由前半句说明。
+                "方向由验证阶段的证据裁决。"
                 "假设是基于监控筛查证据的竞争性候选——是待验证的猜测、非已确认结论，"
                 "probability 即表达不确定性；提出只是记录候选、非断定根因。"
                 "凡需深查或确证的方向，直接写成假设提出即完成本阶段职责，"
@@ -79,43 +84,37 @@ PHASE_SPEC: dict[str, dict] = {
             # the old wording left it unbounded.  Fallback stays "separate
             # entries" — a redundant hypothesis is cheaper than a lost
             # independent failure path.
-            "⚖ 重叠/因果方向判断只做一次：只看两条 statement 的故障机制是否同一、"
-            "以及两个机制是否互为因果；判断完直接提交当前假设列表；"
-            "难以判断时按「分别成条」处理（多提一条更安全，验证阶段自会剔除）",
-            # v3.53.0: third member of the same family — "overlap" (v3.45.10),
-            # "causal direction" (v3.50.0), now "wording polish".  Measured
-            # 2026-10-26 scenario 28 round 2: 10,860 chars, zero tool calls,
-            # content=0, cut by the loop guard; reconstruction shows the model
-            # rewriting the SAME statements and probabilities
-            # ("…they might be independent or partially related… Let me
-            # refine: H1 … Probability: 70%"), i.e. polishing prose rather
-            # than deciding anything.  Statement text is not final here —
-            # VERIFY owns refinement via record_finding(statement_update=…)
-            # and has the evidence to do it.  Polishing in HYPOTHESIZE buys
-            # nothing and has no natural stop.
-            "✍ 表述只写一次：statement 与 probability 写定即提交，"
-            "不在本阶段反复润色；表述不精确留给 VERIFY 用 "
-            "record_finding(statement_update=…) 修正（该阶段才有证据）",
-            # v3.54.0: 预演（deliberation over observation）的 if-then 前置
-            # 引导。实测 2026-10-26 三次复跑：round 2 用 9,347 字符预演最终
-            # 假设清单、round 3 达 25,007 字符、round 7 单响应 12,002/12,004
-            # 两次，全部零工具调用，被 8k 守卫或超时收走。根因不是"想得多"，
-            # 而是在"一次廉价工具调用就能落地"的地方继续用推理重建输出。
-            # if-then 形式（Gollwitzer & Sheeran 2006, 94 项研究 d≈.65）比
-            # 事后禁令有效；正向配方，不写"禁止"。
-            "⏱ 若你准备在 reasoning 里写出完整的假设清单或最终表述 → "
-            "直接把内容写进 propose_hypotheses 的参数字段即可：本阶段不需要"
-            "在思考中预演最终文本，预演会耗尽输出预算且不产生任何动作",
-            "调用 propose_hypotheses 提出（系统自动聚焦概率最高的假设）",
-            "字段契约：每条假设必须含 statement/probability/rationale 三字段，"
-            "statement 必填且为一句完整的根因表述（缺失会导致调用失败并重试）；"
-            "可选 independent_anomaly=true 标记已观察到且不能由其他假设解释的"
-            "独立异常/独立故障源——即使概率低，系统也不会按低概率跳过，"
-            "以免漏掉会影响修复动作的第二故障",
-            "粒度契约：一条 statement 只表述一个根因机制；同一故障若由多个相互独立的"
-            "机制共同造成（如 stress 进程打满 CPU 与 tc 策略丢包并存），须分别成条提出，"
-            "每条独立验证、独立确认——多根因保护与置信度按假设计数，合并成一条会让"
-            "次要根因失去独立验证与披露",
+            # v3.57.0: 两段反向文字规则（"同源应合并"与"互为因果应分别成条"）
+            # 收敛为一张判定表——反向并列会让模型在两者间做元判断，是
+            # round-2 长推理的来源之一；表结构同时给出唯一默认（难以判断→
+            # 分别成条）。
+            # v3.58.0 (A1+A2)：概率改分档（去掉"算一个精确数"的复核动机）；
+            # 判定结论落到 independent_anomaly 字段，写好即固定。
+            "机制关系按一张表判定（只做一次）："
+            "同一机制的不同描述层级（现象/机制/落点）→ 合并 1 条；"
+            "两个机制互为因果、初始触发端未知 → 分别成条各给 probability；"
+            "难以判断 → 分别成条；独立故障源并存时各给合理 probability（≥30%），"
+            "多根因保护按假设计数；probability 按证据强度选档"
+            "（高 ≥70 / 中 40–69 / 低 <40）；判定结论写进 "
+            "independent_anomaly（独立→true、因果链→false），写完即固定",
+            # v3.57.0: 原「✍ 表述只写一次（不在本阶段反复润色）」改为不含
+            # 行为提及的正向单句——"反复润色"本身也是被点名的行为。
+            "一次写定：statement 与 probability 写出即提交；"
+            "精化用 record_finding(statement_update=…)（该阶段才有证据）",
+            # v3.57.0: 删除原「⏱ 若你准备在 reasoning 里写出完整的假设清单
+            # 或最终表述 →…预演最终文本」一条。它把要避免的动作完整描述了
+            # 两遍，是最强的启动源：Semantic Gravity Wells（arXiv:2601.08070）
+            # 证明负面约束一旦点名被禁行为，注意力落在该行为上（PI>0），
+            # 抑制反被启动（成功遵守压低 22.8pp vs 失败仅 5.2pp）；
+            # Don't Think of the White Bear（arXiv:2511.12381）进一步显示
+            # 高认知负荷下更易反弹。实测 2026-10-26/27 四次复跑中 round 2
+            # 循环 2 次，输入侧的十二条引导文本逐字相同——问题不在"缺引导"。
+            # v3.57.0: 「字段契约」「粒度契约」与原样例合并为一条骨架——
+            # 同一决策点不再出现三套表述（骨架自身即含字段名与结构）。
+            "字段骨架（照抄结构）：propose_hypotheses(hypotheses=["
+            "{\"statement\": \"一句完整根因表述\", \"probability\": 70, "
+            "\"rationale\": \"依据\"}])；每条必须含 statement 与 probability；"
+            "独立故障源加 independent_anomaly=true（低概率也不会被按噪声跳过）",
             "合法样例（照抄结构并保持字段名一致）：propose_hypotheses(hypotheses=["
             "{\"statement\": \"节点 15:02 CPU 打满导致 kubelet 心跳超时\", "
             "\"probability\": 70, \"rationale\": \"15:02 CPU 92%，同时刻该节点 NotReady\"}])——"
@@ -137,9 +136,9 @@ PHASE_SPEC: dict[str, dict] = {
             # 描述或最终结论，而不是直接调用 task / record_finding。实测
             # 2026-10-26 run3 round 7：单响应 12,002 / 12,004 字符两次、零
             # 工具调用；专家侧同型（summary-only 重试 167s 才回收）。
-            "⏱ 若你准备在 reasoning 里预写委派描述或最终结论 → 直接调用 "
-            "task（描述写进 description）或 record_finding（结论写进 "
-            "evidence_summary）：本阶段不需要在思考中预演文本",
+            # v3.57.0：同上，改为正向单句（不点名"预写/预演"）。
+            "本阶段一步到位：调用 task（描述写进 description）或 "
+            "record_finding（结论写进 evidence_summary）",
             "每轮聚焦验证一个假设。优先单专家委派、record_finding 后再推进；"
             "当系统提示某假设单视角证据不足（inconclusive）时，可同轮并行委派系统建议的"
             "多个互补视角专家——并行委派须全部指向同一假设、description 含「验证假设Hx」字样，"

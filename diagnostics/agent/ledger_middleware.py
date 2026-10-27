@@ -267,6 +267,75 @@ def _unknown_hypothesis_fields(tool_args: dict) -> list[str]:
     return unknown
 
 
+_HYPOTHESIS_FIELD_ALIASES = {
+    "statement": "statement", "statment": "statement",
+    "statements": "statement", "statement_text": "statement", "stat": "statement",
+    "probability": "probability", "probablity": "probability",
+    "probabilty": "probability", "prob": "probability",
+    "rationale": "rationale", "rationnal": "rationale", "rational": "rationale",
+    "rationnale": "rationale", "reason": "rationale",
+    "independent_anomaly": "independent_anomaly",
+    "independentanomaly": "independent_anomaly",
+    "is_independent": "independent_anomaly",
+}
+
+
+def _canonical_hypothesis_field(name: str) -> str | None:
+    """Map a near-miss hypothesis field name to its canonical name (v3.58.0).
+
+    Measured 2026-10-27 run1 round 3: ``rationnal`` (rationale) was dropped by
+    ``extra=ignore``, leaving that hypothesis without its rationale.  A
+    near-miss is a typo, not a different intent — correcting it deterministically
+    is strictly better than letting the field vanish.
+    """
+    return _HYPOTHESIS_FIELD_ALIASES.get(str(name or "").strip().lower())
+
+
+def _normalize_hypothesis_fields(tool_args: dict) -> list[str]:
+    """Rename near-miss keys in place; return a human-readable fix list."""
+    fixed: list[str] = []
+    for i, h in enumerate((tool_args or {}).get("hypotheses") or []):
+        if not isinstance(h, dict):
+            continue
+        for key in list(h.keys()):
+            canon = _canonical_hypothesis_field(key)
+            if not canon or canon == key:
+                continue
+            if canon in h:
+                h.pop(key, None)
+                fixed.append(f"hypotheses[{i}].{key}（重复，已丢弃）")
+            else:
+                h[canon] = h.pop(key)
+                fixed.append(f"hypotheses[{i}].{key}→{canon}")
+    return fixed
+
+
+def _backfill_statements(tool_args: dict, limit: int = 120) -> list[str]:
+    """Fill a missing ``statement`` from the rationale's first sentence.
+
+    A hypothesis without ``statement`` fails schema validation and costs a full
+    round: measured 2026-10-27 run1 round 2, the model submitted three
+    hypotheses carrying only ``probability`` + ``rationale`` although the field
+    skeleton sits on the second line of the phase guidance.  The rationale
+    already states the mechanism, so its first sentence is a faithful stand-in;
+    the receipt says it was back-filled and ``statement_update`` remains the
+    correction channel.
+    """
+    filled: list[str] = []
+    for i, h in enumerate((tool_args or {}).get("hypotheses") or []):
+        if not isinstance(h, dict) or str(h.get("statement") or "").strip():
+            continue
+        rat = str(h.get("rationale") or "").strip()
+        if not rat:
+            continue
+        first = re.split(r"[。；;\n]", rat)[0].strip()
+        if not first:
+            continue
+        h["statement"] = first[:limit]
+        filled.append(f"hypotheses[{i}].statement←rationale 首句")
+    return filled
+
+
 def _missing_required_hypothesis_fields(tool_args: dict) -> list[str]:
     """Which required per-hypothesis fields are absent (v3.54.0).
 
@@ -2581,7 +2650,17 @@ class RecordFindingInput(BaseModel):
             "假设 ID（如 H1），同时 verdict 仍传 refuted。系统会记为"
             "「并入 H1（机制被覆盖，非排除）」，报告写入并入小节而不是"
             "「已排除」。若确实有针对本假设的负证据，请留空并改用"
-            "evidence_summary 说明该证据。"
+            "evidence_summary 说明该证据。**填写本字段时 supersede_reason 必填**。"
+        ),
+    )
+    supersede_reason: str = Field(
+        default="",
+        description=(
+            "并入的**方向证据**（填 superseded_by 时必填）："
+            "①时间先后——本假设的异常起始时刻晚于目标假设、且两者同源；"
+            "②机制解释——目标假设的机制能解释本假设的量级（如日志写入速率"
+            "覆盖磁盘增长）。两者都没有，说明方向未定：请改判 inconclusive，"
+            "或用 independent_anomaly=true 保留为独立根因（多根因不丢）。"
         ),
     )
     evidence_refs: list[str] = Field(
@@ -5051,6 +5130,23 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # v3.48.0: hypothesis ids cited by an expert receipt that do not
         # exist in the ledger (collected below, disclosed at return).
         _invalid_rel_ids: list[str] = []
+
+        # ── propose_hypotheses 确定性字段修复（v3.58.0）──
+        # 必须在 handler 校验之前完成（tool_args 与 request.tool_call["args"]
+        # 是同一对象，就地修改即可生效）：
+        #  ①键名拼写近似（rationnal→rationale 等）——extra=ignore 会把字段
+        #    整条丢弃，导致该假设最终没有 rationale；
+        #  ②缺 statement——骨架就在本步要求第二行，模型仍会漏（2026-10-27
+        #    run1 round 2 三条假设全缺，浪费一整轮）；用 rationale 首句代填，
+        #    并在完成回执里说明可用 statement_update 修正。
+        if tool_name == "propose_hypotheses":
+            _arg_fixes = _normalize_hypothesis_fields(tool_args)
+            _arg_fixes += _backfill_statements(tool_args)
+            if _arg_fixes:
+                logger.info(
+                    "propose_hypotheses args normalized (round=%d): %s",
+                    self._model_call_count, "；".join(_arg_fixes[:6]),
+                )
 
         # ── Malformed file-tool call observability ──
         # The streaming layer cannot warn on empty args (they may arrive
@@ -7612,6 +7708,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             new_insights: str = "",
             statement_update: str = "",
             superseded_by: str = "",
+            supersede_reason: str = "",
             evidence_refs: list[str] | None = None,
         ) -> str:
             ledger = mw._current_ledger
@@ -8280,6 +8377,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     ledger, hypothesis_id, verdict,
                     evidence_summary, probability_update, new_insights,
                     statement_update, superseded_by=superseded_by,
+                    supersede_reason=supersede_reason,
                 )
             except ValueError as e:
                 return f"记录失败: {e}"
@@ -8289,6 +8387,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # never-tested hypothesis is not excluded at all (it is shelved).
             _refutation_note = ""
             _rn = ledger.get("hypotheses", {}).get(hypothesis_id) or {}
+
+            # v3.58.0: 单通道披露绑定终态——改判为 confirmed 时撤销此前披露，
+            # 否则日志里会永久留下"某假设曾被单通道证伪"，事后分析据此误读
+            # （实测 2026-10-27 run1：H2 round 6 触发披露、round 8 改判 confirmed）。
+            if (verdict == "confirmed"
+                    and _rn.get("_single_channel_disclosed")):
+                _rn.pop("_single_channel_disclosed", None)
+                _single_channel_hint = (
+                    "\nℹ 此前对该假设的单通道证伪披露**已撤销**"
+                    "（本次改判 confirmed，披露不再适用）")
             if _rn.get("terminal_reason") == "superseded_by":
                 _refutation_note = (
                     f"\nℹ 已记为「并入 {fmt_hid(_rn.get('superseded_by'))}」"
@@ -8349,6 +8457,8 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     ",".join(_sc_signal.get("channels") or []) or "-",
                     self._model_call_count,
                 )
+                # v3.58.0: 标记披露时点，供后续改判时撤销（见上方 confirmed 分支）。
+                _rn["_single_channel_disclosed"] = self._model_call_count
 
             # G21 arbitration counter resets on every successful verdict
             # (design document §8, v3.16.0): a completed verdict means the
