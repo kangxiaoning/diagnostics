@@ -29,7 +29,6 @@ class _ProducerError:
 
 
 from diagnostics.server.step_tracker import TOOL_LABELS as _TOOL_LABELS
-from diagnostics.agent.ollama_chat import ReasoningLoopError  # v3.63.0 预算强制截断
 
 
 def _make_tool_label(name: str) -> str:
@@ -597,21 +596,14 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     state._resp_reasoning_alerted = True
                     logger.warning(
                         "[round=%d] Single-response reasoning reached %d chars "
-                        "(> %d) — looping inside one call; aborting so the "
-                        "retry can regenerate with thinking disabled",
+                        "(> %d) — looping inside one call; the budget guard in "
+                        "ollama_chat aborts it one layer down",
                         state.round_number, _single,
                         _RESPONSE_REASONING_ALERT_CHARS)
-                    # v3.63.0 (C)：预算强制截断。此前 12k 只告警，响应继续
-                    # 生成到 12.3k–16.8k、或撞 256 字符重复块才被
-                    # ReasoningLoopError 收走；两次复跑 2/2 命中 12k，且
-                    # 失败轮 12.0–16.8k vs 正常轮 <8k 界限清晰。
-                    # 依据：Budget Forcing（s1，思考超预算即注入结束符，
-                    # 精度损失 <1% 时省 ~70% 成本）。
-                    # 复用 ReasoningLoopError 通道 → 走既有 thinking-off 重试。
-                    raise ReasoningLoopError(
-                        f"single-response reasoning reached {_single} chars "
-                        f"(> {_RESPONSE_REASONING_ALERT_CHARS}) — hard cap: "
-                        "aborting instead of letting it run into the timeout")
+                    # v3.63.0：这里只告警。硬截断必须在 ollama_chat 的流式
+                    # 守卫里做（与重复块同层）——在 streaming 抛会被会话层
+                    # 当作 Stream error 终止整个会话（实测 2026-10-28
+                    # 15:48:34：1144 秒后 exit=2）。
                 logger.debug("[round=%d] Reasoning chunk: %d chars, first 200: %r",
                              state.round_number, len(reasoning_text), reasoning_text[:200])
                 events.append(AgentEvent("text_delta", {

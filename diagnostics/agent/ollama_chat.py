@@ -55,6 +55,15 @@ _LOOP_ANCHOR_CHARS = int(os.getenv("DIAGNOSTICS_LOOP_ANCHOR_CHARS", "256"))
 """Length of the tail block that must reappear earlier in the same response."""
 
 _LOOP_SCAN_LIMIT = int(os.getenv("DIAGNOSTICS_LOOP_SCAN_LIMIT", "24000"))
+
+# v3.63.0 (C)：单响应 reasoning 预算强制截断。必须与重复块检测**同层**
+# （都在本模块的流式守卫里）——在 streaming.py 抛会被会话层当作 Stream
+# error 直接终止会话（实测 2026-10-28 15:48:34：1144 秒后 exit=2），
+# 这里抛才能被 G7' 重试捕获 → thinking-off 重新生成。
+# 依据 Budget Forcing（s1）：思考超预算即强制结束；实测失败轮 12.0–16.8k
+# 而正常轮 <8k。
+_RESP_HARD_CAP_CHARS = int(os.getenv("DIAGNOSTICS_RESP_HARD_CAP", "12000"))
+_RESP_TOTAL: ContextVar[int] = ContextVar("resp_reasoning_total", default=0)
 """Rolling buffer cap; older text is dropped so the scan stays O(n)."""
 
 _REASONING_BUF: ContextVar[str] = ContextVar("reasoning_stream_buf", default="")
@@ -72,7 +81,16 @@ class ReasoningLoopError(RuntimeError):
 
 
 def _guard_reasoning_stream(delta: str) -> None:
-    """Accumulate reasoning deltas and raise when a long block repeats."""
+    """Accumulate reasoning deltas; abort on repeats or budget overflow."""
+    # v3.63.0 (C)：预算强制。单响应累计超 12k 即中断——正常轮 <8k，
+    # 失败轮 12.0–16.8k（6 次样本），界限清晰。
+    _total = _RESP_TOTAL.get() + len(delta)
+    _RESP_TOTAL.set(_total)
+    if _total > _RESP_HARD_CAP_CHARS:
+        raise ReasoningLoopError(
+            f"single-response reasoning reached {_total} chars "
+            f"(> {_RESP_HARD_CAP_CHARS}) — budget forcing: aborting so the "
+            "retry can regenerate with thinking disabled")
     buf = _REASONING_BUF.get() + delta
     if len(buf) > _LOOP_SCAN_LIMIT:
         buf = buf[-_LOOP_SCAN_LIMIT:]
@@ -114,6 +132,7 @@ class OllamaChatOpenAI(ChatOpenAI):
         # Each request starts with an empty reasoning buffer: the loop guard
         # must judge one response at a time, never carry state across turns.
         _REASONING_BUF.set("")
+        _RESP_TOTAL.set(0)
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         mct = payload.get("max_completion_tokens")
         if mct is not None and "max_tokens" not in payload:
