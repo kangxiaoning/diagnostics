@@ -48,20 +48,36 @@ _ALLOWED_ARGS = ("subagent_type", "description")
 # 若用单一全局槽，后者会覆盖前者、先返回的 task 读到错误的量、后返回的读空
 # ——按 id 关联才不会被并发串号。
 STRIPPED_BY_CALL: dict[str, dict[str, int]] = {}
+# v3.62.0: fallback 槽。实测 2026-10-28：剥离已发生（1340→321），但回执从未
+# 出现——`take_strip(tool_call_id)` 未命中（该调用的 id 与写入时的 key 不一致，
+# 或为空）。id 命中优先；未命中时退回"最近一次剥离"，并在并发场景下由 id
+# 优先保证不串号。
+_LAST_STRIP: dict[str, int] = {}
 
 
 def remember_strip(tool_call_id: str, before: int, after: int) -> None:
     """Record a description strip for one delegation call."""
-    if tool_call_id and before > after:
-        STRIPPED_BY_CALL[str(tool_call_id)] = {
-            "before": int(before), "after": int(after)}
+    if before <= after:
+        return
+    rec = {"before": int(before), "after": int(after)}
+    if tool_call_id:
+        STRIPPED_BY_CALL[str(tool_call_id)] = rec
+    _LAST_STRIP.clear()
+    _LAST_STRIP.update(rec)
 
 
 def take_strip(tool_call_id: str) -> dict[str, int]:
-    """Pop the strip record for *tool_call_id* (empty dict when none)."""
-    if not tool_call_id:
-        return {}
-    return STRIPPED_BY_CALL.pop(str(tool_call_id), {})
+    """Pop the strip record for this call (id first, then the last one)."""
+    if tool_call_id:
+        rec = STRIPPED_BY_CALL.pop(str(tool_call_id), None)
+        if rec:
+            _LAST_STRIP.clear()
+            return rec
+    if _LAST_STRIP:
+        rec = dict(_LAST_STRIP)
+        _LAST_STRIP.clear()
+        return rec
+    return {}
 """The two parameters the delegation contract defines.  Anything else is a
 model-invented key: it is stripped before dispatch (never forwarded to the
 subagent) and its content is folded into `description` when it is a short

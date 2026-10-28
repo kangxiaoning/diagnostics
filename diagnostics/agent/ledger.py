@@ -2947,6 +2947,13 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + _record_hint
             + _attribution_hint
             + _ddx_hint
+            # v3.62.0: 单焦点约束前移。实测 2026-10-28 round 4：模型同轮并行
+            # 委派 host-expert(焦点 H1) 与 k8s-expert(另一个假设)，第二个被
+            # `task() blocked by single-focus batch rule` 拦下，白耗一次调用。
+            # 规则本身正确（每步验证一个假设），缺的只是"写在哪里"——紧跟在
+            # `_ddx_hint`（要求写入其它假设编号）之后，避免两句被读成冲突。
+            + "- 同轮并行委派须指向当前焦点假设；其它假设只作 "
+            "related_hypotheses 方向声明，不作为本次验证目标\n"
             + "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
             "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
             "委派时明确要求专家「复用已有证据，仅补查缺失项」\n"
@@ -3090,13 +3097,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # exists (honest-negative exit path).
         _report_cons = compute_report_guidance(ledger)
         _report_banner = f"\n- {_report_cons}\n" if _report_cons else ""
-        return (
-            "你当前处于 EVALUATE 阶段。\n"
-            + exit_banner +
-            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('evaluate')}\n"
-            + _report_banner +
-            f"- {duty}\n"
-            + _eval_rec +
+        # v3.62.0 (E1)：唯一动作存在时**不渲染菜单**。"⭐ 唯一动作"与"5 个
+        # 并列选项"同时出现是自相矛盾（Decision Paralysis：等权冲突 + 无
+        # 优先级 → 在方案间振荡不收敛）。实测 2026-10-28 round 8 evaluate：
+        # 10,925 字符里 `Actually, looking at the evidence more carefully:`
+        # 重复 2 次、三段"H1/H2 已解释全貌"清单重复 2 次——模型在"收尾"与
+        # "继续验证 H3"之间反复证明。duty 本就写明方向由状态机呈现为
+        # THE action，菜单与它冲突。
+        _eval_menu = "" if _eval_rec else (
             "- 下一步路径菜单：\n"
             # v3.34.2: split the mixed reuse bullet (positive/negative
             # split, design document §9) — the "省轮次" invite folded with
@@ -3118,6 +3126,15 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             "修正其表述（假设为扁平结构，无层级深化）\n"
             "  · 本层全部 refuted 且有搁置假设 → backtrack 回溯恢复\n"
             + _retry_option
+        )
+        return (
+            "你当前处于 EVALUATE 阶段。\n"
+            + exit_banner +
+            f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('evaluate')}\n"
+            + _report_banner +
+            f"- {duty}\n"
+            + _eval_rec +
+            _eval_menu
             + _append_option +
             "- 根因与角色：只有证据支持且满足反事实判据（移除该因素后故障"
             "不再发生或显著缓解）才列为独立根因；仅放大影响的因素列为促成/"

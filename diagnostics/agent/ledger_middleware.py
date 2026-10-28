@@ -7284,7 +7284,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                         ledger["_hypo_nudge_count"] = _nudges + 1
                         mutated = True
-                        logger.warning(
+                        # v3.62.0: 首次 nudge 属**预期路径**（round 1 是
+                        # understand，round 2 首次进入 hypothesize 时"尚无
+                        # 假设"是必然状态），100% 触发，用 INFO；只有提示过
+                        # 仍未提出（第 2 次起）才是真偏离，保留 WARNING。
+                        _log = (logger.info if _nudges == 0 else logger.warning)
+                        _log(
                             "Safety: hypothesize owes a propose (round %d, "
                             "no hypotheses, nudge #%d) — naming the single "
                             "action", round_num, _nudges + 1)
@@ -8583,7 +8588,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         if _sc_alt else ""
                     )
                 )
-                logger.warning(
+                # v3.62.0: 说明类日志——单通道披露是**预期内的证据局限说明**
+                # （合法判定，不阻断落账），每次单通道 refuted 都会出现，
+                # WARNING 会稀释真实告警（G17/G21/循环）。降为 INFO。
+                logger.info(
                     "single-channel refute disclosed on %s "
                     "(expert=%s channels=%s round=%d)",
                     fmt_hid(hypothesis_id),
