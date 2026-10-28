@@ -29,6 +29,7 @@ class _ProducerError:
 
 
 from diagnostics.server.step_tracker import TOOL_LABELS as _TOOL_LABELS
+from diagnostics.agent.ollama_chat import ReasoningLoopError  # v3.63.0 预算强制截断
 
 
 def _make_tool_label(name: str) -> str:
@@ -596,10 +597,21 @@ def _process_chunk(raw: Any, state: _EventState, session_id: str = "") -> list[A
                     state._resp_reasoning_alerted = True
                     logger.warning(
                         "[round=%d] Single-response reasoning reached %d chars "
-                        "(> %d) — looping inside one call; expect no tool call "
-                        "and a possible timeout",
+                        "(> %d) — looping inside one call; aborting so the "
+                        "retry can regenerate with thinking disabled",
                         state.round_number, _single,
                         _RESPONSE_REASONING_ALERT_CHARS)
+                    # v3.63.0 (C)：预算强制截断。此前 12k 只告警，响应继续
+                    # 生成到 12.3k–16.8k、或撞 256 字符重复块才被
+                    # ReasoningLoopError 收走；两次复跑 2/2 命中 12k，且
+                    # 失败轮 12.0–16.8k vs 正常轮 <8k 界限清晰。
+                    # 依据：Budget Forcing（s1，思考超预算即注入结束符，
+                    # 精度损失 <1% 时省 ~70% 成本）。
+                    # 复用 ReasoningLoopError 通道 → 走既有 thinking-off 重试。
+                    raise ReasoningLoopError(
+                        f"single-response reasoning reached {_single} chars "
+                        f"(> {_RESPONSE_REASONING_ALERT_CHARS}) — hard cap: "
+                        "aborting instead of letting it run into the timeout")
                 logger.debug("[round=%d] Reasoning chunk: %d chars, first 200: %r",
                              state.round_number, len(reasoning_text), reasoning_text[:200])
                 events.append(AgentEvent("text_delta", {

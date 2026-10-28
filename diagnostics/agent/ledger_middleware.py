@@ -499,6 +499,55 @@ def _phase_rejection_suffix(phase: str) -> str:
     return ""
 
 
+_TOOL_FOLD_KEEP = 3
+_TOOL_FOLD_MIN_CHARS = 400
+_TOOL_FOLD_FAILURE_MARKERS = ("error", "failed", "timeout", "traceback", "超时")
+
+
+def _fold_old_tool_results(
+        messages: list, keep: int = _TOOL_FOLD_KEEP) -> tuple[list, int]:
+    """Collapse older tool results into one-line placeholders (v3.63.0).
+
+    Structural only — depends on ``role == "tool"``, a string ``content`` and
+    the message order, never on what a tool returns.  ``tool_call_id`` pairing
+    is untouched (only ``content`` is replaced), so the provider-side message
+    validation stays satisfied.
+
+    Measured 2026-10-28 round 6: 7 tool results totalled 6,662 chars inside a
+    45.8k request; keeping the newest 3 and folding the rest buys ~2.5k.  The
+    authoritative copy of every observation stays in the ledger
+    (``tool_results`` + ``record_finding`` evidence), so nothing is lost.
+
+    Failures are never folded: the diagnosis needs to know what failed.
+    Returns (messages, folded_count).
+    """
+    if not messages:
+        return messages, 0
+    idx = [i for i, m in enumerate(messages)
+           if getattr(m, "type", getattr(m, "role", "")) == "tool"]
+    if len(idx) <= keep:
+        return messages, 0
+    out = list(messages)
+    folded = 0
+    for i in idx[:-keep]:
+        msg = out[i]
+        content = getattr(msg, "content", "")
+        if not isinstance(content, str) or len(content) < _TOOL_FOLD_MIN_CHARS:
+            continue
+        low = content.lower()
+        if any(marker in low for marker in _TOOL_FOLD_FAILURE_MARKERS):
+            continue
+        try:
+            out[i] = msg.model_copy(update={
+                "content": f"[工具结果已折叠·原 {len(content)} 字符；"
+                           "完整内容见台账与「已有工具调用结果」段]",
+            })
+            folded += 1
+        except Exception:  # 不因折叠失败影响主流程
+            continue
+    return out, folded
+
+
 def _phase_scoped_tools(
         tools: object, phase: str,
         ledger: DiagnosisLedger | None = None) -> list | None:
@@ -3645,6 +3694,15 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 request.system_message, combined_block)
         if _phase_tools is not None:
             _overrides["tools"] = _phase_tools
+        # v3.63.0 (A)：折叠较早的工具结果（保留最近 3 条，失败的不折）。
+        # 与 deepagents 的内置摘要不同，这里不需要额外模型调用。
+        _folded_msgs, _folded_n = _fold_old_tool_results(
+            getattr(request, "messages", None) or [])
+        if _folded_n:
+            _overrides["messages"] = _folded_msgs
+            logger.info(
+                "tool results folded: %d older entries collapsed (round=%d)",
+                _folded_n, self._model_call_count)
         _call_request = request.override(**_overrides) if _overrides else request
         _effective_timeout = _phase_timeout(_phase(ledger))
         # ── G7' transient-failure retry (design document §8) ──
@@ -6213,17 +6271,24 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # 剥离此前是静默的（仅 WARNING 日志），模型无从得知，于是每轮继续
         # 复述台账（实测 1562→514、1541→522）；自我修正只在拿到外部反馈时
         # 才发生，故把结果写进 task 回执。
-        if tool_name == "task" and isinstance(result, ToolMessage):
+        if tool_name == "task":
             # 按 tool_call_id 取，避免并行委派时串号（实测 16:01:58 两条剥离）。
             _strip = take_strip(tool_call_id)
             if _strip and _strip.get("before", 0) > _strip.get("after", 0):
                 _dropped = _strip["before"] - _strip["after"]
-                result = result.model_copy(update={"content": (
-                    f"{result.content}\n\n"
-                    f"ℹ 你的委派描述有 {_dropped} 字与已注入专家上下文的台账"
-                    "重复，系统已剥离——专家看得到台账，无需复述。"
-                    "下次只写：①验证假设Hx ②待覆盖通道 ③实体参数。"
-                )})
+                _strip_note = (
+                    f"上一轮委派描述有 {_dropped} 字与已注入专家上下文的台账"
+                    "重复，系统已剥离——专家看得到台账，无需复述；"
+                    "下次只写：①验证假设Hx ②待覆盖通道 ③实体参数")
+                # v3.62.0: task 正常返回的是 Command 而非 ToolMessage，
+                # `isinstance(result, ToolMessage)` 恒为 False——这是剥离回执
+                # 两次复跑都没出现的真正原因。改为写入台账，由下一轮「本步
+                # 要求」渲染（前置引导），并在能塞回执时一并塞。
+                if ledger is not None:
+                    ledger["_last_strip_hint"] = _strip_note
+                if isinstance(result, ToolMessage):
+                    result = result.model_copy(update={"content": (
+                        f"{result.content}\n\nℹ {_strip_note}")})
 
         # ── propose_hypotheses validation-feedback enhancement ──
         # Failure path: append the self-contained field contract (with

@@ -2145,6 +2145,14 @@ def _render_hypothesis_tree(
     sub-hypotheses no longer exist.
     """
     prefix = "  " * indent
+    # v3.63.0 (E)：**evaluate / report** 相位只渲染一行（ID + 状态 + 概率 +
+    # 陈述前 60 字），不再渲染证据明细。实测 2026-10-28 round 6（frame 26091）：
+    # 假设树 2,791 字符，而模型在 evaluate 反复重写的内容与它**逐字同构**
+    # （「H1: …（概率 75%）+ 证据：…」×5），属 conversational inertia（模型把
+    # 自己此前的输出当范本模仿，arXiv:2602.03664）。
+    # verify 保持完整：该相位正要判断"证据够不够 confirmed"，明细是判据。
+    # evaluate/report 的明细在 record_finding 回执与「已有工具调用结果」段有备份。
+    _compact = derive_phase(ledger) in ("evaluate", "report")
     for hid in ids:
         node = ledger["hypotheses"].get(hid)
         if node is None:
@@ -2160,11 +2168,16 @@ def _render_hypothesis_tree(
         # (report-phase context included) — the coverage limitation used
         # to be a block; it is now a visible property of the node.
         _sc_tag = " [单通道证伪]" if node.get("_single_channel_refute") else ""
+        _stmt_txt = display_statement(node)
+        if _compact and len(_stmt_txt) > 60:
+            _stmt_txt = _stmt_txt[:60] + "…"
         lines.append(
             f"{prefix}### {fmt_hid(node['id'])} [{node['status']}{deferred_tag}"
             f"{_sc_tag} p={node['probability']}%]{marker} "
-            f"{display_statement(node)}{active_marker}"
+            f"{_stmt_txt}{active_marker}"
         )
+        if _compact:
+            continue
         # Evidence.  Once a coordinator verdict exists (verdict_reason
         # set by record_finding), two classes of duplicates are skipped:
         # 1. undetermined auto-collected evidence (raw expert output,
@@ -2653,6 +2666,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         active = ledger["hypotheses"].get(active_id, {})
         stmt = active.get("statement", "?")
         disp_id = fmt_hid(active_id) if active_id != "?" else "?"
+        # v3.62.0: 上一轮委派描述被剥离时，把量摆到下一轮的动作之前。
+        # task 正常返回 Command（不是 ToolMessage），回执通道无法承载这条
+        # 反馈——两次复跑里剥离都发生了（1340→321、1746→727），模型却从未
+        # 收到过提示，于是一直复述台账。pop 保证只提示一次。
+        _strip_hint = ""
+        _strip_msg = str(ledger.pop("_last_strip_hint", "") or "")
+        if _strip_msg:
+            _strip_hint = f"- ℹ {_strip_msg}\n"
         sls_verify = ""
         # Scene-aware expert map (design document §9, 2026-08-05): only the
         # CURRENT scene's verification experts are shown (same principle as
@@ -2921,6 +2942,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         return (
             f"你当前处于 VERIFY 阶段，聚焦验证 {disp_id}: {stmt}\n"
             + _vd_block
+            + _strip_hint
             + _related_verdict_hint
             + _sc_hint
             + _obs_hint
