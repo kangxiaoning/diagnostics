@@ -1110,6 +1110,37 @@ _OBSERVATION_EVIDENCE_TOOLS = frozenset({
 })
 
 
+_SYMPTOM_SELF_MARKERS = (
+    "非独立根因", "而非独立根因", "不是独立根因", "非根因", "而非根因",
+    "下游症状", "级联症状",
+)
+
+
+def is_symptom_self_declared(statement: str) -> bool:
+    """Whether a statement itself disclaims being a root cause (v3.61.0).
+
+    Measured 2026-10-27 scenario 28: H3's statement read 「H3 确认为 H1+H2 的
+    **下游症状而非独立根因**：…级联触发 NotReady…」 and was still confirmed at
+    p=90 and counted in ``root_causes`` — costing one verification round and
+    leaving the report with a "root cause" that no fix can remove.
+
+    A hypothesis set may only hold **candidate causes** (differential
+    diagnosis: MSD Manual / IEEE — "a set of candidate explanations"); a
+    cascade narrative or a symptom is presentation, not a candidate cause.
+    RCA agrees: the root cause is "the conditions that must change"
+    (improvement.company), the "true origin instead of its visible symptom"
+    (Arda) — fixing a symptom "feels like progress until the same incident
+    comes back" (Dimeri).
+
+    Conservative by design: requires an explicit self-disclaimer, so an
+    ordinary statement that merely mentions 症状 is not caught.
+    """
+    text = str(statement or "")
+    if "症状" not in text:
+        return False
+    return any(marker in text for marker in _SYMPTOM_SELF_MARKERS)
+
+
 def corroborating_observation_evidence(
         ledger: DiagnosisLedger, hid: str) -> bool:
     """Whether *hid* holds coordinator-collected raw observation evidence.
@@ -2587,29 +2618,27 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             '{"statement": "一句完整根因表述（必填）", "probability": 70, '
             '"rationale": "依据"}])——每条必须含 statement 与 probability'
             "（缺失会导致调用失败；失败不消耗提出预算，修正后重试即可）；"
-            "独立故障源请加 independent_anomaly=true（低概率也不会被按噪声跳过）\n"
+            "独立故障源请加 independent_anomaly=true（低概率也不会被按噪声跳过）；"
+            # v3.61.0 (A)：假设集只装候选病因。实测 2026-10-27：H3 的
+            # statement 自述「下游症状而非独立根因」，仍被 confirm 并计入
+            # root_causes——多耗一轮验证，报告多一条无法修复的"根因"。
+            # 依据：RCA 的根因是「必须改变的条件」（improvement.company）；
+            # 鉴别诊断只枚举候选病因（MSD Manual / IEEE）。
+            "statement 必须是**可修复的根因**（配置/代码缺陷/容量/策略）——"
+            "症状与级联影响（NotReady、Pod 驱逐、延迟升高）不立为假设\n"
             f"- {duty}\n"
-            "- 机制关系判定（只做一次，按表处理）：\n"
-            "  | 情形 | 处理 |\n"
-            "  | 同一机制的不同描述层级（现象/机制/落点） | 合并为 1 条 |\n"
-            "  | 两个机制互为因果、初始触发端未知 | 分别成条，各给 probability |\n"
-            "  | 难以判断 | 分别成条 |\n"
-            "  独立故障源并存时各条给合理 probability（≥30%）；"
-            "probability 按证据强度选档：高 ≥70 / 中 40–69 / 低 <40\n"
-            # v3.59.0 (F)：事实与机制分层。实测 2026-10-27 run2：H2 的 statement
-            # 把「磁盘 100% 满」（事实）与「是独立首因」（因果断言）捆在一句里，
-            # k8s-expert 的「MemoryPressure 先于 DiskPressure」一否掉因果，整条
-            # 被 refuted，磁盘满这个客观故障也随之从报告消失。
-            "  事实与机制分层：可观测事实（如「磁盘 100% 满、ext4 journal abort」）"
-            "与因果机制（如「日志写满磁盘导致…」）分别成条——事实型可由直接观测"
-            "confirmed，机制型需专家机制证据；合并成一条时，方向证据一旦否掉机制，"
-            "事实也会一起丢失\n"
-            # v3.58.0 (A2)：给判定一个确定性落点——"独立还是因果链"由参数
-            # 承载，写好即固定。实测 2026-10-27 run2：模型在同一条判定上反复
-            # 重算（`独立`×37、`因果链`×15、`按规则分别成条`×8），因为判定
-            # 结果没有落到任何字段，只能在 reasoning 里一次次重来。
-            "  判定结论写进 independent_anomaly（独立→true、因果链→false），"
-            "写完即固定，后续不再重判\n"
+            # v3.60.0 (A)：判定块 8 行 → 1 条。依据 Agent Patterns Catalog
+            # 《Decision Paralysis》——等权冲突目标 + 无优先级会让 agent
+            # "在方案间振荡而不收敛"，这是 LLM 对真实目标冲突最常见的反应；
+            # 以及 Attention Dilution（指令越多，每条分到的注意力越少）。
+            # 实测 2026-10-27 两次复跑：判定块扩到 8 行后 round 2 循环复发
+            # 2/2——run2 的「这两个问题可能是独立的，也可能是互为因果的」
+            # 重复 13 次、时间线推演重复 16 次（"我需要确定哪个是根本原因"）。
+            # 原则：给唯一默认 + 唯一例外，不再要求模型推演因果方向。
+            "- 机制关系：默认分别成条（多一条冗余 < 漏一条独立源）；"
+            "仅当两条描述的是同一机制的不同层级（现象/机制/落点）时才合并。"
+            "probability 按证据强度选档：高 ≥70 / 中 40–69 / 低 <40"
+            "（独立故障源不低于 30%）\n"
             f"- 提出预算：全程最多 {MAX_PROPOSE_CALLS} 次"
             f"（本次为第 {ledger.get('_propose_count', 0) + 1} 次）；"
             "一次写定：statement 与 probability 写出即提交，后续精化用 "

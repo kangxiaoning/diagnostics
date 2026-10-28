@@ -45,25 +45,15 @@ PHASE_SPEC: dict[str, dict] = {
                 "均属同一因果链，应合并为一条（深层机制/具体落点作为 statement 细化，不并列），"
                 "报告时再区分根因、促成因素与症状；"
                 "仅当证据显示相互独立的故障源并存时才拆成多条；statement_update 只精化原机制，独立故障源分别成条。"
-                # v3.50.0: two rules used to collide exactly here — "merge
-                # upstream/downstream" vs "independent mechanisms must be
-                # separate entries".  For a mutually-causal pair (disk full ↔
-                # memory leak) BOTH applied and there was no arbiter: measured
-                # 2026-10-26 scenario 28, round 2 — 10,014 chars oscillating
-                # between "memory leak → log flood → disk full" and "disk
-                # full → IO/swap pressure → OOM", zero tool calls, cut by the
-                # loop guard.  The arbiter is FORM-based (description level),
-                # never severity-based: merge only when both texts name the
-                # SAME mechanism at different granularity; mutually-causal
-                # distinct mechanisms become competing hypotheses and the
-                # evidence decides the direction in VERIFY.
-                "两段表述若指向**同一机制的不同描述层级**（现象 / 机制 / 具体落点），"
-                "合并为一条；若两个机制**互为因果且无法判定执行链的初始触发端**"
-                "（如「磁盘写满→内存压力」与「内存泄漏→日志暴涨→磁盘写满」），"
-                "它们属于竞争性假设——分别成条、各自给 probability，"
-                # v3.57.0：去掉"不要在本阶段自行裁决"（负面提及），
-                # 方向归属已由前半句说明。
-                "方向由验证阶段的证据裁决。"
+                # v3.60.0: 删除 v3.50.0 的"互为因果且初始触发端未知 →
+                # 分别成条、方向由验证裁决"整段。它是 round 2 循环的直接
+                # 推演对象（实测 2026-10-27 run2：「这两个问题可能是独立的，
+                # 也可能是互为因果的——我需要确定哪个是根本原因」重复 13 次、
+                # 时间线推演重复 16 次），因为模型手里只有两条同步上升的曲线、
+                # 无法判定方向。改为唯一默认（见上句"相互独立的故障源分别
+                # 成条"）：多一条冗余 < 漏一条独立源。依据 Agent Patterns
+                # Catalog《Decision Paralysis》——等权冲突 + 无优先级会让
+                # agent 振荡不收敛，解法是给优先级而不是要求它判定。
                 "假设是基于监控筛查证据的竞争性候选——是待验证的猜测、非已确认结论，"
                 "probability 即表达不确定性；提出只是记录候选、非断定根因。"
                 "凡需深查或确证的方向，直接写成假设提出即完成本阶段职责，"
@@ -90,19 +80,15 @@ PHASE_SPEC: dict[str, dict] = {
             # 分别成条）。
             # v3.58.0 (A1+A2)：概率改分档（去掉"算一个精确数"的复核动机）；
             # 判定结论落到 independent_anomaly 字段，写好即固定。
-            "机制关系按一张表判定（只做一次）："
-            "同一机制的不同描述层级（现象/机制/落点）→ 合并 1 条；"
-            "两个机制互为因果、初始触发端未知 → 分别成条各给 probability；"
-            "难以判断 → 分别成条；独立故障源并存时各给合理 probability（≥30%），"
-            "多根因保护按假设计数；probability 按证据强度选档"
-            "（高 ≥70 / 中 40–69 / 低 <40）；判定结论写进 "
-            "independent_anomaly（独立→true、因果链→false），写完即固定；"
-            # v3.59.0 (F)：事实与机制分层——事实型假设的 confirmed 不受因果
-            # 方向证据影响，避免"否掉机制 = 事实一起消失"。并入本条的同一段
-            # 文本，不新增条目（保持 6 条上限）。
-            "事实与机制分层：可观测事实（磁盘 100% 满、OOM 事件）与因果机制"
-            "（日志写满磁盘导致…）分别成条——事实型可由直接观测 confirmed，"
-            "机制型需专家机制证据",
+            # v3.60.0 (A+B)：判定规则压成一条（默认 + 唯一例外），不再要求
+            # 模型推演因果方向；"事实与机制分层"移出生成点（它属于报告表述，
+            # 放在这里只增加负荷）。依据 Decision Paralysis（等权冲突 + 无
+            # 优先级 → 振荡不收敛；Agent Patterns Catalog）与 Attention
+            # Dilution（指令越多，每条分到的注意力越少）。
+            "机制关系：默认分别成条（多一条冗余 < 漏一条独立源）；"
+            "仅当两条描述的是同一机制的不同层级（现象/机制/落点）时才合并；"
+            "probability 按证据强度选档（高 ≥70 / 中 40–69 / 低 <40，"
+            "独立故障源不低于 30%）",
             # v3.57.0: 原「✍ 表述只写一次（不在本阶段反复润色）」改为不含
             # 行为提及的正向单句——"反复润色"本身也是被点名的行为。
             "一次写定：statement 与 probability 写出即提交；"
@@ -120,7 +106,10 @@ PHASE_SPEC: dict[str, dict] = {
             "字段骨架（照抄结构）：propose_hypotheses(hypotheses=["
             "{\"statement\": \"一句完整根因表述\", \"probability\": 70, "
             "\"rationale\": \"依据\"}])；每条必须含 statement 与 probability；"
-            "独立故障源加 independent_anomaly=true（低概率也不会被按噪声跳过）",
+            "独立故障源加 independent_anomaly=true（低概率也不会被按噪声跳过）；"
+            # v3.61.0 (A)：假设集只装候选病因（症状/级联影响不立为假设）。
+            "statement 必须是可修复的根因（配置/代码缺陷/容量/策略）——"
+            "症状与级联影响（NotReady、Pod 驱逐、延迟升高）不立为假设",
             "合法样例（照抄结构并保持字段名一致）：propose_hypotheses(hypotheses=["
             "{\"statement\": \"节点 15:02 CPU 打满导致 kubelet 心跳超时\", "
             "\"probability\": 70, \"rationale\": \"15:02 CPU 92%，同时刻该节点 NotReady\"}])——"
@@ -382,7 +371,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是一位资深 IaaS 运维 SRE 专家，专注�
 
 ## 根因与因果分层
 - **已确认根因**：仅列满足反事实判据（移除该因素后故障不再发生或显著缓解）的独立根因；多条分别列出，每条以 Hn 标注对应假设，并标注证据层级（【深度确证】/【工具直接观测】/【指标直接观测】）与置信度——【工具直接观测】指协调员直采的实时探测/日志原始输出（dmesg、journalctl、OOM 计数器等），只能支撑事实性断言，机制性归因仍须【深度确证】
-- **促成或加剧因素**：仅放大故障影响、但移除后核心故障仍存在的因素；独立成节并标注证据层级，不计入根因数量
+- **促成或加剧因素**：仅放大故障影响、但移除后核心故障仍存在的因素；独立成节并标注证据层级，不计入根因数量（v3.60.0：**事实与机制分层**——可观测事实（如「磁盘 100% 满、ext4 journal abort」）与因果机制归因（如「日志写满磁盘导致…」）分列表述，前者按事实层标注，后者标【深度确证】；两者混写在一条陈述里时，方向证据一旦否掉机制，事实也会一起丢失）
 - **症状与下游影响**：如 API 只读、Pod NotReady、延迟升高等表现，保持症状角色单独列出
 - **排除的假设**：仅列已判定 refuted 的竞争性假设及排除原因，每条以 Hn 标注；未验证或已搁置的假设写入「未验证」章节或后续排查建议，并保持其未验证状态（台账中标注「单通道证伪」的假设，须在原因后注明「证据局限：仅由单一专家通道支撑，未经跨通道复核」；系统另会在报告末尾自动补入该书面披露段）
 - **并入/被覆盖的机制**：某假设的机制被另一假设的表述吸收、但没有针对它的负证据时（台账 `terminal_reason=superseded_by`），写入本小节并注明「并入 Hx（机制被覆盖，非独立根因）」，**不要写入「排除的假设」**——被覆盖不等于被证伪，该机制可能仍并存

@@ -111,6 +111,7 @@ from diagnostics.agent.ledger import parse_hid  # ID 双命名空间解析：H2/
 from diagnostics.agent.ledger import exit_block_is_actionable  # v3.48.0 退出阻塞判据（确定性谓词，不再匹配文案子串）
 from diagnostics.agent.ledger import corroborating_observation_evidence  # v3.52.0 工具原始观测可作确证层证据
 from diagnostics.agent.ledger import _OBSERVATION_EVIDENCE_TOOLS  # v3.55.0 实时探测/日志工具白名单（EV 归属校验）
+from diagnostics.agent.ledger import is_symptom_self_declared  # v3.61.0 症状不得作为根因落账
 from diagnostics.agent.delegation_guard import take_strip  # v3.59.0 委派描述剥离反馈（按 tool_call_id）
 from diagnostics.agent.evidence_ledger import iter_artifacts  # v3.55.0 原始观测条目查询（EV 编号 → 工具/轮次）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
@@ -8008,6 +8009,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                     "\n⚠ 以下编号不是实时探测/日志类观测（或不在证据索引中），"
                     "未采纳：" + "、".join(_ref_rejected)
                     + "；可用编号见「原始证据索引」")
+            # v3.61.0 (B)：症状不能作为根因落账。保守判据——仅当 statement
+            # 自述「症状 / 非独立根因」时触发。实测 2026-10-27：H3 的
+            # statement 明写「下游症状而非独立根因」，仍被 confirmed p=90 并
+            # 计入 root_causes（多耗一轮验证，报告多一条无法修复的"根因"）。
+            if verdict == "confirmed":
+                _declared_stmt = str(
+                    (ledger.get("hypotheses", {}).get(hypothesis_id) or {})
+                    .get("statement") or "")
+                if is_symptom_self_declared(_declared_stmt):
+                    raise ValueError(
+                        "本假设的 statement 自述为「症状 / 非独立根因」，"
+                        "而症状不能作为根因落账（假设集只装候选病因）。"
+                        "请改判 inconclusive，或用 statement_update 改写为"
+                        "可修复的根因（配置/代码缺陷/容量/策略），或直接 refuted")
             if (verdict == "confirmed"
                     and hypothesis_id in ledger.get("hypotheses", {})):
                 _g17_node = ledger["hypotheses"][hypothesis_id]
