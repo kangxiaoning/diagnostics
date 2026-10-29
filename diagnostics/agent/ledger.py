@@ -268,8 +268,8 @@ class DiagnosisLedgerState(DeepAgentState):
     # consumed by awrap_model_call on the NEXT round (injected into the
     # system message), then cleared.  Ordinary LastValue (NOT EphemeralValue)
     # — the value must survive the before_model super-step to reach
-    # awrap_model_call, which EphemeralValue clears too early (verified by a
-    # controlled test; see .local/scripts/tests/test_jump_to_guidance.py).
+    # awrap_model_call, which EphemeralValue clears too early (verified by the
+    # controlled jump-to guidance test suite).
     _stall_guidance: Annotated[
         NotRequired[str | None],
         PrivateStateAttr,
@@ -1921,20 +1921,30 @@ def display_statement(node: dict) -> str:
     return str(node.get("statement") or "")
 
 
-def _short_cache_path(path: str, limit: int = 46) -> str:
-    """Render a tool-result path as ``<cache>/<basename>`` (v3.64.0).
+def _short_cache_path(path: str, limit: int = 72) -> str:
+    """Render a tool-result path as ``/tool_results/r{n}/<basename>`` (v3.68.0).
 
-    Measured 2026-10-28: each rendered line carried a ~80-char absolute path;
-    33 lines meant ≈2.3k chars of paths alone, while the Coordinator never
-    opens them (it reads the ledger's conclusions).  The full path stays in
-    ``tool_results`` and in ``/tool_results/`` itself.
+    v3.64.0 rendered ``<cache>/<basename>`` with the basename clipped at 46
+    chars to save ~2.3k chars.  Measured 2026-10-29 (capture 27/28-request):
+    the Coordinator cannot use that form — it drops the round segment and
+    clips the name, so the model must GUESS the path before every read-back.
+    It ended up reading evidence in two batches over two rounds, while the
+    evidence index (rendered elsewhere) carried the complete paths the whole
+    time.  Two inconsistent renderings of the same pointer is the defect; the
+    fix keeps the reusable relative form (drop only the local absolute
+    prefix) and clips the basename only when it genuinely overflows.
     """
     if not path:
         return ""
-    name = path.rsplit("/", 1)[-1]
-    if len(name) > limit:
-        name = name[:limit - 1] + "…"
-    return f"<cache>/{name}"
+    idx = path.find("/tool_results/")
+    rel = path[idx:] if idx >= 0 else path
+    if len(rel) <= limit:
+        return rel
+    head, _, name = rel.rpartition("/")
+    room = max(8, limit - len(head) - 2)
+    if len(name) > room:
+        name = name[:room] + "…"
+    return f"{head}/{name}"
 
 
 def render_ledger_context(ledger: DiagnosisLedger | None,
@@ -2868,6 +2878,19 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 "的直接条目（无 related_via，专家被派来验证本假设）；"
                 "②同一假设**无相互冲突的证据通道**（如 argus 指标与日志/事件"
                 "矛盾）——冲突未澄清时 confirmed 会被系统拦截\n"
+                # v3.67.0 (C): 冲突的"存在"上一句已披露，但"怎么裁决"
+                # 与"部分成立怎么记"原本只写在阶段说明的中段（距生成点
+                # 约 3 万字符）。实测 2026-10-29：单响应 12003 字符、
+                # 13 次 "Actually" 全部消耗在这两个判断上（capture
+                # 19-response 全文无一次工具调用）。两段规则原样前移到
+                # 决策点——不新增内容，也不点名任何被回避的行为
+                # （§11 v3.57.0：点名被禁行为会反向激活）。
+                "- 冲突裁决一次到位：按采集口径对齐后（实时探测/日志 > "
+                "时序监控 > 用户主诉）直接落账，在 evidence_summary 写明"
+                "差异与置信度降级理由；同一组矛盾数据只裁决一次\n"
+                "- 核心机制成立、仅某环节（落点/量级/范围）不成立 → "
+                "confirmed + statement_update 记录成立部分，只精化该环节；"
+                "refuted 保留给存在直接反证的假设\n"
             )
             # v3.38.4 (R2): when this hypothesis holds RELATED evidence (filed
             # via another delegation's structured return), state that its
@@ -3085,13 +3108,15 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + _record_hint
             + _attribution_hint
             # （_ddx_hint 已前移到动作行之后，v3.66.0 D）
-            # v3.62.0: 单焦点约束前移。实测 2026-10-28 round 4：模型同轮并行
-            # 委派 host-expert(焦点 H1) 与 k8s-expert(另一个假设)，第二个被
-            # `task() blocked by single-focus batch rule` 拦下，白耗一次调用。
-            # 规则本身正确（每步验证一个假设），缺的只是"写在哪里"——紧跟在
-            # `_ddx_hint`（要求写入其它假设编号）之后，避免两句被读成冲突。
-            + "- 同轮并行委派须指向当前焦点假设；其它假设只作 "
-            "related_hypotheses 方向声明，不作为本次验证目标\n"
+            # v3.68.0 (R1): 原句是"同轮并行委派须指向当前焦点假设；其它假设
+            # 只作 related_hypotheses 方向声明，不作为本次验证目标"——它与上面
+            # `_ddx_hint`（"编号可多个，逗号分隔")正面冲突，模型遵守更强的具体
+            # 禁令，只用 H1 委派；于是 H2 只剩旁支证据，必须补一轮定向委派
+            # （2026-10-29 实测：+1 轮委派、+450s、占时长 18%）。规则的约束
+            # 对象从"假设个数"改回"专家个数"后两句自洽。
+            + "- 委派单位是专家观测域：同一专家观测域内的未决假设写成同一条"
+            "委派（如 `验证假设H1,H2`），专家逐条给结论；不同观测域的专家"
+            "分轮委派\n"
             + "- ⚠ 委派专家前先检查上方「已有工具调用结果」与假设「证据」字段："
             "此前验证其他假设时若已产出相关检查数据（check_* / 指标 / 专家结论），"
             "委派时明确要求专家「复用已有证据，仅补查缺失项」\n"
@@ -3370,6 +3395,14 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"- {duty}"
             + multi_hint + unverified_hint +
             "\n- 报告模板参考系统提示中的 REPORT 阶段说明\n"
+            # v3.68.0 (R3c): 证据可得性配方。上下文瘦身后原文不在窗口里，
+            # 但「根因支持证据」段与「原始证据索引」已给出逐字片段与完整
+            # 路径——2026-10-29 实测模型仍分两批回读 10 个文件（两轮 164s），
+            # 因为不知道该一次读完还是边读边判断。这里给出终止条件：
+            # 需要核对就一次并行读完，然后立即写；写完即交付。
+            "- 报告所需证据取自上方的「根因支持证据」段与证据索引（含逐字"
+            "片段与原文路径）：内容已足够时直接写报告；确需核对原文时，"
+            "本轮一次并行读取所需条目，随后立即 write_file\n"
             "- ⚠ 诊断台账（ledger JSON）已由系统自动持久化，无需手动写入"
         )
     return ""

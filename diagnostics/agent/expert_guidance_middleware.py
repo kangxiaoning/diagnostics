@@ -320,6 +320,30 @@ _REDUNDANCY_WRAPUP_GUIDANCE = (
     "不要再用相同参数重复调用任何工具。"
 )
 
+# v3.67.0 (B): brief wrap-up detection.  G33 above assumes "zero executed
+# calls ⇒ the text is a plan"; measured 2026-10-29 (capture 21-response,
+# delegation verifying H1) the expert HAD run 6 evidence calls and then ended
+# the turn with one 24-character progress sentence ("关键证据已初步采集，
+# 继续深入取证以确认根因链条。", finish_reason absent, no tool_calls).
+# G33 skipped it (`if s["calls"]: return None`), the sentence was booked as a
+# conclusion, and the Coordinator burned 12k characters re-adjudicating H1
+# because one expert report contained nothing it could use.
+#
+# A conclusion this short cannot carry evidence + verdict + coverage gaps, so
+# it gets the same one-shot bounce as the zero-call case, with guidance that
+# asks for the conclusion tool instead of more evidence.  Threshold is shared
+# by env NAME with `ledger_middleware._MIN_CONCLUSION_CHARS` (same contract,
+# two stacks; the modules must not import each other).
+_BRIEF_WRAPUP_CHARS = _env_int(
+    "DIAGNOSTICS_EXPERT_MIN_CONCLUSION_CHARS", 60)
+_BRIEF_WRAPUP_GUIDANCE = (
+    "[系统提示·结论待提交] 本次委派已采集到证据，但收尾只有一句过程说明，"
+    "不构成结论。请立即调用结论工具（ArgusExpertFindings / "
+    "DeepExpertFindings）提交：确证项写 key_evidence，反证写 "
+    "negative_evidence，未取证的维度在 coverage_gaps 按『维度名：类型｜原因』"
+    "声明（类型：数据不可用/不适用/强制收尾）。"
+)
+
     # Q4 (v3.38.5): near-truncation reasoning pressure.  A single turn whose
     # reasoning stream runs an order of magnitude longer than its siblings is
     # the leading indicator of the degeneracy that ends in a length
@@ -832,8 +856,8 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         )
 
     def _zero_forensics_recovery(self, state: Any) -> dict | None:
-        """Bounce a delegation ending with ZERO executed diagnostic calls
-        and no structured conclusion (design document §8 expert guards).
+        """Bounce a delegation whose wrap-up carries no usable conclusion
+        (design document §8 expert guards).
 
         Observed 2026-10-24 (scenario 17): host-expert returned after ~11s
         with only "我将按取证策略：概览先行 → …" — a plan, not evidence.
@@ -842,35 +866,67 @@ class ExpertGuidanceMiddleware(AgentMiddleware):
         verify stall guard auto-closed the hypothesis.  One bounded bounce
         asks for real tool calls; the second miss passes through and the
         delegation degrades exactly as before (no new failure mode).
+
+        v3.67.0 (B): "zero calls" was too narrow a trigger.  Measured
+        2026-10-29 (capture 21-response): six evidence calls had run, then the
+        turn ended on a 24-character progress sentence with no structured
+        conclusion — the old `if s["calls"]: return None` skipped it, the
+        sentence was booked as the expert's answer, and the Coordinator spent
+        12k characters re-adjudicating the hypothesis.  The wrapper therefore
+        also bounces a BRIEF wrap-up that follows real forensics; guidance
+        asks for the conclusion tool rather than for more evidence.  Same
+        one-shot latch, so the cost stays one extra turn at most.
         """
         try:
             key = self._key_from_state(state)
             s = self._ledger.session(key)
-            if s["calls"]:
-                return None            # real forensics already gathered
             if self._ledger.truncation_count(key):
                 return None            # zero-call truncation belongs to G28
             if self._ledger.zerocall_bounced(key):
                 return None            # one-shot latch already spent
             if _pending_tool_calls(state):
                 return None            # legitimate work proposed — let it run
+            # Only the model's OWN last turn counts as the wrap-up.  Reading
+            # any message would pick up the delegation instruction
+            # (HumanMessage) — the pre-v3.67.0 code did exactly that and it
+            # never mattered while the predicate was "zero calls"; with a
+            # length contract it would judge the Coordinator's text instead of
+            # the expert's.
+            last_text = ""
             for msg in reversed(state.get("messages", []) or []):
+                if getattr(msg, "type", "") != "ai":
+                    continue
                 text = getattr(msg, "content", "")
-                if isinstance(text, str) and text.strip():
-                    if "【需要参数】" in text:
-                        return None    # missing parameters: cannot gather
-                    break
+                last_text = text.strip() if isinstance(text, str) else ""
+                break
+            if not last_text:
+                # No assistant turn to judge (mid-turn or a caller-supplied
+                # fixture): leave the decision to the other guards.
+                return None
+            if "【需要参数】" in last_text:
+                return None            # missing parameters: cannot gather
+            if s["calls"]:
+                # Real forensics already gathered: only a text too short to
+                # carry evidence + verdict is worth a bounce.
+                if len(last_text) >= _BRIEF_WRAPUP_CHARS:
+                    return None
+                guidance = _BRIEF_WRAPUP_GUIDANCE
+                branch = "brief-wrapup"
+            else:
+                guidance = (
+                    "[系统提示·尚未取证] 本次委派尚未执行任何取证工具调用——"
+                    "计划或策略描述不等于证据。请立即调用 1-3 个与任务最相关的"
+                    "取证工具获取真实数据，再基于结果提交结论；"
+                    "确因缺少必要参数无法取证的，在结论 clarification 中写明缺什么。"
+                )
+                branch = "zero-forensics"
             self._ledger.mark_zerocall_bounced(key)
-            guidance = (
-                "[系统提示·尚未取证] 本次委派尚未执行任何取证工具调用——"
-                "计划或策略描述不等于证据。请立即调用 1-3 个与任务最相关的"
-                "取证工具获取真实数据，再基于结果提交结论；"
-                "确因缺少必要参数无法取证的，在结论 clarification 中写明缺什么。"
-            )
             self._ledger.mark_conclusion_hinted(key, guidance)
             logger.warning(
-                "Zero-forensics delegation %s bounced once before wrap-up "
-                "(turn=%d, executed_calls=0)", key, self._ledger.turns(key))
+                "Delegation %s bounced once before wrap-up (%s, turn=%d, "
+                "executed_calls=%d, text_chars=%d)",
+                key, branch, self._ledger.turns(key), len(s["calls"] or ()),
+                len(last_text))
             return {"jump_to": "model"}
         except Exception:
             return None                # the guard must never break wrap-up

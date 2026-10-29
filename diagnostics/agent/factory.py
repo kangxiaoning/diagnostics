@@ -276,17 +276,26 @@ def _fold_repeated_items(items: Any) -> Any:
 # Deep diagnostic experts (host-expert / k8s-expert / serverless-expert /
 # kmc-expert / sci-expert): verdict + evidence + root cause.
 class RelatedHypothesis(BaseModel):
-    """A hypothesis this delegation's evidence ALSO bears on (v3.37.7).
+    """A hypothesis this delegation's evidence ALSO bears on (v3.37.7; v3.68.0).
 
     One forensic pass routinely informs several competing hypotheses
     (differential-diagnosis practice: a single finding simultaneously
-    supports and excludes candidates — dual-inference DDx).  The
-    delegation still targets ONE assigned hypothesis, but the expert is
-    the only party that knows which OTHER hypotheses its evidence
-    touches, so it declares them here.  The ledger then files the
-    evidence against each declared hypothesis, which is what keeps a
-    later `record_finding confirmed` from being blocked for "no expert
-    evidence" on a hypothesis that was in fact already informed.
+    supports and excludes candidates — dual-inference DDx).  The expert
+    is the only party that knows which OTHER hypotheses its evidence
+    touches, so it declares them here and the ledger files the entry as a
+    same-domain observation on that hypothesis.
+
+    v3.68.0: the docstring used to claim this kept a later
+    ``record_finding confirmed`` from being blocked.  It never did — G17
+    requires a **direct** conclusion (no ``related_via``), and a
+    ``supports`` entry declared here is booked as incidental (the
+    asymmetry with ``effect="refutes"``, which does carry weight, is
+    deliberate: exclusion from one's own data is decidable, confirmation
+    of a mechanism one was not asked to examine is not).  A promise the
+    implementation contradicts made the model skip declaring targets and
+    then lose a round (2026-10-29: H2 re-delegated, +450s).  The contract
+    now states what is true: declare the hypothesis in the delegation's
+    target list (``验证假设H1,H2``) when it should carry a verdict.
     """
 
     id: str = Field(
@@ -318,9 +327,12 @@ class DeepExpertFindings(BaseModel):
         description=(
             "受本次取证影响的其他假设（≤3 项，可选）：一次取证常同时支持或排除多个"
             "竞争假设——把你这次结论还影响到、且**委派描述中出现过**的假设编号写上"
-            "（如 H2，写 2 亦可——系统两种写法都认），"
-            "并标注作用方向；系统据此把本次证据同时归档到这些假设（后续对它们判 "
-            "confirmed 时不会因『缺少专家证据』被拦）。没有其他受影响假设时留空数组。"
+            "（如 H2，写 2 亦可——系统两种写法都认），并标注作用方向。"
+            "系统据此把本次证据归档为这些假设的**同域观测**（旁支方向声明），"
+            "供报告引用与跨假设复用：supports 只作补充说明，不能单独承载 confirmed；"
+            "refutes 则记为直接负证据（可支撑该假设判 refuted）。"
+            "若要让某假设直接承载 confirmed，**把它写进委派描述的目标编号**"
+            "（`验证假设H1,H2`）。没有其他受影响假设时留空数组。"
         ),
     )
 

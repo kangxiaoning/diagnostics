@@ -506,6 +506,45 @@ def strip_unissued_evidence_ids(content: str, ledger: dict) -> tuple[str, list[s
     return cleaned, dropped
 
 
+_PACK_SIGNAL_RE = re.compile(
+    r"oom|kill|error|fail|abort|panic|evict|notready|no space|denied|"
+    r"100%|exhaust|throttl|leak", re.I)
+"""Signals that make a raw observation root-cause-bearing (v3.68.0 R3a-2)."""
+
+
+def _rank_artifacts(arts: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Deterministic relevance order for the report-time pack (v3.68.0 R3a-2).
+
+    Acquisition order is anti-correlated with usefulness.  In the 2026-10-29
+    run H1's pack received the first three gathered results — a 132-char
+    controller dump, a 134-char `ps` line and a 376-char node-conditions
+    table — while the decisive observations (dmesg ``oom-killer`` at 291
+    chars, ``describe_k8s_resource`` OOMKilled at 472) sat at positions 5
+    and 9 and never entered the pack.  The model then re-read them from
+    disk, two rounds in a row.
+
+    Chroma's Context Rot study (2025-07) is the reason this is a bug rather
+    than a style choice: a *single* near-miss distractor already degrades
+    accuracy, and the effect grows with input length.  Selecting by "what
+    was gathered first" actively injects distractors into the root-cause
+    section.
+
+    Order: never-failed first, signal-bearing before the rest, then
+    excerpted before non-excerpted, then by information volume, then EV id
+    (stable tie-break).  Pure code, no model involvement.
+    """
+    def _key(item: tuple[str, dict]) -> tuple:
+        info = item[1]
+        failed = bool(info.get("is_failure") or info.get("is_empty"))
+        blob = f"{info.get('preview') or ''}"
+        signal = bool(_PACK_SIGNAL_RE.search(blob))
+        has_digest = bool(info.get("digest"))
+        return (failed, not signal, not has_digest,
+                -int(info.get("chars") or 0),
+                str(info.get("ev_id") or ""))
+    return sorted(arts, key=_key)
+
+
 def _hypothesis_groups(ledger: dict) -> list[tuple[str, dict]]:
     """Hypotheses to render evidence for: root causes first, then refuted."""
     hypotheses = ledger.get("hypotheses", {}) or {}
@@ -581,11 +620,19 @@ def _pack_block(hid: str, node: dict, arts: list[tuple[str, dict]],
         head += f" · 全文 `{path}`）" if path else "）"
         lines.append(head)
         digest = str(info.get("digest") or "")
+        if not digest:
+            # v3.68.0 (R3a-1): 短结果（< DIGEST_MIN_CONTENT）不生成 digest，
+            # 但 preview 就是它的全文——直接内联。此前该分支输出"结果过短，
+            # 无摘录"，导致 2026-10-29 复跑的根因支持证据段 6/6 全是"见路径"，
+            # 而被 400 字符门槛挡掉的恰好是最关键的观测：H1 的 dmesg
+            # `java invoked oom-killer`（291 字符）与 H2 的 `df` 100% 满
+            # （183 字符）。模型因此只能按路径逐条回读（两轮 10 次）。
+            digest = str(info.get("preview") or "").strip()
         if digest:
-            for dline in digest.splitlines():
+            for dline in (digest.splitlines() or [digest]):
                 lines.append(f"  - `{dline.strip()[:800]}`")
         else:
-            lines.append("  - （结果过短，无摘录——见路径或 preview）")
+            lines.append("  - （无可用摘录——见路径）")
     return lines
 
 
@@ -632,7 +679,9 @@ def render_evidence_pack(
     budget = max_chars
     truncated = False
     for hid, node in groups:
-        arts = by_hid.get(hid, [])[:per_hypothesis]
+        # v3.68.0 (R3a-2): 先按相关性排序再取前 N——采集顺序会把最能支撑
+        # 根因的条目挤出证据包（见 _rank_artifacts 的实证）。
+        arts = _rank_artifacts(by_hid.get(hid, []))[:per_hypothesis]
         block = _pack_block(hid, node, arts, metric_by_hid.get(hid, 0))
         block_len = sum(len(x) + 1 for x in block)
         if block_len > budget:

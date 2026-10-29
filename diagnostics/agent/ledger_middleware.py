@@ -458,6 +458,33 @@ def _gate_hint(phase: str) -> str:
 # mis-read here is lost clarity, never a wrong state transition.
 _PHASE_TOOL_OK_MARK = "【当前阶段动作】"
 _PHASE_TOOL_BLOCKED_MARK = "【当前阶段不可用】"
+
+# ── task 参数说明的 handoff 契约（模块级：单源 + 可被受控测试扫描）──
+# v3.59.0 (B′)：把 handoff 契约写进 task 的 description **参数说明**——schema
+# 是离生成点最近的契约。此前"台账已注入专家上下文"只写在协调员 prompt
+# 中段，而模型的通用先验是"子代理不继承上下文"，于是把台账复述进
+# description（实测 1562→514、1541→522 被剥离）。
+#
+# v3.67.0 (A)：本条曾与字段说明前半段（"诊断参数由系统自动注入"）同时生效，
+# 形成两条互斥指令——模型据"③实体参数"新开参数键承载它们（实测 2026-10-29：
+# `proposed_params` 使 round-1 两个委派全被 G30 拒绝；同族键 `expert`/
+# `parameters` 当日上午各出现一次）。参数契约因此收敛为单源：参数一律声明
+# 为系统注入，第三段只留"实体落点"这个**叙述性**动作，不再出现可被当作
+# 参数槽位的字段名。
+_TASK_PAYLOAD_NOTE = (
+    "系统已把台账与假设树注入专家上下文，无需复述；"
+    "主机/集群/命名空间/时间窗等实体信息同样由系统注入。"
+    "description 只写：①验证假设Hx：<一句话陈述> ②待覆盖的证据通道 "
+    "③实体落点（用自然语言写明对象即可）；"
+    "需专家归档到其他未决假设时，附其编号与一句话陈述"
+)
+
+# 委派描述剥离反馈（v3.59.0 / v3.67.0 同源收敛）。占位符 {dropped} 为字符数。
+_STRIP_NOTE_TEMPLATE = (
+    "上一轮委派描述有 {dropped} 字与已注入专家上下文的台账"
+    "重复，系统已剥离——专家看得到台账，实体信息由系统注入；"
+    "下次只写：①验证假设Hx ②待覆盖通道 ③实体落点（自然语言）"
+)
 # Idempotency guard: strip a previously injected marker before re-adding.
 _PHASE_TOOL_MARK_RE = re.compile(
     r"^(【当前阶段动作】|【当前阶段不可用】(（[^）]*）)?)")
@@ -629,16 +656,7 @@ def _phase_scoped_tools(
             changed = True
         except Exception:  # noqa: BLE001 — guidance must never raise
             out.append(tool)
-    # v3.59.0 (B′): 把 handoff 契约写进 task 的 description **参数说明**——
-    # schema 是离生成点最近的契约。此前"台账已注入专家上下文"只写在协调员
-    # prompt 中段，而模型的通用先验是"子代理不继承上下文"，于是把台账复述
-    # 进 description（实测 1562→514、1541→522 被剥离）。
-    _TASK_PAYLOAD_NOTE = (
-        "系统已把台账与假设树注入专家上下文，无需复述；只写三段："
-        "①验证假设Hx：<一句话陈述> ②待覆盖的证据通道 ③实体参数"
-        "（hostname/cluster_name/namespace）；需专家归档到其他未决假设时，"
-        "附其编号与一句话陈述"
-    )
+    # handoff 契约文本见模块级 `_TASK_PAYLOAD_NOTE`（单源，受控测试可扫描）。
     for _t in out:
         _nm = _t.get("name") if isinstance(_t, dict) else getattr(_t, "name", None)
         if _nm != "task":
@@ -655,7 +673,12 @@ def _phase_scoped_tools(
         if "无需复述" in _cur:
             continue
         try:
-            _fld.description = f"{_cur}。{_TASK_PAYLOAD_NOTE}".strip("。")
+            # 拼接前去掉基准段的句末标点：两侧都自带句号时会出现
+            # "预定义。。系统已…"（2026-10-29 抓包实证），既不美观也让
+            # 两段来源看起来像一次未完成的编辑。
+            _base = _cur.rstrip("。.；; ")
+            _fld.description = (
+                f"{_base}。{_TASK_PAYLOAD_NOTE}" if _base else _TASK_PAYLOAD_NOTE)
             changed = True
         except Exception:
             pass
@@ -733,6 +756,25 @@ def _refute_root_candidate(hypothesis: dict) -> str:
 
 _MODEL_CALL_TIMEOUT = int(os.getenv("DIAGNOSTICS_MODEL_TIMEOUT", "300"))  # seconds per LLM call attempt
 _REPORT_PHASE_TIMEOUT = int(os.getenv("DIAGNOSTICS_REPORT_TIMEOUT", "600"))  # report phase generates a long report
+
+# v3.68.0 (R4a): REPORT 停滞判据的硬上限（轮）。进展式判据容忍一次"核对
+# 证据"，但核对本身可能反复发生——超过该轮数仍无 write_file 即按停滞处理。
+_REPORT_STALL_HARD_ROUNDS = int(
+    os.getenv("DIAGNOSTICS_REPORT_STALL_ROUNDS", "3"))
+
+
+def _report_stall_reached(stall_rounds: int, progress_calls: int) -> bool:
+    """Whether the REPORT valve should escalate (v3.68.0 R4a).
+
+    ``stall_rounds`` counts rounds since REPORT began; ``progress_calls``
+    counts read-only corroboration calls executed in REPORT (reading raw
+    evidence is a legitimate §7 action and Real progress).  One round of
+    corroboration is tolerated; zero progress escalates immediately; the
+    hard ceiling applies regardless.
+    """
+    if stall_rounds >= _REPORT_STALL_HARD_ROUNDS:
+        return True
+    return stall_rounds >= 1 and progress_calls == 0
 
 # ── Decision-phase budget (v3.45.11) ─────────────────────────────────
 # Eight timeouts recorded on 2026-10-22/23 fell EXCLUSIVELY into
@@ -1115,8 +1157,50 @@ def _has_collected_tool_results(request: Any) -> bool:
         return True
 
 
+def _int_env(name: str, default: int) -> int:
+    """Env var with a safe floor (operational knob, not a product API)."""
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+_MIN_CONCLUSION_CHARS = _int_env(
+    "DIAGNOSTICS_EXPERT_MIN_CONCLUSION_CHARS", 60)
+"""Shortest text that can count as a conclusion rather than a progress note.
+
+Kept aligned with ``expert_guidance_middleware._BRIEF_WRAPUP_CHARS``: the two
+modules sit on different stacks (Coordinator model wrapper vs expert graph)
+and must not import each other, so the contract is pinned by the shared env
+name rather than by a symbol.
+"""
+
+
+def _messages_have_task_call(messages: Any) -> bool:
+    """Whether the transcript already carries a ``task`` call (v3.67.0 D).
+
+    Counts ISSUED calls, not accepted ones: a delegation refused by a
+    precondition guard is still an attempt to collect data, and telling the
+    model "you have not called any diagnostic tool" right after it delegated
+    contradicts its own — correct — action.  Measured 2026-10-29 (capture
+    2-request): two `proposed_params` rejections at round 1 produced that
+    receipt at round 2, together with two prohibitions the model could not
+    act on.
+    """
+    try:
+        for msg in messages or ():
+            for call in (getattr(msg, "tool_calls", None) or ()):
+                name = (call.get("name") if isinstance(call, dict)
+                        else getattr(call, "name", ""))
+                if name == "task":
+                    return True
+    except Exception:  # noqa: BLE001 — guidance must never raise
+        return False
+    return False
+
+
 def _response_is_incomplete(response: Any) -> bool:
-    """Whether a subagent model call produced nothing usable (v3.45.9).
+    """Whether a subagent model call produced nothing usable (v3.45.9 / v3.67.0).
 
     An expert turn must end with either a tool call (keep gathering) or a
     conclusion (content).  A response carrying neither, **with no
@@ -1130,8 +1214,18 @@ def _response_is_incomplete(response: Any) -> bool:
     empty result, and that empty result was still booked as coverage — so the
     Coordinator re-delegated the same hypothesis and lost a round.
 
-    Only ``finish_reason`` absent/empty counts: an explicit ``stop`` with
-    empty content is the model's own decision and must not be retried.
+    v3.67.0 (B): the "content must be EMPTY" predicate was too narrow.  An
+    expert that stops mid-reasoning still emits one progress sentence before
+    the action it was about to take — measured 2026-10-29 (capture 21-response,
+    finish_reason None, no tool_calls): ``content`` was 24 characters
+    ("关键证据已初步采集，继续深入取证以确认根因链条。"), the delegate was
+    booked as a conclusion, and the Coordinator spent 12k characters
+    re-adjudicating a verdict on evidence it could not use.  A text shorter
+    than ``_MIN_CONCLUSION_CHARS`` cannot carry evidence + verdict, so it is
+    treated as the same interrupted-response class and retried verbatim once.
+
+    Only ``finish_reason`` absent/empty counts: an explicit ``stop`` — with
+    any content — is the model's own decision and must not be retried.
     """
     try:
         results = (response.result if isinstance(response.result, list)
@@ -1141,13 +1235,14 @@ def _response_is_incomplete(response: Any) -> bool:
     for msg in results:
         if getattr(msg, "tool_calls", None):
             return False
-        if str(getattr(msg, "content", "") or "").strip():
-            return False
+        text = str(getattr(msg, "content", "") or "").strip()
         meta = getattr(msg, "response_metadata", None) or {}
         if isinstance(meta, dict):
             finish = meta.get("finish_reason")
             if finish not in (None, ""):
                 return False
+        if len(text) >= _MIN_CONCLUSION_CHARS:
+            return False
     return True
 
 
@@ -2951,6 +3046,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         # warning.
         self._report_phase_start_round: int = 0
         self._report_forced_enter_round: int = 0
+        # v3.68.0 (R4a): REPORT 阶段的"有进展"确定性信号——只读脚手架
+        # 执行计数（核对证据原文）。旧判据只看"进入 REPORT 后第 N 轮仍无
+        # write_file"，把合法的证据核对判成停滞：2026-10-29 实测 round10/11
+        # 各并行读 6/4 个证据文件，各触发一次告警，且注入的禁令（"禁止调用
+        # 任何诊断工具"）与 §7「read_file 任意相位可用」直接冲突——模型连续
+        # 两轮无视该禁令，禁令被证伪。
+        self._report_progress_calls: int = 0
         self._verify_stall_count: int = 0  # consecutive verify-phase stalls
         self._verify_stuck_last_fired: int = -100  # cooldown for verify-stuck valve
         self._evaluate_stall_count: int = 0  # consecutive evaluate-phase stalls
@@ -3567,7 +3669,13 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         context_block = render_ledger_context(ledger, report_path=self.report_path,
                                                start_time=self._start_time,
                                                end_time=self._end_time)
-        safety_block, safety_mutated = self._build_safety_warnings(ledger)
+        safety_block, safety_mutated = self._build_safety_warnings(
+            ledger,
+            # v3.67.0 (D): an already-issued task call (even one a
+            # precondition guard refused) is progress, not stagnation.
+            delegation_attempted=_messages_have_task_call(
+                getattr(request, "messages", None)),
+        )
         if safety_mutated:
             # A valve mutated the ledger during prompt assembly (auto
             # verdict / forced REPORT / argus degrade) — re-render the
@@ -5084,8 +5192,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         if _unrec_g6:
                             _g6_ids = ", ".join(
                                 fmt_hid(_h) for _h, _n in _unrec_g6)
+                            # v3.67.0 (D): REPORT 阶段的交付物是 write_file，
+                            # 文案直接给这条动作（P7：只注入本阶段应执行的
+                            # 动作），而不是列出做不到的事。
                             self._pending_guidance = (
-                                "REPORT 阶段禁止纯文本收尾。\n"
+                                "REPORT 阶段的交付物是 write_file 报告。\n"
                                 f"{_g6_ids} 已有专家证据但尚未落账。"
                                 "请先逐项 record_finding 补落账（本阶段已开放），"
                                 f"再调用 write_file 写入 {self.report_path}；"
@@ -5093,10 +5204,11 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             )
                         else:
                             self._pending_guidance = (
-                                "REPORT 阶段禁止纯文本收尾。\n"
-                                "你必须在下一轮调用 write_file 将完整诊断"
-                                f"报告写入 {self.report_path}。\n"
-                                "禁止调用任何诊断工具，禁止输出纯文本分析。"
+                                "REPORT 阶段的交付物是 write_file 报告。\n"
+                                "下一轮调用 write_file 将完整诊断报告写入"
+                                f" {self.report_path} 即完成本阶段；\n"
+                                "报告内容取自 <diagnosis_ledger> 的证据链，"
+                                "写完即自动进入交付。"
                             )
                         response = ModelResponse(result=[AIMessage(
                             content="",
@@ -6268,6 +6380,16 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
         else:
             result = await handler(request)
 
+        # v3.68.0 (R4a): REPORT 阶段的合法进展记账。报告需要核对原文时
+        # read_file 是设计允许的动作（§7 全局只读脚手架豁免），它把原文带进
+        # 上下文，属于真实进展——安全阀据此区分"在核对"与"在空转"。
+        if tool_name in ("read_file", "ls", "grep", "glob"):
+            try:
+                if _phase(self._current_ledger or {}) == "report":
+                    self._report_progress_calls += 1
+            except Exception:  # noqa: BLE001 — 记账失败不得影响工具结果
+                pass
+
         # v3.59.0: 委派描述剥离反馈——把"你写的 X 字被丢弃"变成可见结果。
         # 剥离此前是静默的（仅 WARNING 日志），模型无从得知，于是每轮继续
         # 复述台账（实测 1562→514、1541→522）；自我修正只在拿到外部反馈时
@@ -6277,10 +6399,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _strip = take_strip(tool_call_id)
             if _strip and _strip.get("before", 0) > _strip.get("after", 0):
                 _dropped = _strip["before"] - _strip["after"]
-                _strip_note = (
-                    f"上一轮委派描述有 {_dropped} 字与已注入专家上下文的台账"
-                    "重复，系统已剥离——专家看得到台账，无需复述；"
-                    "下次只写：①验证假设Hx ②待覆盖通道 ③实体参数")
+                # v3.67.0 (A): 与 task 参数级说明同源——第三段写"实体落点"
+                # 而不是"实体参数"，否则回执本身又成为一个参数槽位的邀约
+                # （2026-10-29 抓包：本行与 schema 说明同时在上下文里）。
+                # v3.67.0 (A)：文案与 task 参数级说明同源（模块级模板），
+                # 第三段写"实体落点"而不是"实体参数"，否则回执本身又成为
+                # 一个参数槽位的邀约（2026-10-29 抓包：本行与 schema 说明
+                # 同时在上下文里）。
+                _strip_note = _STRIP_NOTE_TEMPLATE.format(dropped=_dropped)
                 # v3.62.0: task 正常返回的是 Command 而非 ToolMessage，
                 # `isinstance(result, ToolMessage)` 恒为 False——这是剥离回执
                 # 两次复跑都没出现的真正原因。改为写入台账，由下一轮「本步
@@ -7098,8 +7224,20 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
 
     # ── Safety mechanisms: max-round, loop detection, stagnation fallback ──
 
-    def _build_safety_warnings(self, ledger: DiagnosisLedger) -> tuple[str, bool]:
+    def _build_safety_warnings(
+        self,
+        ledger: DiagnosisLedger,
+        delegation_attempted: bool = False,
+    ) -> tuple[str, bool]:
         """Build safety directive messages injected into the system prompt.
+
+        ``delegation_attempted`` (v3.67.0 D) tells the UNDERSTAND stagnation
+        valve that a ``task`` call was already ISSUED this session, even when
+        a precondition guard rejected it before dispatch.  Measured 2026-10-29
+        (capture 2-request): round 1 delegated correctly but the delegation
+        guard refused both calls (`proposed_params`), so at round 2 the ledger
+        still showed "no diagnostic tools" and the valve fired with a
+        stagnation receipt that contradicted the model's own correct action.
 
         Returns ``(warnings_text, mutated)``.  ``mutated`` is True when a
         valve changed ledger state during this pass (auto-verdict via
@@ -7382,16 +7520,21 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                 # delegation while genuinely in UNDERSTAND; otherwise
                 # nudge proposing from user input (same semantics as
                 # the argus-degrade path).
-                if _phase(ledger) == "understand":
+                if _phase(ledger) == "understand" and not delegation_attempted:
                     _required_names = "、".join(_required_argus(ledger))
+                    # v3.67.0 (D): 正向配方替代两条禁令（design document §2
+                    # P7：前置引导只注入本阶段应执行的动作）。原句"禁止输出
+                    # 纯文本分析，禁止调用 propose_hypotheses"只说明不做
+                    # 什么，而模型此刻真正需要的是"调哪个工具、之后会怎样"。
                     warnings.append(
-                        "⚠ [系统强制] 当前是第"
-                        f"{round_num}轮，你尚未提出任何假设，"
-                        "且未调用任何诊断工具采集数据。\n"
-                        "禁止输出纯文本分析，禁止调用 propose_hypotheses。\n"
-                        f"你必须在本轮调用 task() 委派 Argus 专家"
-                        f"（{_required_names}）采集监控指标数据。\n"
-                        "这是诊断的第一步——没有数据就无法形成假设。"
+                        "【本阶段唯一动作】task()：委派 Argus 专家采集监控"
+                        "指标数据（第"
+                        f"{round_num}轮）。\n"
+                        f"本轮委派：{_required_names}——可在同一条消息里并行"
+                        "发起。\n"
+                        "数据到位后系统自动进入 HYPOTHESIZE，届时再基于时序"
+                        "证据提出假设；假设建立在监控数据之上，"
+                        "用户描述的现象留给假设阶段解释。"
                     )
                     logger.warning(
                         "Safety: understand stagnation without data (round %d, "
@@ -7653,43 +7796,49 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # consistent with the record_finding channel opened for it,
             # instead of forbidding the very action the gate now requires.
             _unrec_here = unrecorded_evidence_hypotheses(ledger)
+            # v3.68.0 (R4b)：文案改为"唯一动作 + 合法核对路径"。旧文案写着
+            # "禁止调用任何诊断工具"与"禁止输出分析"，而 read_file 属 §7
+            # 全局只读豁免（门控放行）——引导与门控相反，模型连续两轮按门控
+            # 行动，禁令被证伪后其可信度会污染后续所有引导（P6/P7）。
             if _unrec_here:
                 _unrec_ids = ", ".join(fmt_hid(_h) for _h, _n in _unrec_here)
                 warnings.append(
-                    "⛔ [系统强制] 已进入 REPORT 阶段"
-                    f"（第{self._report_phase_start_round}轮起）。\n"
-                    f"⛔ {_unrec_ids} 已采集专家证据但尚未 record_finding 落账。\n"
-                    "请先逐项 record_finding 补落账（本阶段已为此开放），"
-                    "再立即调用 write_file——报告中的假设终态必须与台账一致。\n"
-                    "禁止调用任何诊断工具、委派专家、propose_hypotheses。\n"
-                    "禁止输出分析、总结或复盘文字。\n"
-                    f"落账后必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
-                    "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
+                    f"## 本阶段唯一动作（第{self._report_phase_start_round}轮起）\n"
+                    f"- 先落账：{_unrec_ids} 已有专家证据、尚未 record_finding；"
+                    "逐项补落账（本阶段已开放），报告的假设终态须与台账一致\n"
+                    f"- 再交付：调用 write_file 把诊断报告写入 {self.report_path}\n"
+                    "- 报告所需证据已在「根因支持证据」段与上方证据索引；"
+                    "确需核对原文时，本轮一次并行读取所需条目，随后立即 write_file"
                 )
             else:
                 warnings.append(
-                    "⛔ [系统强制] 已进入 REPORT 阶段"
-                    f"（第{self._report_phase_start_round}轮起）。\n"
-                    "⛔ 不要输出文本 — 你的唯一任务是立即调用 write_file。\n"
-                    "系统已自动终结所有挂起假设，你无需再调用 "
-                    "record_finding / propose_hypotheses。\n"
-                    "禁止调用任何诊断工具、委派专家、record_finding、"
-                    "propose_hypotheses。\n"
-                    "禁止输出分析、总结或复盘文字。\n"
-                    f"必须立即调用 write_file 将诊断报告写入 {self.report_path}。\n"
-                    "报告内容基于上方 <diagnosis_ledger> 中的证据链和根因。"
+                    f"## 本阶段唯一动作（第{self._report_phase_start_round}轮起）\n"
+                    f"- 调用 write_file 把诊断报告写入 {self.report_path}，"
+                    "内容取自上方的证据链与根因\n"
+                    "- 系统已自动终结所有挂起假设；若仍有「已采集未落账」的假设，"
+                    "先补落账再写报告\n"
+                    "- 报告所需证据已在「根因支持证据」段与上方证据索引；"
+                    "确需核对原文时，本轮一次并行读取所需条目，随后立即 write_file"
                 )
-            if round_num - self._report_phase_start_round >= 1:
+            # v3.68.0 (R4a)：判据换锚点——从"第 N 轮仍无 write_file"改为
+            # "进展式 + 硬上限"。有只读核对的一轮算进展（容忍一次完整性核对），
+            # 零进展则首轮即告警；超过硬上限不论进展一律告警。
+            _stall_rounds = round_num - self._report_phase_start_round
+            if _report_stall_reached(_stall_rounds,
+                                     self._report_progress_calls):
                 logger.warning(
-                    "Safety: REPORT phase round %d without write_file "
-                    "(started round %d) — re-injecting mandatory "
-                    "write_file directive (no auto-write)",
-                    round_num, self._report_phase_start_round,
+                    "Safety: REPORT phase round %d without write_file after "
+                    "%d round(s) (started round %d, read-only calls=%d) — "
+                    "re-injecting the single-action directive (no auto-write)",
+                    round_num, _stall_rounds,
+                    self._report_phase_start_round,
+                    self._report_progress_calls,
                 )
         elif current_phase != "report":
             # Reset trackers when leaving REPORT phase (e.g. backtrack)
             self._report_phase_start_round = 0
             self._report_forced_enter_round = 0
+            self._report_progress_calls = 0
 
         return ("\n\n".join(warnings) if warnings else ""), mutated
 
@@ -8759,9 +8908,10 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             if should_exit:
                 exit_hint = (
                     f"\n⚠ {reason} — 进入REPORT阶段。\n"
-                    "⛔ 你必须在下一轮调用 write_file 将诊断报告写入"
+                    # v3.67.0 (D): 只声明本阶段唯一动作（P7），
+                    # 不再并列两条模型无法执行的禁令。
+                    "⭐ 唯一动作：write_file —— 把诊断报告写入"
                     f" {mw.report_path}。\n"
-                    "禁止调用任何诊断工具，禁止输出纯文本分析。"
                     "立即基于 <diagnosis_ledger> 中的证据链生成报告并调用 write_file。"
                 )
                 # Evidence-closure proactive note (design document §6.3,
@@ -8891,7 +9041,7 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                         # statements, Gollwitzer & Sheeran 2006).  State
                         # the legal next ACTION, not the prohibition.
                         "若候选对应已有未决假设：下一步 task 定向委派该"
-                        "假设的验证（description 带候选机制与实体参数）→ "
+                        "假设的验证（description 带候选机制与实体落点）→ "
                         "专家结论到位即 record_finding confirmed 落账——"
                         "提前委派可省 1 轮。"
                     )
