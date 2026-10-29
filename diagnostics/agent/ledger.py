@@ -360,6 +360,34 @@ def new_hypothesis(
     )
 
 
+_DELEGATION_TARGET_RE = re.compile(
+    r"验证假设\s*(H\d+(?:\s*[,，、]\s*H\d+)*)", re.IGNORECASE)
+
+
+def parse_delegation_targets(text: str) -> list[str]:
+    """Hypothesis ids a delegation declares as its targets (v3.65.0).
+
+    Differential diagnosis treats one workup as able to separate **several**
+    rivals ("the one discriminating test that separates them", updating each
+    rival's likelihood — Abstractopedia《Diagnostic Differential》); CauseFix's
+    hypothesis-driven RCA likewise asks for the required evidence source **per
+    hypothesis** rather than one at a time.  So the question a confirmation
+    gate must ask is not "was this the delegation's assigned hypothesis" but
+    "did the delegation declare this hypothesis and did the expert land
+    evidence on it".
+
+    Only the explicit ``验证假设H1,H2`` form counts — free text must not be
+    parsed, or incidental mentions would silently upgrade to direct evidence.
+    """
+    out: list[str] = []
+    for match in _DELEGATION_TARGET_RE.finditer(str(text or "")):
+        for part in re.split(r"[,，、]", match.group(1)):
+            hid = part.strip().upper()
+            if hid and hid not in out:
+                out.append(hid)
+    return out
+
+
 def confirmatory_expert_evidence(ledger: DiagnosisLedger, hid: str) -> bool:
     """Whether *hid* holds expert evidence able to carry a ``confirmed``
     verdict (design document §8 G17, evidence-standard gate; v3.42.0).
@@ -2932,12 +2960,18 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
                 if len(_s) > 30:
                     _s = _s[:30] + "…"
                 _ddx_items.append(f"{fmt_hid(_h)}：{_s}" if _s else fmt_hid(_h))
+            # v3.65.0 (C)：修正承诺。原句写"归档到这些假设（后续判 confirmed
+            # 时不会被拦）"，而 G17 的判据把 supports 一律记为旁支、不能承载
+            # confirmed——prompt 的承诺与代码相反，模型据此行动必然被打回
+            # （实测 2026-10-29 round 5：H2/H3 各被拦一次）。现改为"写明目标
+            # 编号即可，声明的目标其 supports 记为直接证据"。
             _ddx_hint = (
-                "- ⚠ 委派描述中请一并写入其它未决假设的编号与一句话陈述（"
-                + "；".join(_ddx_items)
-                + "）——专家据此声明 related_hypotheses，系统把本次证据同时"
-                "归档到这些假设（后续对它们判 confirmed 时不会因「缺少专家"
-                "证据」被拦）\n"
+                "- ⚠ 委派描述写明本次要验证的假设编号（**可多个**，逗号分隔，"
+                "如 `验证假设H1,H2`）"
+                + (f"；其它未决假设（{'；'.join(_ddx_items)}）" if _ddx_items else "")
+                + "——专家据此声明 related_hypotheses：**声明的目标**其中 "
+                "supports 记为直接证据（可承载 confirmed），未声明的顺带观察"
+                "仍记为旁支（只能支撑 inconclusive）\n"
                 # v3.56.0: one delegation may SETTLE several candidates when
                 # they share the same evidence domain (differential diagnosis:
                 # one workup can exclude several alternatives).  Explicitly

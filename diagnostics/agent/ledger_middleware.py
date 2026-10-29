@@ -112,6 +112,7 @@ from diagnostics.agent.ledger import exit_block_is_actionable  # v3.48.0 退出�
 from diagnostics.agent.ledger import corroborating_observation_evidence  # v3.52.0 工具原始观测可作确证层证据
 from diagnostics.agent.ledger import _OBSERVATION_EVIDENCE_TOOLS  # v3.55.0 实时探测/日志工具白名单（EV 归属校验）
 from diagnostics.agent.ledger import is_symptom_self_declared  # v3.61.0 症状不得作为根因落账
+from diagnostics.agent.ledger import parse_delegation_targets  # v3.65.0 一次委派可声明多个目标
 from diagnostics.agent.delegation_guard import take_strip  # v3.59.0 委派描述剥离反馈（按 tool_call_id）
 from diagnostics.agent.evidence_ledger import iter_artifacts  # v3.55.0 原始观测条目查询（EV 编号 → 工具/轮次）
 from diagnostics.agent.ledger import attributed_structured  # 旁支归因证据的 verdict 重述（v3.38.4）
@@ -6603,6 +6604,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                             elif _structured_expert is not None:
                                 _rel_items = getattr(
                                     _structured_expert, "related_hypotheses", None)
+                            # v3.65.0 (B)：本次委派**声明**的目标假设。鉴别诊断
+                            # 允许一次 workup 区分多个候选（Abstractopedia
+                            # 《Diagnostic Differential》：一个 discriminating
+                            # test 同时更新各候选的 likelihood），所以"声明的
+                            # 目标"其 supports 应记为直接证据；未声明的顺带
+                            # 观察仍为旁支。
+                            _declared_targets = set(parse_delegation_targets(
+                                str(tool_args.get("description", "") or "")))
                             for _rel in _rel_items or []:
                                 if isinstance(_rel, dict):
                                     _raw_rid = str(_rel.get("id") or "").strip()
@@ -6676,6 +6685,12 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
                                     if _effect == "refutes":
                                         _rev["supports"] = False
                                         _rev["_declared_refutation"] = True
+                                    elif fmt_hid(_rid) in _declared_targets:
+                                        # v3.65.0 (B)：委派描述里声明了该假设
+                                        # 是本次目标 → 专家对它给出的 supports
+                                        # 是该假设的**针对性证据**，记为直接
+                                        # 证据（可承载 confirmed）。
+                                        _rev["_declared_target"] = target_hid
                                     else:
                                         _rev["related_via"] = target_hid
                                 _rnode = ledger["hypotheses"][_rid]
