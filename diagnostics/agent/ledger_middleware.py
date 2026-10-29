@@ -8592,6 +8592,34 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             _refutation_note = ""
             _rn = ledger.get("hypotheses", {}).get(hypothesis_id) or {}
 
+            # v3.64.1 (A)：专家执行摘要。ExpertSessionLedger 是 **per-delegation**
+            # （key = 委派描述全文的哈希），所以同一专家被多次委派时看不到
+            # 自己上次查过什么，会重复调用同一批工具（业界称
+            # "subagents may redo context-gathering"）。deepagents 的默认
+            # isolated 模式本就不跨委派记忆，官方建议由**主管侧**维护长期
+            # 记忆；这里即按该思路把"哪个专家、验的哪个假设、结论如何"记到
+            # 协调员台账，供下次委派前下发。
+            _src_experts = {
+                str(e.get("source") or "").split(":", 1)[1]
+                for e in (_rn.get("evidence") or [])
+                if str(e.get("source") or "").startswith("expert:")
+                and e.get("supports") is not None}
+            if _src_experts:
+                _hist = ledger.setdefault("expert_history", [])
+                _hist[:] = [
+                    h for h in _hist
+                    if not (h.get("expert") in _src_experts
+                            and h.get("hypothesis") == hypothesis_id)]
+                for _ex in sorted(_src_experts):
+                    _hist.append({
+                        "round": self._model_call_count,
+                        "expert": _ex,
+                        "hypothesis": hypothesis_id,
+                        "verdict": verdict,
+                        "points": (evidence_summary or "").strip()[:80],
+                    })
+                del _hist[:-24]
+
             # v3.58.0: 单通道披露绑定终态——改判为 confirmed 时撤销此前披露，
             # 否则日志里会永久留下"某假设曾被单通道证伪"，事后分析据此误读
             # （实测 2026-10-27 run1：H2 round 6 触发披露、round 8 改判 confirmed）。

@@ -2074,6 +2074,18 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
                 + "；原文见 /tool_results/")
         lines.append("")
 
+    # v3.64.1 (D)：专家执行记录——独立成段（没有工具结果时也要显示）。
+    # 协调员据此判断"该维度是否已查过、结论如何"，而不只看到工具名与预览。
+    _eh_rows = (ledger.get("expert_history") or [])[-6:]
+    if _eh_rows:
+        lines.append("## 专家执行记录（同一维度已有结论时不必重复委派）")
+        for _rec in _eh_rows:
+            lines.append(
+                f"- [{_rec.get('expert', '?')}] 第{_rec.get('round', '?')}轮"
+                f" → {fmt_hid(str(_rec.get('hypothesis') or '?'))} "
+                f"{_rec.get('verdict', '?')}：{str(_rec.get('points') or '')[:60]}")
+        lines.append("")
+
     # ── Diagnostic history: round-by-round tool call timeline ──
     # Only rendered when there is substantive content.  Coordinator
     # rounds typically contain task() calls only, which previously
@@ -2961,6 +2973,22 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
         # 披露——把"当前只覆盖一个通道"写在动作之前，让补通道成为默认路径。
         _sc_pre = (single_channel_refute_signal(ledger, active_id)
                    if active_id != "?" else None)
+        # v3.64.1 (A)：专家执行摘要前置。同一 expert 被多次委派时，把它
+        # 之前查过的假设、结论与要点写在动作之前，避免重复查询同一维度
+        # （ExpertSessionLedger 是 per-delegation，跨委派无记忆）。
+        _eh_hint = ""
+        _eh_records = ledger.get("expert_history") or []
+        if _eh_records:
+            _eh_lines = []
+            for _rec in _eh_records[-4:]:
+                _eh_lines.append(
+                    f"  第{_rec.get('round', '?')}轮 {_rec.get('expert', '?')}"
+                    f" → {fmt_hid(str(_rec.get('hypothesis') or '?'))} "
+                    f"{_rec.get('verdict', '?')}：{_rec.get('points', '')}")
+            _eh_hint = (
+                "- ℹ 本会话专家执行记录（同一维度通常已有结论，"
+                "无新变化时不必重复查询）：\n"
+                + "\n".join(_eh_lines) + "\n")
         _sc_hint = ""
         if _sc_pre:
             _sc_label = "、".join(_sc_pre.get("channel_labels") or []) or "?"
@@ -2994,6 +3022,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + _strip_hint
             + _related_verdict_hint
             + _sc_hint
+            + _eh_hint
             + _obs_hint
             # v3.54.0: if-then 预演引导（deliberation-over-observation 在
             # VERIFY 的形态）。实测 2026-10-26 run3 round 7：单响应
