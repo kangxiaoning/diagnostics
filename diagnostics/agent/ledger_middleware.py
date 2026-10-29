@@ -8614,11 +8614,14 @@ class DiagnosisLedgerMiddleware(AgentMiddleware):
             # isolated 模式本就不跨委派记忆，官方建议由**主管侧**维护长期
             # 记忆；这里即按该思路把"哪个专家、验的哪个假设、结论如何"记到
             # 协调员台账，供下次委派前下发。
+            # v3.66.0: 去掉 `supports is not None`——实测 2026-10-29 两次复跑
+            # 的专家证据多为 supports=None（专家给出结论但未给方向），结果
+            # expert_history 一条都没写入（v3.64.1 等于没上线）。只要来源是
+            # expert:* 就记录"该专家验过这个假设、verdict 是什么"。
             _src_experts = {
                 str(e.get("source") or "").split(":", 1)[1]
                 for e in (_rn.get("evidence") or [])
-                if str(e.get("source") or "").startswith("expert:")
-                and e.get("supports") is not None}
+                if str(e.get("source") or "").startswith("expert:")}
             if _src_experts:
                 _hist = ledger.setdefault("expert_history", [])
                 _hist[:] = [

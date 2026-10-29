@@ -3064,6 +3064,10 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             # 重试才产出动作。引导前移到动作之前，不新增任何门控。
             # 首行必须仍是"本阶段动作"（最靠近生成点的唯一动作声明）。
             + f"- 本阶段动作：{_PHASE_ALLOWED_HINT.get('verify')}\n"
+            # v3.66.0 (D)：多目标写法前移到动作行之后。实测 2026-10-29 两次
+            # 复跑：`验证假设H1` 11 次、`H2` 2 次、`H3` 1 次，**没有一次**
+            # 写成 `验证假设H1,H2`——写法埋在 duty 之后太远。
+            + _ddx_hint
             # v3.57.0：原「⏱ 若你准备在 reasoning 里预写委派描述或最终结论
             # →…预演文本」点名了回避行为，按同一原则改为正向单句。
             + "- 本阶段一步到位：调用 task（描述写进 description）或 "
@@ -3080,7 +3084,7 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             f"{disp_id}\"并传入假设上下文\n"
             + _record_hint
             + _attribution_hint
-            + _ddx_hint
+            # （_ddx_hint 已前移到动作行之后，v3.66.0 D）
             # v3.62.0: 单焦点约束前移。实测 2026-10-28 round 4：模型同轮并行
             # 委派 host-expert(焦点 H1) 与 k8s-expert(另一个假设)，第二个被
             # `task() blocked by single-focus batch rule` 拦下，白耗一次调用。
@@ -3270,10 +3274,15 @@ def _phase_guidance(phase: DiagnosisPhase, ledger: DiagnosisLedger,
             + _eval_rec +
             _eval_menu
             + _append_option +
-            "- 根因与角色：只有证据支持且满足反事实判据（移除该因素后故障"
-            "不再发生或显著缓解）才列为独立根因；仅放大影响的因素列为促成/"
-            "加剧因素，下游表现列为症状与影响。confirmed 只表示验证状态，"
-            "不自动证明因果角色；refuted 仅用于证据明确证伪。\n"
+            # v3.66.0 (A′)：反事实改为参考，判据改成三条可操作的，并给出
+            # "数据不足"的合法出口（依据 US EPA / SciXa / NTSB 的 probable
+            # cause 实践）。
+            "- 根因与角色（三条可操作判据，任一满足即可）：①时间先后；②机制"
+            "解释（可解释量级）；③可修复性（对应配置/代码/容量/策略）。"
+            "**三条都不满足 → 写「数据不足，角色未定」并列出缺失的数据**；"
+            "仅放大影响的因素列为促成/加剧因素，下游表现列为症状与影响；"
+            "反事实（移除后是否复发）仅作参考，不要求你证明。"
+            "confirmed 只表示验证状态，不自动证明因果角色。\n"
             "- ⚠ 独立故障源识别：多个进程/配置异常各自被观测到且相互独立时，"
             "应分别建假设、验证和登记；不得用 statement_update 把新独立机制"
             "并入已有假设，也不得仅因『非主症状直接原因』而 refuted 客观存在"
