@@ -1893,6 +1893,22 @@ def display_statement(node: dict) -> str:
     return str(node.get("statement") or "")
 
 
+def _short_cache_path(path: str, limit: int = 46) -> str:
+    """Render a tool-result path as ``<cache>/<basename>`` (v3.64.0).
+
+    Measured 2026-10-28: each rendered line carried a ~80-char absolute path;
+    33 lines meant ≈2.3k chars of paths alone, while the Coordinator never
+    opens them (it reads the ledger's conclusions).  The full path stays in
+    ``tool_results`` and in ``/tool_results/`` itself.
+    """
+    if not path:
+        return ""
+    name = path.rsplit("/", 1)[-1]
+    if len(name) > limit:
+        name = name[:limit - 1] + "…"
+    return f"<cache>/{name}"
+
+
 def render_ledger_context(ledger: DiagnosisLedger | None,
                           report_path: str = "",
                           start_time: str = "",
@@ -2019,18 +2035,43 @@ def render_ledger_context(ledger: DiagnosisLedger | None,
         lines.append(
             "## 已有工具调用结果 (摘要；原文路径仅在需要核对时查阅)"
             "  ←禁止重复调用")
-        for cache_key, info in sorted(
-            tool_results.items(), key=lambda x: x[1].get("round", 0)
-        ):
+        # v3.64.0 (A2)：按轮折叠。orchestrator 是调度视图——它只需知道
+        # \"查过什么\"（避免重复调用），不需要每条预览。最近 3 轮完整保留，
+        # 更早的按轮汇总工具名（保留可查性）。实测 2026-10-28 round 4：
+        # 该段 6,314 字符 / 33 条，其中第 1 轮 8 条是 Argus 参数回显，
+        # 模型从未回看；而专家的 context 走另一套渲染器（expert_session_ledger），
+        # 不受此处影响——依据 AgentPatterns：planners get summaries,
+        # workers get file excerpts。
+        _sorted_items = sorted(
+            tool_results.items(), key=lambda x: x[1].get("round", 0))
+        # 按**条目数**截断而非轮次：实测 2026-10-28 round 4 只有 3 个轮次
+        # 但要渲染 33 条，按"最近 3 轮"会让折叠完全不触发。
+        _KEEP_ITEMS = 12
+        _keep_keys = {k for k, _ in _sorted_items[-_KEEP_ITEMS:]}
+        _folded_rounds: dict[int, list[str]] = {}
+        for cache_key, info in _sorted_items:
             tool_name = cache_key.split(":")[0]
+            rnd = int(info.get("round") or 0)
+            if cache_key not in _keep_keys:
+                bucket = _folded_rounds.setdefault(rnd, [])
+                if tool_name not in bucket:
+                    bucket.append(tool_name)
+                continue
             preview = info.get("preview", "")[:80]
-            path = info.get("path", "")
+            path = _short_cache_path(str(info.get("path") or ""))
             fail = " ⚠失败" if info.get("is_failure") else ""
             ref = f"原文: {path}" if path else "(未落盘)"
             lines.append(
-                f"- [{tool_name}] 第{info['round']}轮: {preview}... "
+                f"- [{tool_name}] 第{rnd}轮: {preview}... "
                 f"({info.get('lines', '?')}行) → {ref}{fail}"
             )
+        for rnd in sorted(_folded_rounds):
+            names = _folded_rounds[rnd]
+            lines.append(
+                f"- 第{rnd}轮已折叠（{len(names)} 类）："
+                + "、".join(names[:8])
+                + ("…" if len(names) > 8 else "")
+                + "；原文见 /tool_results/")
         lines.append("")
 
     # ── Diagnostic history: round-by-round tool call timeline ──
@@ -2152,7 +2193,14 @@ def _render_hypothesis_tree(
     # 自己此前的输出当范本模仿，arXiv:2602.03664）。
     # verify 保持完整：该相位正要判断"证据够不够 confirmed"，明细是判据。
     # evaluate/report 的明细在 record_finding 回执与「已有工具调用结果」段有备份。
-    _compact = derive_phase(ledger) in ("evaluate", "report")
+    _phase_now = derive_phase(ledger)
+    _compact = _phase_now in ("evaluate", "report")
+    # v3.64.0 (E2)：VERIFY 的证据明细压成一行（source 标签 + 前 40 字）。
+    # verify 需要"证据够不够"的判断，但不需要 3,000 字原文——完整明细在
+    # record_finding 回执、专家结论与「已有工具调用结果」段均有备份。
+    # 实测 2026-10-28 两次复跑：round 4 verify 的假设树 3,327 字符，而模型
+    # 反复重写的内容与它逐字同构（「H1 confirmed p=90 + 证据…」×7）。
+    _brief_evidence = _phase_now == "verify"
     for hid in ids:
         node = ledger["hypotheses"].get(hid)
         if node is None:
@@ -2196,10 +2244,11 @@ def _render_hypothesis_tree(
         for ev in evidence_entries:
             # v3.45.7: channel/time-semantics tag — see `_evidence_source_tag`.
             _src_tag = _evidence_source_tag(ev.get("source", ""))
+            _ev_limit = 40 if _brief_evidence else 3000
             lines.append(
                 f"{prefix}  证据: "
                 f"{f'{_src_tag} ' if _src_tag else ''}"
-                f"{_clean_evidence_text(ev.get('summary', ''), 3000)} "
+                f"{_clean_evidence_text(ev.get('summary', ''), _ev_limit)} "
                 f"({_support_tag(ev.get('supports'))})"
             )
         # Verification tools
